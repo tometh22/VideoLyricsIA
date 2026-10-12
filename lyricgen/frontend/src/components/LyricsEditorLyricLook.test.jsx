@@ -78,3 +78,25 @@ describe("LyricsEditor — video hecho sin fondo generado", () => {
     expect(screen.queryByTestId("editor-look-needs-bg")).toBeNull();
   });
 });
+
+describe("LyricsEditor — panel «Variante»", () => {
+  it("con look muestra el panel y cada acción avisa al padre", () => {
+    const onLookVariantChange = vi.fn();
+    render(<LyricsEditor {...props({
+      lyricLook: "cinetico",
+      lookVariant: { lyricVariant: 2, lyricFontMain: "anton", lyricColor: "#FFFFFF" },
+      onLookVariantChange,
+    })} />);
+    expect(screen.getByTestId("editor-variant-panel")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("editor-variant-next"));
+    expect(onLookVariantChange).toHaveBeenLastCalledWith("lyricVariant", 3);
+    fireEvent.click(screen.getByTestId("editor-variant-restore"));
+    expect(onLookVariantChange).toHaveBeenCalledWith("lyricFontMain", "");
+    expect(onLookVariantChange).toHaveBeenCalledWith("lyricVariant", "");
+  });
+
+  it("sin look no hay panel", () => {
+    render(<LyricsEditor {...props({ lyricLook: "" })} />);
+    expect(screen.queryByTestId("editor-variant-panel")).toBeNull();
+  });
+});

@@ -154,6 +154,7 @@ export const LOOK_LAYOUT_KEYFRAMES = `
   @keyframes wlp-kin-spin { 0% { transform: ${KINETIC_FROM.spin}; opacity: 0; } 100% { transform: none; opacity: 1; } }
   @keyframes wlp-kin-stretch { 0% { transform: ${KINETIC_FROM.stretch}; opacity: 0; } 100% { transform: none; opacity: 1; } }
   @keyframes wlp-kin-pulse { 0%, 100% { transform: scale(1); } 14% { transform: scale(1.1); } 45% { transform: scale(1); } }
+  @keyframes wlp-kin-shake { 0%, 100% { transform: scale(1) rotate(0); } 8% { transform: scale(1.08) rotate(-4deg); } 16% { transform: scale(1.04) rotate(3deg); } 26% { transform: scale(1) rotate(-1deg); } 40% { transform: scale(1) rotate(0); } }
   @keyframes wlp-kin-blink { 0% { opacity: 1; } 50% { opacity: .3; } }
   @keyframes wlp-kin-bubble { from { transform: rotate(var(--rot)) scale(.2); opacity: 0; } to { transform: rotate(var(--rot)) scale(1); opacity: 1; } }
   @keyframes wlp-look-reveal { from { clip-path: inset(-40% 100% -40% -5%); } to { clip-path: inset(-40% -5% -40% -5%); } }
@@ -475,6 +476,14 @@ function kineticLayout(ctx) {
     }
   });
   const seed = seedOf(`${lineIdx}:${tokens.join(" ")}`);
+  // Composición de la variante (resolve.style): sin `style` se conserva el
+  // Cinético de siempre (rayos / globo / subrayado, conectores manuscritos
+  // inclinados en el acento).
+  const ks = lp.kineticStyle || null;
+  const DECO_OF = { burst: "rays", bubble: "bubble", swoosh: "swoosh", slash: "slash" };
+  const decoPool = ks
+    ? ks.decorations.map((d) => DECO_OF[d]).filter(Boolean)
+    : ["rays", "bubble", "swoosh"];
   let rowN = 0;
   const body = columns.map((col, ci) => (
     <div
@@ -499,13 +508,16 @@ function kineticLayout(ctx) {
         const delay = sampleWordDelay(first);
         const script = sp.kind === "script";
         const kind = script ? "pop" : KINETIC_KINDS[(Math.floor(seed / 7) + r * 3) % KINETIC_KINDS.length];
-        const colour = script ? accent : (sp.kind === "key" ? accent : [ink, alt][r % 2]);
-        const tilt = script ? (((seed >> r) & 1) ? -7 : 6) : 0;
+        const colour = script
+          ? (ks ? (ks.connectorColor || alt) : accent)
+          : (sp.kind === "key" ? accent : [ink, alt][r % 2]);
+        const tilt = script && (!ks || ks.connectorTilt) ? (((seed >> r) & 1) ? -7 : 6) : 0;
+        const scriptFace = script ? ((ks && ks.connectorFont) || lp.scriptFont || null) : null;
         const enter = enterStyle({
           live, visible, delay, kf: `wlp-kin-${kind}`, durS: 0.26, hidden: { transform: KINETIC_FROM[kind] },
         });
         const isKey = sp.kind === "key";
-        const deco = isKey ? seed % 3 : null;
+        const deco = isKey && decoPool.length ? decoPool[seed % decoPool.length] : null;
         const showDeco = isKey && (!live || visible);
         const decoDelay = live ? 0.12 : delay + 0.12;
         return (
@@ -520,14 +532,28 @@ function kineticLayout(ctx) {
               lineHeight: script ? 0.95 : 0.84,
               whiteSpace: "nowrap",
               color: colour,
-              fontFamily: script && lp.scriptFont ? lp.scriptFont.css : undefined,
-              fontWeight: script && lp.scriptFont ? lp.scriptFont.weight : undefined,
+              fontFamily: scriptFace ? scriptFace.css : (isKey && lp.keyFont ? lp.keyFont.css : undefined),
+              fontWeight: scriptFace ? scriptFace.weight : (isKey && lp.keyFont ? lp.keyFont.weight : undefined),
               transform: tilt ? `rotate(${tilt}deg)` : undefined,
               zIndex: isKey ? 1 : 2,
               margin: isKey ? "0.08em 0" : 0,
             }}
           >
-            {showDeco && deco === 0 ? (
+            {showDeco && deco === "slash" ? (
+              <svg
+                data-look-deco="slash"
+                aria-hidden="true"
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
+                style={{ position: "absolute", left: "-6%", width: "112%", top: "-10%", height: "120%", overflow: "visible", zIndex: 3, pointerEvents: "none", animation: `wlp-look-reveal .18s ${(decoDelay + 0.05).toFixed(2)}s linear both` }}
+              >
+                {/* Zarpazo: tres trazos diagonales cruzando la clave. */}
+                {[[18, 92, 46, 6], [38, 96, 66, 10], [58, 94, 86, 4]].map(([x0, y0, x1, y1], n) => (
+                  <line key={n} x1={x0} y1={y0} x2={x1} y2={y1} stroke={alt} strokeWidth="0.45cqw" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                ))}
+              </svg>
+            ) : null}
+            {showDeco && deco === "rays" ? (
               <svg
                 data-look-deco="rays"
                 aria-hidden="true"
@@ -543,7 +569,7 @@ function kineticLayout(ctx) {
                 ))}
               </svg>
             ) : null}
-            {showDeco && deco === 1 ? (
+            {showDeco && deco === "bubble" ? (
               <span
                 data-look-deco="bubble"
                 aria-hidden="true"
@@ -563,7 +589,7 @@ function kineticLayout(ctx) {
                 <span style={{ position: "absolute", bottom: "-0.14em", [seed & 2 ? "left" : "right"]: "14%", width: "0.3em", height: "0.3em", background: alt, transform: "rotate(45deg)" }} />
               </span>
             ) : null}
-            {showDeco && deco === 2 ? (
+            {showDeco && deco === "swoosh" ? (
               <svg
                 data-look-deco="swoosh"
                 aria-hidden="true"
@@ -577,12 +603,20 @@ function kineticLayout(ctx) {
             <span style={{ display: "inline-block", transformOrigin: "50% 100%", ...enter }}>
               <span
                 data-beat-pulse={isKey && beat ? (beat.pulsing ? "on" : "off") : undefined}
+                data-beat-shake={isKey && ks && ks.beatShake ? "true" : undefined}
                 style={isKey && beat
-                  // Beats reales (en vivo): la clave patea sobre el beat de pulso.
-                  ? { display: "inline-block", transform: `scale(${beat.pulsing ? 1.1 : 1})`, transition: "transform 50ms ease-out" }
+                  // Beats reales (en vivo): la clave patea sobre el beat de
+                  // pulso; con beat_shake además da un sacudón (giro corto).
+                  ? {
+                    display: "inline-block",
+                    transform: `scale(${beat.pulsing ? 1.1 : 1})${ks && ks.beatShake ? ` rotate(${beat.pulsing ? -4 : 0}deg)` : ""}`,
+                    transition: "transform 50ms ease-out",
+                  }
                   : {
                     display: "inline-block",
-                    animation: isKey ? `wlp-kin-pulse .55s ${(live ? 0.4 : delay + 0.4).toFixed(2)}s ease-out infinite` : undefined,
+                    animation: isKey
+                      ? `${ks && ks.beatShake ? "wlp-kin-shake" : "wlp-kin-pulse"} .55s ${(live ? 0.4 : delay + 0.4).toFixed(2)}s ease-out infinite`
+                      : undefined,
                   }}
               >
                 {sp.text}
@@ -766,7 +800,8 @@ function blockLayout(ctx) {
               display: "block",
               fontSize: toCqw(sp.fs),
               lineHeight: 0.84,
-              fontWeight: sp.heavy ? look.font.weight : (lp.lightWeight || 300),
+              fontWeight: sp.key && lp.keyFont ? lp.keyFont.weight : (sp.heavy ? look.font.weight : (lp.lightWeight || 300)),
+              fontFamily: sp.key && lp.keyFont ? lp.keyFont.css : undefined,
               color: sp.key ? (lp.accent || textColor) : textColor,
               whiteSpace: "nowrap",
               letterSpacing: "0.01em",
@@ -867,7 +902,7 @@ function arcLayout(ctx) {
           stroke="rgba(0,0,0,.7)"
           strokeWidth={kfs * 0.03}
           paintOrder="stroke"
-          style={{ transformBox: "fill-box", transformOrigin: "center", animation: `wlp-look-keypop .12s ${(live ? 0 : sampleWordDelay(k)).toFixed(2)}s cubic-bezier(.3,.7,.4,1) both` }}
+          style={{ fontFamily: lp.keyFont ? lp.keyFont.css : undefined, fontWeight: lp.keyFont ? lp.keyFont.weight : undefined, transformBox: "fill-box", transformOrigin: "center", animation: `wlp-look-keypop .12s ${(live ? 0 : sampleWordDelay(k)).toFixed(2)}s cubic-bezier(.3,.7,.4,1) both` }}
         >
           {tokens[k]}
         </text>
@@ -904,7 +939,14 @@ function floorLayout(ctx) {
       style={{ display: "inline-block", fontSize: toCqw(basePx), transformOrigin: "50% 50%", "--yaw": `${yaw}deg`, ...motion }}
     >
       {tokens.map((tok, i) => (
-        <span key={i} data-look-key={i === k ? "true" : undefined} style={{ color: i === k ? (lp.accent || textColor) : undefined }}>
+        <span
+          key={i}
+          data-look-key={i === k ? "true" : undefined}
+          style={{
+            color: i === k ? (lp.accent || textColor) : undefined,
+            ...(i === k && lp.keyFont ? { fontFamily: lp.keyFont.css, fontWeight: lp.keyFont.weight } : {}),
+          }}
+        >
           {(i ? " " : "") + tok}
         </span>
       ))}

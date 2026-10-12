@@ -13,6 +13,15 @@
 // depende del idioma activo.
 
 import { LYRIC_LOOK_LABELS } from "./lyricLooks.js";
+import { STATIC_LOOK_CATALOG } from "./lyricLookVariants.js";
+
+// Variantes de look: género y fuentes del catálogo de respaldo (los mismos
+// ids que /lyric-looks/catalog). Los nombres de fuente son marcas: no se
+// traducen.
+const lookFontLabels = (t) => ({
+  "": t("upload.variant_font_default_plain") || "De la variante",
+  ...Object.fromEntries(STATIC_LOOK_CATALOG.fonts.map((f) => [f.id, f.label])),
+});
 
 /** code → etiqueta de Movimiento. "" (Auto) incluido. */
 export const MOVEMENT_LABELS = (t) => ({
@@ -109,6 +118,13 @@ export const AXIS_VALUE_LABELS = (t) => ({
   },
   // Look de letra: mismo catálogo que el picker (lib/lyricLooks).
   lyric_look: LYRIC_LOOK_LABELS(t),
+  // Variante del look (lib/lyricLookVariants): "" = automático.
+  lyric_genre: {
+    "": t("upload.variant_genre_auto") || "Automático",
+    ...Object.fromEntries(STATIC_LOOK_CATALOG.genres.map((g) => [g.id, g.label])),
+  },
+  lyric_font_main: lookFontLabels(t),
+  lyric_font_key: lookFontLabels(t),
   title_template: {
     auto: t("upload.titlecard_auto") || "Auto",
     centered: t("upload.titlecard_centered") || "Centrada",

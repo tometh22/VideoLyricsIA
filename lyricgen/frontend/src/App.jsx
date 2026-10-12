@@ -98,6 +98,9 @@ import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
 import { normalizeLyricLook, lyricColorForSubmit, lookOwnsBackground } from "./lib/lyricLooks";
 import {
+  LOOK_VARIANT_FIELDS, appendLookVariantFields, lookVariantFieldsFromParams, pickLookVariantFields,
+} from "./lib/lyricLookVariants";
+import {
   canRebuildMissingGenerationJob,
   isMissingGenerationJob,
   rebuildGenerationRequestFromLocalAudio,
@@ -1597,6 +1600,11 @@ function VariantWizardRoute({
         lyricsAnimation: params.lyrics_animation || "none",
         lineTransition: params.line_transition || "none",
         lyricLook: normalizeLyricLook(params.lyric_look || ""),
+        // Variante del look del padre (género / fuentes / colores). El
+        // NÚMERO no: una variante es otro video, arranca en automático y el
+        // backend le elige uno distinto al del padre (resolve con `fresh`).
+        ...lookVariantFieldsFromParams(params),
+        lyricVariant: "",
         // Normalizado igual que en edición: el backend persiste el valor CRUDO
         // y un padre con "dinamico" (lo emiten SceneEditModal y el derivado por
         // energía) no matchea ninguna tarjeta → la galería quedaba sin nada
@@ -2078,6 +2086,7 @@ export default function App() {
     const fields = [
       "font", "textCase", "fontScale", "textContrast",
       "lyricsAnimation", "lineTransition", "lyricLook",
+      ...LOOK_VARIANT_FIELDS.map(([camel]) => camel),
       "lyricColor", "lyricSungColor",
       "movementStyle", "effect", "concept", "genre",
       "backgroundHint", "bgVerbatim",
@@ -2461,6 +2470,9 @@ export default function App() {
           lyricsAnimation: preset("lyrics_animation", "lyricsAnimation", job.lyrics_animation || "none"),
           lineTransition: preset("line_transition", "lineTransition", job.line_transition || "none"),
           lyricLook: normalizeLyricLook(preset("lyric_look", "lyricLook", job.lyric_look || "")),
+          ...pickLookVariantFields(Object.fromEntries(LOOK_VARIANT_FIELDS.map(([camel, snake]) => (
+            [camel, preset(snake, camel, job[snake] ?? job.render_params?.[snake] ?? "")]
+          )))),
           lyricColor: preset("lyric_color", "lyricColor", job.lyric_color || "#FFFFFF"),
           lyricSungColor: preset("lyric_sung_color", "lyricSungColor", job.lyric_sung_color || "#FFFFFF"),
           textContrast: preset("text_contrast", "textContrast", job.text_contrast || "medium"),
@@ -3428,6 +3440,7 @@ export default function App() {
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
         lyricLook: normalizeLyricLook(entry.lyricLook),
+        ...pickLookVariantFields(entry),
         // Title card customization (Full Rotor v1).
         titleTemplate: entry.titleTemplate || "auto",
         titleSize: entry.titleSize || "1.0",
@@ -3515,6 +3528,7 @@ export default function App() {
             lyricsAnimation: entry.lyricsAnimation || "none",
             lineTransition: entry.lineTransition || "none",
             lyricLook: normalizeLyricLook(entry.lyricLook),
+            ...pickLookVariantFields(entry),
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
             segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
             coverageWarning: !!data.coverage_warning,
@@ -3674,6 +3688,7 @@ export default function App() {
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
         lyricLook: normalizeLyricLook(entry.lyricLook),
+        ...pickLookVariantFields(entry),
         // Title card customization (Full Rotor v1).
         titleTemplate: entry.titleTemplate || "auto",
         titleSize: entry.titleSize || "1.0",
@@ -4382,6 +4397,10 @@ export default function App() {
       lyricsAnimation: r.lyricsAnimation || "none",
       lineTransition: r.lineTransition || "none",
       lyricLook: normalizeLyricLook(r.lyricLook),
+      // Variante del look + lo que /resolve eligió para ESTA canción en el
+      // preview: al generar, los "automático" viajan con ese número/género.
+      ...pickLookVariantFields(r),
+      lookResolved: r.lookResolved || null,
       textContrast: r.textContrast || "medium",
       lyricColor: r.lyricColor || "#FFFFFF",
       lyricSungColor: r.lyricSungColor || "#FFFFFF",
@@ -4606,6 +4625,8 @@ export default function App() {
         // como "" para no pisar el color propio del look (lib/lyricLooks).
         formData.append("lyric_look", normalizeLyricLook(jobList[i].lyricLook));
         formData.append("lyric_color", lyricColorForSubmit(jobList[i].lyricLook, jobList[i].lyricColor));
+        // Variante del look: sólo los campos con valor (lib/lyricLookVariants).
+        appendLookVariantFields(formData, jobList[i]);
         formData.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         // Title card customization (Full Rotor v1).
@@ -4898,6 +4919,8 @@ export default function App() {
         // como "" para no pisar el color propio del look (lib/lyricLooks).
         generateBody.append("lyric_look", normalizeLyricLook(jobList[i].lyricLook));
         generateBody.append("lyric_color", lyricColorForSubmit(jobList[i].lyricLook, jobList[i].lyricColor));
+        // Variante del look: sólo los campos con valor (lib/lyricLookVariants).
+        appendLookVariantFields(generateBody, jobList[i]);
         generateBody.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         // Title card customization (Full Rotor v1).
@@ -5115,6 +5138,8 @@ export default function App() {
         lyricsAnimation: last.lyricsAnimation || "none",
         lineTransition: last.lineTransition || "none",
         lyricLook: normalizeLyricLook(last.lyricLook),
+        ...pickLookVariantFields(last),
+        lookResolved: last.lookResolved || null,
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
@@ -5424,7 +5449,15 @@ export default function App() {
       editMode: !!currentReview?.editMode || !!currentReview?.variantMode || !!currentReview?.campaignId,
       bgSelectMode,
       enableScenes,
-      lookOwnsBackground: lookOwnsBackground(currentReview?.lyricLook),
+      // La variante resuelta manda: Cinético pinta tarjetas en pop pero usa
+      // el fondo de la canción en rock/metal (entonces sí hay que pre-generarlo).
+      lookOwnsBackground: (() => {
+        const res = currentReview?.lookResolved;
+        if (res && res.look === currentReview?.lyricLook && res.background) {
+          return res.background === "flat" || res.background === "gradient";
+        }
+        return lookOwnsBackground(currentReview?.lyricLook);
+      })(),
     }),
     api: API,
     authHeaders,
@@ -5866,6 +5899,8 @@ export default function App() {
             lyricsAnimation: currentReview.lyricsAnimation || "none",
             lineTransition: currentReview.lineTransition || "none",
             lyricLook: normalizeLyricLook(currentReview.lyricLook),
+            // Variante del look del video (panel «Variante» del paso 4).
+            ...pickLookVariantFields(currentReview),
             movementStyle: currentReview.movementStyle || "",
             effect: currentReview.effect || "",
             // Los colores de letra TAMBIÉN se siembran, aunque su picker esté
@@ -6366,6 +6401,11 @@ export default function App() {
             onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
             onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
             onLyricLookChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricLook: normalizeLyricLook(c) } : r))}
+            // Variante del look (panel «Variante» de la columna standalone).
+            lookVariant={{ ...pickLookVariantFields(currentReview), lyricColor: currentReview.lyricColor || "#FFFFFF" }}
+            lookArtist={currentReview.artist || ""}
+            lookSongTitle={currentReview.songTitle || ""}
+            onLookVariantChange={(field, value) => setCurrentReview((r) => (r ? { ...r, [field]: value } : r))}
             // UX specialist 2026-05-24: chip de status del pre-gen del
             // fondo. Status posibles: "idle" | "queued" | "generating" |
             // "done" | "error" | "disabled" (free-tier plan-tier guard).

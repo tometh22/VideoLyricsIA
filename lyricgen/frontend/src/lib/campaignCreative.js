@@ -5,6 +5,9 @@ export const REVIEW_FIELDS = {
   concept: "concept", backgroundHint: "background_hint", titleTemplate: "title_template",
   titleSize: "title_size", titleArtistFont: "title_artist_font", titleSongFont: "title_song_font",
   titleSongBreak: "title_song_break", frameFormat: "frame_format",
+  // Variante del look (lib/lyricLookVariants): "" = automático.
+  lyricGenre: "lyric_genre", lyricVariant: "lyric_variant", lyricFontMain: "lyric_font_main",
+  lyricFontKey: "lyric_font_key", lyricAltColor: "lyric_alt_color", lyricAccentColor: "lyric_accent_color",
 };
 
 export function reviewCreativeSettings(review, top) {

@@ -131,6 +131,20 @@ describe("describeSceneSource: dice la verdad sobre lo que hizo el worker", () =
   });
 });
 
+describe("variante del look", () => {
+  it("género, variante, fuentes y colores se ven con etiqueta; '' no genera chip", () => {
+    const chips = flat(buildSettingsSummary({
+      lyric_look: "cinetico", lyric_genre: "metal", lyric_variant: 3,
+      lyric_font_main: "rubik-dirt", lyric_font_key: "metal-mania", lyric_accent_color: "#D0101E", lyric_alt_color: "",
+    }, deps));
+    expect(chips).toEqual(expect.arrayContaining([
+      "Género del look: Metal", "Variante: 3", "Letra principal: Rubik Dirt",
+      "Letra destacada: Metal Mania", "Color destacado: #D0101E",
+    ]));
+    expect(chips.join(" ")).not.toMatch(/Color secundario/);
+  });
+});
+
 describe("el catálogo de ejes no se desincroniza del backend", () => {
   it("cubre los ejes de _VARIANT_OVERRIDABLE_FIELDS que son visuales", () => {
     // custom_colors, bg_verbatim y match_lyrics se muestran de otra forma

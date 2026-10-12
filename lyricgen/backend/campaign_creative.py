@@ -41,6 +41,12 @@ def field(label, group, kind="text", **kw):
 
 
 import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
+import lyric_recipes as _lyric_recipes  # noqa: E402
+
+# Looks that paint the whole frame in every genre. Cinético does it only in
+# pop (its original design), so a Veo group needs the campaign's genre set to
+# one where it uses the song's background (lyric_recipes.may_own_background).
+_ALWAYS_OWN_BACKGROUND = {"pop70", "degrade"}
 
 FIELDS = {
     "font": field("Tipografía", "Letra", "select", options=[""] + CATALOG["fonts"]),
@@ -52,6 +58,14 @@ FIELDS = {
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
     "lyric_look": field("Look de letra", "Letra", "select", options=["", *_lyric_looks.LOOKS]),
+    # Look variant: genre ("" = detectar), variant ("" = automática, sin
+    # repetir entre canciones de la campaña) and operator overrides.
+    "lyric_genre": field("Género del look", "Letra", "select", options=["", *_lyric_recipes.GENRES]),
+    "lyric_variant": field("Variante del look", "Letra", "text", max_length=4),
+    "lyric_font_main": field("Letra principal del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_font_key": field("Letra destacada del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_alt_color": field("Color secundario del look", "Letra", "color"),
+    "lyric_accent_color": field("Color destacado del look", "Letra", "color"),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),
@@ -78,7 +92,9 @@ FIELDS = {
 RENDER_KEYS = (set(FIELDS) - {"scene_source"}) | {"match_lyrics", "bg_verbatim"}
 DEFAULTS = {"font": "", "font_scale": 1., "text_case": "upper", "text_contrast": "medium",
             "lyric_color": "#FFFFFF", "lyric_sung_color": "#FFFFFF", "lyrics_animation": "none",
-            "line_transition": "none", "lyric_look": "", "background_id": None, "background_mode": "as_is",
+            "line_transition": "none", "lyric_look": "", "lyric_genre": "", "lyric_variant": "",
+            "lyric_font_main": "", "lyric_font_key": "", "lyric_alt_color": "", "lyric_accent_color": "",
+            "background_id": None, "background_mode": "as_is",
             "match_lyrics": True, "bg_verbatim": False, "background_hint": "", "genre": "", "concept": "",
             "movement_style": "", "effect": "", "style": "auto", "custom_colors": "",
             "animate_image": False, "enable_scenes": False, "title_template": "auto", "title_size": 1.,
@@ -112,6 +128,18 @@ def normalize_settings(settings):
         if not spec:
             fail(f"Ajuste no permitido: {key}")
         kind = spec["kind"]
+        if key == "lyric_variant":
+            # "" = automatic; else a variant number (the editor sends ints).
+            if value in ("", None):
+                value = ""
+            elif type(value) is int or (isinstance(value, str) and value.isdigit()):
+                if not 0 <= int(value) <= 9999:
+                    fail(f"{spec['label']}: fuera de rango")
+                value = str(int(value))
+            else:
+                fail(f"{spec['label']}: valor no válido")
+            out[key] = value
+            continue
         if kind == "boolean":
             if type(value) is not bool:
                 fail(f"{spec['label']}: se requiere sí/no")
@@ -128,7 +156,9 @@ def normalize_settings(settings):
                 fail(f"{spec['label']}: opción no disponible")
             if kind == "color":
                 import re
-                if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                # "" = automatic for colours whose default is "" (look variant).
+                if not (value == "" and DEFAULTS.get(key) == "") and \
+                        not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
                     fail("Color no válido")
         out[key] = value
     source = out.pop("scene_source", None)
@@ -242,8 +272,10 @@ def validate_combination(db, campaign, settings, group, user):
             fail("Fondo no disponible para esta campaña", 404)
     if settings.get("enable_scenes") and (asset or not has_scenes_access(user)):
         fail("Escenas requiere acceso habilitado y fondo IA")
-    if (group.requirement in ("veo", "photo_effect")
-            and _lyric_looks.owns_background(settings.get("lyric_look"))):
+    if (group.requirement in ("veo", "photo_effect") and settings.get("lyric_look")
+            and (settings.get("lyric_look") in _ALWAYS_OWN_BACKGROUND
+                 or _lyric_recipes.may_own_background(settings.get("lyric_look"),
+                                                      settings.get("lyric_genre") or ""))):
         fail("Este look no usa fondo (pinta todo el cuadro): elegí otro look o un grupo sin fondo IA")
     if group.requirement == "photo_effect":
         if settings.get("effect") in (None, "", "none", "foto_viva"):

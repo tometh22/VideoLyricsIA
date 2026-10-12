@@ -48,6 +48,13 @@ const JOB_FULL = {
     line_transition: "fade",
     lyric_look: "cine",
     lyric_color: "#FF0000",
+    // Variante del look (lib/lyricLookVariants): el backend guarda lo que usó.
+    lyric_genre: "metal",
+    lyric_variant: 3,
+    lyric_font_main: "rubik-dirt",
+    lyric_font_key: "metal-mania",
+    lyric_alt_color: "#CFC9BE",
+    lyric_accent_color: "#D0101E",
     lyric_sung_color: "#00FF00",
     movement_style: "estatico",
     genre: "rock",

@@ -73,6 +73,11 @@ class Look:
     gradient: tuple[str, ...] = ()  # background="gradient": top → bottom
     card_palettes: tuple[tuple[str, ...], ...] = ()  # (ink, alt, accent) per card
     beat_sync: bool = False         # needs the song's beat times
+    key_font: str = ""              # kinetic: font file for the key word
+    connector_tilt: bool = True     # kinetic: tilt the small connector words
+    kinetic_decos: tuple[str, ...] = ("burst", "bubble", "swoosh")
+    beat_shake: bool = False        # kinetic: rows jolt on every pulse beat
+    cascade: bool = True            # kinetic: key word may tumble letter by letter
     # How the generated background should be steered for this look (palette,
     # mood, where to leave room for the text). Consumed by the background
     # prompt; "" = no steering.
@@ -270,6 +275,76 @@ LOOKS: dict[str, Look] = {
 }
 
 
+# --- Genre skins -------------------------------------------------------------
+#
+# A look keeps its motion and composition, but its typography, palette,
+# decorations and background treatment adapt to the song: the same Cinético
+# reads bubbly-pop on a Karol G single and has to read raw on Almafuerte.
+# Genres come from pipeline._normalize_genre's keys; they collapse into a
+# few visual families.
+
+GENRE_FAMILIES = {
+    "metal": "heavy", "rock": "heavy", "punk": "heavy",
+    "pop": "pop", "latin": "pop", "reggaeton": "pop",
+    "hiphop": "urban", "electronic": "urban",
+    "ballad": "soft", "folk": "soft", "indie": "soft",
+}
+
+_HEAVY_GRADE = ("eq=contrast=1.28:saturation=0.55:brightness=-0.10,"
+                "vignette=angle=PI/3.6")
+
+SKINS: dict[tuple[str, str], dict] = {
+    # Almafuerte & co.: grunge caps and a spiky metal key word in blood red
+    # over the song's own (darkened, desaturated, grainy) background. No
+    # pastel cards, no script, no speech bubbles — scratches and a hard
+    # jolt on the beat instead.
+    ("cinetico", "heavy"): dict(
+        font_file="RubikDirt-Regular.ttf",
+        extra_fonts=("BigShouldersDisplay-Black.ttf",),
+        key_font="MetalMania-Regular.ttf",
+        # Grunge type lets the background through its texture: a black
+        # outline + hard shadow keeps it readable over bright skies.
+        primary="#F2EEE6", outline=3, outline_color="#000000",
+        shadow=6, shadow_color="#000000", shadow_alpha=0x20,
+        background="source", flat_colors=(), card_palettes=(),
+        line_colors=("#F2EEE6", "#CFC9BE", "#D0101E"),
+        connector_tilt=False, kinetic_decos=("slash", "burst"),
+        beat_shake=True, cascade=False,
+        grade=_HEAVY_GRADE, effect="film",
+        bg_hint="raw, dark, high-contrast scene with harsh light and deep shadows",
+    ),
+    ("neon", "heavy"): dict(
+        font_file="RubikDirt-Regular.ttf", extra_fonts=("MetalMania-Regular.ttf",),
+        line_colors=("#FF2A2A", "#FF7A00", "#E8E8E8", "#B000FF"),
+        grade="eq=brightness=-0.24:saturation=0.45:contrast=1.2,vignette=angle=PI/3.6",
+        force_case="",
+    ),
+    ("cuaderno", "heavy"): dict(
+        font_file="RubikDirt-Regular.ttf", bold=False, force_case="",
+        primary="#ECE6DA", outline=2, shadow=4, circle_key=True, doodles=False,
+        grade=_HEAVY_GRADE, effect="film",
+    ),
+    ("pincel", "heavy"): dict(
+        key_scale=1.6, grade=_HEAVY_GRADE,
+    ),
+}
+
+
+def genre_family(genre: str | None) -> str:
+    g = (genre or "").strip().lower()
+    return GENRE_FAMILIES.get(g, "")
+
+
+def resolve_look(look_id: str | None, genre: str | None = "") -> "Look | None":
+    """The look adapted to the song's genre (or the base look when there is
+    no skin for that genre family)."""
+    look = get_look(look_id)
+    if look is None:
+        return None
+    skin = SKINS.get((look.id, genre_family(genre)))
+    return dataclasses.replace(look, **skin) if skin else look
+
+
 def get_look(look_id: str | None) -> Look | None:
     return LOOKS.get((look_id or "").strip().lower())
 
@@ -297,7 +372,8 @@ def font_path(look: Look) -> str:
 
 def font_paths(look: Look) -> list[str]:
     """Every font file the look's ASS can reference (for the fontsdir)."""
-    return [font_path(look)] + [os.path.join(_FONTS_DIR, f) for f in look.extra_fonts]
+    extra = list(look.extra_fonts) + ([look.key_font] if look.key_font else [])
+    return [font_path(look)] + [os.path.join(_FONTS_DIR, f) for f in extra]
 
 
 # --- Key word ---------------------------------------------------------------
@@ -485,6 +561,21 @@ def _em_per_fs(path: str) -> float:
     return 200.0 / max(1, asc + desc)
 
 
+_CAP_CACHE: dict[str, float] = {}
+
+
+def cap_per_fs(path: str) -> float:
+    """Rendered cap height per libass \\fs unit for a font file. Faces differ
+    a lot (Bungee 0.28 vs UnifrakturCook 0.71): swapping a look's font without
+    compensating makes the lyrics tiny or huge."""
+    v = _CAP_CACHE.get(path)
+    if v is None:
+        from PIL import ImageFont
+        bb = ImageFont.truetype(path, 1000).getbbox("H")
+        v = _CAP_CACHE[path] = _em_per_fs(path) * (bb[3] - bb[1]) / 1000.0
+    return v
+
+
 class _Measure:
     """Word widths from the real font file (PIL), in libass pixels.
 
@@ -497,6 +588,18 @@ class _Measure:
         self.path = path
         self._fonts: dict[int, object] = {}
         self._em_per_fs = _em_per_fs(path)
+
+    def ink_height(self, text: str, size: int) -> float:
+        """Height of the actual glyph ink (not the line box) in libass px.
+        Script faces put a lot of air in the line box; frames built from
+        the line box come out far too tall."""
+        from PIL import ImageFont
+        em = max(1, int(round(size * self._em_per_fs)))
+        f = self._fonts.get(em)
+        if f is None:
+            f = self._fonts[em] = ImageFont.truetype(self.path, em)
+        box = f.getbbox(text or "x")
+        return float(box[3] - box[1])
 
     def width(self, text: str, size: int) -> float:
         from PIL import ImageFont
@@ -774,6 +877,35 @@ def _neon_events(look: Look, n: int, display: str, start: float, end: float,
 
 
 # --- Chat ----------------------------------------------------------------------
+
+def _measured_rows(text: str, fs: int, max_w: float, measure) -> list[str]:
+    """Fewest balanced rows whose REAL measured width fits `max_w`.
+    (ass_render._balanced_breaks estimates width from the character count,
+    which over-splits narrow script faces into 2-word rows.)"""
+    words = text.split()
+    if not words:
+        return [text]
+    for n in range(1, len(words) + 1):
+        target = len(text) / n
+        rows, cur = [], []
+        for w in words:
+            cand = " ".join(cur + [w])
+            if cur and len(cand) > target and len(rows) < n - 1:
+                prev = " ".join(cur)
+                if abs(len(cand) - target) < abs(len(prev) - target):
+                    rows.append(cand)
+                    cur = []
+                    continue
+                rows.append(prev)
+                cur = [w]
+            else:
+                cur.append(w)
+        if cur:
+            rows.append(" ".join(cur))
+        if max(measure.width(r, fs) for r in rows) <= max_w:
+            return rows
+    return words
+
 
 def _wrap_rows(tokens: list[str], fs: int, max_w: float, measure) -> list[str]:
     rows: list[str] = []
@@ -1175,6 +1307,18 @@ def _beat_pulse(beats, t0: float, t1: float, after_ms: int, scale: int = 108) ->
     return "".join(out[:40])
 
 
+def _beat_shake(beats, t0: float, t1: float, after_ms: int, seed: int = 0) -> str:
+    """Hard jolt on each pulse beat: a quick rotation kick and back."""
+    out = []
+    for i, b in enumerate(_beats_in(beats, t0, t1)):
+        ms = int(round((b - t0) * 1000))
+        if ms < after_ms or ms > (t1 - t0) * 1000 - 200:
+            continue
+        a = (2.5 if (i + seed) % 2 else -2.5)
+        out.append(f"\\t({ms},{ms + 40},\\frz{a})\\t({ms + 40},{ms + 160},\\frz0)")
+    return "".join(out[:40])
+
+
 def _beat_blink(beats, t0: float, t1: float, on_alpha: int, off_alpha: int,
                 after_ms: int) -> str:
     """Neon-sign blink: alternate on/off on every pulse beat."""
@@ -1216,7 +1360,7 @@ def _entrance(kind: str, x: float, y: float, sc: float) -> tuple[str, str]:
 
 
 def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
-                thick: float = 6) -> str:
+                thick: float = 6, sy: float = 1.0) -> str:
     """Radiating dashes around a point (the comic 'pow' rays)."""
     import math
     parts = []
@@ -1224,8 +1368,8 @@ def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
         a = 2 * math.pi * i / rays
         ca, sa = math.cos(a), math.sin(a)
         nx, ny = -sa * thick / 2, ca * thick / 2
-        x0, y0 = cx + ca * r0, cy + sa * r0
-        x1, y1 = cx + ca * r1, cy + sa * r1
+        x0, y0 = cx + ca * r0, cy + sa * r0 * sy
+        x1, y1 = cx + ca * r1, cy + sa * r1 * sy
         parts.append(f"m {_n(x0 + nx)} {_n(y0 + ny)} l {_n(x1 + nx)} {_n(y1 + ny)} "
                      f"{_n(x1 - nx)} {_n(y1 - ny)} {_n(x0 - nx)} {_n(y0 - ny)}")
     return " ".join(parts)
@@ -1234,7 +1378,7 @@ def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
 def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
                     start: float, end: float, base_fs: int, width: int,
                     height: int, sc: float, heavy, script, script_family: str,
-                    beats) -> list[str]:
+                    beats, key_m=None, key_family: str = "") -> list[str]:
     """Words land one by one as they are sung and build a typographic
     composition: function words small in a script face, content words in
     heavy caps stretched to the block width, the key word huge in an accent
@@ -1303,8 +1447,11 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
                                       cx=cx, col=col_i))
                 continue
             is_key = (k in r) and len(r) == 1
-            nat = max(1.0, heavy.width(text, 100))
-            fs = 100 * block_w * (1.0 if is_key else 0.90) / nat
+            nat = max(1.0, (key_m if (is_key and key_m) else heavy).width(text, 100))
+            # Two columns: the key word's bubble/burst is wider than the word,
+            # so keep the word narrower or it invades the other column.
+            key_w = 0.78 if len(columns) > 1 else 1.0
+            fs = 100 * block_w * (key_w if is_key else 0.90) / nat
             fs = max(base_fs * 0.8, min(base_fs * (5.5 if is_key else 4.2), fs))
             col_specs.append(dict(r=r, text=text, fs=fs, kind="key" if is_key else "heavy",
                                   h=fs * 0.84, cx=cx, col=col_i))
@@ -1320,6 +1467,19 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
         for sp in col_specs:
             y += sp["h"]
             sp["y"] = y
+        # Keep the whole column (incl. the key word's bubble/burst) inside
+        # the frame: slots near the edges used to push long key words out.
+        margin = width * 0.04
+        half = 0.0
+        for sp in col_specs:
+            w_ = (key_m if (sp["kind"] == "key" and key_m) else heavy).width(sp["text"], sp["fs"])
+            if sp["kind"] == "key":
+                w_ = w_ * 1.18 + sp["fs"] * 0.7
+            half = max(half, w_ / 2.0)
+        lo, hi = margin + half, width - margin - half
+        cx_fit = min(max(cx, lo), hi) if lo <= hi else width / 2.0
+        for sp in col_specs:
+            sp["cx"] = cx_fit
         specs.extend(col_specs)
 
     seed = int(hashlib.sha1(f"{n}:{' '.join(tokens)}".encode()).hexdigest()[:8], 16)
@@ -1340,8 +1500,10 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
         if sp["kind"] == "script":
             kind = "pop"
             face = f"\\fn{script_family}\\b1" if script_family else ""
-            colour = accent if accent else alt
-            tilt = -7 if (seed >> r_i) & 1 else 6
+            # Heavy skins keep connectors quiet (grey, straight) so the red
+            # stays reserved for the key word.
+            colour = (accent if accent else alt) if look.connector_tilt else alt
+            tilt = (-7 if (seed >> r_i) & 1 else 6) if look.connector_tilt else 0
             pos, tr = _entrance(kind, x, y + sp["fs"] * 0.05, sc)
             ov = (f"\\an2{pos}\\q2\\fs{_n(sp['fs'])}{face}\\1c{_c(colour)}\\frz{tilt}{tr}"
                   + smear)
@@ -1351,23 +1513,48 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
             pos, tr = _entrance(kind, x, y, sc)
             pulse = (_beat_pulse(beats, w_start, end, after_ms=380, scale=110)
                      if sp["kind"] == "key" else "")
-            ov = (f"\\an2{pos}\\q2\\fs{_n(sp['fs'])}\\1c{_c(colour)}{tr}{pulse}" + smear)
-        if sp["kind"] == "key" and seed % 4 == 3 and len(sp["text"]) >= 4:
+            if look.beat_shake:
+                pulse += _beat_shake(beats, w_start, end, after_ms=300, seed=seed + r_i)
+            face = (f"\\fn{key_family}" if (sp["kind"] == "key" and key_family) else "")
+            ov = (f"\\an2{pos}\\q2\\fs{_n(sp['fs'])}{face}\\1c{_c(colour)}{tr}{pulse}" + smear)
+        if (sp["kind"] == "key" and look.cascade and seed % 4 == 3
+                and len(sp["text"]) >= 4):
             # Letters tumble in one by one instead of the word landing whole.
-            kw = heavy.width(sp["text"], sp["fs"])
+            m_key = key_m or heavy
+            kw = m_key.width(sp["text"], sp["fs"])
             events.extend(_cascade_events(sp["text"], x - kw / 2, y, _n(sp["fs"]),
-                                          colour, w_start, end, heavy, sc, beats))
+                                          colour, w_start, end, m_key, sc, beats,
+                                          face=(f"\\fn{key_family}" if key_family else "")))
             continue
         events.append(_dialogue(3, w_start, end, "{" + ov + "}" + _ass._ass_escape(sp["text"])))
 
         if sp["kind"] == "key":
-            kw = heavy.width(sp["text"], sp["fs"])
+            kw = (key_m or heavy).width(sp["text"], sp["fs"])
             ky = y - sp["fs"] * 0.40
-            deco = seed % 3
+            deco_kind = look.kinetic_decos[seed % len(look.kinetic_decos)]
+            deco = {"burst": 0, "bubble": 1, "swoosh": 2, "slash": 3}.get(deco_kind, 0)
             t0 = _deco_start(w_start + 0.12, start, end)
             d2 = max(1, int(round((end - t0) * 1000)))
             fade = f"\\t({max(1, d2 - exit_ms)},{d2},\\alpha&HFF&)"
-            if deco == 0:
+            if deco == 3:
+                # Claw scratches torn across the key word, slammed in on the
+                # beat (heavy skins).
+                parts = []
+                for i_ in range(3):
+                    off = (i_ - 1) * sp["fs"] * 0.34
+                    xa, ya = x - kw * 0.62 + off, ky + sp["fs"] * 0.62
+                    xb, yb = x + kw * 0.62 + off, ky - sp["fs"] * 0.62
+                    th_ = (7 - i_ * 1.5) * sc
+                    parts.append(f"m {_n(xa)} {_n(ya)} l {_n(xb)} {_n(yb - th_)} "
+                                 f"{_n(xb + th_ * 0.6)} {_n(yb + th_ * 0.4)} "
+                                 f"{_n(xa + th_)} {_n(ya + th_ * 0.5)}")
+                clip = (f"\\clip({_n(x - kw)},0,{_n(x - kw)},{height})"
+                        f"\\t(0,140,\\clip({_n(x - kw)},0,{_n(x + kw)},{height}))")
+                blink = _beat_blink(beats, t0, end, 0x30, 0xA0, after_ms=200)
+                events.append(_drawing(2, t0, end,
+                                       f"\\an7\\pos(0,0)\\1c{_c(alt)}\\blur0.8\\alpha&H30&"
+                                       + clip + blink + fade, " ".join(parts)))
+            elif deco == 0:
                 # Burst rays that blink on the beat.
                 rays = _burst_path(x, ky, kw * 0.58, kw * 0.58 + sp["fs"] * 0.45,
                                    rays=16, thick=5 * sc)
@@ -1377,7 +1564,10 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
                                        f"\\alpha&HFF&\\t(0,120,\\alpha&H00&){blink}{fade}", rays))
             elif deco == 1:
                 # Speech bubble behind the key word.
-                bw, bh = kw + sp["fs"] * 0.7, sp["fs"] * 1.15
+                # Hug the key word's ink (caps ≈ 0.72 fs) so the bubble does
+                # not climb over the script connector above it.
+                bw, bh = kw + sp["fs"] * 0.6, sp["fs"] * 0.95
+                ky = y - sp["fs"] * 0.36
                 bx, by = x - bw / 2, ky - bh / 2
                 events.append(_drawing(2, t0, end,
                                        f"\\an7\\pos({_n(bx)},{_n(by)})\\1c{_c(alt)}"
@@ -1416,21 +1606,33 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
     script = (n % 2 == 1) and bool(script_family)
     m = script_measure if script else measure
     fs = int(base_fs * (1.35 if script else 1.0))
-    rows = _ass._balanced_breaks(display, fs, width).split("\n")
+    # Leave room for the haze (outline + blur) on both sides.
+    limit = width * 0.82 - 2 * (14 + 26) * sc
+    rows = _measured_rows(display, fs, min(limit, width * 0.62), m)
     tw = max(m.width(r, fs) for r in rows)
     # The break estimate is generic; measure the real face and shrink until
     # the tube (plus its glow and frame) fits the frame — script neon on a
     # vertical short used to run off both sides.
-    # Leave room for the haze (outline + blur) on both sides.
-    limit = width * 0.82 - 2 * (14 + 26) * sc
     for _ in range(4):
         if tw <= limit:
             break
         fs = max(18, int(fs * limit / tw))
-        rows = _ass._balanced_breaks(display, fs, width).split("\n")
+        rows = _measured_rows(display, fs, limit, m)
         tw = max(m.width(r, fs) for r in rows)
+    def ink_block(fs_: int, rows_: list[str]) -> float:
+        # Rows sit one line box (fs) apart; the ink of the block spans the
+        # first row's ink to the last row's ink.
+        return (len(rows_) - 1) * fs_ + max(m.ink_height(r, fs_) for r in rows_)
+
+    th = ink_block(fs, rows)
+    for _ in range(4):
+        if th + fs * 0.6 <= height * 0.78:
+            break
+        fs = max(18, int(fs * 0.85))
+        rows = _measured_rows(display, fs, limit, m)
+        tw = max(m.width(r, fs) for r in rows)
+        th = ink_block(fs, rows)
     text = "\\N".join(_ass._ass_escape(r) for r in rows)
-    th = len(rows) * fs * 0.95
     cx, cy = width / 2.0, height / 2.0
     dur = max(1, int(round((end - start) * 1000)))
     face = f"\\fn{script_family}" if script else ""
@@ -1461,22 +1663,26 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
 
     # Frame: a tube outline that blinks on the beat.
     kind = n % 3
-    pad = fs * 0.55
+    pad_x, pad_y = fs * 0.38, fs * 0.24
+    fw, fh = tw + 2 * pad_x, th + 2 * pad_y
+    x0, y0 = cx - fw / 2, cy - fh / 2
     if kind == 0:
-        fw, fh = tw + 2 * pad, th + pad * 1.2
-        path = _rounded_rect_path(fw, fh, fh * 0.35)
-        anchor = f"\\an7\\pos({_n(cx - fw / 2)},{_n(cy - fh / 2)})"
+        path = _rounded_rect_path(fw, fh, min(fh * 0.35, fs * 0.5))
+        anchor = f"\\an7\\pos({_n(x0)},{_n(y0)})"
     elif kind == 1:
-        # Arrow pointing right around the text.
-        fw, fh = tw + 2 * pad, th + pad * 1.2
-        hx = fh * 0.55
-        x0, y0 = cx - fw / 2, cy - fh / 2
-        path = (f"m 0 0 l {_n(fw)} 0 l {_n(fw)} {_n(-fh * 0.25)} l {_n(fw + hx)} {_n(fh / 2)} "
-                f"l {_n(fw)} {_n(fh * 1.25)} l {_n(fw)} {_n(fh)} l 0 {_n(fh)}")
+        # Arrow pointing right around the text; the head stays proportional
+        # to the type, not to the (possibly tall) block, and inside the frame.
+        hx = min(fh * 0.5, fs * 0.7, max(0.0, width - (x0 + fw) - 12 * sc))
+        flare = min(fh * 0.25, fs * 0.3)
+        x0 = max(12 * sc, x0 - hx / 2)
+        path = (f"m 0 0 l {_n(fw)} 0 l {_n(fw)} {_n(-flare)} l {_n(fw + hx)} {_n(fh / 2)} "
+                f"l {_n(fw)} {_n(fh + flare)} l {_n(fw)} {_n(fh)} l 0 {_n(fh)}")
         anchor = f"\\an7\\pos({_n(x0)},{_n(y0)})"
     else:
-        path = _burst_path(0, 0, tw * 0.62, tw * 0.62 + fs * 0.5, rays=22, thick=4 * sc)
-        anchor = f"\\an7\\pos({_n(cx)},{_n(cy)})\\fscy55"
+        # Rays clear the text block both ways (the ring is squashed to 0.55).
+        r0 = max(tw * 0.56, (th / 2 + pad_y) / 0.55)
+        path = _burst_path(cx, cy, r0, r0 + fs * 0.45, rays=22, thick=4 * sc, sy=0.55)
+        anchor = "\\an7\\pos(0,0)"
     blink = _beat_blink(beats, start, end, 0x00, 0xD0, after_ms=lit + 300)
     # The frame is an outline only: flicker/blink its OUTLINE alpha (\\3a),
     # never \\alpha, which would also turn the transparent fill opaque.
@@ -1494,19 +1700,27 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
 
 def _cascade_events(word: str, x_left: float, baseline: float, fs: int,
                     colour: str, t0: float, end: float, measure, sc: float,
-                    beats=None) -> list[str]:
-    """The word's letters tumble in one by one along a diagonal."""
+                    beats=None, face: str = "") -> list[str]:
+    """The word's letters tumble in one by one along a diagonal.
+
+    `measure`/`face` must be the face the word was sized with (the key-word
+    font), or the letters overflow the slot the layout clamped. The stagger
+    shrinks on short lines so every letter lands before the line ends (a
+    letter starting in the last 20 ms used to be dropped)."""
     events = []
     x = x_left
     fs = int(fs)
+    step = 0.06
+    if len(word) > 1:
+        step = min(step, max(0.0, end - t0 - 0.30) / (len(word) - 1))
     for i, ch in enumerate(word):
         w = measure.width(ch, fs)
-        ts = t0 + i * 0.06
-        if ts >= end:
+        ts = t0 + i * step
+        if ts >= end - 0.05:
             ts = t0
         d = max(1, int(round((end - ts) * 1000)))
         sx, sy = x - 120 * sc, baseline - 260 * sc
-        ov = (f"\\an1\\move({_n(sx)},{_n(sy)},{_n(x)},{_n(baseline)},0,220)\\fs{fs}"
+        ov = (f"\\an1\\move({_n(sx)},{_n(sy)},{_n(x)},{_n(baseline)},0,220)\\fs{fs}{face}"
               f"\\1c{_c(colour)}\\frz{35 - (i % 3) * 20}\\t(0,220,\\frz0)"
               + _beat_pulse(beats, ts, end, after_ms=300, scale=110)
               + f"\\t({max(221, d - 200)},{d},\\fscx230\\alpha&HFF&)")
@@ -1529,6 +1743,7 @@ def build_look_ass(
     primary_override: str = "",
     title_lines: list | None = None,
     beats: list[float] | None = None,
+    genre: str = "",
 ) -> str:
     """Complete ASS document for `look` over `segments`.
 
@@ -1540,6 +1755,9 @@ def build_look_ass(
     above everything else so every job keeps a readable title card.
     beats: the song's beat times in seconds (beat_snap.detect_beats). Looks
     with beat_sync kick/blink on them; without beats they simply don't."""
+    # `genre` is accepted for compatibility only: the caller resolves the
+    # look (lyric_recipes.resolve: genre skin / recipe / operator overrides)
+    # before calling, and re-applying a skin here would undo the recipe.
     if (primary_override and re.match(r"^#[0-9a-fA-F]{6}$", primary_override)
             and primary_override.upper() != "#FFFFFF"):
         look = dataclasses.replace(look, primary=primary_override)
@@ -1588,6 +1806,11 @@ def build_look_ass(
             second = _Measure(font_paths(look)[1])
             second_family = _ass.font_family(font_paths(look)[1])[0]
 
+    key_m, key_family = None, ""
+    if look.key_font:
+        _kp = os.path.join(_FONTS_DIR, look.key_font)
+        key_m, key_family = _Measure(_kp), _ass.font_family(_kp)[0]
+
     light, light_family = None, ""
     if look.layout == "block":
         light = _Measure(font_paths(look)[1]) if look.extra_fonts else measure
@@ -1622,7 +1845,7 @@ def build_look_ass(
             events.extend(_kinetic_events(look, n, tokens, timings, start, end,
                                           base_fs, width, height, sc, measure,
                                           second or measure, second_family,
-                                          beats or []))
+                                          beats or [], key_m, key_family))
             continue
         if look.layout in ("build", "block", "arc"):
             timings = _ass._word_timings(display, start, end, seg.get("words"))
@@ -1698,6 +1921,20 @@ def build_look_ass(
         # it falls back to white, and always keeps a readable outline.
         r, g, b = _hex_rgb(look.primary)
         dark = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 < 0.45
+        # The artist line uses the look's display face (key font): paint it
+        # in the look's accent and drop the forced faux-bold, which smears
+        # decorative faces (Metal Mania, Shrikhand, scripts).
+        key_family_t = (_ass.font_family(os.path.join(_FONTS_DIR, look.key_font))[0]
+                        if look.key_font else "")
+        accent_t = (look.line_colors[2] if len(look.line_colors) > 2
+                    else look.accent)
+        styled = []
+        for tl in title_lines:
+            upd = {"bold": False}
+            if key_family_t and tl.font_name == key_family_t and accent_t:
+                upd["color"] = accent_t
+            styled.append(dataclasses.replace(tl, **upd))
+        title_lines = styled
         doc = _ass.build_ass(width=width, height=height, font_name=family,
                              base_fontsize=fs_for(40),
                              outline=max(look.outline, 2.0) * sc,

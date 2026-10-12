@@ -19,7 +19,8 @@
 // Función pura: sin fetch, sin React. Testeable sin DOM.
 
 import { backgroundRegenExtras } from "./editWizardDiff.js";
-import { normalizeLyricLook } from "./lyricLooks.js";
+import { getLyricLook, lyricColorForSubmit, normalizeLyricLook } from "./lyricLooks.js";
+import { lookVariantAbsoluteFields } from "./lyricLookVariants.js";
 
 const str = (v) => (v == null ? "" : String(v));
 
@@ -66,6 +67,10 @@ export function buildVariantPayload({
     // Look de letra: absoluto como el resto ("" = la variante va sin look
     // aunque el padre tuviera uno).
     lyric_look: normalizeLyricLook(r.lyricLook),
+    // Variante del look, también absoluta ("" = automático). Sin look van
+    // todos en "". lyric_variant / lyric_genre: si el operador dejó
+    // "automático", el número/género que /resolve mostró en el preview.
+    ...lookVariantAbsoluteFields(r),
     // ── Tipografía ──────────────────────────────────────────────────
     font: str(r.font),
     font_scale: num(r.fontScale, 1.0),
@@ -85,6 +90,13 @@ export function buildVariantPayload({
     style: str(style) || "auto",
     custom_colors: str(customColors).trim(),
   };
+
+  // Color de texto: sólo con look (lo edita el panel «Variante»; el blanco
+  // default = "el de la variante"). Sin look el wizard de variante no lo
+  // muestra, así que no se manda (no hay control que lo respalde).
+  if (getLyricLook(r.lyricLook)) {
+    payload.lyric_color = lyricColorForSubmit(r.lyricLook, r.lyricColor);
+  }
 
   // Biblioteca de fondos: sólo cuenta si el tab activo es "library"
   // (mismo gate que appendBackgroundFields para /generate — un

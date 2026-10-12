@@ -16,7 +16,10 @@ import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
-import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookFontLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
+import { makeLookResolvedPin, pickLookVariantFields } from "../lib/lyricLookVariants";
+import { useLookVariant } from "../hooks/useLookVariant";
+import LookVariantPanel from "./LookVariantPanel";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
@@ -673,6 +676,15 @@ export default function LyricsEditor({
   // Look de letra ("" = sin look). Con look, font/animación/transición los
   // define el look y sus selects quedan deshabilitados (lib/lyricLooks).
   lyricLook = "",
+  // Variante del look (lib/lyricLookVariants): { lyricGenre, lyricVariant,
+  // lyricFontMain, lyricFontKey, lyricColor, lyricAltColor, lyricAccentColor }
+  // + la canción para /resolve y /detect-genre. Cada cambio del panel
+  // «Variante» sale por onLookVariantChange(field, value); lo que /resolve
+  // eligió sale como onLookVariantChange("lookResolved", pin).
+  lookVariant = null,
+  lookArtist = "",
+  lookSongTitle = "",
+  onLookVariantChange = null,
   // Edición: el video se renderizó SIN fondo generado porque su look pinta
   // todo el cuadro (render_params.background_owned_by_look). Si el operador
   // elige un look que sí usa fondo (o "Sin look") avisamos que lo regenere en
@@ -978,6 +990,16 @@ export default function LyricsEditor({
   const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
   const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
   const [selectedLook, setSelectedLook] = useState(normalizeLyricLook(lyricLook));
+  // Panel «Variante» (columna tipográfica standalone). Estado local sembrado
+  // del job, como el resto de la tipografía de esta columna.
+  const [variantValues, setVariantValues] = useState(() => ({
+    ...pickLookVariantFields(lookVariant || {}),
+    lyricColor: (lookVariant && lookVariant.lyricColor) || "#FFFFFF",
+  }));
+  const setVariantField = (field, value) => {
+    setVariantValues((v) => ({ ...v, [field]: value }));
+    onLookVariantChange?.(field, value);
+  };
   // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
   // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
   // se queda con el seed inicial y no refleja los cambios que el operador
@@ -992,6 +1014,28 @@ export default function LyricsEditor({
     setSelectedLineTransition(lineTransition || "none");
     setSelectedLook(normalizeLyricLook(lyricLook));
   }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition, lyricLook]);
+  const showLookVariant = !hideTypographyControls && !hideInternalPreview && !!getLyricLook(selectedLook);
+  const editorLookVariant = useLookVariant({
+    look: selectedLook,
+    genre: variantValues.lyricGenre,
+    variant: variantValues.lyricVariant,
+    fontMain: variantValues.lyricFontMain,
+    fontKey: variantValues.lyricFontKey,
+    color: variantValues.lyricColor,
+    altColor: variantValues.lyricAltColor,
+    accentColor: variantValues.lyricAccentColor,
+    jobId: transcribeJobId,
+    artist: lookArtist,
+    songTitle: lookSongTitle,
+    lyricsText: Array.isArray(segments) ? segments.map((sg) => (sg && sg.text) || "").filter(Boolean).join("\n") : "",
+    enabled: showLookVariant,
+  });
+  const editorLookResolved = editorLookVariant.resolved;
+  useEffect(() => {
+    if (!editorLookResolved || !onLookVariantChange) return;
+    onLookVariantChange("lookResolved", makeLookResolvedPin(editorLookResolved));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorLookResolved]);
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -6176,7 +6220,14 @@ export default function LyricsEditor({
               <span className="text-[11px] text-ink-tertiary shrink-0">{t("upload.look_section") || "Look"}</span>
               <select
                 value={selectedLook}
-                onChange={(e) => { const v = normalizeLyricLook(e.target.value); setSelectedLook(v); onLyricLookChange?.(v); }}
+                onChange={(e) => {
+                  const v = normalizeLyricLook(e.target.value);
+                  // Otro look = otro pool de variantes: el número no aplica.
+                  if (v !== selectedLook && variantValues.lyricVariant !== "" && variantValues.lyricVariant != null) {
+                    setVariantField("lyricVariant", "");
+                  }
+                  setSelectedLook(v); onLyricLookChange?.(v);
+                }}
                 className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
                 data-testid="editor-lyric-look"
                 aria-label={t("upload.look_section") || "Look"}
@@ -6188,8 +6239,21 @@ export default function LyricsEditor({
             </div>
             {getLyricLook(selectedLook) && (
               <p className="px-1 text-[10px] text-amber-300/80" data-testid="editor-look-locked">
-                {lookLockedNote(t, selectedLook)}
+                {lookLockedNote(t, selectedLook)} {lookFontLockedNote(t, selectedLook)}
               </p>
+            )}
+            {showLookVariant && (
+              <LookVariantPanel
+                t={t}
+                className="px-1 py-2 rounded-md bg-surface-2/40 ring-1 ring-white/[0.06]"
+                testIdPrefix="editor-variant"
+                catalog={editorLookVariant.catalog}
+                resolved={editorLookResolved}
+                detected={editorLookVariant.detected}
+                loading={editorLookVariant.loading}
+                values={variantValues}
+                onChange={setVariantField}
+              />
             )}
             {backgroundOwnedByLook && !lookOwnsBackground(selectedLook) && (
               <p className="px-1 text-[10px] text-amber-300/90" data-testid="editor-look-needs-bg" role="status">

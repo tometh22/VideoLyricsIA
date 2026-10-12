@@ -43,6 +43,13 @@ export const SETTINGS_GROUPS = [
     axes: [
       // El look primero: con look activo define tipografía/animación/transición.
       { key: "lyric_look", labelKey: "detail.axis_look", labelFallback: "Look", kind: "raw" },
+      // Variante del look (sólo existen con look): "" = automático, sin chip.
+      { key: "lyric_genre", labelKey: "detail.axis_lyric_genre", labelFallback: "Género del look", kind: "raw" },
+      { key: "lyric_variant", labelKey: "detail.axis_lyric_variant", labelFallback: "Variante", kind: "raw" },
+      { key: "lyric_font_main", labelKey: "detail.axis_lyric_font_main", labelFallback: "Letra principal", kind: "raw" },
+      { key: "lyric_font_key", labelKey: "detail.axis_lyric_font_key", labelFallback: "Letra destacada", kind: "raw" },
+      { key: "lyric_alt_color", labelKey: "detail.axis_lyric_alt_color", labelFallback: "Color secundario", kind: "raw" },
+      { key: "lyric_accent_color", labelKey: "detail.axis_lyric_accent_color", labelFallback: "Color destacado", kind: "raw" },
       { key: "font", labelKey: "detail.axis_font", labelFallback: "Tipografía", kind: "font" },
       { key: "font_scale", labelKey: "detail.axis_font_scale", labelFallback: "Tamaño", kind: "scale" },
       { key: "text_case", labelKey: "detail.axis_text_case", labelFallback: "Mayúsculas", kind: "raw" },
