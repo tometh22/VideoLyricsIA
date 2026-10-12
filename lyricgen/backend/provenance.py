@@ -106,6 +106,11 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("gemini-2.5-flash-image", "google_vertex"): 0.039,
     # Gemini text/multimodal — averaged across our prompt sizes
     ("gemini-2.5-flash", "google_vertex"): 0.01,
+    # Full-audio listening (reference hypothesis, targeted verify). Missing
+    # from the table until 9-oct-2026, so 3,251 September calls fell through
+    # to DEFAULT_COST_PER_CALL ($0.01). September GCP billing: audio input
+    # $6.95 plus its share of text output ≈ $0.005 per call.
+    ("gemini-2.5-flash-audio", "google_vertex"): 0.005,
     ("gemini-2.5-flash-lite", "google_vertex"): 0.005,
     ("gemini-2.5-pro", "google_vertex"): 0.05,
     # Content validator. ONE provenance row covers a whole video scan, and
@@ -119,10 +124,13 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("gemini-2.5-flash-vision-image", "google_vertex"): 0.0005,
     # Replicate — invisible to this table until the 2026-08 audit, so
     # whisperX / forced-align / demucs spend never showed up at all
-    # (real invoices: $3.67 may, $7.12 jun). Rates from the model pages.
-    ("victor-upmeet/whisperx", "replicate"): 0.02,
-    ("cureau/force-align-wordstamps", "replicate"): 0.007,
-    ("cjwbw/demucs", "replicate"): 0.035,
+    # (real invoices: $3.67 may, $7.12 jun). Recalibrated 9-oct-2026 against
+    # September's compute seconds from the Replicate API ÷ runs: demucs
+    # $7.92/792, whisperx $1.07/923, force-align $1.46/102. The model-page
+    # rates overstated demucs 3.5x and whisperx 17x.
+    ("victor-upmeet/whisperx", "replicate"): 0.0012,
+    ("cureau/force-align-wordstamps", "replicate"): 0.014,
+    ("cjwbw/demucs", "replicate"): 0.010,
     # Whisper local — runs on our compute, no API charge
     ("whisper", "local"): 0.0,
     ("whisper-large-v3", "local"): 0.0,
@@ -133,11 +141,18 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("whisper", "openai"): 0.021,
     # Gap rescue transcribes clips capped at 120 s, not a full ~3.5 min song.
     ("whisper-1-gap-rescue", "openai"): 0.012,
-    # Same bounded clip pricing as gap rescue. Two calls per unsafe window
-    # (stem + mix); the quality stats retain exact billed audio seconds.
-    ("whisper-1-targeted-consensus", "openai"): 0.012,
+    # Targeted consensus and the live independent verify send short clips
+    # (a few seconds per unsafe window), not 120 s. Calibrated 9-oct-2026
+    # against September's OpenAI invoice: whisper $10.88 for the month, of
+    # which ~$1.28 is the 61 full-song calls above, leaving ~$9.60 for
+    # 13,933 clip calls ≈ $0.0007 each. The previous $0.012 put ~$160 on
+    # targeted consensus alone, 15x the whole whisper bill.
+    ("whisper-1-targeted-consensus", "openai"): 0.0007,
+    ("whisper-1-live-independent-verify", "openai"): 0.0007,
+    ("whisper-1-live-independent-verify-mix", "openai"): 0.0007,
     # Small text-only formatter call (one numbered lyric payload per song).
-    ("gpt-4o-mini", "openai"): 0.001,
+    # September invoice: $0.026 for 600 calls.
+    ("gpt-4o-mini", "openai"): 0.00005,
     # Human-provided fallback — no AI cost
     ("human-provided", "user_upload"): 0.0,
 }
