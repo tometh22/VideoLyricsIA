@@ -1926,11 +1926,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "lyric_look": lyric_look,
             # Look variant fields (operator choices; the concrete variant and
             # detected genre were merged above by prepare_opts).
-            **{k: v for k, v in {
-                "lyric_genre": lyric_genre, "lyric_font_main": lyric_font_main,
-                "lyric_font_key": lyric_font_key, "lyric_alt_color": lyric_alt_color,
-                "lyric_accent_color": lyric_accent_color,
-            }.items() if v},
+            # With a look, write every operator field (""/None included) so a
+            # value cleared on a new /generate doesn't linger for retries.
+            **({
+                "lyric_genre": lyric_genre or "", "lyric_font_main": lyric_font_main or "",
+                "lyric_font_key": lyric_font_key or "", "lyric_alt_color": lyric_alt_color or "",
+                "lyric_accent_color": lyric_accent_color or "",
+            } if lyric_look else {}),
             "style": style,
             "genre": genre,
             "concept": concept,
@@ -19046,7 +19048,10 @@ def _render_lyrics_ass(
                 width=spec.width, height=spec.height, duration=duration,
                 case_fn=lambda t: _apply_case(t, text_case),
                 font_scale=font_scale,
-                primary_override=lyric_color or "",
+                # With variant opts the text colour already lives in the
+                # resolved look; applying it again would undo look-specific
+                # rules (e.g. Neón keeps a white tube core for dark inks).
+                primary_override=("" if lyric_look_opts else (lyric_color or "")),
                 title_lines=title_lines,
                 beats=_look_beats(look, mp3_path),
             )
@@ -20093,7 +20098,8 @@ def _build_short_ass_doc(
             duration=(duration if duration else
                       max((s["end"] for s in clean_segments), default=0.0)),
             case_fn=lambda t: _apply_case(t, text_case),
-            font_scale=font_scale, primary_override=lyric_color or "",
+            font_scale=font_scale,
+            primary_override=("" if look_obj is not None else (lyric_color or "")),
             beats=beats,
         )
     lines = _ass.segments_to_lines(
@@ -21227,16 +21233,33 @@ def run_edit_pipeline(
     if lyric_look:
         try:
             import lyric_look_runtime as _llr
+            _look_rp = dict(merged)
+            _variant_keys = ("lyric_genre", "lyric_variant", "lyric_font_main",
+                             "lyric_font_key", "lyric_alt_color", "lyric_accent_color")
+            _legacy = (base_params.get("lyric_look") == lyric_look
+                       and not base_params.get("lyric_variant_sig")
+                       and not any(k in edit_params for k in _variant_keys))
+            if _legacy:
+                # Rendered before look variants existed: keep it exactly as it
+                # was (the look as designed) instead of re-skinning it on a
+                # plain text/typography edit.
+                _look_rp.update(lyric_variant=0)
+                _look_rp.pop("lyric_genre", None)
             _look_opts, _look_update = _llr.prepare_opts(
                 job_id=job_id, lyric_look=lyric_look, artist=artist,
                 song_title=song_title or "",
                 lyrics_text=" ".join(str(sg.get("text") or "") for sg in (segments or [])
                                      if isinstance(sg, dict)),
-                render_params=merged,
+                render_params=_look_rp, detect_genre=not _legacy,
             )
+            if _legacy:
+                _look_opts["genre"] = ""
             if _look_update:
                 from jobs import merge_render_params as _merge_look
                 _merge_look(job_id, _look_update)
+                # The edit ends by writing `merged` back to render_params:
+                # carry the decisions so they aren't erased.
+                merged.update(_look_update)
         except Exception as _look_exc:  # noqa: BLE001
             logger.warning("[LOOK] edit variant preparation failed (%s)", _look_exc)
             _look_opts = {}

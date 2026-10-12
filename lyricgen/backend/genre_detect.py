@@ -46,10 +46,21 @@ def _r2_key(k: str) -> str:
 
 def parse_answer(text: str) -> str:
     """First known genre word in the model's answer ("" if none)."""
-    for tok in re.findall(r"[a-záéíóúñ\-]+", str(text or "").lower()):
-        tok = {"hip-hop": "hiphop", "rap": "hiphop", "trap": "hiphop", "latino": "latin",
-               "balada": "ballad", "electronica": "electronic", "folclore": "folk",
-               "reggaeton": "reggaeton", "reguetón": "reggaeton"}.get(tok, tok)
+    import unicodedata
+    raw = unicodedata.normalize("NFKD", str(text or "").lower())
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
+    whole = {"hip-hop": "hiphop", "hip hop": "hiphop", "k-pop": "pop", "j-pop": "pop",
+             "pop-punk": "punk", "folk-rock": "rock", "pop-rock": "rock",
+             "nu-metal": "metal", "heavy metal": "metal", "hard rock": "rock"}
+    for phrase, g in whole.items():
+        if phrase in raw:
+            return g
+    alias = {"rap": "hiphop", "trap": "hiphop", "latino": "latin", "balada": "ballad",
+             "electronica": "electronic", "folclore": "folk", "reggaeton": "reggaeton",
+             "regueton": "reggaeton", "edm": "electronic", "house": "electronic",
+             "techno": "electronic", "bolero": "ballad", "tango": "folk"}
+    for tok in re.findall(r"[a-z]+", raw):
+        tok = alias.get(tok, tok)
         if tok in R.GENRES:
             return tok
     return ""
@@ -69,7 +80,8 @@ def detect(artist: str, title: str, lyrics_text: str = "", *, job_id: str | None
         if storage.is_enabled() and storage.object_exists(_r2_key(k)):
             with tempfile.NamedTemporaryFile(suffix=".json") as tf:
                 if storage.download_object(_r2_key(k), tf.name):
-                    g = R.normalize_genre(json.load(open(tf.name)).get("genre"))
+                    with open(tf.name) as fh:
+                        g = R.normalize_genre(json.load(fh).get("genre"))
                     if g:
                         with _LOCK:
                             _MEM[k] = g
@@ -88,6 +100,10 @@ def detect(artist: str, title: str, lyrics_text: str = "", *, job_id: str | None
         logger.warning("[GENRE] detection failed for %r / %r: %s", artist, title, exc)
         return "", "none"
     if not genre:
+        # Remember "unknown" for this process so renders/previews of the same
+        # song don't pay for the same unanswerable question again.
+        with _LOCK:
+            _MEM[k] = ""
         return "", "none"
     with _LOCK:
         _MEM[k] = genre

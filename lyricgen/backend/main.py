@@ -3164,6 +3164,15 @@ def _apply_lyric_variant_edit(body, job, edit_params: dict) -> None:
     import lyric_look_runtime as _llr
     fields = ("lyric_genre", "lyric_variant", "lyric_font_main", "lyric_font_key",
               "lyric_alt_color", "lyric_accent_color")
+    _rp0 = dict(job.render_params or {})
+    _lc = getattr(body, "lyric_color", None)
+    if _lc is not None:
+        # Text colour of the look ("" or the wizard's white = the variant's).
+        _lc = _lc.strip()
+        _lc = _lc.upper() if re.match(r"^#[0-9a-fA-F]{6}$", _lc) else ""
+        _rp0["lyric_color"] = _lc
+        edit_params["lyric_color"] = _lc
+        job.render_params = _rp0
     changed = {f: getattr(body, f, None) for f in fields
                if getattr(body, f, None) is not None}
     if not changed:
@@ -13045,6 +13054,8 @@ class EditJobRequest(BaseModel):
     line_transition: str | None = Field(default=None, max_length=16)
     # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
     lyric_look: str | None = Field(default=None, max_length=16)
+    # Color de texto del look ("" = el de la variante).
+    lyric_color: str | None = Field(default=None, max_length=8)
     # Look variant fields; None = no cambia, "" = volver a automático.
     lyric_genre: str | None = Field(default=None, max_length=16)
     lyric_variant: str | int | None = Field(default=None)
@@ -14223,21 +14234,32 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
     look_id = _normalize_lyric_look(body.lyric_look)
     if not look_id:
         raise HTTPException(status_code=422, detail="Look desconocido.")
-    seed_key, rp = "", {}
+    rp, job_id_for_sibs = {}, ""
+    artist, song_title = body.artist, body.song_title
     if body.job_id:
         from database import Job as JobModel
-        job = (db.query(JobModel).filter(JobModel.job_id == body.job_id,
-                                         JobModel.tenant_id == current_user["tenant_id"])
-               .first())
+        q = db.query(JobModel).filter(JobModel.job_id == body.job_id)
+        if current_user.get("role") != "admin":
+            q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
+        job = q.first()
         if job is not None:
-            seed_key, rp = job.job_id, dict(job.render_params or {})
-    if not seed_key:
-        seed_key = f"{body.artist.strip().lower()}|{body.song_title.strip().lower()}"
+            rp, job_id_for_sibs = dict(job.render_params or {}), job.job_id
+            artist = artist or job.artist or ""
+            song_title = song_title or job.song_title or ""
+    # Same seed the render uses (lyric_look_runtime.prepare_opts): the song.
+    seed_key = lyric_recipes.seed_key_for(artist, song_title)
     genre_src = "operator"
     genre = lyric_recipes.normalize_genre(body.lyric_genre)
     if not genre:
         genre = lyric_recipes.normalize_genre(rp.get("lyric_genre")) or \
             lyric_recipes.normalize_genre(rp.get("lyric_genre_detected"))
+        if not genre and (artist or song_title):
+            # Same detection (and cache, keyed by artist + title) the render
+            # uses, so the preview shows the genre version that will render.
+            import genre_detect
+            genre, _src = genre_detect.detect(artist, song_title, "",
+                                              job_id=job_id_for_sibs or None)
+            genre = lyric_recipes.normalize_genre(genre)
         genre_src = "detected" if genre else "none"
     variant = _llr.normalize_variant(body.lyric_variant)
     if variant is None:
@@ -14245,7 +14267,8 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
                 and lyric_recipes.normalize_genre(rp.get("lyric_genre") or rp.get("lyric_genre_detected")) == genre:
             variant = _llr.normalize_variant(rp.get("lyric_variant"))
         else:
-            sibs = _llr.sibling_signatures(seed_key, look_id) if body.job_id else set()
+            sibs = (_llr.sibling_signatures(job_id_for_sibs, look_id)
+                    if job_id_for_sibs else set())
             variant = lyric_recipes.choose_auto_variant(look_id, genre, seed_key, sibs)
     _look, info = lyric_recipes.resolve(
         look_id, genre=genre, variant=variant, seed_key=seed_key,
@@ -19350,6 +19373,12 @@ async def retry_job(
               "label_line"):
         if k in _retry_render_params and _retry_render_params[k] not in (None, ""):
             retry_pipeline_kwargs[k] = _retry_render_params[k]
+    # Look-variant fields only travel with a look (a worker that predates them
+    # must never receive them for a job without one).
+    if not _normalize_lyric_look(retry_pipeline_kwargs.get("lyric_look")):
+        for _k in ("lyric_look", "lyric_genre", "lyric_variant", "lyric_font_main",
+                   "lyric_font_key", "lyric_alt_color", "lyric_accent_color"):
+            retry_pipeline_kwargs.pop(_k, None)
 
     # Audit A5: re-gatear enable_scenes con el acceso ACTUAL del usuario, igual
     # que /generate y /upload. Un tenant al que se le sacó el acceso (o se cayó
@@ -19660,6 +19689,8 @@ class VariantJobRequest(BaseModel):
     line_transition: str | None = Field(default=None, max_length=16)
     # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
     lyric_look: str | None = Field(default=None, max_length=16)
+    # Color de texto del look ("" = el de la variante).
+    lyric_color: str | None = Field(default=None, max_length=8)
     # Look variant fields; None = no cambia, "" = volver a automático.
     lyric_genre: str | None = Field(default=None, max_length=16)
     lyric_variant: str | int | None = Field(default=None)
@@ -19729,6 +19760,7 @@ _VARIANT_OVERRIDABLE_FIELDS = (
     "lyrics_animation",
     "line_transition",
     "lyric_look",
+    "lyric_color",
     "lyric_genre",
     "lyric_variant",
     "lyric_font_main",
@@ -20206,6 +20238,12 @@ async def create_variant(
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
     # Sin look → no se manda la kwarg (compat con workers previos al campo).
+    if getattr(body, "lyric_variant", None) is None:
+        # A new job gets its own automatic variant (avoiding the parent's,
+        # which is now a sibling) instead of inheriting the parent's number.
+        new_render_params.pop("lyric_variant", None)
+        pipeline_kwargs.pop("lyric_variant", None)
+    new_render_params.pop("lyric_variant_sig", None)
     _variant_look = _normalize_lyric_look(pipeline_kwargs.pop("lyric_look", ""))
     _variant_fields = {f: pipeline_kwargs.pop(f, "") for f in (
         "lyric_genre", "lyric_variant", "lyric_font_main", "lyric_font_key",

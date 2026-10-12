@@ -196,7 +196,7 @@ def test_prepare_opts_respects_operator_then_persisted_then_detects(monkeypatch)
     assert isinstance(upd["lyric_variant"], int) and "lyric_variant_sig" in upd
     opts2, upd2 = RT.prepare_opts(job_id="j1", lyric_look="cinetico",
                                   render_params={"lyric_genre": "pop", "lyric_variant": 4})
-    assert opts2["genre"] == "pop" and opts2["variant"] == 4 and "lyric_variant" not in upd2
+    assert opts2["genre"] == "pop" and opts2["variant"] == 4 and upd2["lyric_variant"] == 4
     assert len(calls) == 1
 
 
@@ -232,3 +232,64 @@ def test_genre_detection_never_raises(monkeypatch):
     import storage
     monkeypatch.setattr(storage, "is_enabled", lambda: False)
     assert genre_detect.detect("X", "Y", provider=Boom()) == ("", "none")
+
+
+# --- regresiones de la revisión ---------------------------------------------------
+
+def test_preview_and_render_share_the_song_seed(monkeypatch):
+    monkeypatch.setattr(RT, "sibling_signatures", lambda j, l: set())
+    opts, _ = RT.prepare_opts(job_id="any-job-id", lyric_look="bloque", artist="La Renga",
+                              song_title="Blues Cardíaco",
+                              render_params={"lyric_genre": "rock", "lyric_variant": 2})
+    render = RT.resolve_for_render("bloque", opts)
+    preview, _ = R.resolve("bloque", genre="rock", variant=2,
+                           seed_key=R.seed_key_for("  la renga ", "Blues  Cardíaco"))
+    assert render == preview
+
+
+def test_auto_variants_spread_across_songs_without_siblings():
+    songs = [R.seed_key_for("Artista", f"Canción {i}") for i in range(12)]
+    picked = {R.choose_auto_variant("cinetico", "metal", s) for s in songs}
+    assert len(picked) >= 4
+
+
+def test_main_font_override_keeps_the_second_face():
+    neon, info = R.resolve("neon", genre="", variant=0, seed_key="s",
+                           overrides={"font_main": "anton"})
+    assert neon.font_file == "Anton-Regular.ttf"
+    assert neon.extra_fonts == ("Neonderthaw-Regular.ttf",)
+    assert info["fonts"]["key"]["id"] == "neonderthaw"
+    bloque, _ = R.resolve("bloque", genre="", variant=0, seed_key="s",
+                          overrides={"font_main": "anton"})
+    assert bloque.extra_fonts == ("BigShouldersDisplay-Light.ttf",)
+
+
+def test_genre_answers_with_hyphens_and_accents():
+    import genre_detect
+    assert genre_detect.parse_answer("folk-rock") == "rock"
+    assert genre_detect.parse_answer("Pop-punk") == "punk"
+    assert genre_detect.parse_answer("K-pop") == "pop"
+    assert genre_detect.parse_answer("Reggaetón") == "reggaeton"
+
+
+def test_campaign_accepts_automatic_colours_and_numeric_variants():
+    import campaign_creative as cc
+    out = cc.normalize_settings({"lyric_alt_color": "", "lyric_accent_color": "#FF0000",
+                                 "lyric_variant": 3, "lyric_genre": "metal"})
+    assert out["lyric_alt_color"] == "" and out["lyric_variant"] == "3"
+    assert cc.normalize_settings({"lyric_variant": ""})["lyric_variant"] == ""
+    assert cc.normalize_settings({"lyric_variant": "25"})["lyric_variant"] == "25"
+
+
+def test_veo_group_allows_cinetico_but_not_frame_owning_looks():
+    import campaign_creative as cc
+    from fastapi import HTTPException
+    g = cc.Group(id="g", name="Veo", weight=100, requirement="veo", model=cc.VEO_LITE)
+
+    class _C:
+        tenant_id = "t"
+    cc.validate_combination(None, _C(), {"lyric_look": "cinetico",
+                                         "movement_style": "estandar"}, g, {})
+    with pytest.raises(HTTPException):
+        cc.validate_combination(None, _C(), {"lyric_look": "pop70",
+                                             "movement_style": "estandar"}, g, {})

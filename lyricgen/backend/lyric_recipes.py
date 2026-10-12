@@ -79,6 +79,7 @@ FONTS = {
     "audiowide": ("Audiowide-Regular.ttf", "Audiowide", "Audiowide", 400, ("urban", "pop"), ("text", "display")),
     "bebas-neue": ("BebasNeue-Regular.ttf", "Bebas Neue", "Bebas Neue", 400, ("heavy", "urban"), ("text",)),
     "big-shoulders": ("BigShouldersDisplay-Black.ttf", "Big Shoulders", "Big Shoulders Display", 900, ("heavy", "urban", "pop"), ("text", "display")),
+    "big-shoulders-light": ("BigShouldersDisplay-Light.ttf", "Big Shoulders Light", "Big Shoulders Display", 300, ("urban", "heavy"), ("text",)),
     "black-ops-one": ("BlackOpsOne-Regular.ttf", "Black Ops One", "Black Ops One", 400, ("heavy", "urban"), ("text", "display")),
     "bungee": ("Bungee-Regular.ttf", "Bungee", "Bungee", 400, ("heavy", "pop", "urban"), ("text", "display")),
     "caveat": ("Caveat-Bold.ttf", "Caveat", "Caveat", 700, ("pop", "soft"), ("hand", "script", "text")),
@@ -225,6 +226,14 @@ class Recipe:
         return f"{fonts} · {self.palette.replace('_', ' ')} · {self.grade}"
 
 
+def seed_key_for(artist: str, song_title: str) -> str:
+    """The seed both the preview and the render use: the song itself (normalised
+    artist + title), so the wizard — which may not have a job id yet — shows
+    exactly what the worker will render."""
+    norm = lambda v: re.sub(r"\s+", " ", str(v or "").strip().lower())
+    return f"{norm(artist)}|{norm(song_title)}"
+
+
 def job_seed(seed_key: str) -> int:
     return int(hashlib.sha1(str(seed_key or "").encode("utf-8")).hexdigest()[:10], 16)
 
@@ -283,10 +292,15 @@ def choose_auto_variant(look_id: str, genre: str, seed_key: str,
                         used_signatures: set | None = None, limit: int = 40) -> int:
     """Smallest variant whose look isn't already used by a sibling song."""
     used = used_signatures or set()
-    for v in range(limit):
+    # Start each song at its own offset so a batch resolved before any sibling
+    # has rendered (a campaign, a wizard batch) still spreads across variants
+    # instead of all landing on variant 0.
+    start = job_seed(seed_key) % 6
+    for i in range(limit):
+        v = (start + i) % limit
         if recipe_for(look_id, genre, seed_key, v).signature not in used:
             return v
-    return 0
+    return start
 
 
 # --- Applying fonts / colours to a look ---------------------------------------------
@@ -347,6 +361,14 @@ def _duotone_grade(ink: str, accent: str) -> str:
     lr, lg, lb = (int(ink[i:i + 2], 16) / 255 for i in (1, 3, 5))
     return (f"hue=s=0,eq=contrast=1.35,curves=r='0/{dr:.2f} 1/{lr:.2f}'"
             f":g='0/{dg:.2f} 1/{lg:.2f}':b='0/{db:.2f} 1/{lb:.2f}'")
+
+
+def _second_face(look: L.Look) -> str:
+    """The look's second typeface: the key-word face for kinetic/keyword
+    looks, the alternate face kept in extra_fonts for block and neon."""
+    if look.layout in ("block",) or look.motion == "neon":
+        return look.extra_fonts[0] if look.extra_fonts else look.font_file
+    return look.key_font or look.font_file
 
 
 def build_from_recipe(rec: Recipe, *, bg_luma: float | None = None) -> L.Look:
@@ -428,7 +450,7 @@ def resolve(look_id: str, *, genre: str = "", variant=0, seed_key: str = "",
     rec = recipe_for(base.id, genre, seed_key, variant)
     look = build_from_recipe(rec, bg_luma=bg_luma)
     main_id = _FONT_BY_FILE.get(look.font_file, rec.fonts[0])
-    key_id = _FONT_BY_FILE.get(look.key_font or look.font_file, rec.fonts[1])
+    key_id = _FONT_BY_FILE.get(_second_face(look), rec.fonts[1])
     if ov["font_main"] or ov["font_key"]:
         look = apply_fonts(look, base, ov["font_main"] or main_id, ov["font_key"] or key_id)
         main_id, key_id = ov["font_main"] or main_id, ov["font_key"] or key_id
@@ -456,6 +478,22 @@ def resolve(look_id: str, *, genre: str = "", variant=0, seed_key: str = "",
         "overridden": {"font_main": bool(ov["font_main"]), "font_key": bool(ov["font_key"]),
                        "ink": bool(ov["ink"]), "alt": bool(ov["alt"]), "accent": bool(ov["accent"])},
         "background": look.background, "signature": list(rec.signature[1]) + [rec.signature[2]],
+        # How the look is drawn in this variant (for an exact preview).
+        "style": {
+            "decorations": list(look.kinetic_decos) if look.layout == "kinetic" else [],
+            # Kinetic connectors are set in the look's second face
+            # (extra_fonts[0]: Caveat script in pop, the main face in heavy).
+            "connector_font": (_FONT_BY_FILE.get(look.extra_fonts[0], main_id)
+                               if look.extra_fonts else main_id)
+            if look.layout == "kinetic" else None,
+            "connector_color": (cur[1] if not look.connector_tilt else cur[2])
+            if look.layout == "kinetic" else None,
+            "connector_tilt": bool(look.connector_tilt),
+            "beat_shake": bool(look.beat_shake),
+            "cascade": bool(look.cascade),
+            "letterbox": bool(look.letterbox),
+            "effect": look.effect or "",
+        },
         "warnings": warnings,
     }
     return look, info

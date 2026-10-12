@@ -112,15 +112,18 @@ def prepare_opts(*, job_id: str, lyric_look: str, artist: str = "", song_title: 
         except Exception as exc:  # pragma: no cover
             logger.warning("[LOOK] genre detection failed for %s: %s", job_id, exc)
     eff_genre = genre or detected
+    seed_key = R.seed_key_for(artist, song_title) if (artist or song_title) else job_id
     variant = normalize_variant(rp.get("lyric_variant"))
     if variant is None:
-        variant = R.choose_auto_variant(lyric_look, eff_genre, job_id,
+        variant = R.choose_auto_variant(lyric_look, eff_genre, seed_key,
                                         sibling_signatures(job_id, lyric_look))
-        update["lyric_variant"] = variant
-    rec = R.recipe_for(lyric_look, eff_genre, job_id, variant)
+    # Always persisted (also when the operator chose it): edits, retries and
+    # the preview must find the exact variant this render used.
+    update["lyric_variant"] = variant
+    rec = R.recipe_for(lyric_look, eff_genre, seed_key, variant)
     update["lyric_variant_sig"] = _sig_json(rec.signature)
     opts = {
-        "genre": eff_genre, "variant": variant, "seed_key": job_id,
+        "genre": eff_genre, "variant": variant, "seed_key": seed_key,
         "font_main": rp.get("lyric_font_main") or "", "font_key": rp.get("lyric_font_key") or "",
         "ink": rp.get("lyric_color") or "", "alt": rp.get("lyric_alt_color") or "",
         "accent": rp.get("lyric_accent_color") or "",
