@@ -23,6 +23,9 @@ import {
 import { getLyricLook, normalizeLyricLook } from "../lib/lyricLooks";
 
 export const RESOLVE_DEBOUNCE_MS = 250;
+// La detección es una llamada paga (y 30/min): se espera a que el operador
+// deje de tipear artista/título antes de pedirla.
+export const DETECT_DEBOUNCE_MS = 800;
 
 /** Catálogo (cacheado por sesión) con respaldo estático. */
 export function useLookCatalog({ api = LOOK_API, authHeaders = lookAuthHeaders, enabled = true } = {}) {
@@ -53,10 +56,12 @@ export function useLookVariant({
   artist = "",
   songTitle = "",
   lyricsText = "",
+  fresh = false,
   api = LOOK_API,
   authHeaders = lookAuthHeaders,
   enabled = true,
   debounceMs = RESOLVE_DEBOUNCE_MS,
+  detectDebounceMs = DETECT_DEBOUNCE_MS,
 } = {}) {
   const lookCode = normalizeLyricLook(look);
   const active = enabled && !!getLyricLook(lookCode);
@@ -80,9 +85,11 @@ export function useLookVariant({
       return undefined;
     }
     setDetected(null);
-    fetchDetectGenre({ artist, songTitle, lyricsText: lyricsRef.current, jobId }, api, authHeaders)
-      .then((res) => { if (alive) setDetected(res); });
-    return () => { alive = false; };
+    const timer = setTimeout(() => {
+      fetchDetectGenre({ artist, songTitle, lyricsText: lyricsRef.current, jobId }, api, authHeaders)
+        .then((res) => { if (alive) setDetected(res); });
+    }, detectDebounceMs);
+    return () => { alive = false; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantDetect, artist, songTitle, api]);
 
@@ -102,7 +109,7 @@ export function useLookVariant({
     const seq = ++seqRef.current;
     const body = buildResolveBody({
       look: lookCode, genre: operatorGenre, variant, fontMain, fontKey,
-      color, altColor, accentColor, jobId, artist, songTitle,
+      color, altColor, accentColor, jobId, artist, songTitle, fresh,
     });
     setLoading(true);
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -113,7 +120,10 @@ export function useLookVariant({
           if (data && typeof data === "object") {
             // `_request`: para qué canción se resolvió (el pin de envío no
             // puede aplicarse a otra si la review cambió mientras volaba).
-            setResolved({ ...data, _request: { artist: body.artist, songTitle: body.song_title, jobId: body.job_id } });
+            setResolved({ ...data, _request: {
+              artist: body.artist, songTitle: body.song_title, jobId: body.job_id || null,
+              genre: body.lyric_genre, variant: body.lyric_variant,
+            } });
             setError(false);
           }
           setLoading(false);
@@ -134,7 +144,7 @@ export function useLookVariant({
     // la toma de su cache por artista+título (genre_source "detected").
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, lookCode, operatorGenre, variant, fontMain, fontKey, color, altColor, accentColor,
-    jobId, artist, songTitle, api, debounceMs, detectedGenre]);
+    jobId, artist, songTitle, fresh, api, debounceMs, detectedGenre]);
 
   // Fuentes que el catálogo/la variante usan y no están precargadas.
   useEffect(() => {

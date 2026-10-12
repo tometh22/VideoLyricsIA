@@ -43,8 +43,9 @@ def field(label, group, kind="text", **kw):
 import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
 import lyric_recipes as _lyric_recipes  # noqa: E402
 
-# Looks that paint the whole frame in every genre. (Cinético does it only in
-# pop; in rock/metal it uses the song's background, so a Veo group is fine.)
+# Looks that paint the whole frame in every genre. Cinético does it only in
+# pop (its original design), so a Veo group needs the campaign's genre set to
+# one where it uses the song's background (lyric_recipes.may_own_background).
 _ALWAYS_OWN_BACKGROUND = {"pop70", "degrade"}
 
 FIELDS = {
@@ -271,8 +272,10 @@ def validate_combination(db, campaign, settings, group, user):
             fail("Fondo no disponible para esta campaña", 404)
     if settings.get("enable_scenes") and (asset or not has_scenes_access(user)):
         fail("Escenas requiere acceso habilitado y fondo IA")
-    if (group.requirement in ("veo", "photo_effect")
-            and settings.get("lyric_look") in _ALWAYS_OWN_BACKGROUND):
+    if (group.requirement in ("veo", "photo_effect") and settings.get("lyric_look")
+            and (settings.get("lyric_look") in _ALWAYS_OWN_BACKGROUND
+                 or _lyric_recipes.may_own_background(settings.get("lyric_look"),
+                                                      settings.get("lyric_genre") or ""))):
         fail("Este look no usa fondo (pinta todo el cuadro): elegí otro look o un grupo sin fondo IA")
     if group.requirement == "photo_effect":
         if settings.get("effect") in (None, "", "none", "foto_viva"):

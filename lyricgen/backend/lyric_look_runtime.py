@@ -7,7 +7,12 @@ calls `resolve_for_render`, which is pure given `opts` (+ the background
 brightness, which only tunes the grade).
 
 opts keys: genre, genre_detected, variant, seed_key, font_main, font_key, ink,
-alt, accent.
+alt, accent, legacy.
+
+A job rendered before variants existed carries ``lyric_look_legacy`` (set by
+the edit pipeline on its first edit): it keeps rendering the look exactly as
+designed — variant 0, no genre, the text colour applied the old way — until
+the operator explicitly picks a genre/variant/font/colour for it.
 """
 from __future__ import annotations
 
@@ -100,6 +105,13 @@ def prepare_opts(*, job_id: str, lyric_look: str, artist: str = "", song_title: 
     rp = dict(render_params or {})
     if not L.get_look(lyric_look):
         return {}, {}
+    if rp.get("lyric_look_legacy"):
+        seed_key = R.seed_key_for(artist, song_title) if (artist or song_title) else job_id
+        rec = R.recipe_for(lyric_look, "", seed_key, 0)
+        return ({"genre": "", "variant": 0, "seed_key": seed_key, "legacy": True,
+                 "font_main": "", "font_key": "", "ink": "", "alt": "", "accent": ""},
+                {"lyric_look_legacy": True, "lyric_variant": 0,
+                 "lyric_variant_sig": _sig_json(rec.signature)})
     genre = R.normalize_genre(rp.get("lyric_genre"))
     detected = R.normalize_genre(rp.get("lyric_genre_detected"))
     update = {}
@@ -143,6 +155,16 @@ def bg_luma(path: str | None) -> float | None:
         return (sum(out) / (len(out) * 255.0)) if out else None
     except Exception:
         return None
+
+
+def primary_override(opts: dict | None, lyric_color: str | None) -> str:
+    """Text colour build_look_ass paints over the resolved look. With variant
+    opts the colour already lives in the resolved look (applying it again
+    would undo look-specific rules, e.g. Neón's white tube core); legacy jobs
+    and renders whose variant preparation failed keep the old behaviour."""
+    if opts and not opts.get("legacy"):
+        return ""
+    return lyric_color or ""
 
 
 def resolve_for_render(lyric_look: str, opts: dict | None, *, bg_path: str | None = None):

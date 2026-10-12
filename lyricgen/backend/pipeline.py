@@ -1627,8 +1627,22 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     for _k in ("lyric_genre_detected",):
                         if _prev.get(_k):
                             _look_rp[_k] = _prev[_k]
+                    # A job rendered before variants existed keeps its look as
+                    # designed on a retry/regenerate too (see run_edit_pipeline),
+                    # unless this run carries an explicit genre/font/colour.
+                    if _prev.get("lyric_look_legacy") and _prev.get("lyric_look") == lyric_look \
+                            and not any([lyric_genre, lyric_font_main, lyric_font_key,
+                                         lyric_alt_color, lyric_accent_color]) \
+                            and str(lyric_variant if lyric_variant is not None else "0").strip() in ("", "0"):
+                        _look_rp["lyric_look_legacy"] = True
+                    # Re-run (retry/regenerate) of the same look and genre:
+                    # keep the variant it already rendered with. A different
+                    # genre means a different recipe pool → choose again.
+                    _prev_genre = _prev.get("lyric_genre") or _prev.get("lyric_genre_detected") or ""
+                    _cur_genre = lyric_genre or _prev.get("lyric_genre_detected") or ""
                     if lyric_variant in (None, "") and _prev.get("lyric_look") == lyric_look \
-                            and _prev.get("lyric_variant") not in (None, ""):
+                            and _prev.get("lyric_variant") not in (None, "") \
+                            and str(_prev_genre).strip().lower() == str(_cur_genre).strip().lower():
                         _look_rp["lyric_variant"] = _prev.get("lyric_variant")
                 except Exception:
                     pass
@@ -18971,7 +18985,7 @@ def _render_lyrics_ass(
         # has one, e.g. Metal Mania), the song the look's lyric font. Fonts
         # the operator picked explicitly still win.
         _look_artist_font = ""
-        if look is not None:
+        if look is not None and not (lyric_look_opts or {}).get("legacy"):
             _look_artist_font = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
         title_artist_path = (_resolve_font(title_artist_font)
                              or _look_artist_font or extrabold_font)
@@ -19051,7 +19065,7 @@ def _render_lyrics_ass(
                 # With variant opts the text colour already lives in the
                 # resolved look; applying it again would undo look-specific
                 # rules (e.g. Neón keeps a white tube core for dark inks).
-                primary_override=("" if lyric_look_opts else (lyric_color or "")),
+                primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
                 title_lines=title_lines,
                 beats=_look_beats(look, mp3_path),
             )
@@ -20064,6 +20078,7 @@ def _build_short_ass_doc(
     beats: list[float] | None = None,
     duration: float | None = None,
     look_obj=None,
+    look_primary_override: str | None = None,
 ) -> str:
     """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
     derivaciones de estilo que _render_lyrics_ass usa para el video
@@ -20099,7 +20114,8 @@ def _build_short_ass_doc(
                       max((s["end"] for s in clean_segments), default=0.0)),
             case_fn=lambda t: _apply_case(t, text_case),
             font_scale=font_scale,
-            primary_override=("" if look_obj is not None else (lyric_color or "")),
+            primary_override=(look_primary_override if look_primary_override is not None
+                              else ("" if look_obj is not None else (lyric_color or ""))),
             beats=beats,
         )
     lines = _ass.segments_to_lines(
@@ -20191,6 +20207,7 @@ def _burn_short_text_ass(
             lyrics_animation=lyrics_animation, line_transition=line_transition,
             lyric_look=lyric_look, beats=beats, duration=short_dur,
             look_obj=_look,
+            look_primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
         )
         # The look's grade goes in the same pass, before the text burn.
         _grade = f"{_look.grade}," if (_look is not None and _look.grade) else ""
@@ -21236,15 +21253,15 @@ def run_edit_pipeline(
             _look_rp = dict(merged)
             _variant_keys = ("lyric_genre", "lyric_variant", "lyric_font_main",
                              "lyric_font_key", "lyric_alt_color", "lyric_accent_color")
-            _legacy = (base_params.get("lyric_look") == lyric_look
-                       and not base_params.get("lyric_variant_sig")
-                       and not any(k in edit_params for k in _variant_keys))
-            if _legacy:
-                # Rendered before look variants existed: keep it exactly as it
-                # was (the look as designed) instead of re-skinning it on a
-                # plain text/typography edit.
-                _look_rp.update(lyric_variant=0)
-                _look_rp.pop("lyric_genre", None)
+            _touched = any(k in edit_params for k in _variant_keys)
+            _legacy = (base_params.get("lyric_look") == lyric_look and not _touched
+                       and (base_params.get("lyric_look_legacy")
+                            or not base_params.get("lyric_variant_sig")))
+            # Rendered before look variants existed: keep it exactly as it
+            # was (the look as designed) on every later edit too — the flag
+            # persists — until the operator picks a variant/genre/font/colour.
+            _look_rp["lyric_look_legacy"] = bool(_legacy)
+            merged.pop("lyric_look_legacy", None)
             _look_opts, _look_update = _llr.prepare_opts(
                 job_id=job_id, lyric_look=lyric_look, artist=artist,
                 song_title=song_title or "",
@@ -21252,8 +21269,11 @@ def run_edit_pipeline(
                                      if isinstance(sg, dict)),
                 render_params=_look_rp, detect_genre=not _legacy,
             )
-            if _legacy:
-                _look_opts["genre"] = ""
+            if not _legacy:
+                # The flag must not survive into render_params either.
+                from jobs import merge_render_params as _merge_flag
+                if base_params.get("lyric_look_legacy"):
+                    _merge_flag(job_id, {"lyric_look_legacy": False})
             if _look_update:
                 from jobs import merge_render_params as _merge_look
                 _merge_look(job_id, _look_update)

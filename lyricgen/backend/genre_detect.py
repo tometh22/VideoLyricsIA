@@ -44,31 +44,53 @@ def _r2_key(k: str) -> str:
     return f"lyric_genre/{k}.json"
 
 
+_PHRASES = {
+    # Compound answers: the genre that decides the look comes LAST in English
+    # ("pop rock" is rock, "rap metal" is metal) — except the few below.
+    "hip hop": "hiphop", "k pop": "pop", "j pop": "pop", "latin pop": "latin",
+    "pop latino": "latin", "rock nacional": "rock", "nu metal": "metal",
+    "heavy metal": "metal", "hard rock": "rock",
+}
+_ALIAS = {
+    "rap": "hiphop", "trap": "hiphop", "drill": "hiphop", "latino": "latin",
+    "cumbia": "latin", "salsa": "latin", "bachata": "latin", "cuarteto": "latin",
+    "merengue": "latin", "dembow": "reggaeton", "regueton": "reggaeton",
+    "balada": "ballad", "bolero": "ballad", "electronica": "electronic",
+    "edm": "electronic", "house": "electronic", "techno": "electronic",
+    "folclore": "folk", "folklore": "folk", "tango": "folk", "zamba": "folk",
+    "chacarera": "folk", "metalcore": "metal", "thrash": "metal",
+    "hardcore": "metal", "grunge": "rock", "synthpop": "pop",
+}
+
+
 def parse_answer(text: str) -> str:
-    """First known genre word in the model's answer ("" if none)."""
+    """Genre of the model's answer ("" if none). The model is told to answer
+    one word; when it doesn't, the LAST genre word of the first phrase wins
+    ("pop rock" → rock, "folk-rock" → rock, "pop punk" → punk)."""
     import unicodedata
     raw = unicodedata.normalize("NFKD", str(text or "").lower())
     raw = "".join(c for c in raw if not unicodedata.combining(c))
-    whole = {"hip-hop": "hiphop", "hip hop": "hiphop", "k-pop": "pop", "j-pop": "pop",
-             "pop-punk": "punk", "folk-rock": "rock", "pop-rock": "rock",
-             "nu-metal": "metal", "heavy metal": "metal", "hard rock": "rock"}
-    for phrase, g in whole.items():
-        if phrase in raw:
+    # First clause only: "rock, it's pop" / "rock. maybe pop" → rock.
+    raw = re.split(r"[,.;:\n(/]| or | o ", raw, maxsplit=1)[0]
+    raw = " ".join(re.findall(r"[a-z]+", raw))
+    for phrase, g in _PHRASES.items():
+        if re.search(rf"\b{phrase}\b", raw):
             return g
-    alias = {"rap": "hiphop", "trap": "hiphop", "latino": "latin", "balada": "ballad",
-             "electronica": "electronic", "folclore": "folk", "reggaeton": "reggaeton",
-             "regueton": "reggaeton", "edm": "electronic", "house": "electronic",
-             "techno": "electronic", "bolero": "ballad", "tango": "folk"}
-    for tok in re.findall(r"[a-z]+", raw):
-        tok = alias.get(tok, tok)
+    found = ""
+    for tok in raw.split():
+        tok = _ALIAS.get(tok, tok)
         if tok in R.GENRES:
-            return tok
-    return ""
+            found = tok
+    return found
 
 
 def detect(artist: str, title: str, lyrics_text: str = "", *, job_id: str | None = None,
-           provider=None) -> tuple[str, str]:
-    """(genre, source) where source is 'cache' | 'ai' | 'none'."""
+           provider=None, cached_only: bool = False) -> tuple[str, str]:
+    """(genre, source) where source is 'cache' | 'ai' | 'none'.
+
+    ``cached_only`` never calls the model (high-rate preview endpoints read
+    the cache; the paid call goes through the rate-limited detect endpoint
+    or the render)."""
     if not (artist or title):
         return "", "none"
     k = _key(artist, title)
@@ -88,6 +110,8 @@ def detect(artist: str, title: str, lyrics_text: str = "", *, job_id: str | None
                         return g, "cache"
     except Exception as exc:  # pragma: no cover - cache is best-effort
         logger.info("[GENRE] cache read failed: %s", exc)
+    if cached_only:
+        return "", "none"
     try:
         if provider is None:
             from ai_providers import get_text_provider

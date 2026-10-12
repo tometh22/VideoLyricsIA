@@ -1600,8 +1600,11 @@ function VariantWizardRoute({
         lyricsAnimation: params.lyrics_animation || "none",
         lineTransition: params.line_transition || "none",
         lyricLook: normalizeLyricLook(params.lyric_look || ""),
-        // Variante del look del padre (género / número / fuentes / colores).
+        // Variante del look del padre (género / fuentes / colores). El
+        // NÚMERO no: una variante es otro video, arranca en automático y el
+        // backend le elige uno distinto al del padre (resolve con `fresh`).
         ...lookVariantFieldsFromParams(params),
+        lyricVariant: "",
         // Normalizado igual que en edición: el backend persiste el valor CRUDO
         // y un padre con "dinamico" (lo emiten SceneEditModal y el derivado por
         // energía) no matchea ninguna tarjeta → la galería quedaba sin nada

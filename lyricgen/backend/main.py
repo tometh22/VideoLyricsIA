@@ -14215,9 +14215,13 @@ class _LookResolveReq(BaseModel):
     lyric_color: str = Field(default="", max_length=8)
     lyric_alt_color: str = Field(default="", max_length=8)
     lyric_accent_color: str = Field(default="", max_length=8)
-    job_id: str = Field(default="", max_length=64)
+    # null is accepted (the wizard has no job yet before transcription).
+    job_id: str | None = Field(default=None, max_length=64)
     artist: str = Field(default="", max_length=255)
     song_title: str = Field(default="", max_length=500)
+    # Preview for a NEW job derived from `job_id` (the /variant wizard): the
+    # parent's variant is a sibling to avoid, not the one to show.
+    fresh: bool = False
 
 
 @app.post("/lyric-looks/resolve")
@@ -14243,38 +14247,55 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
             q = q.filter(JobModel.tenant_id == current_user["tenant_id"])
         job = q.first()
         if job is not None:
+            _audit_cross_tenant_access(db, current_user, job, "lyric-look-resolve")
             rp, job_id_for_sibs = dict(job.render_params or {}), job.job_id
             artist = artist or job.artist or ""
             song_title = song_title or job.song_title or ""
     # Same seed the render uses (lyric_look_runtime.prepare_opts): the song.
     seed_key = lyric_recipes.seed_key_for(artist, song_title)
+    variant = _llr.normalize_variant(body.lyric_variant)
+    same_look = rp.get("lyric_look") == look_id and not body.fresh
+    overrides = {"font_main": body.lyric_font_main, "font_key": body.lyric_font_key,
+                 "ink": body.lyric_color, "alt": body.lyric_alt_color,
+                 "accent": body.lyric_accent_color}
+    _ov = lyric_recipes.normalize_overrides(**overrides)
+    if (same_look and not lyric_recipes.normalize_genre(body.lyric_genre) and variant is None
+            and not any(v for k, v in _ov.items() if k != "ink")
+            and (rp.get("lyric_look_legacy") or not rp.get("lyric_variant_sig"))):
+        # A job rendered before variants existed: its edits keep the look as
+        # designed (pipeline legacy rule), so the preview shows that too.
+        _look, info = lyric_recipes.resolve(look_id, genre="", variant=0, seed_key=seed_key,
+                                            overrides={"ink": _ov["ink"]})
+        info["genre_source"] = "none"
+        return info
+    # The genre the operator chose travels in the body ("" = automatic); the
+    # stored operator genre is NOT a fallback, or "Automático" could never
+    # clear it. Automatic = the detection the render uses, read from cache
+    # only: the paid call goes through the rate-limited /detect-genre.
     genre_src = "operator"
     genre = lyric_recipes.normalize_genre(body.lyric_genre)
     if not genre:
-        genre = lyric_recipes.normalize_genre(rp.get("lyric_genre")) or \
-            lyric_recipes.normalize_genre(rp.get("lyric_genre_detected"))
+        genre = lyric_recipes.normalize_genre(rp.get("lyric_genre_detected"))
         if not genre and (artist or song_title):
-            # Same detection (and cache, keyed by artist + title) the render
-            # uses, so the preview shows the genre version that will render.
             import genre_detect
-            genre, _src = genre_detect.detect(artist, song_title, "",
-                                              job_id=job_id_for_sibs or None)
+            genre, _src = genre_detect.detect(artist, song_title, "", cached_only=True)
             genre = lyric_recipes.normalize_genre(genre)
         genre_src = "detected" if genre else "none"
-    variant = _llr.normalize_variant(body.lyric_variant)
     if variant is None:
-        if rp.get("lyric_look") == look_id and _llr.normalize_variant(rp.get("lyric_variant")) is not None \
-                and lyric_recipes.normalize_genre(rp.get("lyric_genre") or rp.get("lyric_genre_detected")) == genre:
+        stored_genre = lyric_recipes.normalize_genre(
+            rp.get("lyric_genre") or rp.get("lyric_genre_detected"))
+        if same_look and _llr.normalize_variant(rp.get("lyric_variant")) is not None \
+                and stored_genre == genre:
             variant = _llr.normalize_variant(rp.get("lyric_variant"))
         else:
             sibs = (_llr.sibling_signatures(job_id_for_sibs, look_id)
                     if job_id_for_sibs else set())
+            if body.fresh and rp.get("lyric_look") == look_id and rp.get("lyric_variant_sig"):
+                sibs = set(sibs) | {tuple(tuple(x) if isinstance(x, list) else x
+                                          for x in rp["lyric_variant_sig"])}
             variant = lyric_recipes.choose_auto_variant(look_id, genre, seed_key, sibs)
     _look, info = lyric_recipes.resolve(
-        look_id, genre=genre, variant=variant, seed_key=seed_key,
-        overrides={"font_main": body.lyric_font_main, "font_key": body.lyric_font_key,
-                   "ink": body.lyric_color, "alt": body.lyric_alt_color,
-                   "accent": body.lyric_accent_color})
+        look_id, genre=genre, variant=variant, seed_key=seed_key, overrides=overrides)
     info["genre_source"] = genre_src
     return info
 
@@ -14283,7 +14304,7 @@ class _GenreDetectReq(BaseModel):
     artist: str = Field(default="", max_length=255)
     song_title: str = Field(default="", max_length=500)
     lyrics_text: str = Field(default="", max_length=20000)
-    job_id: str = Field(default="", max_length=64)
+    job_id: str | None = Field(default=None, max_length=64)
 
 
 @app.post("/lyric-looks/detect-genre")
@@ -14295,14 +14316,17 @@ def lyric_looks_detect_genre(request: Request, body: _GenreDetectReq,
     title). Persists it on the job as lyric_genre_detected when given."""
     import genre_detect
     import lyric_recipes
-    genre, source = genre_detect.detect(body.artist, body.song_title, body.lyrics_text,
-                                        job_id=body.job_id or None)
-    if genre and body.job_id:
+    job = None
+    if body.job_id:
         from database import Job as JobModel
+        # Only the caller's own job is charged for the call / updated.
         job = (db.query(JobModel).filter(JobModel.job_id == body.job_id,
                                          JobModel.tenant_id == current_user["tenant_id"])
                .first())
-        if job is not None and not (job.render_params or {}).get("lyric_genre_detected"):
+    genre, source = genre_detect.detect(body.artist, body.song_title, body.lyrics_text,
+                                        job_id=job.job_id if job is not None else None)
+    if genre and job is not None:
+        if not (job.render_params or {}).get("lyric_genre_detected"):
             from jobs import merge_render_params
             merge_render_params(job.job_id, {"lyric_genre_detected": genre})
     return {"genre": genre, "family": lyric_recipes.family_of(genre), "source": source}
@@ -20050,8 +20074,21 @@ async def create_variant(
             _value = _normalize_movement_style(_value or "")
         if _field == "lyric_look":
             _value = _normalize_lyric_look(_value)
+        if _field == "lyric_color":
+            _value = _value.upper() if re.match(r"^#[0-9a-fA-F]{6}$", str(_value)) else ""
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
+    # Look-variant fields persist validated (same rules as /generate): an
+    # invalid value is dropped, never stored raw.
+    import lyric_look_runtime as _llr_v
+    _vkeys = ("lyric_genre", "lyric_variant", "lyric_font_main", "lyric_font_key",
+              "lyric_alt_color", "lyric_accent_color")
+    _vclean = _llr_v.clean_fields(**{k: new_render_params.get(k) for k in _vkeys})
+    for _k in _vkeys:
+        if _k in _vclean:
+            new_render_params[_k] = _vclean[_k]
+        else:
+            new_render_params.pop(_k, None)
     new_render_params = _merge_content_validation_choice(
         new_render_params,
         bypass=body.bypass_content_validation,

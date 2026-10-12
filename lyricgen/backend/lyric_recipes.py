@@ -117,6 +117,8 @@ LOOK_TEXT_ROLE = {"cuaderno": "hand", "romantico": "script", "chat": "ui"}
 # Looks that paint their own surfaces (cards, bubbles, gradient): recipes swap
 # only their fonts; operator colours still apply.
 _FONT_ONLY_RECIPES = {"pop70", "degrade", "chat"}
+# Palette name of a typography-only variant (its colours are the look's own).
+FONTS_ONLY_PALETTE = "fuentes"
 
 # --- Palettes (ink, alt, accent) & grades & overlays per family ---------------------
 
@@ -189,6 +191,12 @@ def _clashes(accent: str, tint) -> bool:
     return min(d, 360 - d) < 35
 
 
+def contrast_ratio(a: str, b: str) -> float:
+    """WCAG-style contrast between two colours (1..21)."""
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
 def luminance(hex_color: str) -> float:
     r, g, b = (int(hex_color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
@@ -223,6 +231,8 @@ class Recipe:
             return f"Diseño curado · {a}" + (f" + {b}" if a != b else "")
         a, b = (FONTS[f][1] for f in self.fonts)
         fonts = a if a == b else f"{a} + {b}"
+        if self.palette == FONTS_ONLY_PALETTE:
+            return f"{fonts} · colores del diseño"
         return f"{fonts} · {self.palette.replace('_', ' ')} · {self.grade}"
 
 
@@ -269,6 +279,23 @@ def recipe_for(look_id: str, genre: str, seed_key: str, variant: int) -> Recipe:
              or sorted(k for k, v in FONTS.items() if text_role in v[5])
              or _font_pool(family, "text"))
     keys = _font_pool(family, "display") or mains
+    if look_id in _FONT_ONLY_RECIPES:
+        # Only the typography changes (the look's own colours/cards stay), so
+        # a variant IS its font pair: walk the distinct pairs in a per-song
+        # order, so consecutive variants (and sibling songs) always differ.
+        orig = (_FONT_BY_FILE.get(look.font_file, ""),
+                _FONT_BY_FILE.get(look.key_font or look.font_file, ""))
+        pairs = sorted({(m, k if text_role == "text" else m)
+                        for m in mains for k in (keys if text_role == "text" else [m])} - {orig})
+        if pairs:
+            random.Random(f"{family}:{look_id}:{job_seed(seed_key)}").shuffle(pairs)
+            idx = variant - (1 if family == NATIVE.get(look_id) else 0)
+            main, key = pairs[idx % len(pairs)]
+            cols = (look.primary,
+                    look.line_colors[1] if len(look.line_colors) > 1 else look.primary,
+                    look.accent or (look.line_colors[0] if look.line_colors else look.primary))
+            return Recipe(family, look_id, variant, (main, key), FONTS_ONLY_PALETTE, cols,
+                          "original", look.effect, ())
     pals = PALETTES[family]
     grades = GRADES[family]
     base_seed = job_seed(seed_key)
@@ -348,9 +375,11 @@ def apply_colors(look: L.Look, ink: str, alt: str, accent: str,
         # The duotone poster is painted from the accent: lettering never uses it.
         upd["line_colors"] = (ink, alt, ink, "#FFFFFF")
     elif look.layout == "chat":
-        incoming = look.flat_colors[0] if look.flat_colors else "#E9E9EB"
-        upd.update(primary=ink if explicit else look.primary,
-                   flat_colors=(incoming, accent), accent="#FFFFFF")
+        # Chat roles: Texto = incoming message text, Secundario = incoming
+        # bubble, Destacado = outgoing bubble; the outgoing text picks
+        # whichever of white/near-black reads on it.
+        upd.update(primary=ink, flat_colors=(alt, accent),
+                   accent="#FFFFFF" if luminance(accent) < 0.6 else "#111111")
     if look.flat_accents and explicit:
         upd["flat_accents"] = ()
     return dataclasses.replace(look, **upd)
@@ -413,6 +442,17 @@ def build_from_recipe(rec: Recipe, *, bg_luma: float | None = None) -> L.Look:
     return look
 
 
+def may_own_background(look_id: str, genre: str = "") -> bool:
+    """Whether some variant of the look paints the whole frame for this
+    genre ("" = not known yet, i.e. any detected genre, so the look's native
+    family). Variant 0 is the original/curated design; every other variant
+    of a look shares its background rule, so 0 and 1 cover them all."""
+    if look_id not in L.LOOKS:
+        return False
+    return any(build_from_recipe(recipe_for(look_id, genre, "", v)).background
+               in ("flat", "gradient") for v in (0, 1))
+
+
 # --- Full resolution (recipe + operator overrides) ------------------------------------
 
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -429,6 +469,7 @@ def normalize_overrides(*, font_main="", font_key="", ink="", alt="", accent="")
     ink = _hex_or_empty(ink)
     if ink == "#FFFFFF":
         ink = ""
+    font_main, font_key = (f if isinstance(f, str) else "" for f in (font_main, font_key))
     return {
         "font_main": font_main if font_main in FONTS else "",
         "font_key": font_key if font_key in FONTS else "",
@@ -444,8 +485,8 @@ def resolve(look_id: str, *, genre: str = "", variant=0, seed_key: str = "",
         return None, {}
     ov = normalize_overrides(**(overrides or {}))
     try:
-        variant = max(0, int(variant or 0))
-    except (TypeError, ValueError):
+        variant = min(9999, max(0, int(variant or 0)))
+    except (TypeError, ValueError, OverflowError):
         variant = 0
     rec = recipe_for(base.id, genre, seed_key, variant)
     look = build_from_recipe(rec, bg_luma=bg_luma)
@@ -462,7 +503,10 @@ def resolve(look_id: str, *, genre: str = "", variant=0, seed_key: str = "",
             look = dataclasses.replace(look, grade=_duotone_grade(ink, accent))
         cur = (ink, alt, accent)
     warnings = []
-    if luminance(cur[0]) < 0.35 and look.layout != "chat":
+    if look.layout == "chat":
+        if contrast_ratio(cur[0], cur[1]) < 3.0:
+            warnings.append("low_contrast_ink")
+    elif luminance(cur[0]) < 0.35:
         warnings.append("low_contrast_ink")
     if luminance(cur[2]) < 0.12:
         warnings.append("low_contrast_accent")
@@ -500,6 +544,9 @@ def resolve(look_id: str, *, genre: str = "", variant=0, seed_key: str = "",
 
 
 def effective_colors(look: L.Look, rec: Recipe) -> tuple[str, str, str]:
+    if look.layout == "chat":
+        incoming, outgoing = (tuple(look.flat_colors) + ("#E9E9EB", "#1F8BFF"))[:2]
+        return (look.primary, incoming, outgoing)
     if look.line_colors and look.layout == "kinetic":
         return tuple(look.line_colors[:3])  # type: ignore[return-value]
     if look.card_palettes:

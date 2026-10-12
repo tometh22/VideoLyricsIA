@@ -122,6 +122,7 @@ export default function LookVariantPanel({
     low_contrast_ink: t("upload.variant_warning_low_contrast_ink", "El color de texto tiene poco contraste: puede no leerse."),
     low_contrast_alt: t("upload.variant_warning_low_contrast_alt", "El color secundario tiene poco contraste: puede no leerse."),
     low_contrast_accent: t("upload.variant_warning_low_contrast_accent", "El color destacado tiene poco contraste: puede no leerse."),
+    accent_same_as_text: t("upload.variant_warning_accent_same_as_text", "El color destacado es igual al del texto: la palabra clave no va a resaltar."),
   }[w] || t("upload.variant_warning_low_contrast", "Poco contraste: la letra puede no leerse."));
 
   const canRestore = hasLookOverrides(values);
@@ -146,7 +147,12 @@ export default function LookVariantPanel({
           <span className="text-[11px] text-gray-600 shrink-0 w-20">{t("upload.variant_genre_label", "Género")}</span>
           <Listbox
             value={operatorGenre}
-            onChange={(v) => set("lyricGenre", v)}
+            onChange={(v) => {
+              // Otro género = otro pool de variantes: el número elegido para
+              // el anterior no significa nada en el nuevo.
+              set("lyricGenre", v);
+              if (values.lyricVariant !== "" && values.lyricVariant != null) set("lyricVariant", "");
+            }}
             options={genreOptions}
             className="flex-1"
             ariaLabel={t("upload.variant_genre_label", "Género")}

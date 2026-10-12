@@ -77,8 +77,8 @@ export const STATIC_LOOK_CATALOG = {
     font("anton", "Anton", 400, ["heavy", "urban"]),
     font("audiowide", "Audiowide", 400, ["urban", "pop"]),
     font("bebas-neue", "Bebas Neue", 400, ["heavy", "urban"]),
-    font("big-shoulders", "Big Shoulders Display", 900, ["heavy", "urban", "pop"]),
-    font("big-shoulders-light", "Big Shoulders Display", 300, ["urban", "heavy"]),
+    { ...font("big-shoulders", "Big Shoulders Display", 900, ["heavy", "urban", "pop"]), label: "Big Shoulders" },
+    { ...font("big-shoulders-light", "Big Shoulders Display", 300, ["urban", "heavy"]), label: "Big Shoulders Light" },
     font("black-ops-one", "Black Ops One", 400, ["heavy", "urban"]),
     font("bungee", "Bungee", 400, ["heavy", "pop", "urban"]),
     font("caveat", "Caveat", 700, ["pop", "soft"]),
@@ -240,8 +240,11 @@ export function pickLookVariantFields(entry) {
 // ── Lo último que resolvió el backend ("pin") ───────────────────────────
 // Para que el preview sea el render: si el operador NO pidió otra variante
 // (lyric_variant ""), al enviar se manda el número que /resolve eligió para
-// ESA canción, y el género resuelto si el operador no eligió uno. El pin
-// guarda look + canción para no aplicárselo a otra.
+// ESA canción. El género NO se pinea: "automático" viaja como "" y el render
+// usa la misma detección cacheada que el preview (pinearlo lo convertía en
+// un género "elegido por el operador" que después no se podía limpiar). El
+// pin guarda look + canción + género/variante pedidos: si cualquiera cambió
+// desde que se resolvió, no se aplica.
 
 const songKey = (artist, title) =>
   `${String(artist || "").trim().toLowerCase()}|${String(title || "").trim().toLowerCase()}`;
@@ -251,11 +254,15 @@ export function makeLookResolvedPin(resolved, song = null) {
   if (!resolved || !resolved.look) return null;
   // Por defecto, la canción para la que se pidió (useLookVariant la anota).
   const { artist = "", songTitle = "" } = song || resolved._request || {};
+  const req = resolved._request || {};
   return {
     look: normalizeLyricLook(resolved.look),
     variant: normalizeLyricVariant(resolved.variant),
     genre: normalizeLyricGenre(resolved.genre),
     song: songKey(artist, songTitle),
+    // Para qué género/variante del operador se resolvió.
+    reqGenre: normalizeLyricGenre(req.genre),
+    reqVariant: normalizeLyricVariant(req.variant),
     // Si la variante pinta su propio fondo (tarjetas/degradé) o usa el de la
     // canción: decide si vale la pena pre-generar el fondo.
     background: ["flat", "gradient", "source"].includes(resolved.background)
@@ -268,6 +275,10 @@ function pinFor(entry) {
   if (!pin || !pin.look) return null;
   if (pin.look !== normalizeLyricLook(entry.lyricLook)) return null;
   if (pin.song !== songKey(entry.artist, entry.songTitle)) return null;
+  // Resuelto para otro género/variante (el operador cambió algo y la
+  // respuesta nueva todavía no llegó, o falló): no sirve.
+  if ((pin.reqGenre || "") !== normalizeLyricGenre(entry.lyricGenre)) return null;
+  if ((pin.reqVariant ?? "") !== normalizeLyricVariant(entry.lyricVariant)) return null;
   return pin;
 }
 
@@ -279,10 +290,7 @@ export function effectiveLookVariantFields(entry) {
   const base = pickLookVariantFields(entry);
   if (!getLyricLook(entry && entry.lyricLook)) return base;
   const pin = pinFor(entry);
-  if (pin) {
-    if (base.lyricVariant === "" && pin.variant !== "") base.lyricVariant = pin.variant;
-    if (!base.lyricGenre && pin.genre) base.lyricGenre = pin.genre;
-  }
+  if (pin && base.lyricVariant === "" && pin.variant !== "") base.lyricVariant = pin.variant;
   return base;
 }
 
@@ -324,10 +332,10 @@ export function lookVariantAbsoluteFields(entry) {
 // ── Body de /lyric-looks/resolve ────────────────────────────────────────
 export function buildResolveBody({
   look, genre, variant, fontMain, fontKey, color, altColor, accentColor,
-  jobId, artist, songTitle,
+  jobId, artist, songTitle, fresh = false,
 } = {}) {
   const c = normalizeHexOrEmpty(color);
-  return {
+  const body = {
     lyric_look: normalizeLyricLook(look),
     lyric_genre: normalizeLyricGenre(genre),
     lyric_variant: normalizeLyricVariant(variant),
@@ -337,16 +345,21 @@ export function buildResolveBody({
     lyric_color: c === "#FFFFFF" ? "" : c,
     lyric_alt_color: normalizeHexOrEmpty(altColor),
     lyric_accent_color: normalizeHexOrEmpty(accentColor),
-    job_id: jobId || null,
     artist: String(artist || "").trim(),
     song_title: String(songTitle || "").trim(),
   };
+  // Sin job (wizard antes de transcribir, campañas) la key no viaja.
+  if (jobId) body.job_id = String(jobId);
+  // Variante NUEVA de un job: la del padre es una hermana a evitar.
+  if (fresh) body.fresh = true;
+  return body;
 }
 
 /** ¿Trae la respuesta de /resolve warnings de contraste? */
 export function contrastWarnings(resolved) {
   const w = resolved && Array.isArray(resolved.warnings) ? resolved.warnings : [];
-  return w.filter((x) => typeof x === "string" && x.startsWith("low_contrast_"));
+  return w.filter((x) => typeof x === "string"
+    && (x.startsWith("low_contrast_") || x === "accent_same_as_text"));
 }
 
 // ── Red ─────────────────────────────────────────────────────────────────
@@ -558,5 +571,22 @@ export function lookWithVariant(look, {
   if (lp.lineColors && r && !flat) {
     lp.lineColors = [ink || lp.color, alt, accent].filter(Boolean);
   }
+  if (lp.layout === "chat" && r) {
+    // Mismos roles que el render (lyric_recipes.apply_colors): Texto =
+    // mensaje recibido, Secundario = su globo, Destacado = globo enviado;
+    // el texto enviado es blanco o casi negro según lo que se lea.
+    const [inc, out] = lp.bubbles || ["#E9E9EB", "#1F8BFF"];
+    const outgoing = accent || out;
+    lp.bubbles = [alt || inc, outgoing];
+    lp.accent = hexLuminance(outgoing) < 0.6 ? "#FFFFFF" : "#111111";
+  }
   return { ...look, font: main || look.font, preview: lp };
+}
+
+// Misma fórmula que lyric_recipes.luminance (sin linealizar).
+function hexLuminance(hex) {
+  const h = normalizeHexOrEmpty(hex);
+  if (!h) return 0;
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }

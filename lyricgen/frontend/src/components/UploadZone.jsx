@@ -553,6 +553,11 @@ export default function UploadZone({
     if (field === "movementStyle" || field === "effect") {
       track("wizard.style_pick", { field, value });
     }
+    if (field === "lyricLook" && value !== batchDefaults.lyricLook
+        && batchDefaults.lyricVariant !== "" && batchDefaults.lyricVariant != null) {
+      // Otro look = otro pool de variantes: el número del anterior no aplica.
+      updateBatchDefault("lyricVariant", "");
+    }
     setBatchDefaults((prev) => {
       const next = { ...prev, [field]: value };
       // El sticky es para BATCHES NUEVOS. Editar un video existente no puede
@@ -570,7 +575,12 @@ export default function UploadZone({
       }
       return next;
     });
-    onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
+    // El número de variante es POR CANCIÓN: en un lote de varias, "Otra
+    // variante" vale para la canción que se está viendo (su review, abajo);
+    // las demás eligen la suya sin repetir entre hermanas (backend).
+    onFiles((prev) => (field === "lyricVariant" && prev.length > 1
+      ? prev
+      : prev.map((f) => ({ ...f, [field]: value }))));
     // El review que se está mostrando es también una fuente de submit, tanto
     // al CREAR como al EDITAR. El fan-out a `files[]` no alcanza: reviews
     // restauradas o server-backed pueden no conservar el mismo objeto File y
@@ -1568,6 +1578,8 @@ export default function UploadZone({
     altColor: batchDefaults.lyricAltColor,
     accentColor: batchDefaults.lyricAccentColor,
     jobId: beatsJobId || editSeed?.jobId || null,
+    // Variante de un video: un job NUEVO; la variante del padre se evita.
+    fresh: !!variantMode,
     artist: titlePreviewArtist,
     songTitle: titlePreviewSong,
     lyricsText: lookVariantLyrics,

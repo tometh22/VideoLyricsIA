@@ -1520,9 +1520,11 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
         if (sp["kind"] == "key" and look.cascade and seed % 4 == 3
                 and len(sp["text"]) >= 4):
             # Letters tumble in one by one instead of the word landing whole.
-            kw = heavy.width(sp["text"], sp["fs"])
+            m_key = key_m or heavy
+            kw = m_key.width(sp["text"], sp["fs"])
             events.extend(_cascade_events(sp["text"], x - kw / 2, y, _n(sp["fs"]),
-                                          colour, w_start, end, heavy, sc, beats))
+                                          colour, w_start, end, m_key, sc, beats,
+                                          face=(f"\\fn{key_family}" if key_family else "")))
             continue
         events.append(_dialogue(3, w_start, end, "{" + ov + "}" + _ass._ass_escape(sp["text"])))
 
@@ -1698,19 +1700,27 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
 
 def _cascade_events(word: str, x_left: float, baseline: float, fs: int,
                     colour: str, t0: float, end: float, measure, sc: float,
-                    beats=None) -> list[str]:
-    """The word's letters tumble in one by one along a diagonal."""
+                    beats=None, face: str = "") -> list[str]:
+    """The word's letters tumble in one by one along a diagonal.
+
+    `measure`/`face` must be the face the word was sized with (the key-word
+    font), or the letters overflow the slot the layout clamped. The stagger
+    shrinks on short lines so every letter lands before the line ends (a
+    letter starting in the last 20 ms used to be dropped)."""
     events = []
     x = x_left
     fs = int(fs)
+    step = 0.06
+    if len(word) > 1:
+        step = min(step, max(0.0, end - t0 - 0.30) / (len(word) - 1))
     for i, ch in enumerate(word):
         w = measure.width(ch, fs)
-        ts = t0 + i * 0.06
-        if ts >= end:
+        ts = t0 + i * step
+        if ts >= end - 0.05:
             ts = t0
         d = max(1, int(round((end - ts) * 1000)))
         sx, sy = x - 120 * sc, baseline - 260 * sc
-        ov = (f"\\an1\\move({_n(sx)},{_n(sy)},{_n(x)},{_n(baseline)},0,220)\\fs{fs}"
+        ov = (f"\\an1\\move({_n(sx)},{_n(sy)},{_n(x)},{_n(baseline)},0,220)\\fs{fs}{face}"
               f"\\1c{_c(colour)}\\frz{35 - (i % 3) * 20}\\t(0,220,\\frz0)"
               + _beat_pulse(beats, ts, end, after_ms=300, scale=110)
               + f"\\t({max(221, d - 200)},{d},\\fscx230\\alpha&HFF&)")

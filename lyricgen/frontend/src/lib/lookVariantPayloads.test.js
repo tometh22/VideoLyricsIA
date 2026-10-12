@@ -8,6 +8,8 @@ import { campaignGenerateForm, reviewCreativeSettings } from "./campaignCreative
 import { appendLookVariantFields, makeLookResolvedPin } from "./lyricLookVariants.js";
 
 const RESOLVED = { look: "cinetico", genre: "metal", variant: 3 };
+// Respuesta de /resolve pedida con el género/variante del operador `req`.
+const asked = (resolved, req = {}) => ({ ...resolved, _request: { genre: "", variant: "", ...req } });
 
 describe("creación: /generate", () => {
   const approved = (extra = {}) => buildGenerationJob({
@@ -28,9 +30,15 @@ describe("creación: /generate", () => {
     expect(form(job)).toEqual({ lyric_genre: "rock", lyric_font_key: "creepster", lyric_accent_color: "#FF0000" });
   });
 
-  it("en automático viaja el número/género que mostró el preview de esa canción", () => {
-    const pin = makeLookResolvedPin(RESOLVED, { artist: "Almafuerte", songTitle: "Toro y Pampa" });
-    expect(form(approved({ lookResolved: pin }))).toEqual({ lyric_genre: "metal", lyric_variant: "3" });
+  it("en automático viaja el número que mostró el preview de esa canción (el género no: lo detecta igual el render)", () => {
+    const pin = makeLookResolvedPin(asked(RESOLVED), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    expect(form(approved({ lookResolved: pin }))).toEqual({ lyric_variant: "3" });
+  });
+
+  it("un pin resuelto para otro género/variante del operador no se aplica", () => {
+    const pin = makeLookResolvedPin(asked(RESOLVED, { genre: "pop" }), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    expect(form(approved({ lookResolved: pin }))).toEqual({});
+    expect(form(approved({ lyricGenre: "rock", lookResolved: pin }))).toEqual({ lyric_genre: "rock" });
   });
 
   it("sin look nada (aunque haya overrides guardados)", () => {
@@ -67,18 +75,24 @@ describe("edición: diff typography", () => {
   it("Restaurar manda '' (reset explícito) o el número resuelto si ya lo hay", () => {
     const out = submit({ lyricVariant: "" });
     expect(out.payload.lyric_variant).toBe("");
-    const pin = makeLookResolvedPin({ ...RESOLVED, variant: 5 }, { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    const pin = makeLookResolvedPin(asked({ ...RESOLVED, variant: 5 }, { genre: "metal" }), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
     expect(submit({ lyricVariant: "", lookResolved: pin }).payload.lyric_variant).toBe(5);
     // Restaurar a lo mismo que ya tiene el video: nada que re-renderizar.
-    const same = makeLookResolvedPin(RESOLVED, { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    const same = makeLookResolvedPin(asked(RESOLVED, { genre: "metal" }), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
     expect(submit({ lyricVariant: "", lookResolved: same }).payload).toBeNull();
   });
 
   it("cambiar de look manda la variante resuelta para el look nuevo", () => {
-    const pin = makeLookResolvedPin({ look: "neon", genre: "metal", variant: 1 }, { artist: "Almafuerte", songTitle: "Toro y Pampa" });
-    const out = submit({ lyricLook: "neon", lyricVariant: "", lyricGenre: "", lookResolved: pin });
+    const pin = makeLookResolvedPin(asked({ look: "neon", genre: "metal", variant: 1 }, { genre: "metal" }), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    const out = submit({ lyricLook: "neon", lyricVariant: "", lookResolved: pin });
     expect(out.payload).toMatchObject({ lyric_look: "neon", lyric_variant: 1 });
     expect(out.payload.lyric_genre).toBeUndefined(); // metal == metal
+  });
+
+  it("Automático limpia el género que el operador había elegido", () => {
+    const pin = makeLookResolvedPin(asked({ ...RESOLVED, genre: "rock", variant: 4 }), { artist: "Almafuerte", songTitle: "Toro y Pampa" });
+    const out = submit({ lyricGenre: "", lyricVariant: "", lookResolved: pin });
+    expect(out.payload).toMatchObject({ lyric_genre: "", lyric_variant: 4 });
   });
 
   it("el blanco del texto con look viaja como '' (= el de la variante)", () => {
@@ -93,10 +107,10 @@ describe("variante: absoluto", () => {
   it("manda los 6 campos con look ('' = automático) y lyric_color", () => {
     const payload = buildVariantPayload({
       review: { lyricLook: "cinetico", lyricFontMain: "anton", lyricColor: "#FFFFFF", artist: "A", songTitle: "T",
-        lookResolved: makeLookResolvedPin(RESOLVED, { artist: "A", songTitle: "T" }) },
+        lookResolved: makeLookResolvedPin(asked(RESOLVED), { artist: "A", songTitle: "T" }) },
     });
     expect(payload).toMatchObject({
-      lyric_look: "cinetico", lyric_genre: "metal", lyric_variant: 3, lyric_font_main: "anton",
+      lyric_look: "cinetico", lyric_genre: "", lyric_variant: 3, lyric_font_main: "anton",
       lyric_font_key: "", lyric_alt_color: "", lyric_accent_color: "", lyric_color: "",
     });
   });

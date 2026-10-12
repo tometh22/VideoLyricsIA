@@ -2,7 +2,7 @@
 // respuestas viejas, /detect-genre una vez por canción.
 import { renderHook, act, cleanup } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useLookVariant, RESOLVE_DEBOUNCE_MS } from "./useLookVariant";
+import { useLookVariant, RESOLVE_DEBOUNCE_MS, DETECT_DEBOUNCE_MS } from "./useLookVariant";
 import { STATIC_LOOK_CATALOG, _resetLookVariantCaches } from "../lib/lyricLookVariants";
 
 const json = (data, ok = true) => Promise.resolve({ ok, status: ok ? 200 : 500, json: () => Promise.resolve(data) });
@@ -112,7 +112,9 @@ describe("useLookVariant — /resolve", () => {
     expect(calls.resolve[0]).toMatchObject({ lyric_look: "cinetico", lyric_genre: "metal", lyric_variant: 2, job_id: "job-1" });
     await advance(1);
     expect(result.current.resolved.variant).toBe(2);
-    expect(result.current.resolved._request).toEqual({ artist: "A", songTitle: "T", jobId: "job-1" });
+    expect(result.current.resolved._request).toEqual({
+      artist: "A", songTitle: "T", jobId: "job-1", genre: "metal", variant: 2,
+    });
   });
 
   it("una respuesta vieja que llega tarde no pisa a la más nueva", async () => {
@@ -160,7 +162,7 @@ describe("useLookVariant — /detect-genre", () => {
     mockFetch();
     const props = { look: "cinetico", genre: "", artist: "Almafuerte", songTitle: "Toro y Pampa", lyricsText: "letra" };
     const a = renderHook(() => useLookVariant(props));
-    await flush();
+    await advance(DETECT_DEBOUNCE_MS + 1);
     expect(calls.detect).toHaveLength(1);
     expect(calls.detect[0]).toMatchObject({ artist: "Almafuerte", song_title: "Toro y Pampa", lyrics_text: "letra" });
     await flush();
@@ -170,6 +172,30 @@ describe("useLookVariant — /detect-genre", () => {
     await flush();
     expect(calls.detect).toHaveLength(1);
     expect(b.result.current.detected.genre).toBe("metal");
+  });
+
+  it("detección: espera a que se deje de tipear (una llamada paga, 30/min)", async () => {
+    mockFetch();
+    const { rerender } = renderHook((p) => useLookVariant(p), {
+      initialProps: { look: "cinetico", artist: "Al", songTitle: "" },
+    });
+    for (const artist of ["Alm", "Almaf", "Almafue", "Almafuerte"]) {
+      await advance(100);
+      rerender({ look: "cinetico", artist, songTitle: "" });
+    }
+    await advance(DETECT_DEBOUNCE_MS - 50);
+    expect(calls.detect).toHaveLength(0);
+    await advance(100);
+    expect(calls.detect).toHaveLength(1);
+    expect(calls.detect[0]).toMatchObject({ artist: "Almafuerte" });
+  });
+
+  it("sin job no manda job_id (el backend no acepta null en versiones viejas) y fresh viaja", async () => {
+    mockFetch();
+    renderHook(() => useLookVariant({ look: "neon", fresh: true }));
+    await advance(RESOLVE_DEBOUNCE_MS + 1);
+    expect(calls.resolve[0]).not.toHaveProperty("job_id");
+    expect(calls.resolve[0].fresh).toBe(true);
   });
 
   it("no detecta sin look ni con género elegido por el operador", async () => {

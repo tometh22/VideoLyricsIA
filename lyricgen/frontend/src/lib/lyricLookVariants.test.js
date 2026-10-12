@@ -73,9 +73,9 @@ describe("payload de /generate: sólo campos con valor", () => {
     expect(lookVariantSubmitFields({ lyricLook: "", lyricGenre: "rock", lyricVariant: 2 })).toEqual({});
   });
 
-  it("en automático manda el número y el género que /resolve eligió para ESTA canción", () => {
+  it("en automático manda el número que /resolve eligió para ESTA canción (no el género)", () => {
     const pin = makeLookResolvedPin(RESOLVED, { artist: "Almafuerte", songTitle: "Toro y Pampa" });
-    expect(lookVariantSubmitFields({ ...base, lookResolved: pin })).toEqual({ lyric_genre: "metal", lyric_variant: 3 });
+    expect(lookVariantSubmitFields({ ...base, lookResolved: pin })).toEqual({ lyric_variant: 3 });
     // El operador gana sobre el pin.
     expect(lookVariantSubmitFields({ ...base, lookResolved: pin, lyricVariant: 7, lyricGenre: "punk" }))
       .toEqual({ lyric_genre: "punk", lyric_variant: 7 });
@@ -174,5 +174,21 @@ describe("preview: look con la variante aplicada", () => {
     const out = lookWithVariant(getLyricLook("cine"), { fontMain: "pirata-one", accentColor: "#00ff00" });
     expect(out.font.css).toContain("Pirata One");
     expect(out.preview.accent).toBe("#00FF00");
+  });
+});
+
+describe("chat: roles de color iguales al render", () => {
+  it("Texto = recibido, Secundario = su globo, Destacado = globo enviado con texto legible", async () => {
+    const { getLyricLook } = await import("./lyricLooks.js");
+    const { lookWithVariant } = await import("./lyricLookVariants.js");
+    const chat = getLyricLook("chat");
+    const out = lookWithVariant(chat, {
+      resolved: { look: "chat", colors: { ink: "#222222", alt: "#DDEEFF", accent: "#FFE680" }, fonts: {} },
+    });
+    expect(out.preview.color).toBe("#222222");
+    expect(out.preview.bubbles).toEqual(["#DDEEFF", "#FFE680"]);
+    expect(out.preview.accent).toBe("#111111");
+    const dark = lookWithVariant(chat, { resolved: { look: "chat", colors: { ink: "#111111", alt: "#E9E9EB", accent: "#0A3D91" }, fonts: {} } });
+    expect(dark.preview.accent).toBe("#FFFFFF");
   });
 });

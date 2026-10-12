@@ -6220,7 +6220,14 @@ export default function LyricsEditor({
               <span className="text-[11px] text-ink-tertiary shrink-0">{t("upload.look_section") || "Look"}</span>
               <select
                 value={selectedLook}
-                onChange={(e) => { const v = normalizeLyricLook(e.target.value); setSelectedLook(v); onLyricLookChange?.(v); }}
+                onChange={(e) => {
+                  const v = normalizeLyricLook(e.target.value);
+                  // Otro look = otro pool de variantes: el número no aplica.
+                  if (v !== selectedLook && variantValues.lyricVariant !== "" && variantValues.lyricVariant != null) {
+                    setVariantField("lyricVariant", "");
+                  }
+                  setSelectedLook(v); onLyricLookChange?.(v);
+                }}
                 className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
                 data-testid="editor-lyric-look"
                 aria-label={t("upload.look_section") || "Look"}

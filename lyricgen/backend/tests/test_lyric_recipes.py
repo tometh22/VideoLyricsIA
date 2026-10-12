@@ -218,8 +218,14 @@ def test_genre_answer_parsing():
     import genre_detect
     assert genre_detect.parse_answer("Metal.") == "metal"
     assert genre_detect.parse_answer("hip-hop") == "hiphop"
-    assert genre_detect.parse_answer("cumbia") == ""
+    assert genre_detect.parse_answer("cumbia") == "latin"      # the prompt says so
     assert genre_detect.parse_answer("latino") == "latin"
+    # Compounds: the last genre word decides, with or without a hyphen.
+    for answer, genre in (("pop rock", "rock"), ("Pop-Rock", "rock"), ("Pop punk", "punk"),
+                          ("folk rock", "rock"), ("rap metal", "metal"), ("latin pop", "latin"),
+                          ("metalcore", "metal"), ("Rock, but also pop", "rock"),
+                          ("N/A", ""), ("R&B", ""), ("alternative", "")):
+        assert genre_detect.parse_answer(answer) == genre, answer
 
 
 def test_genre_detection_never_raises(monkeypatch):
@@ -281,15 +287,112 @@ def test_campaign_accepts_automatic_colours_and_numeric_variants():
     assert cc.normalize_settings({"lyric_variant": "25"})["lyric_variant"] == "25"
 
 
-def test_veo_group_allows_cinetico_but_not_frame_owning_looks():
+def test_veo_group_allows_cinetico_only_where_it_uses_the_song_background():
     import campaign_creative as cc
     from fastapi import HTTPException
     g = cc.Group(id="g", name="Veo", weight=100, requirement="veo", model=cc.VEO_LITE)
 
     class _C:
         tenant_id = "t"
-    cc.validate_combination(None, _C(), {"lyric_look": "cinetico",
+    # Rock/metal Cinético composes over the song's background → Veo is seen.
+    cc.validate_combination(None, _C(), {"lyric_look": "cinetico", "lyric_genre": "metal",
                                          "movement_style": "estandar"}, g, {})
+    # Genre "" (detected per song) or pop: its original design paints the
+    # whole frame, so the Veo background would be skipped/hidden.
+    for genre in ("", "pop"):
+        with pytest.raises(HTTPException):
+            cc.validate_combination(None, _C(), {"lyric_look": "cinetico", "lyric_genre": genre,
+                                                 "movement_style": "estandar"}, g, {})
+    assert not R.may_own_background("cine", "") and R.may_own_background("pop70", "metal")
     with pytest.raises(HTTPException):
         cc.validate_combination(None, _C(), {"lyric_look": "pop70",
                                              "movement_style": "estandar"}, g, {})
+
+
+def test_legacy_flag_keeps_the_look_as_designed_on_every_edit(monkeypatch):
+    import genre_detect
+    monkeypatch.setattr(genre_detect, "detect", lambda *a, **k: ("metal", "ai"))
+    monkeypatch.setattr(RT, "sibling_signatures", lambda *a: set())
+    opts, upd = RT.prepare_opts(job_id="j", lyric_look="cinetico", artist="Almafuerte",
+                                song_title="Niño Jefe",
+                                render_params={"lyric_look_legacy": True, "lyric_variant": 0,
+                                               "lyric_variant_sig": ["x"],
+                                               "lyric_color": "#19E0BC"})
+    assert opts["legacy"] and opts["genre"] == "" and opts["variant"] == 0
+    assert upd["lyric_look_legacy"] is True
+    look = RT.resolve_for_render("cinetico", opts)
+    assert look == L.LOOKS["cinetico"]                      # exactly as designed
+    # …and the text colour is applied the old way (on top of the look).
+    assert RT.primary_override(opts, "#19E0BC") == "#19E0BC"
+    fresh, _ = RT.prepare_opts(job_id="j", lyric_look="cinetico", artist="Almafuerte",
+                               song_title="Niño Jefe", render_params={"lyric_color": "#19E0BC"})
+    assert RT.primary_override(fresh, "#19E0BC") == ""     # lives in the resolved look
+    assert RT.primary_override({}, "#19E0BC") == "#19E0BC"  # preparation failed
+
+
+def test_short_and_master_apply_the_same_text_colour_when_opts_failed():
+    import pipeline
+    doc = pipeline._build_short_ass_doc(
+        [{"start": 0.0, "end": 3.0, "text": "hola"}],
+        font_path=L.font_path(L.LOOKS["cine"]), text_case="upper", font_scale=1.0,
+        lyric_color="#19E0BC", lyric_sung_color="", text_contrast="medium",
+        lyrics_animation="none", line_transition="none", lyric_look="cine",
+        look_obj=L.LOOKS["cine"], look_primary_override=RT.primary_override({}, "#19E0BC"))
+    assert "&H00BCE019" in doc
+
+
+def test_libass_gets_the_family_name_it_can_match():
+    # libass matches name ID 1; Pillow reports the typographic family (ID 16),
+    # so "Montserrat" fell back to DejaVu Sans in every title card.
+    import ass_render
+    fonts = os.path.join(os.path.dirname(L.__file__), "fonts")
+    assert ass_render.font_family(os.path.join(fonts, "Montserrat-ExtraBold.ttf"))[0] == "Montserrat ExtraBold"
+    assert ass_render.font_family(os.path.join(fonts, "Fredoka-SemiBold.ttf"))[0] == "Fredoka SemiBold"
+    assert ass_render.font_family(os.path.join(fonts, "Anton-Regular.ttf")) == ("Anton", False)
+
+
+def test_chat_colour_overrides_keep_every_message_readable():
+    look, info = R.resolve("chat", variant=0, overrides={"ink": "#FF0000"})
+    assert look.flat_colors[1] != "#FFFFFF" and look.accent == "#FFFFFF"   # outgoing readable
+    look, info = R.resolve("chat", variant=3, overrides={"accent": "#00AA00"})
+    assert look.primary == info["colors"]["ink"] != "#FFFFFF"              # incoming stays dark
+    assert look.flat_colors == (info["colors"]["alt"], "#00AA00")
+    look, _ = R.resolve("chat", overrides={"accent": "#FFE680"})
+    assert look.accent == "#111111"                                         # dark text on light bubble
+    _, info = R.resolve("chat", overrides={"ink": "#DDDDDD"})
+    assert "low_contrast_ink" in info["warnings"]
+
+
+@pytest.mark.parametrize("look_id", sorted(R._FONT_ONLY_RECIPES))
+def test_typography_only_variants_never_repeat_a_font_pair(look_id):
+    for genre in ("", "metal", "hiphop", "ballad"):
+        recs = [R.recipe_for(look_id, genre, "a|b", v) for v in range(0, 12)]
+        sigs = [r.signature for r in recs[1:]]
+        # Every distinct pair is used before any repeats (chat has only a
+        # handful of UI faces, so it cycles).
+        n = len(set(sigs))
+        assert n >= 2 and len(set(sigs[:n])) == n, (genre, sigs)
+        assert all(a != b for a, b in zip(sigs, sigs[1:]))
+        for r in recs:
+            if not (r.original or r.curated):
+                assert r.palette == R.FONTS_ONLY_PALETTE and "colores del diseño" in r.describe()
+
+
+def test_cascade_key_word_lands_whole_and_inside_the_frame():
+    look, _ = R.resolve("cinetico", variant=1, seed_key="s|t")
+    assert look.cascade
+    hit = False
+    for f1 in ("a", "de", "mi", "tu", "la", "el", "y", "en", "su", "no", "ya", "yo"):
+        for f2 in ("se", "lo", "me", "te", "al", "va", "si", "es"):
+            doc = L.build_look_ass([{"start": 0.0, "end": 1.0,
+                                     "text": f"{f1} {f2} INTERNACIONALIZACIÓN"}], look,
+                                   width=1080, height=1920, duration=1.0)
+            evs = [d for d in _dialogues(doc) if "\\an1\\move" in d]
+            if not evs:
+                continue
+            hit = True
+            assert "".join(e.rsplit("}", 1)[1] for e in evs) == "INTERNACIONALIZACIÓN"
+            assert all("\\fn" in e for e in evs)                # the key face
+            xs = [float(re.search(r"\\move\([^,]+,[^,]+,([-\d.]+)", e).group(1)) for e in evs]
+            assert min(xs) >= 0 and max(xs) < 1080
+    assert hit
