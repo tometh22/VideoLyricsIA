@@ -10,7 +10,10 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
-import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground, lookBeatSync } from "../lib/lyricLooks";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookFontLockedNote, lookOwnsBackground, lookBeatSync } from "../lib/lyricLooks";
+import { catalogFamily, genreFamily, makeLookResolvedPin, orderLooksForFamily } from "../lib/lyricLookVariants";
+import { useLookVariant } from "../hooks/useLookVariant";
+import LookVariantPanel from "./LookVariantPanel";
 import { useJobBeats } from "../hooks/useJobBeats";
 import { DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
@@ -57,6 +60,9 @@ const LYRIC_RENDER_FIELDS = new Set([
   "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
   "lyricLook",
+  // Variante del look (panel «Variante»).
+  "lyricGenre", "lyricVariant", "lyricFontMain", "lyricFontKey",
+  "lyricAltColor", "lyricAccentColor",
 ]);
 // Qué cuenta como FOTO subida (vs video). Mismo criterio que el backend, que
 // sólo reconoce estas extensiones como still animable (`_is_still` en
@@ -392,6 +398,11 @@ export default function UploadZone({
     // - lyricSungColor: solo aplica a karaoke = color de la palabra cantada.
     // Default blanco para no romper jobs viejos sin estos params.
     lyricColor: "#FFFFFF", lyricSungColor: "#FFFFFF",
+    // Variante del look (lib/lyricLookVariants). "" = automático. Las
+    // fuentes y colores son sticky como el resto del estilo; género y número
+    // de variante son POR CANCIÓN y se limpian al cargar (ver abajo).
+    lyricGenre: "", lyricVariant: "", lyricFontMain: "", lyricFontKey: "",
+    lyricAltColor: "", lyricAccentColor: "",
     // Escena axis: optional free-text prompt ("Mi prompt"). When non-empty it
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
@@ -423,6 +434,10 @@ export default function UploadZone({
         ...parsed,
         backgroundHint: HARDCODED_BATCH_DEFAULTS.backgroundHint,
         bgVerbatim: HARDCODED_BATCH_DEFAULTS.bgVerbatim,
+        // Mismo criterio que el prompt: el género corregido y la variante
+        // elegida son de UNA canción, no un estilo para el próximo batch.
+        lyricGenre: HARDCODED_BATCH_DEFAULTS.lyricGenre,
+        lyricVariant: HARDCODED_BATCH_DEFAULTS.lyricVariant,
       };
     } catch {
       return HARDCODED_BATCH_DEFAULTS;
@@ -1536,15 +1551,61 @@ export default function UploadZone({
   );
   const activeLook = getLyricLook(batchDefaults.lyricLook);
   const lookLockedText = activeLook ? lookLockedNote(t, activeLook.code) : "";
+  const lookFontLockedText = activeLook ? lookFontLockedNote(t, activeLook.code) : "";
+  // Variante del look (contrato .context/variants_contract.md): catálogo,
+  // detección de género por canción y /resolve con debounce. Lo resuelto
+  // alimenta el panel «Variante», el preview y el orden de la galería.
+  const lookVariantLyrics = Array.isArray(reviewSegments)
+    ? reviewSegments.map((sg) => (sg && sg.text) || "").filter(Boolean).join("\n")
+    : "";
+  const lookVariant = useLookVariant({
+    look: batchDefaults.lyricLook,
+    genre: batchDefaults.lyricGenre,
+    variant: batchDefaults.lyricVariant,
+    fontMain: batchDefaults.lyricFontMain,
+    fontKey: batchDefaults.lyricFontKey,
+    color: batchDefaults.lyricColor,
+    altColor: batchDefaults.lyricAltColor,
+    accentColor: batchDefaults.lyricAccentColor,
+    jobId: beatsJobId || editSeed?.jobId || null,
+    artist: titlePreviewArtist,
+    songTitle: titlePreviewSong,
+    lyricsText: lookVariantLyrics,
+    api: API,
+    authHeaders,
+  });
+  // Lo que /resolve eligió para ESTA canción viaja con la review (no con el
+  // batch: es por canción). Al enviar, si el operador dejó variante/género
+  // en automático, se manda ese número/género → el render es el preview.
+  const lookResolvedForPin = lookVariant.resolved;
+  useEffect(() => {
+    if (!lookResolvedForPin || !onEditFieldChange) return;
+    onEditFieldChange("lookResolved", makeLookResolvedPin(lookResolvedForPin));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lookResolvedForPin]);
+  // Familia de género para ordenar la galería: la resuelta, la elegida, la
+  // detectada o, en última instancia, el género de escena del paso 3 (mismos
+  // códigos).
+  const lookFamily = lookVariant.resolved?.family
+    || genreFamily(lookVariant.catalog, batchDefaults.lyricGenre)
+    || genreFamily(lookVariant.catalog, lookVariant.detected?.genre)
+    || genreFamily(lookVariant.catalog, batchDefaults.genre);
+  const lookFamilyLabel = catalogFamily(lookVariant.catalog, lookFamily)?.label || "";
+  const orderedLooks = orderLooksForFamily(LYRIC_LOOKS, lookVariant.catalog, lookFamily);
   // Fondo y looks que pintan todo el cuadro (Pop 70s / Cinético / Degradé):
   //  - job nuevo: el backend no genera fondo para ellos → lo decimos (ahorra
   //    el costo del fondo, que es lo que el operador quiere saber);
   //  - edición de un video que se hizo SIN fondo: elegir un look que sí lo
   //    usa (o "Sin look") necesita regenerar el fondo en «Fondo».
-  const lookOwnsBgNote = existingBgOwnedByLook == null && lookOwnsBackground(batchDefaults.lyricLook)
+  // Con variante resuelta manda su `background`: p. ej. Cinético en una
+  // canción de metal usa el fondo de la canción ("source"), no tarjetas.
+  const activeLookOwnsBg = lookVariant.resolved
+    ? lookVariant.resolved.background !== "source"
+    : lookOwnsBackground(batchDefaults.lyricLook);
+  const lookOwnsBgNote = existingBgOwnedByLook == null && activeLookOwnsBg
     ? (t("upload.look_owns_bg_note") || "Este look no usa el fondo: no se genera uno (ahorra el costo del fondo).")
     : "";
-  const lookNeedsBgNote = existingBgOwnedByLook && !lookOwnsBackground(batchDefaults.lyricLook)
+  const lookNeedsBgNote = existingBgOwnedByLook && !activeLookOwnsBg
     ? (t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo».")
     : "";
   const lookGridRef = useRef(null);
@@ -4235,6 +4296,14 @@ export default function UploadZone({
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
               lyricLook={hoverLook ?? batchDefaults.lyricLook ?? ""}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
+              /* Variante resuelta (fuentes/colores reales del render) y los
+                 overrides crudos para cuando todavía no hay respuesta. */
+              lookResolved={lookVariant.resolved}
+              lookCatalog={lookVariant.catalog}
+              lyricFontMain={batchDefaults.lyricFontMain || ""}
+              lyricFontKey={batchDefaults.lyricFontKey || ""}
+              lyricAltColor={batchDefaults.lyricAltColor || ""}
+              lyricAccentColor={batchDefaults.lyricAccentColor || ""}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
               /* QA fix 2026-05-28: cuando el operador selecciona un fondo
                  de biblioteca en step 2, la BASE del preview es ese
@@ -4823,7 +4892,7 @@ export default function UploadZone({
                   data-testid="lyric-look-grid"
                   ref={lookGridRef}
                 >
-                  {LYRIC_LOOKS.map((look) => {
+                  {orderedLooks.map((look) => {
                     const active = normalizeLyricLook(batchDefaults.lyricLook) === look.code;
                     const inVideo = isAnchor("lyricLook", look.code);
                     return (
@@ -4863,6 +4932,14 @@ export default function UploadZone({
                         </div>
                         <div className="px-2.5 py-2 bg-surface-1">
                           <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{look.label}</p>
+                          {look.recommended && lookFamilyLabel ? (
+                            <span
+                              data-testid="look-recommended"
+                              className="inline-block mt-1 px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30"
+                            >
+                              {(t("upload.variant_recommended_for") || "Recomendado para {family}").replace(/\{family\}/g, () => lookFamilyLabel)}
+                            </span>
+                          ) : null}
                           <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{look.desc}</p>
                         </div>
                       </button>
@@ -4880,6 +4957,21 @@ export default function UploadZone({
                   </p>
                 ) : null}
               </div>
+
+              {/* Variante del look: género, otra variante / restaurar, fuentes
+                  y colores (lib/lyricLookVariants). Sólo con look activo. */}
+              {activeLook && (
+                <LookVariantPanel
+                  t={t}
+                  className="mb-4 pb-3 border-b border-white/[0.05]"
+                  catalog={lookVariant.catalog}
+                  resolved={lookVariant.resolved}
+                  detected={lookVariant.detected}
+                  loading={lookVariant.loading}
+                  values={batchDefaults}
+                  onChange={updateBatchDefault}
+                />
+              )}
 
               {/* Tipografía — UI gap fix 2026-05-26. El refactor del paso 6
                   (commit 6c2e8a8) ocultó estos controles en LyricsEditor con
@@ -4909,7 +5001,7 @@ export default function UploadZone({
                   </div>
                   {activeLook && (
                     <p className="ml-[5.5rem] -mt-1.5 text-[10px] text-amber-300/80" data-testid="look-font-locked">
-                      {lookLockedText}
+                      {lookFontLockedText}
                     </p>
                   )}
 
@@ -5081,7 +5173,9 @@ export default function UploadZone({
                   disponible en la CREACIÓN, donde /generate sí lo acepta.
                   Para cablearlo hacen falta 3 cambios (diff + EditJobRequest +
                   _VARIANT_OVERRIDABLE_FIELDS); /retry ya lo hereda. */}
-              {!editMode && (
+              {/* Con look el color se elige en «Variante» (Texto / Secundario /
+                  Destacado); acá quedaría duplicado. */}
+              {!editMode && !activeLook && (
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.lyric_color_title") || "Color del texto"}</p>
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-2">
@@ -5109,9 +5203,6 @@ export default function UploadZone({
                       />
                       <span>{t("upload.lyric_color_sung") || "Cantada"}</span>
                     </label>
-                  )}
-                  {activeLook && (batchDefaults.lyricColor || "#FFFFFF").toUpperCase() === "#FFFFFF" && (
-                    <span className="text-[10px] text-gray-600">{t("upload.look_color_hint")}</span>
                   )}
                   {(batchDefaults.lyricColor !== "#FFFFFF" || batchDefaults.lyricSungColor !== "#FFFFFF") && (
                     <button

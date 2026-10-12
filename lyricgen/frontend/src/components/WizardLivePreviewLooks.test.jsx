@@ -485,3 +485,107 @@ describe("Arco — el anillo queda debajo del badge", () => {
     expect(parseFloat(live.container.querySelector('[data-look-arc="true"]').getAttribute("data-arc-top"))).toBeGreaterThan(BADGE_H);
   });
 });
+
+describe("WizardLivePreview — variante resuelta del look", () => {
+  const RESOLVED = {
+    look: "cine", genre: "metal", family: "heavy", variant: 3,
+    fonts: { main: { id: "rubik-dirt", css_family: "Rubik Dirt", weight: 400 }, key: { id: "metal-mania", css_family: "Metal Mania", weight: 400 } },
+    colors: { ink: "#F2EEE6", alt: "#CFC9BE", accent: "#D0101E" },
+    overridden: {}, background: "source", warnings: [],
+  };
+
+  it("usa las fuentes (css_family) y colores resueltos en vez de los fijos del look", () => {
+    const { container } = renderLook({ lyricLook: "cine", lookResolved: RESOLVED });
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    expect(lyric.style.fontFamily).toContain("Rubik Dirt");
+    expect(lyric.style.color).toBe("rgb(242, 238, 230)");
+    const key = container.querySelector('[data-look-key="true"]');
+    expect(key.style.fontFamily).toContain("Metal Mania");
+  });
+
+  it("Cinético con fondo 'source': sin tarjetas propias, palabra clave en el acento", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lookResolved: { ...RESOLVED, look: "cinetico" } });
+    expect(container.querySelector('[data-look-layer="card"]')).toBeNull();
+    const key = container.querySelector('[data-look-kind="key"]');
+    expect(key).not.toBeNull();
+    expect(key.style.color).toBe("rgb(208, 16, 30)");
+    expect(key.style.fontFamily).toContain("Metal Mania");
+  });
+
+  it("un resolve de otro look se ignora (cae al look fijo)", () => {
+    const { container } = renderLook({ lyricLook: "cine", lookResolved: { ...RESOLVED, look: "neon" } });
+    expect(container.querySelector('[data-testid="look-lyric"]').style.fontFamily).toContain("Marcellus");
+  });
+
+  it("sin resolve todavía aplica los overrides crudos (fuente del catálogo, acento)", () => {
+    const { container } = renderLook({ lyricLook: "cine", lyricFontMain: "pirata-one", lyricFontKey: "creepster" });
+    expect(container.querySelector('[data-testid="look-lyric"]').style.fontFamily).toContain("Pirata One");
+    expect(container.querySelector('[data-look-key="true"]').style.fontFamily).toContain("Creepster");
+  });
+});
+
+describe("WizardLivePreview — Cinético con resolve.style", () => {
+  const BASE = {
+    look: "cinetico", genre: "metal", family: "heavy", variant: 1,
+    fonts: { main: { id: "rubik-dirt", css_family: "Rubik Dirt", weight: 400 }, key: { id: "metal-mania", css_family: "Metal Mania", weight: 400 } },
+    colors: { ink: "#F2EEE6", alt: "#CFC9BE", accent: "#D0101E" },
+    overridden: {}, background: "source", warnings: [],
+  };
+  const HEAVY_STYLE = {
+    decorations: ["slash"], connector_font: "big-shoulders", connector_color: "#CFC9BE",
+    connector_tilt: false, beat_shake: true, cascade: false, letterbox: false, effect: "film",
+  };
+  // Línea con conectores (palabras función) y una clave.
+  const LYRIC = "y vos de la tormenta";
+
+  const decos = (container) => [...container.querySelectorAll("[data-look-deco]")].map((d) => d.dataset.lookDeco);
+
+  it("decoraciones sólo de style.decorations: 'slash' dibuja el zarpazo, sin globo", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lyric: LYRIC, lookResolved: { ...BASE, style: HEAVY_STYLE } });
+    expect(decos(container)).toEqual(["slash"]);
+    const lines = container.querySelectorAll('[data-look-deco="slash"] line');
+    expect(lines).toHaveLength(3);
+    expect(lines[0].getAttribute("stroke")).toBe("#CFC9BE");
+  });
+
+  it("decorations vacío = sin decoración", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lyric: LYRIC, lookResolved: { ...BASE, style: { ...HEAVY_STYLE, decorations: [] } } });
+    expect(decos(container)).toEqual([]);
+  });
+
+  it("conectores en connector_font / connector_color y rectos sin connector_tilt", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lyric: LYRIC, lookResolved: { ...BASE, style: HEAVY_STYLE } });
+    const scripts = [...container.querySelectorAll('[data-look-kind="script"]')];
+    expect(scripts.length).toBeGreaterThan(0);
+    for (const row of scripts) {
+      expect(row.style.fontFamily).toContain("Big Shoulders Display");
+      expect(row.style.fontFamily).not.toContain("Metal Mania");
+      expect(row.style.color).toBe("rgb(207, 201, 190)");
+      expect(row.style.transform).toBe("");
+    }
+  });
+
+  it("beat_shake: la clave sacude (keyframe en muestra, giro en el beat en vivo)", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lyric: LYRIC, lookResolved: { ...BASE, style: HEAVY_STYLE } });
+    const pulse = container.querySelector('[data-look-kind="key"] [data-beat-shake="true"]');
+    expect(pulse).not.toBeNull();
+    expect(pulse.style.animation).toContain("wlp-kin-shake");
+  });
+
+  it("style.letterbox prende las franjas aunque el look no las tenga", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lookResolved: { ...BASE, style: { ...HEAVY_STYLE, letterbox: true } } });
+    expect([...container.querySelectorAll("div")].filter((d) => d.style.height === "12.8%")).toHaveLength(2);
+  });
+
+  it("Cine: style.letterbox=false saca las franjas propias del look", () => {
+    const cine = { ...BASE, look: "cine", style: { decorations: [], letterbox: false } };
+    const { container } = renderLook({ lyricLook: "cine", lookResolved: cine });
+    expect([...container.querySelectorAll("div")].filter((d) => d.style.height === "12.8%")).toHaveLength(0);
+  });
+
+  it("sin style se conserva el Cinético de siempre (conectores inclinados, decos clásicas)", () => {
+    const { container } = renderLook({ lyricLook: "cinetico", lyric: LYRIC, lookResolved: BASE });
+    expect(decos(container).every((d) => ["rays", "bubble", "swoosh"].includes(d))).toBe(true);
+    expect(container.querySelector('[data-beat-shake="true"]')).toBeNull();
+  });
+});

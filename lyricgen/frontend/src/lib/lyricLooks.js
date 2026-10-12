@@ -463,6 +463,17 @@ export function lookLockedNote(t, value) {
   return String(template).replace(/\{look\}/g, () => label);
 }
 
+/**
+ * Nota del selector de tipografía con un look activo: las fuentes (y los
+ * colores) ya no se eligen ahí sino en el panel «Variante».
+ */
+export function lookFontLockedNote(t, value) {
+  const template = t("upload.look_font_locked_note")
+    || "Con el look «{look}», las fuentes y los colores se eligen en «Variante».";
+  const label = lyricLookLabel(t, value) || "";
+  return String(template).replace(/\{look\}/g, () => label);
+}
+
 // ── Palabra clave ──────────────────────────────────────────────────────────
 // Espejo de backend lyric_looks.pick_keyword: la ÚLTIMA palabra "de
 // contenido" (≥4 caracteres alfanuméricos y no stopword). Las líneas sin

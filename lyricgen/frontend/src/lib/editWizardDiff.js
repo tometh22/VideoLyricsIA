@@ -8,7 +8,9 @@
 //   - metadata    → { artist?, song_title? }
 //   - typography  → { font?, font_scale?, text_case?, text_contrast?,
 //                     lyrics_animation?, line_transition?, lyric_look?,
-//                     effect? }
+//                     lyric_color?, lyric_genre?, lyric_variant?,
+//                     lyric_font_main?, lyric_font_key?, lyric_alt_color?,
+//                     lyric_accent_color?, effect? }
 //   - lyrics      → { segments: [...] }
 //   - background  → { background_hint?, bg_verbatim?, background_mode?,
 //                     movement_style? }
@@ -24,6 +26,10 @@ import {
   segmentsUnchanged,
   layoutChanged,
 } from "./lyricsEditSubmit.js";
+import { lyricColorForSubmit } from "./lyricLooks.js";
+import {
+  LOOK_VARIANT_FIELDS, effectiveLookVariantFields, pickLookVariantFields,
+} from "./lyricLookVariants.js";
 
 // String equality with empty-vs-undefined treated as equal. The wizard
 // stores "" for "field not set" while the baseline can have null/undefined
@@ -42,6 +48,28 @@ function numEq(a, b) {
   if (Number.isNaN(na) && Number.isNaN(nb)) return true;
   if (Number.isNaN(na) || Number.isNaN(nb)) return false;
   return Math.abs(na - nb) < 1e-6;
+}
+
+// Variante del look (lyric_genre / lyric_variant / fuentes / colores). ""
+// es un RESET explícito (volver a automático), no "no mandar".
+//
+// Variante y género: si el operador no los tocó (valor crudo igual al del
+// video) y el look no cambió, no viajan — aunque el backend haya resuelto
+// algo para el preview. Si los tocó (o cambió el look), viaja el valor
+// EFECTIVO: lo que eligió o, si dejó "automático", el número/género que
+// /resolve eligió para esta canción (así el render es el preview).
+function lookVariantDiff(baseline, current) {
+  const out = {};
+  const base = pickLookVariantFields(baseline);
+  const raw = pickLookVariantFields(current);
+  const eff = effectiveLookVariantFields(current);
+  const lookChanged = !strEq(baseline.lyricLook, current.lyricLook);
+  for (const [camel, snake] of LOOK_VARIANT_FIELDS) {
+    if (!lookChanged && raw[camel] === base[camel]) continue;
+    const value = eff[camel];
+    if (value !== base[camel]) out[snake] = value;
+  }
+  return out;
 }
 
 // Compute the four-bucket diff. Returns an object whose keys are the
@@ -89,6 +117,12 @@ export function computeFieldDiff(baseline, current) {
   if (!strEq(baseline.lyricLook, current.lyricLook)) {
     typoDiff.lyric_look = current.lyricLook || "";
   }
+  // Color de texto: con look, el blanco default viaja como "" (= el de la
+  // variante), igual que en /generate.
+  if (!strEq(String(baseline.lyricColor || "#FFFFFF").toUpperCase(), String(current.lyricColor || "#FFFFFF").toUpperCase())) {
+    typoDiff.lyric_color = lyricColorForSubmit(current.lyricLook, current.lyricColor);
+  }
+  Object.assign(typoDiff, lookVariantDiff(baseline, current));
   if (!strEq(baseline.effect, current.effect)) {
     typoDiff.effect = current.effect || "";
   }

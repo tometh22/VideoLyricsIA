@@ -2,6 +2,7 @@
 // Keeping this shape outside App.jsx makes it testable: fields such as the
 // editor selectors and background cache key must survive this boundary.
 import { normalizeLyricLook } from "./lyricLooks.js";
+import { pickLookVariantFields } from "./lyricLookVariants.js";
 
 export function buildGenerationJob(a) {
   return {
@@ -26,6 +27,11 @@ export function buildGenerationJob(a) {
     // lyricsAnimation / lineTransition, pero se conservan igual: si el
     // operador vuelve a "Sin look" recupera lo que había elegido.
     lyricLook: normalizeLyricLook(a.lyricLook),
+    // Variante del look ("" = automático) + lo que /resolve eligió para
+    // esta canción en el preview (lookResolved): al enviar, los "automático"
+    // viajan con ese número/género (lib/lyricLookVariants).
+    ...pickLookVariantFields(a),
+    lookResolved: a.lookResolved || null,
     textContrast: a.textContrast || "medium",
     lyricColor: a.lyricColor || "#FFFFFF",
     lyricSungColor: a.lyricSungColor || "#FFFFFF",

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { REF_W, lyricFontPx, tierForLength, clampFontScale } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
@@ -8,6 +8,7 @@ import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
 import {
   getLyricLook, keywordSplit, buildRows, LYRIC_LOOK_LABELS,
 } from "../lib/lyricLooks";
+import { lookWithVariant } from "../lib/lyricLookVariants";
 import {
   lookLineMotionStyle, renderLookLayout, LookBackdrop, LOOK_LAYOUT_KEYFRAMES,
   buildWordParts, BuildDoodles,
@@ -152,6 +153,18 @@ export default function WizardLivePreview({
   // toca el picker.
   lyricColor = "#FFFFFF",
   lyricSungColor = "#FFFFFF",
+  // Variante del look (lib/lyricLookVariants): respuesta de
+  // /lyric-looks/resolve para el look activo (fuentes css_family + colores
+  // ink/alt/accent + tipo de fondo). Si no llegó todavía (o es de otro look)
+  // se usan los overrides crudos del operador y, sin ellos, el look fijo.
+  lookResolved = null,
+  // Catálogo de variantes (fuentes por id, p. ej. style.connector_font). Sin
+  // él se usa el respaldo estático.
+  lookCatalog = null,
+  lyricFontMain = "",
+  lyricFontKey = "",
+  lyricAltColor = "",
+  lyricAccentColor = "",
   // Typography 2026-05-26: estos 4 props llegan de batchDefaults en
   // UploadZone (step 4 del wizard). Sin ellos el preview se quedaba
   // mostrando el look default (Montserrat extrabold, UPPER hardcoded en
@@ -278,15 +291,28 @@ export default function WizardLivePreview({
   }, [playbackTickRef]);
   // Look activo + reloj del modo muestra (ver LOOK_LOOP_S arriba). El
   // intervalo sólo corre con look y sin audio en vivo.
-  const look = getLyricLook(lyricLook);
+  const baseLook = getLyricLook(lyricLook);
+  // El look con la variante aplicada (fuentes / colores resueltos). Memo:
+  // el objeto alimenta keys y layouts en cada tick del preview.
+  const look = useMemo(
+    () => lookWithVariant(baseLook, {
+      resolved: lookResolved,
+      fontMain: lyricFontMain,
+      fontKey: lyricFontKey,
+      altColor: lyricAltColor,
+      accentColor: lyricAccentColor,
+      catalog: lookCatalog,
+    }),
+    [baseLook, lookResolved, lyricFontMain, lyricFontKey, lyricAltColor, lyricAccentColor, lookCatalog],
+  );
   const lookPreview = look ? look.preview : null;
   const isLiveTick = !!(livePlaybackTick && livePlaybackTick.activeLine);
   const [lookLoopIdx, setLookLoopIdx] = useState(0);
   useEffect(() => {
-    if (!look || isLiveTick || renderedVideoUrl) return undefined;
+    if (!baseLook || isLiveTick || renderedVideoUrl) return undefined;
     const id = setInterval(() => setLookLoopIdx((i) => i + 1), LOOK_LOOP_S * 1000);
     return () => clearInterval(id);
-  }, [look, isLiveTick, renderedVideoUrl]);
+  }, [baseLook, isLiveTick, renderedVideoUrl]);
   // La preview debe respetar siempre la fuente de la opción seleccionada.
   // Antes, "Ilustración viva" + cualquier efecto sustituía silenciosamente
   // animado.mp4 por preview_base.mp4: la tarjeta mostraba la ilustración,
@@ -703,6 +729,8 @@ export default function WizardLivePreview({
       paintOrder: "stroke fill",
       lineHeight: 1.02,
     };
+    // Fuente de la palabra destacada (variante): sólo si la variante la trae.
+    const keyFace = lp.keyFont ? { fontFamily: lp.keyFont.css, fontWeight: lp.keyFont.weight } : {};
     // Motion de línea: en vivo, calculada del currentTime; en muestra, keyframe.
     const lineMotion = live
       ? {
@@ -757,7 +785,7 @@ export default function WizardLivePreview({
           {split.lead ? (
             <span style={{ display: "block", fontSize: toCqw(basePx * lp.leadScale), marginBottom: "0.15em" }}>{split.lead}</span>
           ) : null}
-          <span data-look-key="true" style={{ display: "block", fontSize: toCqw(basePx * lp.keyScale) }}>{split.key}</span>
+          <span data-look-key="true" style={{ display: "block", fontSize: toCqw(basePx * lp.keyScale), ...keyFace }}>{split.key}</span>
         </>
       ) : (
         <span style={{ fontSize: toCqw(basePx) }}>{text}</span>
@@ -802,6 +830,7 @@ export default function WizardLivePreview({
                         ...parts.outerStyle,
                         fontSize: isKey ? `${lp.keyScale}em` : undefined,
                         color: isKey ? accent : undefined,
+                        ...(isKey ? keyFace : {}),
                       }}
                     >
                       {parts.content}
@@ -817,6 +846,7 @@ export default function WizardLivePreview({
                       display: "inline-block",
                       fontSize: isKey ? `${lp.keyScale}em` : undefined,
                       color: isKey ? accent : undefined,
+                      ...(isKey ? keyFace : {}),
                       ...(live
                         ? {
                           opacity: visible ? 1 : 0,

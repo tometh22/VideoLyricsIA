@@ -12,9 +12,10 @@
  * modo edición, navegando el stepper como el operador).
  */
 import { useState } from "react";
-import { render, screen, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import UploadZone from "./UploadZone";
+import { _resetLookVariantCaches } from "../lib/lyricLookVariants";
 
 vi.mock("../i18n", () => ({
   useI18n: () => ({ t: (key) => key, lang: "es" }),
@@ -23,7 +24,14 @@ vi.mock("./OnboardingTour", () => ({ UploadTour: () => null, MotionStudioCoach: 
 // El preview real se testea aparte (WizardLivePreviewLooks.test.jsx); acá
 // sólo importa QUÉ look recibe.
 vi.mock("./WizardLivePreview", () => ({
-  default: ({ lyricLook }) => <div data-testid="preview" data-preview-look={lyricLook} />,
+  default: ({ lyricLook, lookResolved, lyricFontMain }) => (
+    <div
+      data-testid="preview"
+      data-preview-look={lyricLook}
+      data-preview-variant={lookResolved ? String(lookResolved.variant) : ""}
+      data-preview-font-main={lyricFontMain || ""}
+    />
+  ),
 }));
 vi.mock("./TitleCardPreview", () => ({ default: () => null }));
 vi.mock("./HelpCenter/HelpTip", () => ({ default: () => null }));
@@ -49,7 +57,7 @@ const JOB_FIELDS = {
 
 const reviews = [];
 
-function Harness({ jobFields = JOB_FIELDS, existingBgOwnedByLook }) {
+function Harness({ jobFields = JOB_FIELDS, existingBgOwnedByLook, artist = "", song = "" }) {
   const [, setReview] = useState({ ...jobFields });
   return (
     <UploadZone
@@ -71,6 +79,8 @@ function Harness({ jobFields = JOB_FIELDS, existingBgOwnedByLook }) {
       editSeed={{ jobId: "job-1", genre: "", concept: "", backgroundHint: "", bgVerbatim: false, matchLyrics: true, wizardFields: jobFields }}
       editBaseline={jobFields}
       existingBgOwnedByLook={existingBgOwnedByLook}
+      titlePreviewArtist={artist}
+      titlePreviewSong={song}
     />
   );
 }
@@ -119,7 +129,7 @@ describe("paso 4: picker de looks", () => {
     expect(lookCard("cine").getAttribute("aria-pressed")).toBe("true");
     expect(lookCard("cine").dataset.inVideo).toBe("true");
     expect(fontTrigger().disabled).toBe(true);
-    expect(screen.getByTestId("look-font-locked").textContent).toBe("upload.look_locked_note");
+    expect(screen.getByTestId("look-font-locked").textContent).toBe("upload.look_font_locked_note");
     // Animación y transición colapsan a una nota en vez de las galerías.
     expect(screen.getByTestId("look-motion-locked")).toBeTruthy();
     expect(document.body.textContent).not.toContain("upload.trans_slide_up");
@@ -194,5 +204,88 @@ describe("paso 4: looks que no usan el fondo", () => {
     fireEvent.click(lookCard("cine"));
     expect(screen.queryByTestId("look-needs-bg-note")).toBeNull();
     expect(screen.queryByTestId("look-owns-bg-note")).toBeNull();
+  });
+});
+
+describe("paso 4: variante del look por género", () => {
+  const realFetch = globalThis.fetch;
+  let resolveBodies;
+  const RESOLVED = (body) => ({
+    look: body.lyric_look, genre: "metal", family: "heavy", genre_source: "detected",
+    variant: body.lyric_variant === "" ? 3 : body.lyric_variant,
+    description: "Rubik Dirt + Metal Mania · sangre · oscuro",
+    fonts: { main: { id: "rubik-dirt", css_family: "Rubik Dirt", weight: 400 }, key: { id: "metal-mania", css_family: "Metal Mania", weight: 400 } },
+    colors: { ink: "#F2EEE6", alt: "#CFC9BE", accent: "#D0101E" },
+    overridden: {}, background: "source", warnings: [],
+  });
+  const ok = (data) => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(data) });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    _resetLookVariantCaches();
+  });
+
+  function mockApi() {
+    resolveBodies = [];
+    globalThis.fetch = vi.fn((url, init = {}) => {
+      if (String(url).endsWith("/lyric-looks/catalog")) return Promise.reject(new TypeError("offline"));
+      if (String(url).endsWith("/lyric-looks/detect-genre")) return ok({ genre: "metal", family: "heavy", source: "ai" });
+      if (String(url).endsWith("/lyric-looks/resolve")) {
+        const body = JSON.parse(init.body);
+        resolveBodies.push(body);
+        return ok(RESOLVED(body));
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+  }
+
+  it("con look: panel «Variante», galería con recomendados primero y preview con lo resuelto", async () => {
+    mockApi();
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "cinetico" }} artist="Almafuerte" song="Toro y Pampa" />);
+    goStep(4);
+    expect(screen.getByTestId("variant-panel")).toBeTruthy();
+    await waitFor(() => expect(screen.getByTestId("preview").dataset.previewVariant).toBe("3"));
+    // El pedido lleva el job y la canción.
+    expect(resolveBodies.at(-1)).toMatchObject({ lyric_look: "cinetico", job_id: "job-1", artist: "Almafuerte", song_title: "Toro y Pampa" });
+    // Familia heavy: recomendados primero (sin look siempre primero) con su marca.
+    const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')].map((c) => c.dataset.lyricLook);
+    expect(cards.slice(0, 9)).toEqual(["none", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"]);
+    const badges = screen.getAllByTestId("look-recommended");
+    expect(badges).toHaveLength(8);
+    // (t mockeado devuelve la key; el texto real interpola {family}.)
+    expect(badges[0].textContent).toBe("upload.variant_recommended_for");
+    expect(badges[0].closest("[data-lyric-look]").dataset.lyricLook).toBe("cinetico");
+    // Lo resuelto viaja como pin con la review (para mandar el número al generar).
+    await waitFor(() => expect(reviews.some((r) => r.lookResolved?.variant === 3)).toBe(true));
+    // La tipografía queda bloqueada: se elige en «Variante».
+    expect(screen.getByTestId("look-font-locked").textContent).toBe("upload.look_font_locked_note");
+  });
+
+  it("'Otra variante' y los overrides viajan al review; 'Restaurar' los limpia", async () => {
+    mockApi();
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "cinetico" }} artist="A" song="T" />);
+    goStep(4);
+    await waitFor(() => expect(screen.getByTestId("variant-description").textContent).toContain("Variante 3"));
+    fireEvent.click(screen.getByTestId("variant-next"));
+    expect(reviews.at(-1).lyricVariant).toBe(4);
+    await waitFor(() => expect(resolveBodies.at(-1).lyric_variant).toBe(4));
+    fireEvent.click(screen.getByRole("button", { name: "Letra principal" }));
+    fireEvent.click(screen.getByRole("option", { name: "Creepster" }));
+    expect(reviews.at(-1).lyricFontMain).toBe("creepster");
+    expect(screen.getByTestId("preview").dataset.previewFontMain).toBe("creepster");
+    fireEvent.click(screen.getByTestId("variant-restore"));
+    const last = reviews.at(-1);
+    expect(last.lyricVariant).toBe("");
+    expect(last.lyricFontMain).toBe("");
+    expect(last.lyricColor).toBe("#FFFFFF");
+  });
+
+  it("sin look no hay panel ni pedidos de variante", async () => {
+    mockApi();
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "" }} artist="A" song="T" />);
+    goStep(4);
+    expect(screen.queryByTestId("variant-panel")).toBeNull();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(resolveBodies).toHaveLength(0);
   });
 });

@@ -2,7 +2,8 @@ import { useI18n } from "../../i18n";
 import { AXIS_VALUE_LABELS, EFFECT_LABELS, FONT_LABELS, MOVEMENT_LABELS, dynamicAxisLabel } from "../../lib/optionLabels";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../../hooks/useBackgroundPreviewTokens";
 import WizardLivePreview from "../WizardLivePreview";
-import { campaignApiBase } from "../../lib/campaignApi";
+import { campaignApiBase, authHeaders as campaignAuthHeaders } from "../../lib/campaignApi";
+import { useLookVariant } from "../../hooks/useLookVariant";
 import { inputClass } from "./ui";
 
 export const SOURCE_LABELS = {
@@ -25,7 +26,7 @@ function initialValue(field) {
 export default function StyleControls({ fields = {}, values = {}, update, assets = [], label, disabled = false }) {
   const { t } = useI18n();
   const optionLabel = (key, value) => (key === "effect" ? EFFECT_LABELS(t)[value] : key === "movement_style" ? MOVEMENT_LABELS(t)[value]
-    : key.includes("font") ? FONT_LABELS(t)[value] : AXIS_VALUE_LABELS(t)[key]?.[value] || SOURCE_LABELS[value] || dynamicAxisLabel(t, key, value)) || value || "Auto / ninguno";
+    : key.includes("font") ? (FONT_LABELS(t)[value] || AXIS_VALUE_LABELS(t)[key]?.[value]) : AXIS_VALUE_LABELS(t)[key]?.[value] || SOURCE_LABELS[value] || dynamicAxisLabel(t, key, value)) || value || "Auto / ninguno";
   const groups = [...new Set(Object.values(fields).map((field) => field.group))];
   return <div className="grid gap-2">
     {groups.map((group) => {
@@ -73,12 +74,22 @@ export function StylePreview({ settings: s, assets }) {
   const tokens = useBackgroundPreviewTokens(asset ? [asset.id] : [], API);
   const photo = asset ? asset.file_type !== "mp4" : s.movement_style === "foto-parallax";
   const source = asset ? backgroundPreviewUrl(API, asset.id, tokens[asset.id]) : photo ? "/movement_samples/foto-fija.jpg" : `/movement_samples/${s.movement_style || "estandar"}.mp4`;
+  // Variante del look de la campaña: sin canción (cada tema la resuelve al
+  // generar), pero con el género / variante / fuentes / colores elegidos.
+  const lookVariant = useLookVariant({
+    look: s.lyric_look, genre: s.lyric_genre, variant: s.lyric_variant,
+    fontMain: s.lyric_font_main, fontKey: s.lyric_font_key, color: s.lyric_color,
+    altColor: s.lyric_alt_color, accentColor: s.lyric_accent_color,
+    api: API, authHeaders: () => campaignAuthHeaders(),
+  });
   return <div className="max-w-xl">
     <WizardLivePreview placeholderBg={!asset} clipSrc={source || ""} clipIsVideo={!photo}
       operatorPhoto={!!asset && photo} photoAnimated={s.animate_image} style={s.style} customColors={s.custom_colors}
       movementStyle={s.movement_style} effect={s.effect} font={s.font} fontScale={s.font_scale} textCase={s.text_case}
       textContrast={s.text_contrast} lyricsAnimation={s.lyrics_animation} lineTransition={s.line_transition} lyricLook={s.lyric_look}
       lyricColor={s.lyric_color} lyricSungColor={s.lyric_sung_color} frameFormat={s.frame_format}
+      lookResolved={lookVariant.resolved} lookCatalog={lookVariant.catalog} lyricFontMain={s.lyric_font_main || ""} lyricFontKey={s.lyric_font_key || ""}
+      lyricAltColor={s.lyric_alt_color || ""} lyricAccentColor={s.lyric_accent_color || ""}
       lyric="Así se verá la letra" />
     <p className="mt-2 text-xs text-ink-secondary">Muestra del estilo. El fondo IA definitivo se genera después de aprobar letra y tiempos.</p>
   </div>;
