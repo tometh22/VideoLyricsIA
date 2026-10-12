@@ -24,7 +24,7 @@ ALLOWED_BACKGROUND_TYPES = frozenset({"video", "photo"})
 ALLOWED_KEYS = frozenset({
     "font", "font_scale", "text_case", "transition", "lyric_transition",
     "line_transition", "background_type", "movement", "movement_style",
-    "effect", "style", "background_id", "genre", "concept", "lyric_look",
+    "effect", "style", "background_id", "genre", "concept", "lyric_look", "lyric_genre",
 })
 
 
@@ -113,6 +113,13 @@ def normalize_render_profile(value: str | dict[str, Any] | None) -> dict[str, An
         )
     # Only present when chosen, so profiles without a look stay byte-identical.
     look_field = {"lyric_look": lyric_look} if lyric_look else {}
+    import lyric_recipes
+    lyric_genre = str(pick("lyric_genre", default="")).strip().lower()
+    if lyric_genre and not lyric_recipes.normalize_genre(lyric_genre):
+        raise RenderProfileError(
+            f"lyric_genre must be one of: {', '.join(sorted(lyric_recipes.GENRES))}")
+    if lyric_genre:
+        look_field["lyric_genre"] = lyric_genre
     return {
         "font": font,
         "font_scale": font_scale,
@@ -146,4 +153,5 @@ def pipeline_fields(profile: dict[str, Any]) -> dict[str, Any]:
         "line_transition": "dissolve_blur" if transition == "fade" else "none",
         "lyric_transition": "cut",
         **({"lyric_look": profile["lyric_look"]} if profile.get("lyric_look") else {}),
+        **({"lyric_genre": profile["lyric_genre"]} if profile.get("lyric_genre") else {}),
     }

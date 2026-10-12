@@ -1745,9 +1745,9 @@ def build_look_ass(
     above everything else so every job keeps a readable title card.
     beats: the song's beat times in seconds (beat_snap.detect_beats). Looks
     with beat_sync kick/blink on them; without beats they simply don't."""
-    skin = SKINS.get((look.id, genre_family(genre)))
-    if skin:
-        look = dataclasses.replace(look, **skin)
+    # `genre` is accepted for compatibility only: the caller resolves the
+    # look (lyric_recipes.resolve: genre skin / recipe / operator overrides)
+    # before calling, and re-applying a skin here would undo the recipe.
     if (primary_override and re.match(r"^#[0-9a-fA-F]{6}$", primary_override)
             and primary_override.upper() != "#FFFFFF"):
         look = dataclasses.replace(look, primary=primary_override)

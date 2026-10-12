@@ -41,6 +41,7 @@ def field(label, group, kind="text", **kw):
 
 
 import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
+import lyric_recipes as _lyric_recipes  # noqa: E402
 
 FIELDS = {
     "font": field("Tipografía", "Letra", "select", options=[""] + CATALOG["fonts"]),
@@ -52,6 +53,14 @@ FIELDS = {
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
     "lyric_look": field("Look de letra", "Letra", "select", options=["", *_lyric_looks.LOOKS]),
+    # Look variant: genre ("" = detectar), variant ("" = automática, sin
+    # repetir entre canciones de la campaña) and operator overrides.
+    "lyric_genre": field("Género del look", "Letra", "select", options=["", *_lyric_recipes.GENRES]),
+    "lyric_variant": field("Variante del look", "Letra", "select", options=["", *[str(i) for i in range(0, 20)]]),
+    "lyric_font_main": field("Letra principal del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_font_key": field("Letra destacada del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_alt_color": field("Color secundario del look", "Letra", "color"),
+    "lyric_accent_color": field("Color destacado del look", "Letra", "color"),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),
@@ -78,7 +87,9 @@ FIELDS = {
 RENDER_KEYS = (set(FIELDS) - {"scene_source"}) | {"match_lyrics", "bg_verbatim"}
 DEFAULTS = {"font": "", "font_scale": 1., "text_case": "upper", "text_contrast": "medium",
             "lyric_color": "#FFFFFF", "lyric_sung_color": "#FFFFFF", "lyrics_animation": "none",
-            "line_transition": "none", "lyric_look": "", "background_id": None, "background_mode": "as_is",
+            "line_transition": "none", "lyric_look": "", "lyric_genre": "", "lyric_variant": "",
+            "lyric_font_main": "", "lyric_font_key": "", "lyric_alt_color": "", "lyric_accent_color": "",
+            "background_id": None, "background_mode": "as_is",
             "match_lyrics": True, "bg_verbatim": False, "background_hint": "", "genre": "", "concept": "",
             "movement_style": "", "effect": "", "style": "auto", "custom_colors": "",
             "animate_image": False, "enable_scenes": False, "title_template": "auto", "title_size": 1.,
