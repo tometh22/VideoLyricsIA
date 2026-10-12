@@ -18789,6 +18789,9 @@ def _render_lyrics_ass(
     # composition, motion, grade and default overlay effect; size, case,
     # lyric colour, an explicit effect and the title card still apply.
     lyric_look: str = "",
+    # Song genre (pipeline._normalize_genre key, "" = unknown): picks the
+    # look's genre skin (lyric_looks.SKINS).
+    lyric_genre: str = "",
     # Title-card customization (Full Rotor v1). Defaults reproduce the
     # historical look exactly: auto layout, no size change, artist in
     # Montserrat ExtraBold, song in the lyric font.
@@ -18828,7 +18831,7 @@ def _render_lyrics_ass(
     import ass_render as _ass
     import lyric_looks as _looks
 
-    look = _looks.get_look(lyric_look) if render_text else None
+    look = _looks.resolve_look(lyric_look, lyric_genre) if render_text else None
     if look is not None:
         font_path = _looks.font_path(look)
         effect = effect or look.effect
@@ -18877,7 +18880,15 @@ def _render_lyrics_ass(
             extrabold_font = font_path  # graceful fallback
         # Per-element title fonts: resolve the chosen ids, else fall back to the
         # historical defaults (artist = ExtraBold, song = lyric font).
-        title_artist_path = _resolve_font(title_artist_font) or extrabold_font
+        # With a lyric look the title card speaks the look's typography too:
+        # the artist takes the look's display face (its key-word font when it
+        # has one, e.g. Metal Mania), the song the look's lyric font. Fonts
+        # the operator picked explicitly still win.
+        _look_artist_font = ""
+        if look is not None:
+            _look_artist_font = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
+        title_artist_path = (_resolve_font(title_artist_font)
+                             or _look_artist_font or extrabold_font)
         title_song_path = _resolve_font(title_song_font) or font_path
         title_artist_family, _ = _ass.font_family(title_artist_path)
         title_song_family, _ = _ass.font_family(title_song_path)
@@ -18954,6 +18965,7 @@ def _render_lyrics_ass(
                 primary_override=lyric_color or "",
                 title_lines=title_lines,
                 beats=_look_beats(look, mp3_path),
+                genre=lyric_genre,
             )
         else:
             ass_doc = _ass.build_ass(

@@ -93,6 +93,9 @@ class AssLine:
     # position / clip / blur (\\move, \\clip, \\blur) so it never collides with
     # the animation's scale/colour/per-word tags.
     transition: str = "none"
+    # Per-line fill colour (#RRGGBB, "" = style colour). Used by lyric looks
+    # to paint the title card's artist in the look's accent.
+    color: str = ""
 
 
 # --- Style tiers (single source of truth, mirrored by pipeline) ---------
@@ -910,6 +913,8 @@ def build_ass(
             overrides += f"\\fn{ln.font_name}"
         if ln.bold is not None:
             overrides += "\\b1" if ln.bold else "\\b0"
+        if ln.color:
+            overrides += f"\\1c{hex_to_ass(ln.color)}&"
         # Resolve the line's anchor (px,py) + alignment. Slide transitions need
         # an explicit position to animate from, so compute the center default
         # even when no per-line \pos override was set.
