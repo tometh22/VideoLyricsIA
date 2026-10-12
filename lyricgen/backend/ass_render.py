@@ -218,7 +218,49 @@ def font_family(font_path: str) -> tuple[str, bool]:
     family, style = f.getname()
     blob = f"{family} {style}".lower()
     is_bold = any(w in blob for w in ("bold", "black", "heavy"))
-    return family, is_bold
+    # FreeType (Pillow) reports the TYPOGRAPHIC family (name ID 16, e.g.
+    # "Montserrat" for Montserrat-ExtraBold), but libass matches name ID 1
+    # ("Montserrat ExtraBold") or the full name — asking for "Montserrat"
+    # silently fell back to DejaVu Sans. Use name ID 1 when the file has one.
+    return (_sfnt_family_name(font_path) or family), is_bold
+
+
+def _sfnt_family_name(font_path: str) -> str:
+    """Name ID 1 (font family) of a TrueType/OpenType file, "" if unreadable.
+    Prefers the Windows/Unicode English record, like libass."""
+    import struct
+    try:
+        with open(font_path, "rb") as fh:
+            data = fh.read()
+        num_tables = struct.unpack(">H", data[4:6])[0]
+        for i in range(num_tables):
+            rec = data[12 + 16 * i: 28 + 16 * i]
+            if rec[:4] == b"name":
+                off = struct.unpack(">I", rec[8:12])[0]
+                break
+        else:
+            return ""
+        _fmt, count, str_off = struct.unpack(">HHH", data[off:off + 6])
+        best, best_rank = "", 99
+        for j in range(count):
+            pid, eid, lid, nid, length, soff = struct.unpack(
+                ">HHHHHH", data[off + 6 + 12 * j: off + 18 + 12 * j])
+            if nid != 1:
+                continue
+            raw = data[off + str_off + soff: off + str_off + soff + length]
+            if pid == 3 and eid in (0, 1, 10):
+                rank, text = (0 if lid == 0x409 else 1), raw.decode("utf-16-be", "ignore")
+            elif pid == 0:
+                rank, text = 2, raw.decode("utf-16-be", "ignore")
+            elif pid == 1 and eid == 0:
+                rank, text = 3, raw.decode("mac_roman", "ignore")
+            else:
+                continue
+            if text.strip() and rank < best_rank:
+                best, best_rank = text.strip(), rank
+        return best
+    except Exception:
+        return ""
 
 
 def single_font_dir(font_path: str) -> str:
