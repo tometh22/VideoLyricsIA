@@ -56,6 +56,11 @@ def test_text_after_an_instruction_colon_is_the_lyric_and_a_leading_a_is_kept():
     assert phrases("No aparece letra en 0:15, debería decir: tú ves tu amor") == [("tú ves tu amor", [15.0])]
 
 
+def test_lyric_interminable_is_not_a_timing_instruction():
+    assert phrases('0:50 Y tu figura de LARGURA interminable') == [
+        ('Y tu figura de LARGURA interminable', [50.0])]
+
+
 @pytest.mark.parametrize("comment, kinds", [
     ("Sincronizar bien la frase: 1:31 He pagado un gran peaje", ["timing"]),
     ("corregir sincronización desde 2:49", ["timing"]),

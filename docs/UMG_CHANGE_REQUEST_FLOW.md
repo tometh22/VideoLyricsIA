@@ -10,6 +10,8 @@
 
 Approval of lyrics does not publish. Publication requires the same editor revision and render fingerprint the operator reviewed. A newer save requires another review/render; double-clicks use the transactional outbox's idempotency controls.
 
+If the cut is already published, **Dar por resuelto** checks the requested text. A typo in the customer's comment can return `requested_text_not_found` even when the lyrics are correct. The panel shows those exact phrases and offers **Resolver con revisión manual**: tick every point against the published video, explain the differences and explicitly confirm the request is attended. The reason is visible to the client, and the audit records the unmatched phrases and the reviewed cut. A changed request, editor revision or render invalidates this confirmation. This closes only the selected request against its published revision; it does not edit the comment or lyrics, render, publish another version, or change client approval. If a correction is still missing, edit and publish it instead.
+
 Approved background edits: the editor now honors the same platform-admin permission as Changes (done/rejected as well as pending_review), including AI, library and uploaded backgrounds. Other roles keep their existing permissions. Multi-scene jobs must use the scene editor; neither route can overwrite the timeline with one background. Generation remains an explicit action and does not resolve/publish the request.
 
 ## Publication modes: frozen copy vs pointer to the newest render

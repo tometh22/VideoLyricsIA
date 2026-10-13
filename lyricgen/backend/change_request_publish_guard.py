@@ -39,6 +39,8 @@ producción, así que no se usa acá.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import unicodedata
@@ -72,7 +74,7 @@ _PAREN_RE = re.compile(r"\([^)]*\)")
 # Lo que dice HOY la letra, no lo pedido: 'dice "X"', 'cambiar "X" por …'.
 _CURRENT_BEFORE = re.compile(r"(?:\bdice|\ben\s+(?:vez|lugar)\s+de|\bcambiar|\bsacar|\bquitar|\bborrar|\beliminar)\s*:?\s*$", re.I)
 _TIMING = re.compile(
-    r"sincroniz|desincroniz|timing|desfas|entr[ae]\s+(?:tarde|antes)|termina|empieza|arranc"
+    r"sincroniz|desincroniz|timing|desfas|entr[ae]\s+(?:tarde|antes)|\btermina|\bempieza|\barranc"
     r"|m[aá]s\s+(?:de\s+)?tiempo|se\s+lea|aparece\s+la\s+letra\s+sin|acomodar|alargar|adelantar|atrasar|se\s+va\s+antes",
     re.I)
 _VISUAL = re.compile(
@@ -454,3 +456,14 @@ def text_not_found_audit(user_id, job, kept: dict[str, Any], source: str, **extr
         "missing": kept["missing"][:20], "editor_revision": kept.get("editor_revision"),
         "source": source, **extra,
     })
+
+
+def text_review_token(request, fingerprint: str, editor_revision: int, kept: dict) -> str:
+    """Bind an explicit human review to the exact request, cut and discrepancies.
+
+    This is a concurrency check, not authorization: only an admin may confirm
+    the published cut, and must separately attest review with a reason.
+    """
+    payload = [request.id, request.comment, fingerprint, editor_revision,
+               kept.get('editor_revision'), kept['missing']]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()

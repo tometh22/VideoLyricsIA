@@ -244,3 +244,100 @@ def test_publication_close_refused_when_no_fix_was_saved_after_request(client, a
     assert response.json()['detail']['reason'] == 'no_fix_after_request'
     db.expire_all()
     assert db.get(DeliveryChangeRequest, cr.id).resolved_at is None
+
+
+def _published_text_mismatch(client, admin_token, manual_request, db, monkeypatch):
+    from database import EditorVersion
+    monkeypatch.setenv('CHANGE_REQUEST_PUBLISH_GUARD_ENABLED', '1')
+    job, document, cr, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    cr.comment = '0:00 Letra completa coregida a mano'
+    version = db.query(EditorVersion).filter_by(job_id=job.job_id, revision=document.revision).one()
+    version.segments = document.current_segments
+    version.is_approved = True
+    db.commit()
+    body = {'reviewed_render_fingerprint': render_fingerprint(job),
+            'reviewed_editor_revision': document.revision, 'confirmed_items': 1}
+    url = f'/admin/change-requests/{cr.id}/confirm-publication'
+    first = client.post(url, headers=auth(admin_token), json=body)
+    assert first.status_code == 409, first.text
+    detail = first.json()['detail']
+    assert detail['code'] == 'requested_text_not_found'
+    assert detail['missing'] == ['Letra completa coregida a mano']
+    assert len(detail['review_token']) == 64
+    db.expire_all()
+    assert cr.resolved_at is None
+    return job, document, cr, delivery, body, url, detail['review_token']
+
+
+def test_manual_text_review_closes_exact_published_cut_with_reason_and_audit(
+        client, admin_token, manual_request, db, monkeypatch):
+    from database import AuditLog
+    job, document, cr, delivery, body, url, token = _published_text_mismatch(
+        client, admin_token, manual_request, db, monkeypatch)
+    before = (delivery.published_revision, dict(delivery.published_file_keys), render_fingerprint(job),
+              list(document.current_segments), cr.comment)
+    other = DeliveryChangeRequest(delivery_id=delivery.id, comment='Otro cambio')
+    db.add(other); db.commit()
+    reason = 'El pedido tiene un typo; verifiqué corregida en el video publicado.'
+    response = client.post(url, headers=auth(admin_token), json={**body,
+                           'text_review_token': token, 'text_review_reason': reason})
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    assert cr.resolved_by_revision == delivery.published_revision
+    assert cr.resolution_source == 'publication'
+    assert cr.resolution_note == f'Revisión manual de la versión {delivery.published_revision}: {reason}'
+    assert other.resolved_at is None
+    assert before == (delivery.published_revision, delivery.published_file_keys, render_fingerprint(job),
+                      document.current_segments, cr.comment)
+    audit = db.query(AuditLog).filter_by(action='delivery.change_request.resolve').order_by(AuditLog.id.desc()).first()
+    assert audit.detail['manual_text_review'] == {
+        'reason': reason, 'missing': ['Letra completa coregida a mano'], 'review_token': token}
+    assert client.post(url, headers=auth(admin_token), json=body).json()['already_resolved'] is True
+
+
+@pytest.mark.parametrize('missing', ['reason', 'checklist', 'token'])
+def test_manual_text_review_requires_reason_checklist_and_server_discrepancy_token(
+        client, admin_token, manual_request, db, monkeypatch, missing):
+    _, _, cr, _, body, url, token = _published_text_mismatch(client, admin_token, manual_request, db, monkeypatch)
+    body.update(text_review_token=token, text_review_reason='Verifiqué el pedido contra el video.')
+    if missing == 'reason':
+        body['text_review_reason'] = '   '
+    elif missing == 'checklist':
+        del body['confirmed_items']
+    else:
+        del body['text_review_token']
+    response = client.post(url, headers=auth(admin_token), json=body)
+    assert response.status_code == (409 if missing == 'token' else 422), response.text
+    db.expire_all()
+    assert cr.resolved_at is None
+
+
+@pytest.mark.parametrize('change', ['request', 'corrected_request', 'editor', 'cut', 'guard_disabled'])
+def test_manual_text_review_cannot_reuse_evidence_after_request_editor_or_cut_changes(
+        client, admin_token, manual_request, db, monkeypatch, change):
+    job, document, cr, _, body, url, token = _published_text_mismatch(client, admin_token, manual_request, db, monkeypatch)
+    if change == 'request':
+        cr.comment = '0:00 Una corrección nueva del cliente'
+    elif change == 'corrected_request':
+        cr.comment = '0:00 Letra completa corregida a mano'
+    elif change == 'guard_disabled':
+        monkeypatch.setenv('CHANGE_REQUEST_PUBLISH_GUARD_ENABLED', '0')
+    elif change == 'editor':
+        document.revision += 1
+    else:
+        job.edit_count = (job.edit_count or 0) + 1
+    db.commit()
+    response = client.post(url, headers=auth(admin_token), json={**body,
+                           'text_review_token': token, 'text_review_reason': 'Verificado antes del cambio.'})
+    assert response.status_code == 409, response.text
+    db.expire_all()
+    assert cr.resolved_at is None
+
+
+def test_manual_text_review_keeps_admin_permission(client, admin_token, user_token, manual_request, db, monkeypatch):
+    _, _, cr, _, body, url, token = _published_text_mismatch(client, admin_token, manual_request, db, monkeypatch)
+    response = client.post(url, headers=auth(user_token), json={**body,
+                           'text_review_token': token, 'text_review_reason': 'Verificado.'})
+    assert response.status_code == 403
+    db.expire_all()
+    assert cr.resolved_at is None

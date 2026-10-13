@@ -980,6 +980,29 @@ describe("cerrar un pedido ya publicado", () => {
   const published = { ...BASE_PUBLICATION, revision: 2, render_fingerprint: "cut-2", editor_revision: 14,
     render_matches_editor: true, answers_request: true };
 
+  it("offers manual text review only for the exact cut rejected by the server", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ segments: [] }) })));
+    const confirm = vi.fn();
+    const notice = { requestId: 7, tone: "error", text: "La frase no coincide", textReview: {
+      token: "a".repeat(64), missing: ["despirerta"], renderFingerprint: "cut-2", editorRevision: 14,
+    } };
+    const item = { comment: "0:13 despirerta", workflow: confirmWorkflow, publication: published };
+    renderPanel(item, { crPublishNotice: notice, confirmChangeRequestPublication: confirm });
+    expect(screen.getByRole("region", { name: "Revisión manual de las diferencias" })).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Está en el video: 0:13 despirerta"));
+    fireEvent.change(screen.getByLabelText("Motivo de la revisión manual"), { target: { value: "Verifiqué despierta en el video." } });
+    fireEvent.click(screen.getByLabelText(/Revisé estas diferencias en el video/));
+    expect(screen.getByRole("button", { name: "Dar por resuelto" })).toBeDisabled();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resolver con revisión manual" }));
+    expect(confirm).toHaveBeenCalledWith(7, published, 1, { token: "a".repeat(64), reason: "Verifiqué despierta en el video." });
+    cleanup();
+    renderPanel({ ...item, publication: { ...published, editor_revision: 15 } }, { crPublishNotice: notice });
+    expect(screen.queryByRole("region", { name: "Revisión manual de las diferencias" })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
   it("no deja dar por resuelto hasta marcar cada punto contra el video", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ segments: [{ start: 13, text: "¿Quién sos?" }] }) })));
     const confirm = vi.fn();
@@ -996,7 +1019,7 @@ describe("cerrar un pedido ya publicado", () => {
     fireEvent.click(screen.getByLabelText("Está en el video: 1:02 decir amor"));
     await waitFor(() => expect(button).toBeEnabled());
     fireEvent.click(button);
-    expect(confirm).toHaveBeenCalledWith(7, published, 2);
+    expect(confirm).toHaveBeenCalledWith(7, published, 2, undefined);
     vi.unstubAllGlobals();
   });
 });

@@ -21,6 +21,7 @@ import RequestVideo from "./RequestVideo";
 import { byPublicationMode, byRowMode } from "./publicationMode";
 import { ClientVisibilityControl } from "./ClientVisibility";
 import PublishedRequestChecklist from "./PublishedRequestChecklist";
+import PublishedTextReview from "./PublishedTextReview";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -405,7 +406,7 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
-              onConfirmPublication={(confirmedItems) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems)}
+              onConfirmPublication={(confirmedItems, textReview) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems, textReview)}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
@@ -528,6 +529,10 @@ function ChangeRequestCard({
     && workflow.allowed_actions.includes("confirm_publication");
   const [checklist, setChecklist] = useState({ ready: false, count: 0 });
   const onChecklistChange = useCallback((ready, count) => setChecklist({ ready, count }), []);
+  const textReview = confirmsPublication
+    && actionNotice?.textReview?.renderFingerprint === item.publication?.render_fingerprint
+    && actionNotice?.textReview?.editorRevision === item.publication?.editor_revision
+    ? actionNotice.textReview : null;
   const view = correctionSteps(workflow, {
     isResolved,
     hasJob: Boolean(d.job_id),
@@ -539,7 +544,7 @@ function ChangeRequestCard({
     proposalEnabled,
     qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
     busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim(),
-      unchecked: confirmsPublication && !checklist.ready },
+      unchecked: confirmsPublication && (!checklist.ready || Boolean(textReview)) },
   });
   const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   const primaryWiring = {
@@ -616,7 +621,8 @@ function ChangeRequestCard({
         </span>
       </header>
 
-      <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
+      <div className="grid min-w-0 gap-5 p-4 sm:p-5"
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 18rem), 1fr))" }}>
         <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
           <RequestWorkflowStepper workflow={workflow} steps={view.steps} sentence={view.sentence} />
 
@@ -711,6 +717,16 @@ function ChangeRequestCard({
               comment={item.comment}
               onReadyChange={onChecklistChange}
               onSeek={seekVideo}
+            />
+          )}
+
+          {textReview && (
+            <PublishedTextReview
+              key={textReview.token}
+              review={textReview}
+              checklistReady={checklist.ready}
+              busy={resolving}
+              onConfirm={(reason) => onConfirmPublication?.(checklist.count, { token: textReview.token, reason })}
             />
           )}
 
