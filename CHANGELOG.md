@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.126] - 2026-10-13
+
+### Fixed
+
+- Los pedidos de cambio cuyo comentario tiene errores de escritura pueden cerrarse con **Resolver con revisión manual** después de revisar el video publicado. El operador tiene la decisión final: debe marcar todos los puntos, explicar las diferencias y confirmar que el pedido está atendido. El motivo queda visible al cliente y la auditoría registra las frases rechazadas y la versión revisada. Si cambia el pedido, la letra o el corte, se exige una nueva revisión. El cierre no edita la letra ni vuelve a publicar el video.
+- La frase de Tango «Y tu figura de LARGURA interminable» ya no se ignora por confundir «interminable» con una instrucción de timing.
+- El detalle de un pedido adapta sus columnas al ancho disponible para que el checklist y el motivo de cierre se lean en tarjetas angostas.
+
 ## [1.1.124] - 2026-10-09
 
 ### Security
