@@ -54,6 +54,7 @@ test("closes a published typo request only after explicit manual review, without
   await expect(resolve).toBeDisabled();
   await review.getByLabel(/Revisé estas diferencias en el video publicado/).check();
   await expect(resolve).toBeEnabled();
+  expect((await review.boundingBox()).width).toBeGreaterThan(240);
   await review.screenshot({ path: "../../.context/umg-text-review.png" });
   await resolve.click();
   await expect(page.getByText(/Pedido resuelto con revisión manual de la versión 6/)).toBeVisible();

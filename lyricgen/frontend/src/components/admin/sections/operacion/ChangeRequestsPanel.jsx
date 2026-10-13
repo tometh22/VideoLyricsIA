@@ -621,7 +621,8 @@ function ChangeRequestCard({
         </span>
       </header>
 
-      <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
+      <div className="grid min-w-0 gap-5 p-4 sm:p-5"
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 18rem), 1fr))" }}>
         <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
           <RequestWorkflowStepper workflow={workflow} steps={view.steps} sentence={view.sentence} />
 
