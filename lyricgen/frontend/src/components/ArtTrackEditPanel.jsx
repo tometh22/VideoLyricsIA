@@ -32,6 +32,7 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
   ];
 
   const rp = job.render_params || {};
+  const [artTrackPreset, setArtTrackPreset] = useState(rp.art_track_preset || "waveform");
   const [effect, setEffect] = useState(rp.effect || "");
   const [songTitle, setSongTitle] = useState(job.song_title || "");
   const [artist, setArtist] = useState(job.artist || "");
@@ -89,6 +90,7 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
     try {
       const fd = new FormData();
       fd.append("effect", effect || "");
+      fd.append("art_track_preset", artTrackPreset);
       fd.append("song_title", songTitle || "");
       fd.append("artist", artist || "");
       fd.append("label_line", labelLine || "");
@@ -208,8 +210,16 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
         </div>
       </div>
 
-      {/* Efecto */}
       <div className="mt-5">
+        <label className="block text-label text-ink-secondary mb-1.5">{t("upload.art_track_preset") || "Estilo de Art Track"}</label>
+        <select value={artTrackPreset} onChange={(e) => setArtTrackPreset(e.target.value)} className="input-field text-sm w-full sm:max-w-sm">
+          <option value="waveform">{t("upload.art_track_waveform") || "Portada + onda animada"}</option>
+          <option value="colombia_static">{t("upload.art_track_colombia_static") || "Portada fija + título y artista"}</option>
+        </select>
+      </div>
+
+      {/* Efecto */}
+      {artTrackPreset === "waveform" && <div className="mt-5">
         <label className="block text-label text-ink-secondary mb-1.5">
           {t("artedit.effect") || "Efecto"}
         </label>
@@ -271,7 +281,7 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
             );
           })}
         </div>
-      </div>
+      </div>}
 
       {error && (
         <p className="text-xs text-red-400 mt-4">{error}</p>

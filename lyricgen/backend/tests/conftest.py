@@ -57,6 +57,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+# La revisión rápida busca la letra oficial en lrclib en segundo plano; los
+# tests nunca salen a la red.
+os.environ.setdefault("LYRIC_REVIEW_FETCH_OFFICIAL", "0")
 os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
 os.environ.setdefault(
     "QUALITY_LEARNING_HMAC_KEY", "quality-test-key-0123456789-ABCDEF",
@@ -119,6 +122,19 @@ def db():
     yield session
     session.rollback()
     session.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_used_prompt_history(tmp_path_factory):
+    """Prompt-generation tests must not append to the tracked asset history."""
+    import pipeline
+
+    original = pipeline._USED_PROMPTS_FILE
+    pipeline._USED_PROMPTS_FILE = str(tmp_path_factory.mktemp("prompt-history") / "used.json")
+    try:
+        yield
+    finally:
+        pipeline._USED_PROMPTS_FILE = original
 
 
 # Exit status REAL de la sesión. Lo captura pytest_sessionfinish (que lo recibe

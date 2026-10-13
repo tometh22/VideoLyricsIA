@@ -272,6 +272,12 @@ def build_machine_evidence(result: dict) -> dict:
         "segments",
         pre_anchor_segments,
     )
+    pre_auto_repair = result.get("_pre_auto_repair_segments")
+    if isinstance(pre_auto_repair, list):
+        add(
+            "pre_auto_repair", "pre-auto-repair-output", "segments",
+            pre_auto_repair, allow_empty=True,
+        )
     selected_family = _provider_family(selected)
     add("selected", selected_family, "segments", selected)
     if not any(item.get("role") == "selected" for item in hypotheses):
@@ -305,6 +311,7 @@ def build_machine_evidence(result: dict) -> dict:
             ),
             "independent_present": bool(result.get("_independent_asr_words")),
             "pre_anchor_present": bool(result.get("_pre_anchor_provider_segments")),
+            "pre_auto_repair_present": isinstance(pre_auto_repair, list),
         },
     }
 
@@ -421,6 +428,19 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                     selected_matches_snapshot = True
         if not selected_matches_snapshot:
             raise MachineSnapshotMissing("machine_selected_hypothesis_missing")
+        quality_decision = (evidence.get("decisions") or {}).get("quality")
+        auto_repair = (
+            quality_decision.get("auto_repair")
+            if isinstance(quality_decision, dict) else None
+        )
+        if isinstance(auto_repair, dict) and auto_repair.get("source_snapshot_sha256"):
+            source = [item for item in hypotheses if item.get("role") == "pre_auto_repair"]
+            if (
+                len(source) != 1
+                or source[0].get("kind") != "segments"
+                or source[0].get("events_sha256") != auto_repair["source_snapshot_sha256"]
+            ):
+                raise MachineSnapshotMissing("machine_auto_repair_source_missing")
         if evidence_schema == SCHEMA:
             capture = evidence.get("capture")
             if not isinstance(capture, dict):

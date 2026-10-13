@@ -12,6 +12,14 @@ def segment(start, end, text, **extra):
     return {"start": start, "end": end, "text": text, **extra}
 
 
+def assert_source_complete(comment, parsed):
+    covered = set()
+    for row in parsed["instructions"]:
+        assert row["source_excerpt"] == comment[row["source_start"]:row["source_end"]]
+        covered.update(range(row["source_start"], row["source_end"]))
+    assert {i for i, char in enumerate(comment) if not char.isspace()} <= covered
+
+
 def test_parser_extracts_timestamped_client_text_without_inventing_words():
     comment = '0:13 debe decir "Dicen que soy lo peor"'
     instruction = parse_change_request(comment)["instructions"][0]
@@ -29,28 +37,23 @@ def test_parser_extracts_explicit_before_after_pair_and_repeat_scope():
     assert instruction["scope"] == "all_matching"
 
 
-def test_parser_extracts_umg_timestamp_lists_and_keeps_timing_note_manual():
+def test_historical_unquoted_umg_timestamp_list_requires_review_without_losing_source():
     comment = """0:48_ Un caramelo Blanco de limón
 1:11 Y Con el tu corazón
 1:29 Un caramelo Blanco de limón
 3:34 Porque la vida es un bar (revisar que termina antes de que cante)"""
     parsed = parse_change_request(comment)
-    replacements = [
-        row for row in parsed["instructions"] if row["kind"] == "replace_text"
-    ]
-    assert [(row["timecode_seconds"], row["requested_text"]) for row in replacements] == [
-        (48.0, "Un caramelo Blanco de limón"),
-        (71.0, "Y Con el tu corazón"),
-        (89.0, "Un caramelo Blanco de limón"),
-        (214.0, "Porque la vida es un bar"),
-    ]
-    assert all(row["requested_text"] in comment for row in replacements)
+    assert parsed["has_actionable_text"] is False
+    manual = [row for row in parsed["instructions"] if row["kind"] == "manual_review"]
+    assert [row["timecode_seconds"] for row in manual] == [48.0, 71.0, 89.0, 214.0]
+    assert [row["source_excerpt"] for row in manual] == comment.splitlines()
+    assert_source_complete(comment, parsed)
     timing = [row for row in parsed["instructions"] if row["kind"] == "timing_review"]
     assert len(timing) == 1
     assert timing[0]["timecode_seconds"] == 214.0
 
 
-def test_parser_keeps_untimestamped_continuation_lines_in_same_requested_phrase():
+def test_historical_unquoted_multiline_requests_preserve_every_continuation_for_review():
     comment = """0:03: Yo, Horacio Acavallo
 gracias por el homenaje a todos
 los boxeadores campeones del mundo
@@ -61,37 +64,48 @@ Ringo Bonavena, Uby Sacco
 1:57: Pinas van
 2:01: piñas vienen, piñas van"""
 
-    replacements = [
-        row for row in parse_change_request(comment)["instructions"]
-        if row["kind"] == "replace_text"
+    parsed = parse_change_request(comment)
+    assert parsed["has_actionable_text"] is False
+    assert all(row["kind"] == "manual_review" for row in parsed["instructions"])
+    assert [(row["timecode_seconds"], row["source_excerpt"]) for row in parsed["instructions"]] == [
+        (3.0, "0:03: Yo, Horacio Acavallo\ngracias por el homenaje a todos\n"
+              "los boxeadores campeones del mundo"),
+        (48.0, "0:48: Víctor Galíndez, Carlos Monzón\nNicolino Loche, Horacio Acavallo"),
+        (85.0, "1:25: Víctor Galíndez, Carlos Monzón\nRingo Bonavena, Uby Sacco"),
+        (117.0, "1:57: Pinas van"),
+        (121.0, "2:01: piñas vienen, piñas van"),
     ]
-
-    assert [(row["timecode_seconds"], row["requested_text"]) for row in replacements] == [
-        (
-            3.0,
-            "Yo, Horacio Acavallo gracias por el homenaje a todos "
-            "los boxeadores campeones del mundo",
-        ),
-        (48.0, "Víctor Galíndez, Carlos Monzón Nicolino Loche, Horacio Acavallo"),
-        (85.0, "Víctor Galíndez, Carlos Monzón Ringo Bonavena, Uby Sacco"),
-        (117.0, "Pinas van"),
-        (121.0, "piñas vienen, piñas van"),
-    ]
+    assert_source_complete(comment, parsed)
+    proposal = build_proposal(comment=comment, segments=[segment(2, 6, "Antes")], base_revision=1)
+    assert proposal["status"] == "needs_input"
+    assert proposal["applicable_count"] == 0
+    assert all(not row["applicable"] for row in proposal["operations"])
 
 
-def test_umg_timestamp_list_builds_one_text_patch_per_matching_time():
+@pytest.mark.parametrize("quoted", [False, True], ids=["historical-unquoted-manual", "explicit-quoted-patches"])
+def test_umg_timestamp_list_requires_explicit_literals_before_building_text_patches(quoted):
     segments = [
         segment(47.0, 49.0, "Un caramelo blanco de lima"),
         segment(70.0, 72.0, "Y con tu corazón"),
         segment(88.0, 90.0, "Un caramelo blanco de lima"),
     ]
-    proposal = build_proposal(
-        comment="""0:48_ Un caramelo Blanco de limón
+    original = """0:48_ Un caramelo Blanco de limón
 1:11 Y Con el tu corazón
-1:29 Un caramelo Blanco de limón""",
+1:29 Un caramelo Blanco de limón"""
+    explicit = '''0:48_ "Un caramelo Blanco de limón"
+1:11 "Y Con el tu corazón"
+1:29 "Un caramelo Blanco de limón"'''
+    comment = explicit if quoted else original
+    proposal = build_proposal(
+        comment=comment,
         segments=segments, base_revision=3,
     )
     applicable = [row for row in proposal["operations"] if row["applicable"]]
+    if not quoted:
+        assert proposal["status"] == "needs_input"
+        assert applicable == []
+        assert_source_complete(comment, parse_change_request(comment))
+        return
     assert len(applicable) == 3
     result, _ = apply_operations(segments, proposal, [row["id"] for row in applicable])
     assert [row["text"] for row in result] == [
@@ -110,19 +124,23 @@ def test_parser_keeps_timing_and_structure_review_only():
     }
 
 
-def test_parser_extracts_complete_phrase_for_every_listed_timestamp():
-    parsed = parse_change_request(
+def test_historical_mixed_layout_only_extracts_explicit_quoted_phrases():
+    comment = (
         '0:01 y 0:04: "borracho y agresivo"\n'
         '0:42: Y en la damajuana no hay nada que beber\n\n'
         'Revisar que las frases completas esten en 1 sola pantalla'
     )
+    parsed = parse_change_request(comment)
     rows = [row for row in parsed["instructions"] if row["kind"] == "merge_phrase"]
     assert [(row["timecode_seconds"], row["requested_text"]) for row in rows] == [
         (1.0, "borracho y agresivo"),
         (4.0, "borracho y agresivo"),
-        (42.0, "Y en la damajuana no hay nada que beber"),
     ]
     assert not any(row["kind"] == "replace_text" for row in parsed["instructions"])
+    manual = [row for row in parsed["instructions"] if row["kind"] == "manual_review"]
+    assert len(manual) == 1
+    assert manual[0]["source_excerpt"] == '0:42: Y en la damajuana no hay nada que beber'
+    assert_source_complete(comment, parsed)
 
 
 def test_complete_phrase_builds_exact_structural_merge_and_applies_it():
@@ -135,7 +153,7 @@ def test_complete_phrase_builds_exact_structural_merge_and_applies_it():
     proposal = build_proposal(
         comment=(
             '0:01: "borracho y agresivo"\n'
-            '0:42: Y en la damajuana no hay nada que beber\n'
+            '0:42: "Y en la damajuana no hay nada que beber"\n'
             'Revisar que las frases completas esten en 1 sola pantalla'
         ),
         segments=segments,
@@ -159,10 +177,12 @@ def test_complete_phrase_builds_exact_structural_merge_and_applies_it():
     assert all(row["automatic_apply_allowed"] is False for row in selected)
 
 
-def test_complete_phrase_stays_manual_when_fragments_do_not_match_exactly():
+@pytest.mark.parametrize("quoted", [False, True], ids=["unquoted-manual", "quoted-unmatched-fragments"])
+def test_complete_phrase_stays_manual_when_fragments_do_not_match_exactly(quoted):
+    phrase = '"Y en la damajuana no hay nada que beber"' if quoted else 'Y en la damajuana no hay nada que beber'
     proposal = build_proposal(
         comment=(
-            '0:42: Y en la damajuana no hay nada que beber\n'
+            f'0:42: {phrase}\n'
             'Revisar que las frases completas esten en 1 sola pantalla'
         ),
         segments=[segment(41.8, 44, "Otra frase")],
@@ -170,7 +190,27 @@ def test_complete_phrase_stays_manual_when_fragments_do_not_match_exactly():
     )
     assert proposal["status"] == "needs_input"
     assert proposal["applicable_count"] == 0
-    assert proposal["operations"][0]["reason"] == "complete_phrase_fragments_not_found"
+    expected = "complete_phrase_fragments_not_found" if quoted else "instruction_requires_manual_interpretation"
+    assert proposal["operations"][0]["reason"] == expected
+
+
+def test_explicit_quoted_phrase_and_timing_note_are_separate_instructions():
+    comment = '3:34 "Porque la vida es un bar" (revisar que termina antes de que cante)'
+    parsed = parse_change_request(comment)
+    replacements = [row for row in parsed["instructions"] if row["kind"] == "replace_text"]
+    assert [(row["timecode_seconds"], row["requested_text"]) for row in replacements] == [
+        (214.0, "Porque la vida es un bar"),
+    ]
+    assert len([row for row in parsed["instructions"] if row["kind"] == "timing_review"]) == 1
+    assert_source_complete(comment, parsed)
+
+
+def test_explicit_quoted_full_phrase_preserves_historical_second_and_third_parts():
+    full = "Yo, Horacio Acavallo gracias por el homenaje a todos los boxeadores campeones del mundo"
+    parsed = parse_change_request(f'0:03: "{full}"')
+    assert len(parsed["instructions"]) == 1
+    assert parsed["instructions"][0]["requested_text"] == full
+    assert parsed["instructions"][0]["kind"] == "replace_text"
 
 
 def test_build_and_apply_timestamped_text_proposal_preserves_timing_and_metadata():

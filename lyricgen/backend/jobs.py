@@ -661,6 +661,28 @@ def _archive_deleted_job_lyrics(
         ))
 
 
+def _served_from_working_files(job_ids: list[str]) -> set[str]:
+    """Jobs with an ACTIVE delivery that has no frozen snapshot.
+
+    The portal serves such a delivery straight from the job's own R2 files, so
+    deleting those objects leaves the client with dead download links. A
+    delivery with a snapshot does not depend on them. If the deliveries database
+    cannot be read the answer is 'all of them': deleting is never worth a guess.
+    """
+    if not job_ids:
+        return set()
+    try:
+        from database import Delivery, scoped_deliveries_db
+        with scoped_deliveries_db() as ddb:
+            rows = ddb.query(Delivery.job_id, Delivery.published_file_keys).filter(
+                Delivery.job_id.in_(job_ids), Delivery.removed_at.is_(None),
+            ).all()
+        return {job_id for job_id, keys in rows if keys is None}
+    except Exception:
+        _logger.warning("could not read deliveries before deleting jobs", exc_info=True)
+        return set(job_ids)
+
+
 def delete_job(
     db: Session, job_id: str, tenant_id: str, deleted_by_user_id: Optional[int] = None,
 ) -> tuple[bool, str]:
@@ -684,6 +706,8 @@ def delete_job(
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
+    if _served_from_working_files([job_id]):
+        return False, "published_in_portal"
     _archive_veo_budget_spend(db, [job])
     _archive_deleted_job_lyrics(db, [job], deleted_by_user_id)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
@@ -726,9 +750,12 @@ def bulk_delete_jobs(
             skipped[jid] = "not_found"
 
     deletable_ids: list[str] = []
+    in_portal = _served_from_working_files([r.job_id for r in rows if r.status in _DELETABLE_STATUSES])
     for r in rows:
         if r.status not in _DELETABLE_STATUSES:
             skipped[r.job_id] = f"protected_status:{r.status}"
+        elif r.job_id in in_portal:
+            skipped[r.job_id] = "published_in_portal"
         else:
             deletable_ids.append(r.job_id)
 

@@ -1532,6 +1532,104 @@ def test_analytics_rejects_cross_tenant_nested_and_oversized_batches(client):
     assert other_first.id != first.id
 
 
+def test_platform_admin_editor_analytics_on_client_job_are_recorded(client):
+    """agus77 (admin de plataforma) revisa canciones de universal_music.
+
+    El editor lo deja trabajar (_editor_document_or_404), pero el lookup
+    tenant-only de /analytics/events descartaba TODOS sus eventos sobre esas
+    canciones: 0 seeks, 0 aperturas, 0 aprobaciones desde el 7-sep.
+    """
+    _, _, job_id = _users_and_job("editor_analytics_client")
+    with SessionLocal() as db:
+        admin = create_user(
+            db, f"analytics_admin_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            role="admin", tenant_id="analytics_platform_admin",
+        )
+        regular = create_user(
+            db, f"analytics_user_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            tenant_id="analytics_other_team",
+        )
+    events = {"events": [
+        {"name": "editor_seek", "job_id": job_id,
+         "properties": {"position_ms": 12_000, "source": "editor"}},
+    ]}
+    admin_response = client.post("/analytics/events", headers=auth(_token_for(admin)), json=events)
+    assert admin_response.json() == {"accepted": 1, "rejected": 0}
+    # Un usuario común de otro tenant sigue aislado.
+    regular_response = client.post("/analytics/events", headers=auth(_token_for(regular)), json=events)
+    assert regular_response.json() == {"accepted": 0, "rejected": 1}
+    with SessionLocal() as db:
+        rows = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+        ).all()
+        assert [(row.user_id, row.tenant_id) for row in rows] == [
+            (admin.id, "analytics_platform_admin"),
+        ]
+
+
+def test_analytics_events_store_client_time_or_fall_back_to_arrival(client):
+    first, _, job_id = _users_and_job("editor_analytics_time")
+    token = _token_for(first)
+    client_time = datetime.now(timezone.utc) - timedelta(seconds=30)
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_seek", "job_id": job_id,
+             "occurred_at": client_time.isoformat().replace("+00:00", "Z"),
+             "properties": {"position_ms": 1_000, "source": "editor"}},
+            # Cliente viejo: sin occurred_at.
+            {"name": "editor_seek", "job_id": job_id,
+             "properties": {"position_ms": 2_000, "source": "editor"}},
+            # Reloj del navegador absurdo.
+            {"name": "editor_seek", "job_id": job_id, "occurred_at": "2001-01-01T00:00:00Z",
+             "properties": {"position_ms": 3_000, "source": "editor"}},
+        ]},
+    )
+    assert response.json() == {"accepted": 3, "rejected": 0}
+    with SessionLocal() as db:
+        rows = {
+            row.properties["position_ms"]: row
+            for row in db.query(ProductEvent).filter(
+                ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+            )
+        }
+    assert all(row.occurred_at is not None for row in rows.values())
+    assert abs((rows[1_000].occurred_at - client_time).total_seconds()) < 0.01
+    for position in (2_000, 3_000):
+        lag = abs((rows[position].occurred_at - rows[position].created_at).total_seconds())
+        assert lag < 60, position
+
+
+def test_audio_played_ranges_are_persisted_and_bounded(client):
+    first, _, job_id = _users_and_job("editor_audio_played")
+    token = _token_for(first)
+    session_id = str(uuid.uuid4())
+    valid = {
+        "ranges": [[0, 12_000], [60_000, 64_250]], "played_ms": 16_250,
+        "playback_rate": 1, "audio_duration_ms": 215_400,
+        "flush_reason": "approve", "session_id": session_id,
+    }
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_audio_played", "job_id": job_id, "properties": valid},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[5_000, 1_000]]}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, 1]] * 65}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, "hoy te vi pasar"]]}},
+        ]},
+    )
+    assert response.json() == {"accepted": 1, "rejected": 3}
+    with SessionLocal() as db:
+        row = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_audio_played",
+        ).one()
+    assert row.properties["ranges"] == [[0, 12_000], [60_000, 64_250]]
+    assert row.properties["session_id"] == session_id
+
+
 def test_transaction_rollback_never_leaves_partial_editor_state():
     first, _, job_id = _users_and_job("editor_rollback")
     db = SessionLocal()

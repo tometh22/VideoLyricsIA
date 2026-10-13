@@ -544,3 +544,161 @@ def test_structural_verdict_mixed():
     decl, lex_sk, lex_tot, n_ad = structural_skip_verdict(lines, skipped, 0.10)
     assert not decl                      # 1/20 = 5% < 10%
     assert (lex_sk, lex_tot, n_ad) == (1, 20, 10)
+
+
+# ── split_unvoiced_token_gaps (Carajo "Hacerse Cargo", job 248d012f186a) ────
+
+F = 0.02
+SEP = 777
+
+
+def _t(a, b, sc=0.8):
+    """Token span in FRAMES from seconds (merge_tokens shape)."""
+    return (a / F, b / F, sc)
+
+
+def _split_case(lines, token_secs, regions, **kw):
+    targets, words = ctc_align.build_targets(lines, VOCAB, STAR,
+                                             word_sep_id=SEP)
+    spans = [_t(*x) for x in token_secs]
+    assert len(spans) == len(targets)
+    lt = ctc_align.spans_to_lines(spans, words, len(lines), F)
+    kw.setdefault("from_stem", True)
+    kw.setdefault("word_sep", True)
+    out = ctc_align.split_unvoiced_token_gaps(lt, spans, words, regions, F,
+                                              **kw)
+    return lt, out
+
+
+def _bien_bridge():
+    # "Bien, bien, bien": la "b" del primer Bien quedó pegada a la cola de
+    # la línea anterior (109.16), 2.5 s de blanks sobre silencio, "i-e-n|"
+    # recién en 111.96. Voz medida en el stem: 111.85-113.15 (+ el resto).
+    toks = [(100.0, 100.1, 0.5),                                  # star
+            (109.16, 109.2), (111.96, 112.04), (112.1, 112.3),    # b i e
+            (112.5, 112.7), (112.86, 112.88),                     # n |
+            (113.2, 113.3), (113.3, 113.4), (113.4, 113.5),       # bien|
+            (113.5, 113.7), (113.7, 113.8),
+            (114.0, 114.2), (114.2, 114.4), (114.4, 114.6),       # bien
+            (114.6, 115.0),
+            (115.5, 115.6, 0.5)]                                  # star
+    regions = [(105.0, 109.3), (111.85, 116.0)]
+    return ["Bien, bien, bien"], toks, regions
+
+
+def _bien_outro():
+    # "A aguantársela bien": "b-i-e" sobre la voz (que dura hasta 180.05),
+    # la "n" saltó ~6 s de silencio y se enganchó a la N de un "¡No!"
+    # gritado fuera de la letra (score 0.963).
+    toks = [(170.0, 170.1, 0.5),                                  # star
+            (176.0, 176.2), (176.2, 176.3)]                       # a |
+    t = 176.4
+    for _ in range(len("aguantársela")):
+        toks.append((t, t + 0.1))
+        t += 0.12
+    toks.append((t, t + 0.05))                                    # |
+    toks += [(178.12, 178.2, 0.1), (178.2, 178.3, 0.1),           # b i
+             (178.3, 178.5, 0.1), (184.7, 184.76, 0.963),         # e … n
+             (185.5, 185.6, 0.5)]                                 # star
+    regions = [(176.0, 180.05), (184.6, 185.2)]
+    return ["A aguantársela bien"], toks, regions
+
+
+def _words(out):
+    return [w for lt in out if lt for w in lt[2]]
+
+
+def test_unvoiced_split_start_jump_bridge_bien():
+    lines, toks, regions = _bien_bridge()
+    before, out = _split_case(lines, toks, regions)
+    assert round(before[0][2][0][1], 2) == 109.16  # the stretched span
+    w0 = out[0][2][0]
+    assert w0[0] == "Bien,"
+    assert round(w0[1], 2) == 111.85        # snapped to the voice onset
+    assert round(w0[2], 2) == 112.88        # end untouched
+    assert w0[3] == before[0][2][0][3]      # score untouched
+    assert round(out[0][0], 2) == 111.85    # line start re-derived
+    # the other two words are untouched; text/order/count preserved
+    assert out[0][2][1:] == before[0][2][1:]
+    assert [w[0] for w in _words(out)] == [w[0] for w in _words(before)]
+
+
+def test_unvoiced_split_end_jump_outro_bien():
+    lines, toks, regions = _bien_outro()
+    before, out = _split_case(lines, toks, regions)
+    wb = before[0][2][-1]
+    assert (round(wb[1], 2), round(wb[2], 2)) == (178.12, 184.76)
+    wn = out[0][2][-1]
+    assert wn[0] == "bien"
+    assert round(wn[1], 2) == 178.12
+    assert round(wn[2], 2) == 180.05        # voice offset, not the "¡No!"
+    assert wn[3] == wb[3]                   # score untouched
+    assert round(out[0][1], 2) == 180.05    # line end re-derived
+    assert out[0][2][:-1] == before[0][2][:-1]
+
+
+def test_unvoiced_split_short_breath_gap_does_not_split():
+    # 0.5 s breath inside a held word < 0.8 s threshold → untouched
+    lines = ["hola"]
+    toks = [(9.0, 9.1, 0.5), (10.5, 10.6), (10.6, 10.8),
+            (11.5, 11.7), (11.7, 12.0), (13.0, 13.1, 0.5)]
+    regions = [(10.0, 10.9), (11.4, 12.5)]
+    before, out = _split_case(lines, toks, regions)
+    assert out is before
+
+
+def test_unvoiced_split_no_stem_is_noop():
+    lines, toks, regions = _bien_bridge()
+    before, out = _split_case(lines, toks, regions, from_stem=False)
+    assert out is before
+    before, out = _split_case(lines, toks, [])
+    assert out is before
+
+
+def test_unvoiced_split_kill_switch(monkeypatch):
+    monkeypatch.setenv("CTC_UNVOICED_SPLIT_ENABLED", "0")
+    lines, toks, regions = _bien_outro()
+    before, out = _split_case(lines, toks, regions)
+    assert out is before
+
+
+def test_unvoiced_split_threshold_env(monkeypatch):
+    # the bridge silence is ~2.5 s: a 3 s threshold leaves it alone
+    monkeypatch.setenv("CTC_UNVOICED_SPLIT_GAP_S", "3.0")
+    lines, toks, regions = _bien_bridge()
+    before, out = _split_case(lines, toks, regions)
+    assert out is before
+
+
+def test_unvoiced_split_separator_does_not_win_the_vote():
+    # "yo|": 'y' before the silence, 'o' + separator after it. Clusters
+    # [y] vs [o, |] tie on REAL tokens (the separator doesn't count) →
+    # higher score wins; the kept side snaps to its voice region's end.
+    lines = ["yo tú"]
+    toks = [(0.0, 0.1, 0.5),
+            (1.0, 1.2, 0.9), (3.0, 3.1, 0.2), (3.1, 3.2, 0.2),   # y o |
+            (3.3, 3.5), (3.5, 3.7),                              # tú
+            (4.0, 4.1, 0.5)]
+    regions = [(0.9, 1.4), (2.9, 3.8)]
+    _before, out = _split_case(lines, toks, regions)
+    y = out[0][2][0]
+    assert round(y[1], 2) == 1.0 and round(y[2], 2) == 1.4
+    ws = _words(out)
+    assert all(a[2] <= b[1] for a, b in zip(ws, ws[1:]))  # monotonic
+
+
+def test_edge_snap_picks_region_with_largest_overlap():
+    from ctc_align import trim_unvoiced_edges
+    # first word stretched from the tail of the previous line's voice
+    # (105-109.3) to the real onset (111.85): the FIRST touching region
+    # gave snap = 109.16 (no-op); the largest overlap is the real one.
+    # Symmetric on the last word: the LAST touching region was the
+    # shouted "¡No!" at 184.6.
+    regions = [(105.0, 109.3), (111.85, 113.15),
+               (176.0, 180.05), (184.6, 185.2)]
+    line = [(109.16, 112.88, [("Bien,", 109.16, 112.88, 0.2)]),
+            (176.4, 184.76, [("aguantársela", 176.4, 178.0, 0.8),
+                             ("bien", 178.12, 184.76, 0.25)])]
+    out = trim_unvoiced_edges(line, regions)
+    assert out[0][2][0][1] == 111.85 and out[0][0] == 111.85
+    assert out[1][2][-1][2] == 180.05 and out[1][1] == 180.05

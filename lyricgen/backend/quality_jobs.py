@@ -1274,6 +1274,35 @@ def _confirmed_windows(segments: list[dict], windows: list[dict],
     return unresolved, resolved
 
 
+def _persist_line_consensus_v2(job_id: str, segments: list, rows: list) -> None:
+    """Fase 5.2: el agreement por línea del consenso dirigido, solo escritura.
+
+    Va al AuditLog (append-only) y no a ``transcription_quality``, que varias
+    rutas reescriben enteras. Ligado al ``segments_hash`` que se evaluó.
+    """
+    if not rows:
+        return
+    try:
+        from database import AuditLog, SessionLocal
+        from line_signals_v2 import SCHEMA
+        from transcription_quality import segments_hash
+
+        db = SessionLocal()
+        try:
+            db.add(AuditLog(user_id=None, action="evidence.line_consensus_v2", detail={
+                "job_id": str(job_id),
+                "schema": SCHEMA,
+                "segments_hash": segments_hash(segments),
+                "lines": rows[:500],
+            }))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
+        logger.warning("[LINE_SIGNALS_V2] consenso sin persistir job=%s: %s",
+                       job_id, type(exc).__name__)
+
+
 def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                                   expected_segments_hash: str,
                                   filename: str = "",
@@ -1497,6 +1526,10 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 )
                 raw_proposal_windows = list(
                     provider_stats.pop("quality_proposal_windows", []) or []
+                )
+                _persist_line_consensus_v2(
+                    job_id, snapshot["segments"],
+                    provider_stats.pop("line_consensus_v2", []) or [],
                 )
                 retry_stats.update(provider_stats)
                 retry_stats["artist_lexicon_terms"] = int(

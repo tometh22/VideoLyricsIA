@@ -64,7 +64,9 @@ def test_missing_gemini_candidate_continues_as_manual_review_marker():
     assert hypothesis["review_status"] == "manual_full_review_required"
 
 
-def _recoverable_machine_evidence(*, audio_sha256="e" * 64, audio_revision=2):
+def _recoverable_machine_evidence(*, audio_sha256="e" * 64, audio_revision=2,
+                                 view="full_audio_with_reference",
+                                 transformation="gemini_cleanup_raw"):
     segments = [{"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"}]
     quality = {
         "pipeline_release": "release-sha",
@@ -79,8 +81,8 @@ def _recoverable_machine_evidence(*, audio_sha256="e" * 64, audio_revision=2):
             "kind": "text",
             "events": [{"text": "Hola\nmundo"}],
             "attempt_id": 0,
-            "view": "full_audio_with_reference",
-            "transformation": "gemini_cleanup_raw",
+            "view": view,
+            "transformation": transformation,
         }],
     })
     return segments, finalize_machine_evidence(
@@ -127,3 +129,19 @@ def test_missing_reference_recovery_refuses_tampered_or_wrong_audio_evidence():
         audio_sha256="f" * 64,
         audio_revision=2,
     ) == (None, "reference_recovery_audio_mismatch")
+
+
+def test_audio_only_full_recording_reference_can_be_recovered():
+    segments, evidence = _recoverable_machine_evidence(
+        view="full_audio_without_reference",
+        transformation="gemini_reference_hypothesis_raw",
+    )
+    hypothesis, reason = recover_from_machine_evidence(
+        evidence, original_segments=segments,
+        audio_sha256="e" * 64, audio_revision=2,
+    )
+    assert reason == "ok"
+    assert hypothesis["reference_text"] == "Hola\nmundo"
+    assert validate_binding(
+        hypothesis, audio_sha256="e" * 64, audio_revision=2,
+    ) == (True, "ok")

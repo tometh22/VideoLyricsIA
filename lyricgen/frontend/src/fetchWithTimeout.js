@@ -11,24 +11,13 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 
 export async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const externalSignal = opts.signal;
-  const abortFromCaller = () => controller.abort();
-  if (externalSignal) {
-    if (externalSignal.aborted) controller.abort();
-    else externalSignal.addEventListener("abort", abortFromCaller, { once: true });
-  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     // Transport helper: callers own the endpoint-specific status policy.
     // fetch-no-check-ok — deliberately return the raw Response.
     return await fetch(url, { ...opts, signal: controller.signal });
   } catch (err) {
     if (err && err.name === "AbortError") {
-      if (!timedOut && externalSignal?.aborted) throw err;
       const e = new Error("timeout");
       e.name = "TimeoutError";
       throw e;
@@ -36,6 +25,5 @@ export async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEO
     throw err;
   } finally {
     clearTimeout(timer);
-    externalSignal?.removeEventListener("abort", abortFromCaller);
   }
 }

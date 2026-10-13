@@ -7,14 +7,15 @@ be gated.  Observe mode is deliberately non-blocking.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+from uuid import uuid4
 from typing import Any, Mapping, Sequence
 
 from delivery_media_qc import inspect_delivery_media
-from delivery_ocr import inspect_rendered_text
+from delivery_ocr import inspect_rendered_text, select_identity_observation
 from delivery_preflight import build_delivery_preflight, frame_timecode
 
 
@@ -109,6 +110,83 @@ def effective_delivery_qc_mode() -> str:
     return mode if mode in {"off", "observe", "enforce"} else "off"
 
 
+def _staging_umg_campaign_review_bypass_enabled(job: Any) -> bool:
+    """Existing campaign-scoped review bypass, also used by preflight bypass."""
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    if os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    campaign_id = str(getattr(job, "campaign_id", "") or "").strip()
+    allowed_campaigns = {
+        value.strip()
+        for value in os.environ.get(
+            "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "",
+        ).split(",")
+        if value.strip()
+    }
+    expires_at_raw = os.environ.get(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "",
+    ).strip()
+    try:
+        expires_at = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None or datetime.now(timezone.utc) >= expires_at:
+        return False
+    return bool(campaign_id and campaign_id in allowed_campaigns)
+
+
+def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
+    """Skip manual reminders in staging for an expiring campaign or job scope.
+
+    The job scope is deliberately separate from the legacy campaign scope:
+    enabling it must not inherit that campaign's broader preflight bypass.
+    Fresh QC and objective FAIL checks remain mandatory for the job scope.
+    """
+    if _staging_umg_campaign_review_bypass_enabled(job):
+        return True
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    if os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    try:
+        scope = json.loads(os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_JOB_SCOPE", ""))
+        campaign_id = str(scope["campaign_id"]).strip()
+        job_ids = scope["job_ids"]
+        expires_at = datetime.fromisoformat(str(scope["until_utc"]).replace("Z", "+00:00"))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+    if not isinstance(job_ids, list) or not 1 <= len(job_ids) <= 5:
+        return False
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None or not now < expires_at <= now + timedelta(hours=2):
+        return False
+    return bool(
+        campaign_id
+        and campaign_id == str(getattr(job, "campaign_id", "") or "").strip()
+        and str(getattr(job, "job_id", "") or "").strip() in job_ids
+    )
+
+
+def staging_umg_preflight_bypass_enabled(job: Any) -> bool:
+    """Opt into skipping the UMG preflight gate for one staging campaign.
+
+    This broader emergency bypass requires the existing campaign allowlist and
+    expiry, plus its own explicit switch. It never affects production or other
+    campaigns. Independent approval/publication requirements remain enforced
+    by their owning routes.
+    """
+    if not _staging_umg_campaign_review_bypass_enabled(job):
+        return False
+    return os.environ.get("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def segments_hash(segments: Sequence[Mapping[str, Any]]) -> str:
     from transcription_quality import segments_hash as quality_segments_hash
     return quality_segments_hash([dict(row) for row in segments if isinstance(row, Mapping)])
@@ -147,22 +225,56 @@ def _normalise_issue(issue: Mapping[str, Any], *, fps: float) -> dict[str, Any]:
     return row
 
 
-def _merge_prior_decisions(issues: list[dict[str, Any]], previous: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+def _merge_prior_decisions(
+    issues: list[dict[str, Any]], previous: Mapping[str, Any] | None,
+    *, artifact_sha256: str | None = None, input_identity: dict | None = None,
+    same_source: bool | None = None, same_visual: bool | None = None,
+) -> list[dict[str, Any]]:
     prior = {
         str(row.get("issue_id")): row
         for row in ((previous or {}).get("issues") or []) if isinstance(row, Mapping)
     }
+    # Preserve decisions when rechecking exactly the same artifact and inputs,
+    # never merely because the detector's issue ID stayed the same. Legacy
+    # reports without this evidence cannot attest a new/rebuilt render.
+    same_artifact = bool(
+        artifact_sha256 and (previous or {}).get("artifact_sha256") == artifact_sha256
+    )
     for issue in issues:
-        # A human visual/timing attestation is for one concrete render. Never
-        # inherit it into a rebuilt report, even when the stable check id is
-        # unchanged after a re-render.
-        if issue.get("manual_verification_required"):
+        if not same_artifact:
             continue
         old = prior.get(str(issue.get("issue_id")))
-        if old and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
+        is_manual = bool(issue.get("manual_verification_required"))
+        same_inputs = bool(input_identity and (previous or {}).get("input_identity") == input_identity)
+        if (is_manual and same_visual is False) or (not is_manual and (same_source is False or not same_inputs)):
+            continue
+        if is_manual and old and old.get("status") == "RESOLVED_MANUAL":
+            decision = old.get("operator_decision")
+            if not isinstance(decision, Mapping) or decision.get("decision") != "resolved_manual" or not decision.get("user_id"):
+                continue
+        # A human cannot waive an objective FAIL. It must disappear from the
+        # freshly inspected render before publication can continue.
+        if _issue_result_status(issue) == "FAIL" and issue.get("blocking", True):
+            continue
+        ignored = {'status', 'operator_decision'}
+        same_finding = old and {k: v for k, v in old.items() if k not in ignored} == {
+            k: v for k, v in issue.items() if k not in ignored}
+        if same_finding and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
             issue["status"] = old["status"]
             issue["operator_decision"] = deepcopy(old.get("operator_decision") or {})
     return issues
+
+
+def _artifact_sha256(video_path: str) -> str | None:
+    """Stream the local QC input; missing evidence never preserves a waiver."""
+    try:
+        digest = hashlib.sha256()
+        with open(video_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _issue_result_status(issue: Mapping[str, Any]) -> str:
@@ -227,14 +339,23 @@ def _build_check_results(
             status, reason = "NOT_RUN", "No hubo texto de title card para comparar."
         elif check_id == "metadata_artist" and not matched and not rendered.get("rendered_artist"):
             status, reason = "NOT_RUN", "No hubo texto de artista para comparar."
+        elif check_id == "metadata_version" and not matched and not spec.get("version"):
+            status, reason = "NOT_APPLICABLE", "La especificación de entrega no exige una versión visible."
         elif check_id == "metadata_version" and not matched and not rendered.get("rendered_version"):
-            status, reason = "NOT_RUN", "El render no informa una versión visible para comparar."
+            status, reason = "NOT_RUN", "La especificación exige versión, pero no hay evidencia visible para compararla."
         elif check_id in {"ocr_title", "ocr_lyrics"}:
             kinds = {"title"} if check_id == "ocr_title" else {"lyric"}
-            has_kind = any(str(row.get("kind")) in kinds for row in ocr_observations)
-            if not has_kind and not matched:
+            qualified = []
+            for row in ocr_observations:
+                try:
+                    confidence = float(row.get("confidence") or 0)
+                except (TypeError, ValueError):
+                    confidence = 0
+                if str(row.get("kind")) in kinds and str(row.get("text") or "").strip() and confidence >= .92:
+                    qualified.append(row)
+            if not qualified and not matched:
                 status = "NOT_RUN"
-                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "Sin observación OCR aplicable")
+                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "OCR sin texto legible con confianza suficiente")
         elif check_id == "lyrics_quality" and not quality_verdict and not matched:
             # Deterministic timeline/text checks still ran, but the upstream
             # quality verdict itself was not supplied by the transcription
@@ -257,6 +378,12 @@ def _build_check_results(
         })
 
     for code, summary, description in MANDATORY_REVIEW_CHECKS:
+        # The title metadata check is already represented by the evidence-based
+        # ``metadata_title`` result above. Keeping the generic UMG reminder in
+        # this checklist produced two rows with the same label and confused
+        # reviewers about which one was authoritative.
+        if code == "UMG_TITLE_METADATA":
+            continue
         matched = [row for row in rows if row.get("code") == code]
         # These are always present for batch reports.  Their REVIEW status is
         # intentional: they are awaiting an operator's visual attestation,
@@ -292,7 +419,7 @@ def refresh_check_results(report: Mapping[str, Any]) -> dict[str, Any]:
         "total": len(checks),
         **{
             status.lower(): sum(item.get("status") == status for item in checks)
-            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN", "NOT_APPLICABLE")
         },
     }
     row["check_summary"] = check_summary
@@ -301,19 +428,36 @@ def refresh_check_results(report: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
-def approval_gate(report: Mapping[str, Any] | None, mode: str | None = None) -> dict[str, Any]:
+def approval_gate(
+    report: Mapping[str, Any] | None,
+    mode: str | None = None,
+    *,
+    require_manual_review: bool = False,
+) -> dict[str, Any]:
     actual_mode = mode or effective_delivery_qc_mode()
+    if require_manual_review:
+        actual_mode = "enforce"
     if actual_mode != "enforce":
         return {"blocked": False, "can_approve": True, "reason": "observe_only"}
-    if not report or report.get("status") in {"STALE", "RUNNING", "FAILED"}:
+    if not report or report.get("status") != "COMPLETE":
         return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
     open_rows = [row for row in report.get("issues") or [] if row.get("status") == "OPEN"]
-    open_fail = [row for row in open_rows if _issue_result_status(row) == "FAIL" and row.get("blocking", True)]
-    if open_fail:
+    blocking_fail = [
+        row for row in report.get("issues") or []
+        if _issue_result_status(row) == "FAIL" and row.get("blocking", True)
+    ]
+    if blocking_fail:
         return {
             "blocked": True, "can_approve": False,
-            "reason": "open_fail", "issue_ids": [row["issue_id"] for row in open_fail],
+            "reason": "open_fail", "issue_ids": [row["issue_id"] for row in blocking_fail if row.get("issue_id")],
         }
+    review = [row for row in open_rows if _issue_result_status(row) == "REVIEW" and row.get("blocking")]
+    if require_manual_review:
+        manual = [row for row in report.get("issues") or [] if row.get("manual_verification_required") or str(row.get("code") or "") in LEGACY_MANUAL_CHECK_CODES]
+        missing = sorted(LEGACY_MANUAL_CHECK_CODES - {str(row.get("code") or "") for row in manual})
+        pending = [row for row in manual if row.get("status") != "RESOLVED_MANUAL" or not isinstance(row.get("operator_decision"), Mapping) or row["operator_decision"].get("decision") != "resolved_manual" or not row["operator_decision"].get("user_id")]
+        if review or missing or pending:
+            return {"blocked": True, "can_approve": False, "reason": "manual_review_required" if not review else "review_required", "issue_ids": [row["issue_id"] for row in (review + pending) if row.get("issue_id")], "missing_checks": missing}
     open_review = [row for row in open_rows if _issue_result_status(row) == "REVIEW"]
     if open_review:
         return {
@@ -322,6 +466,126 @@ def approval_gate(report: Mapping[str, Any] | None, mode: str | None = None) -> 
             "issue_ids": [row["issue_id"] for row in open_review],
         }
     return {"blocked": False, "can_approve": True, "reason": "all_findings_resolved"}
+
+
+def is_umg_delivery_job(job: Any) -> bool:
+    keys = getattr(job, "s3_keys", None)
+    keys = keys if isinstance(keys, Mapping) else {}
+    return (
+        str(getattr(job, "delivery_profile", "") or "").lower() in {"umg", "both"}
+        or bool(getattr(job, "umg_spec", None))
+        or bool(getattr(job, "prores_ready", False))
+        or bool(keys.get("umg_master") or keys.get("umg_short"))
+        or str(getattr(job, "workload_class", "interactive") or "interactive") == "batch"
+    )
+
+
+def qc_input_fingerprint(job: Any) -> str:
+    return delivery_qc_source_fingerprint(job)
+
+
+def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def delivery_qc_visual_fingerprint(job: Any) -> str:
+    return _stable_fingerprint({
+        "job_id": getattr(job, "job_id", None),
+        "segments_revision": getattr(job, "segments_revision", 0),
+        "segments_hash": segments_hash(getattr(job, "segments_json", None) or []),
+        "edit_count": getattr(job, "edit_count", 0),
+        "completed_at": getattr(job, "completed_at", None),
+        "artist": getattr(job, "artist", None), "title": getattr(job, "song_title", None),
+        "render_params": getattr(job, "render_params", None),
+        "scene_plan": getattr(job, "scene_plan", None),
+        "background_key": getattr(job, "background_key", None),
+    })
+
+
+def delivery_qc_source_fingerprint(job: Any) -> str:
+    return _stable_fingerprint({
+        "visual": delivery_qc_visual_fingerprint(job),
+        "audio_revision": getattr(job, "audio_revision", 0),
+        "audio_sha256": getattr(job, "input_audio_sha256", None),
+        "spec": getattr(job, "umg_spec", None),
+        "quality": getattr(job, "transcription_quality", None),
+        "filename": getattr(job, "filename", None),
+        "workload_class": getattr(job, "workload_class", "interactive"),
+        "mode": effective_delivery_qc_mode(),
+    })
+
+
+def staging_delivery_gates_off() -> bool:
+    """Staging-only kill switch: delivery QC/preflight never blocks anything.
+
+    Staging writes to the live portal database, so this is an explicit,
+    reversible operator decision (env var), never a code default, and it is
+    inert anywhere ENVIRONMENT is not exactly "staging" (production included).
+    Reports are still generated and shown; they just stop gating.
+    """
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    return os.environ.get("DELIVERY_QC_STAGING_GATES_OFF", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def delivery_gates_off_reason() -> str | None:
+    """Why the delivery QC/preflight gate is switched off right now, or None.
+
+    * ``DELIVERY_QC_GATES_OFF`` works in ANY environment, production included. It
+      exists so a promotion can keep the behaviour production had before this
+      gate existed, until the QC redesign is ready. It is an explicit operator
+      decision (env var, default off), reported in /health, never a code default.
+    * ``DELIVERY_QC_STAGING_GATES_OFF`` is the older switch and only acts when
+      ENVIRONMENT is exactly "staging".
+
+    Reports are still generated and shown; they just stop gating.
+    """
+    if os.environ.get("DELIVERY_QC_GATES_OFF", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "delivery_gates_off"
+    if staging_delivery_gates_off():
+        return "staging_delivery_gates_off"
+    return None
+
+
+def delivery_gates_off() -> bool:
+    return delivery_gates_off_reason() is not None
+
+
+def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_umg_delivery: bool = False) -> dict[str, Any]:
+    gates_off = delivery_gates_off_reason()
+    if gates_off:
+        return {
+            "blocked": False, "can_approve": True,
+            "reason": gates_off,
+            "gates_off": True,
+            "staging_gates_off": gates_off == "staging_delivery_gates_off",
+            "staging_preflight_bypass": True,
+            "staging_manual_review_bypass": True,
+        }
+    required = for_umg_delivery or is_umg_delivery_job(job)
+    if required and staging_umg_preflight_bypass_enabled(job):
+        return {
+            "blocked": False, "can_approve": True,
+            "reason": "staging_preflight_bypass",
+            "staging_preflight_bypass": True,
+            "staging_manual_review_bypass": True,
+        }
+    if required:
+        if str(getattr(job, "status", "")) not in {"pending_review", "done", "rejected"} or not report or report.get("status") != "COMPLETE":
+            return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
+        if report.get("source_fingerprint") != delivery_qc_source_fingerprint(job):
+            return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
+    bypass_manual_review = required and staging_umg_manual_review_bypass_enabled(job)
+    gate = approval_gate(
+        report, "enforce" if required else None,
+        require_manual_review=required and not bypass_manual_review,
+    )
+    if bypass_manual_review:
+        normal_gate = approval_gate(report, "enforce", require_manual_review=True)
+        if normal_gate.get("blocked") and not gate.get("blocked"):
+            gate["staging_manual_review_bypass"] = True
+            gate["reason"] = "staging_manual_review_bypass"
+    return gate
 
 
 def mark_delivery_qc_stale(report: Mapping[str, Any] | None, *, revision: int, reason: str) -> dict[str, Any]:
@@ -343,8 +607,10 @@ def build_runtime_report(
     segments: Sequence[Mapping[str, Any]],
     previous: Mapping[str, Any] | None = None,
     ocr_callback=None,
+    mode_override: str | None = None,
 ) -> dict[str, Any]:
-    mode = (
+    artifact_before = _artifact_sha256(video_path)
+    mode = mode_override or (
         "enforce" if getattr(job, "workload_class", "interactive") == "batch"
         else effective_delivery_qc_mode()
     )
@@ -355,23 +621,37 @@ def build_runtime_report(
     except (TypeError, ValueError):
         pass
     spec = dict(job.umg_spec or {}) if isinstance(job.umg_spec, Mapping) else {}
+    umg_ocr_enabled = None
+    if is_umg_delivery_job(job):
+        umg_ocr_enabled = os.environ.get("DELIVERY_QC_UMG_OCR_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
     media = inspect_delivery_media(video_path, expected_duration=duration, expected={
         key: spec.get(key) for key in ("width", "height", "fps", "codec", "pix_fmt") if spec.get(key) is not None
     })
     ocr = inspect_rendered_text(
         video_path, metadata={"artist": job.artist, "title": job.song_title},
-        segments=segments, ocr_callback=ocr_callback,
+        segments=segments, ocr_callback=ocr_callback, enabled=umg_ocr_enabled,
     )
-    title_ocr = next((row for row in ocr.get("observations") or [] if row.get("kind") == "title" and row.get("text")), None)
-    artist_ocr = next((row for row in ocr.get("observations") or [] if row.get("kind") == "artist" and row.get("text")), None)
+    ocr_observations = ocr.get("observations") or []
+    title_ocr = select_identity_observation(
+        ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="title",
+    )
+    artist_ocr = select_identity_observation(
+        ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="artist",
+    )
+    def trusted_ocr_text(observation):
+        if not isinstance(observation, Mapping) or not str(observation.get("text") or "").strip():
+            return None
+        try:
+            confidence = float(observation.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return None
+        return str(observation["text"]).strip() if confidence >= .92 else None
     fps = float((media.get("probe") or {}).get("video", {}).get("fps") or spec.get("fps") or 30)
     base = build_delivery_preflight(
         metadata={"artist": job.artist, "title": job.song_title},
         segments=segments, approved_lyrics=None, reference_trusted=False,
         asset={
             "filename": job.filename, "duration": (media.get("probe") or {}).get("duration") or duration,
-            "rendered_title": (title_ocr or {}).get("text"),
-            "rendered_artist": (artist_ocr or {}).get("text"),
         },
         quality=quality, fps=fps,
     )
@@ -415,18 +695,40 @@ def build_runtime_report(
     for item in all_rows:
         row = _normalise_issue(item, fps=fps)
         deduped[row["issue_id"]] = row
-    issues = _merge_prior_decisions(list(deduped.values()), previous)
+    artifact_sha256 = _artifact_sha256(video_path)
+    if artifact_sha256 != artifact_before:
+        raise RuntimeError('delivery_qc_artifact_changed')
+    input_identity = {
+        "segments_hash": current_hash,
+        "segments_revision": int(job.segments_revision or 0),
+        "audio_revision": int(getattr(job, "audio_revision", 0) or 0),
+        "audio_sha256": str(getattr(job, "input_audio_sha256", "") or ""),
+        "artist": job.artist, "title": job.song_title, "spec": spec,
+        "quality": deepcopy(quality), "filename": getattr(job, 'filename', None),
+        "mode": mode, "qc_schema": SCHEMA_VERSION,
+    }
+    job_input_fingerprint = qc_input_fingerprint(job)
+    source_fingerprint = delivery_qc_source_fingerprint(job)
+    visual_fingerprint = delivery_qc_visual_fingerprint(job)
+    issues = _merge_prior_decisions(list(deduped.values()), previous,
+        artifact_sha256=artifact_sha256, input_identity=input_identity,
+        same_source=bool(previous and previous.get("source_fingerprint") == source_fingerprint),
+        same_visual=bool(previous and previous.get("visual_fingerprint") == visual_fingerprint))
     issues.sort(key=lambda row: ({"FAIL": 0, "WARN": 1}.get(row.get("severity"), 2), (row.get("seconds") or [0])[0]))
     checks = _build_check_results(
         issues=issues, media=media, ocr=ocr, quality=quality, spec=spec,
-        rendered={"rendered_title": (title_ocr or {}).get("text"),
-                  "rendered_artist": (artist_ocr or {}).get("text")},
+        # OCR is pixel evidence, not a deterministic render manifest. The OCR
+        # checks above remain visible; absent manifest metadata is NOT_RUN.
+        rendered={
+            "rendered_title": trusted_ocr_text(title_ocr),
+            "rendered_artist": trusted_ocr_text(artist_ocr),
+        },
     )
     check_summary = {
         "total": len(checks),
         **{
             status.lower(): sum(row.get("status") == status for row in checks)
-            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN", "NOT_APPLICABLE")
         },
     }
     open_rows = [row for row in issues if row.get("status") == "OPEN"]
@@ -442,9 +744,15 @@ def build_runtime_report(
     blocking_checks = [row for row in checks if row.get("blocking") and row.get("status") in {"FAIL", "REVIEW"}]
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "mode": mode, "status": "COMPLETE",
+        "report_id": uuid4().hex,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "segments_revision": int(job.segments_revision or 0),
         "segments_hash": current_hash,
+        "artifact_sha256": artifact_sha256,
+        "input_identity": input_identity,
+        "job_input_fingerprint": job_input_fingerprint,
+        "source_fingerprint": source_fingerprint,
+        "visual_fingerprint": visual_fingerprint,
         "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
         "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
         "summary": summary, "check_summary": check_summary,
@@ -465,28 +773,62 @@ def build_runtime_report(
             "safe_action_ids": [str(row.get("action_id")) for row in repair_actions if row.get("status") == "APPLIED"],
         },
     }
-    report["approval"] = approval_gate(report, mode)
+    report["approval"] = delivery_readiness_gate(
+        job, report,
+        for_umg_delivery=(mode_override == "enforce" or is_umg_delivery_job(job)),
+    )
     return report
 
 
-def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> dict[str, Any] | None:
+def qc_input_identity(job):
+    from delivery_freshness import render_fingerprint
+    return (render_fingerprint(job), getattr(job, "segments_revision", 0),
+            segments_hash(getattr(job, "segments_json", None) or []), getattr(job, "audio_revision", 0),
+            getattr(job, "input_audio_sha256", None), deepcopy(getattr(job, "umg_spec", None)), getattr(job, "artist", None), getattr(job, "song_title", None),
+            deepcopy(getattr(job, "transcription_quality", None)), getattr(job, "filename", None), getattr(job, "workload_class", "interactive"),
+            (getattr(job, "s3_keys", None) or {}).get('video') if isinstance(getattr(job, "s3_keys", None), dict) else None,
+            effective_delivery_qc_mode())
+
+
+def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
+                            expected_input=None, expected_source_fingerprint=None,
+                            mode_override=None, force=False) -> dict[str, Any] | None:
     """Run and persist QC from a render worker. Never raises in observe mode."""
     from database import Job, SessionLocal
+    from types import SimpleNamespace
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
         if job is None:
             return None
+        if expected_input is not None and qc_input_identity(job) != expected_input:
+            raise RuntimeError('delivery_qc_input_changed')
+        if expected_source_fingerprint is not None and delivery_qc_source_fingerprint(job) != expected_source_fingerprint:
+            return None
         # Contractual batch QC cannot be disabled by the global interactive
         # rollout flag. Interactive jobs retain the existing off switch.
-        if (
+        if not force and mode_override is None and (
             str(job.workload_class or "interactive") != "batch"
             and effective_delivery_qc_mode() == "off"
         ):
             return None
         rows = list(segments if segments is not None else (job.segments_json or []))
-        previous = job.delivery_qc if isinstance(job.delivery_qc, Mapping) else None
-        report = build_runtime_report(job=job, video_path=video_path, segments=rows, previous=previous)
+        previous = deepcopy(job.delivery_qc) if isinstance(job.delivery_qc, Mapping) else None
+        expected = qc_input_identity(job)
+        snapshot = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
+            'artist', 'song_title', 'filename', 'status', 'umg_spec', 'segments_revision',
+            'edit_count', 'transcription_quality', 'workload_class',
+            'audio_revision', 'input_audio_sha256', 'delivery_profile', 'prores_ready',
+            's3_keys', 'segments_json', 'render_params', 'scene_plan', 'background_key',
+            'job_id', 'previous_versions', 'completed_at')})
+        db.rollback()
+        report = build_runtime_report(job=snapshot, video_path=video_path, segments=rows, previous=previous, mode_override=mode_override)
+        job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+        if job is None or expected != qc_input_identity(job):
+            raise RuntimeError('delivery_qc_input_changed')
+        if job.delivery_qc != previous:
+            # A concurrent human decision/recheck wins over this stale run.
+            raise RuntimeError('delivery_qc_review_changed')
         job.delivery_qc = report
         db.commit()
         return report

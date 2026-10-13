@@ -142,7 +142,7 @@ def test_quality_worker_connectivity_gate_reports_each_dependency_without_secret
     assert all("secret" not in error for error in errors)
 
 
-def test_quality_worker_connectivity_checks_enabled_provider_auth_without_cost():
+def test_quality_worker_connectivity_keeps_optional_asr_outage_nonfatal():
     env = {
         "REDIS_URL": "redis://queue",
         "QUALITY_CACHE_REDIS_URL": "redis://cache",
@@ -157,10 +157,7 @@ def test_quality_worker_connectivity_checks_enabled_provider_auth_without_cost()
         replicate_probe=lambda token: seen.append(("replicate", token)) or False,
         openai_probe=lambda token: seen.append(("openai", token)) or False,
     )
-    assert errors == [
-        "vocal_separator_provider_unreachable",
-        "targeted_asr_provider_unreachable",
-    ]
+    assert errors == ["vocal_separator_provider_unreachable"]
     assert seen == [
         ("replicate", "replicate-secret"), ("openai", "openai-secret"),
     ]

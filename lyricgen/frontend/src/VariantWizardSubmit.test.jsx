@@ -86,6 +86,7 @@ const review = () => ({
   effect: "snow",
   lyricsAnimation: "karaoke",
   lineTransition: "slide_up",
+  lyricLook: "pincel",
   font: "bebas-neue",
   fontScale: "1.25",
   textCase: "title",
@@ -143,6 +144,7 @@ describe("buildVariantPayload", () => {
       effect: "snow",
       lyrics_animation: "karaoke",
       line_transition: "slide_up",
+      lyric_look: "pincel",
       // tipografía
       font: "bebas-neue",
       font_scale: 1.25,
@@ -188,6 +190,8 @@ describe("buildVariantPayload", () => {
       bg_verbatim: false,
       lyrics_animation: "none",
       line_transition: "none",
+      // "" = la variante va sin look aunque el padre tuviera uno.
+      lyric_look: "",
       text_case: "upper",
       text_contrast: "medium",
       frame_format: "full",

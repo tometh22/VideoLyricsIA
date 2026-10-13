@@ -1,22 +1,32 @@
 // Workspace operativo de pedidos de cambio de UMG
 // (delivery_change_requests). Una cola compacta mantiene el contexto y el
-// panel de detalle guía el caso por cinco etapas: interpretar, aplicar,
-// renderizar, revisar y publicar. El pedido seleccionado queda en la URL
-// para que el editor pueda devolver al operador al mismo punto del flujo.
+// panel de detalle guía el caso por tres pasos (corregir, generar el video
+// nuevo, publicar) con UNA acción principal por estado. El pedido
+// seleccionado queda en la URL para que el editor pueda devolver al operador
+// al mismo punto del flujo.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
+
+const fmtDateTime = (value) => value
+  ? new Date(value).toLocaleString("es-AR", { dateStyle: "medium", timeStyle: "short" })
+  : "Sin fecha";
 import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
+import { byPublicationMode, byRowMode } from "./publicationMode";
+import { ClientVisibilityControl } from "./ClientVisibility";
+import PublishedRequestChecklist from "./PublishedRequestChecklist";
 import {
   PORTAL_LABELS,
+  correctionSteps,
   requestSearchText,
   requestWorkflow,
+  workflowAllows,
   workflowMatchesFilter,
 } from "./changeRequestWorkflow";
 
@@ -38,21 +48,24 @@ export function publicationStatus(publication) {
   if (!publication) {
     return {
       tone: "idle",
-      title: "Sin publicación activa en el portal",
-      detail: "Esta entrega no está publicada o fue dada de baja.",
+      title: "Publicación por verificar",
+      detail: "No tenemos datos suficientes para confirmar la versión del portal. Actualizá el pedido.",
       canPublish: false,
     };
   }
-  const revision = publication.revision || 1;
+  const revision = publication.revision;
   const prores = publication.prores_pending || [];
 
   if (BUSY_JOB_STATUSES.has(publication.job_status)) {
     return {
       tone: "busy",
       title: "Re-renderizando",
-      detail:
-        "Mientras tanto el portal sigue entregando la versión anterior. " +
-        "Cuando termine, publicá la actualización desde acá.",
+      detail: byRowMode(publication, {
+        snapshot: "Mientras tanto el portal sigue entregando la versión anterior. " +
+          "Cuando termine, publicá la actualización desde acá.",
+        pointer: "El cliente no ve este video hasta que lo publiques (salvo que esté “Siempre visible”). " +
+          "Cuando termine, publicá la actualización desde acá para registrar la versión.",
+      }),
       canPublish: false,
     };
   }
@@ -67,9 +80,9 @@ export function publicationStatus(publication) {
         title: "Hay que elegir el formato del archivo profesional",
         detail:
           "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
-          "Elegilos una vez para generar el .mov del último render. Esto no aplica cambios de letra pendientes.",
+          "Elegilos una vez: generamos el .mov del último render y publicamos el video corregido. Esto no aplica cambios de letra pendientes.",
         canPublish: true,
-        publishLabel: "Elegir formato y actualizar .mov",
+        publishLabel: "Elegir formato y publicar",
         needsProResSetup: true,
       };
     }
@@ -78,21 +91,28 @@ export function publicationStatus(publication) {
       title: "Falta actualizar el archivo profesional (.mov)",
       detail:
         "El archivo profesional está pendiente respecto del último render. " +
-        "Actualizar el .mov no renderiza cambios de letra pendientes ni publica en el portal.",
+        "Al publicar se prepara solo (unos minutos) y el video sale cuando termine; no renderiza cambios de letra pendientes.",
       canPublish: true,
-      publishLabel: "Actualizar archivo profesional",
+      publishLabel: "Publicar en el portal y dar por resuelto",
     };
   }
   if (publication.needs_publish) {
     return {
       tone: "warn",
       title: "El render nuevo está listo para revisar",
-      detail:
-        "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
-        "entregando el corte anterior hasta que publiques la actualización.",
+      detail: byRowMode(publication, {
+        snapshot: "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
+          "entregando el corte anterior hasta que publiques la actualización.",
+        pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”): " +
+          "publicá para registrar la versión nueva y dar por resuelto el pedido.",
+      }),
       canPublish: true,
-      publishLabel: "Publicar actualización",
+      publishLabel: "Publicar en el portal y dar por resuelto",
     };
+  }
+  if (!Number.isInteger(revision) || revision < 1) {
+    return { tone: "idle", title: "Publicación por verificar",
+      detail: "El servidor no confirmó una revisión publicada. No significa que el portal esté actualizado.", canPublish: false };
   }
   if (publication.awaiting_review) {
     return {
@@ -113,7 +133,9 @@ export function publicationStatus(publication) {
   return {
     tone: "ok",
     title: `Versión ${revision} publicada`,
-    detail: "El portal está entregando este mismo corte.",
+    detail: publication.render_matches_editor === true
+      ? "La revisión publicada coincide con el corte según el registro de entrega."
+      : "Existe una publicación registrada; falta confirmar si coincide con el corte actual.",
     canPublish: false,
   };
 }
@@ -152,9 +174,11 @@ export default function ChangeRequestsPanel({
   crLoading,
   crResolvingId,
   resolveChangeRequest,
+  confirmChangeRequestPublication,
   reopenChangeRequest,
   crPublishingId,
   crPublishNotice,
+  reconcilePublication,
   dismissPublishNotice,
   publishDeliveryUpdate,
   prepareProRes = () => {},
@@ -170,6 +194,9 @@ export default function ChangeRequestsPanel({
   regenerateBackground = () => {},
   onProResConfigured = () => {},
   reviewForRender = () => {},
+  refreshChangeRequests = () => {},
+  visibilityBusyId = null,
+  setDeliveryVisibility = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -183,12 +210,12 @@ export default function ChangeRequestsPanel({
     return params.get("change_request_id") || params.get("request");
   }, []);
   const [selectedId, setSelectedId] = useState(initialRequestId);
-  const [returnNotice, setReturnNotice] = useState(() => {
-    if (typeof window === "undefined") return null;
-    return new URLSearchParams(window.location.search).get("render_submitted") === "1"
-      ? "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques."
-      : null;
-  });
+  // Only the FACT is stored; the wording depends on the publication mode, which
+  // the list load sets after this first render, so it is chosen when rendering.
+  const [returnNotice, setReturnNotice] = useState(() => (
+    typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("render_submitted") === "1"
+  ));
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -268,10 +295,6 @@ export default function ChangeRequestsPanel({
       });
       return;
     }
-    if (item.publication?.prores_pending?.length) {
-      prepareProRes(item.delivery?.job_id, item.id);
-      return;
-    }
     if (item.publication?.render_fingerprint && !window.confirm(
       `¿Revisaste el video y confirmás publicar esta actualización en UMG ${item.delivery?.portal_id === "chile" ? "Chile" : "Argentina"}? El pedido quedará resuelto en ese portal.`,
     )) return;
@@ -300,14 +323,22 @@ export default function ChangeRequestsPanel({
         <div role={crPublishNotice.tone === "error" ? "alert" : "status"} aria-label="Resultado del pedido"
           className="rounded-xl bg-sky-500/10 p-3 text-caption text-sky-100">
           Pedido #{crPublishNotice.requestId}: {crPublishNotice.text}
+          {crPublishNotice.outcomeUnknown && (
+            <button type="button" onClick={() => reconcilePublication?.(crPublishNotice.requestId)} className="ml-3 underline">
+              Consultar estado
+            </button>
+          )}
           <button type="button" onClick={dismissPublishNotice} className="ml-3 underline">Cerrar</button>
         </div>
       )}
 
       {returnNotice && (
         <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
-          <span>{returnNotice}</span>
-          <button type="button" onClick={() => setReturnNotice(null)} className="shrink-0 text-label opacity-70 hover:opacity-100">
+          <span>{byPublicationMode({
+            snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
+            pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”).",
+          })}</span>
+          <button type="button" onClick={() => setReturnNotice(false)} className="shrink-0 text-label opacity-70 hover:opacity-100">
             Cerrar
           </button>
         </div>
@@ -374,28 +405,33 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
+              onConfirmPublication={(confirmedItems) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems)}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
+              onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
+              onRefresh={() => refreshChangeRequests()}
+              visibilityBusy={visibilityBusyId != null && visibilityBusyId === selectedItem.delivery?.id}
+              onChangeVisibility={setDeliveryVisibility}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === selectedItem.id}
               proposal={proposalDetails[selectedItem.id] || null}
               onGenerateProposal={() => generateProposal(selectedItem.id)}
               onLoadProposal={() => loadProposal(selectedItem.id)}
-              onAdjustProposal={(proposalId, operationId, requestedText, baseRevision) =>
+              onAdjustProposal={(proposalId, operationId, requestedText, baseRevision, contentHash) =>
                 adjustProposal(
-                  selectedItem.id, proposalId, operationId, requestedText, baseRevision,
+                  selectedItem.id, proposalId, operationId, requestedText, baseRevision, contentHash,
                 )
               }
-              onApplyProposal={(proposalId, operationIds, baseRevision) =>
-                applyProposal(selectedItem.id, proposalId, operationIds, baseRevision)
+              onApplyProposal={(proposalId, operationIds, baseRevision, contentHash) =>
+                applyProposal(selectedItem.id, proposalId, operationIds, baseRevision, contentHash)
               }
               onDismissProposal={(proposalId) => dismissProposal(selectedItem.id, proposalId)}
-              onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode) =>
+              onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode, contentHash) =>
                 regenerateBackground(
                   selectedItem.id, proposalId, operationId, selectedItem.delivery?.job_id,
-                  prompt, backgroundMode,
+                  prompt, backgroundMode, contentHash,
                 )
               }
             />
@@ -412,14 +448,18 @@ export default function ChangeRequestsPanel({
         <EnableProResModal
           jobId={proResSetup.jobId}
           initialFrameSize={proResSetup.frameSize}
-          title="Configurar y actualizar el archivo profesional"
-          description="Elegí el formato que requiere Universal. Vamos a regenerar el .mov con el video corregido; todavía no se publicará en el portal."
-          submitLabel="Guardar formato y actualizar .mov"
+          title="Elegir el formato y publicar"
+          description="Elegí el formato que requiere Universal. Vamos a generar el archivo profesional del video corregido y publicarlo en el portal apenas esté listo."
+          submitLabel="Guardar formato y publicar"
           onClose={() => setProResSetup(null)}
           onSuccess={(data) => {
             const setup = proResSetup;
             setProResSetup(null);
             onProResConfigured(setup.requestId, data);
+            // The operator just asked for exactly this: keep going instead of
+            // stopping at "format saved" and making them press Publish again.
+            const item = changeRequests.find((row) => row.id === setup.requestId);
+            if (item) publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication);
           }}
         />
       )}
@@ -429,15 +469,33 @@ export default function ChangeRequestsPanel({
 
 function ChangeRequestCard({
   item, draft, onDraftChange, resolving, publishing, actionNotice,
-  onResolve, onReopen, onPublish, onReviewRender,
+  onResolve, onConfirmPublication, onReopen, onPublish, onPrepareOnly, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
-  onDismissProposal, onRegenerateBackground,
+  onDismissProposal, onRegenerateBackground, onRefresh,
+  visibilityBusy = false, onChangeVisibility,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
   const status = publicationStatus(item.publication);
   const workflow = requestWorkflow(item, proposal, proposalEnabled);
+  const qcGate = item.delivery_qc_gate;
+  const qcNeedsReview = !isResolved && qcGate?.blocked === true && (
+    Array.isArray(workflow.allowed_actions)
+      ? workflow.allowed_actions.some((action) => ["publish", "prepare_master"].includes(action))
+      : status.canPublish
+  );
+  const qcReviewHref = d.job_id
+    ? `/videos/${encodeURIComponent(d.job_id)}?qc_focus=${qcGate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(`/admin?section=cambios&change_request_id=${item.id}`)}`
+    : null;
+  const qcReviewLabel = qcGate?.reason === "fresh_preflight_required"
+    ? "Revisar este corte antes de publicar"
+    : "Completar revisión del video";
+  const qcReviewMessage = qcGate?.reason === "fresh_preflight_required"
+    ? "Este corte todavía no tiene una revisión al día. Abrilo, revisalo y después publicá."
+    : qcGate?.reason === "manual_review_required"
+      ? "Falta completar la revisión del video antes de publicar."
+      : "La revisión del video encontró puntos pendientes que hay que resolver antes de publicar.";
   const videoRef = useRef(null);
   const proposalRef = useRef(null);
   // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
@@ -456,47 +514,62 @@ function ChangeRequestCard({
   const editorUrl = editorUrlWithRequest(
     d.job_id, item.id, ["applied", "partially_applied"].includes(effectiveProposal?.status) ? effectiveProposal?.id : null,
   );
-  let primaryAction;
-  if (isResolved) {
-    primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
-  } else if (workflow.key === "analyze" && !effectiveProposal) {
-    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
-  } else if (status.canPublish) {
-    primaryAction = {
-      label: publishing
-        ? (item.publication?.prores_pending?.length ? "Solicitando actualización…" : "Publicando…")
-        : status.publishLabel || "Publicar actualización",
-      onClick: onPublish,
-      disabled: publishing,
-    };
-  } else if (workflow.key === "rendering") {
-    primaryAction = { label: "Generando corte nuevo…", disabled: true };
-  } else if (item.publication?.render_matches_editor && !item.publication?.needs_publish) {
-    primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving };
-  } else if (proposalEnabled && !effectiveProposal) {
-    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
-  } else if (["applied", "partially_applied"].includes(effectiveProposal?.status) && d.job_id) {
-    // The compact queue already carries the applied proposal id.  Do not make
-    // the operator reload the full diff just to enter the render step: that
-    // extra round-trip used to fall back to a request-only URL and lose the
-    // explicit render intent after a page refresh.
-    primaryAction = { label: "Revisar y confirmar render", onClick: onReviewRender, disabled: proposalBusy };
-  } else if (proposalEnabled && item.proposal && !proposal) {
-    primaryAction = { label: proposalBusy ? "Cargando…" : "Ver propuesta", onClick: onLoadProposal, disabled: proposalBusy };
-  } else if (["ready", "partial", "needs_input"].includes(proposal?.status)) {
-    primaryAction = {
-      label: "Revisar propuesta",
-      onClick: () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
-    };
-  } else if (d.job_id) {
-    primaryAction = { label: "Editar letra", href: editorUrl };
-  } else {
-    primaryAction = { label: "Sin acción disponible", disabled: true };
-  }
+
+  // UNA acción principal por estado y enlaces chicos debajo. Qué mostrar lo
+  // decide `correctionSteps` (puro y testeado); acá sólo se le conecta cada
+  // acción con su handler o su enlace.
+  const [closeOpen, setCloseOpen] = useState(false);
+  const closeRef = useRef(null);
+  // A different request, or this one resolved/reopened, never inherits an open form.
+  useEffect(() => { setCloseOpen(false); }, [item.id, isResolved]);
+  // Closing by publication needs every point of the request ticked against the
+  // cut. The checklist is keyed by the cut, so a new render starts it over.
+  const confirmsPublication = !isResolved && Array.isArray(workflow.allowed_actions)
+    && workflow.allowed_actions.includes("confirm_publication");
+  const [checklist, setChecklist] = useState({ ready: false, count: 0 });
+  const onChecklistChange = useCallback((ready, count) => setChecklist({ ready, count }), []);
+  const view = correctionSteps(workflow, {
+    isResolved,
+    hasJob: Boolean(d.job_id),
+    publication: item.publication,
+    status,
+    effectiveProposal,
+    loadedProposal: proposal,
+    summaryProposal: item.proposal,
+    proposalEnabled,
+    qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
+    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim(),
+      unchecked: confirmsPublication && !checklist.ready },
+  });
+  const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const primaryWiring = {
+    qc_review: { href: qcReviewHref },
+    edit: { href: editorUrl },
+    see_error: { href: editorUrl },
+    refresh: { onClick: onRefresh },
+    reopen: { onClick: onReopen },
+    publish: { onClick: onPublish },
+    prepare_master: { onClick: onPublish },
+    review_proposal: { onClick: proposal ? scrollToProposal : onLoadProposal },
+    render: { onClick: onReviewRender },
+    close: { onClick: onResolve },
+    confirm_publication: { onClick: () => onConfirmPublication?.(checklist.count) },
+  };
+  const primaryAction = { ...view.primary, ...(primaryWiring[view.primary.key] || {}) };
+  const closeForm = !isResolved && (closeOpen || view.primary.key === "close");
+  const allows = (action) => workflowAllows(workflow, action);
+
+  useEffect(() => {
+    if (closeOpen) closeRef.current?.focus();
+  }, [closeOpen]);
 
   useEffect(() => {
     const handleShortcut = (event) => {
       if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
+      // A focused button/link owns the keypress (for example "Confirmar cierre"):
+      // the shortcut must never run the PRIMARY action, which may be publishing.
+      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, button, a, summary, [contenteditable='true'], [role='dialog']")
+        || document.querySelector("[role='dialog'][aria-modal='true']")) return;
       if (primaryAction.disabled) return;
       event.preventDefault();
       if (primaryAction.onClick) primaryAction.onClick();
@@ -545,7 +618,7 @@ function ChangeRequestCard({
 
       <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
         <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
-          <RequestWorkflowStepper workflow={workflow} />
+          <RequestWorkflowStepper workflow={workflow} steps={view.steps} sentence={view.sentence} />
 
           <div className="overflow-hidden rounded-2xl bg-black/30 ring-1 ring-white/[0.08]">
             {d.video_url ? (
@@ -586,15 +659,34 @@ function ChangeRequestCard({
             )}
           </div>
 
-          <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES[status.tone]}`}>
-            <p className="text-caption font-semibold">{status.title}</p>
-            <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
-            {item.publication?.stale_since && (
-              <p className="text-label opacity-70 mt-1">
-                Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
-              </p>
-            )}
-          </div>
+          {d.published_video_url && (
+            <a href={d.published_video_url} target="_blank" rel="noopener noreferrer"
+              className="block rounded-xl bg-white/[0.03] p-3 text-caption text-brand-light ring-1 ring-white/[0.08]"
+              aria-label="Ver versión publicada">
+              Ver versión publicada{Number.isInteger(d.published_revision) ? ` ${d.published_revision}` : ""} ↗
+              <span className="mt-1 block text-label text-gray-400">Archivo de la publicación registrada, separado del corte candidato de arriba.</span>
+            </a>
+          )}
+
+          {/* La frase del paso ya explica qué falta; acá sólo queda la versión
+              publicada y, si corresponde, cuánto hace que hay cambios en curso. */}
+          {status.tone === "ok" && (
+            <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES.ok}`}>
+              <p className="text-caption font-semibold">{status.title}</p>
+              <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
+            </div>
+          )}
+          {item.publication?.stale_since && (
+            <p className="text-label text-gray-400">
+              Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
+            </p>
+          )}
+          <ClientVisibilityControl
+            publication={item.publication}
+            deliveryId={d.id}
+            busy={visibilityBusy}
+            onChange={onChangeVisibility}
+          />
         </div>
 
         <div className="min-w-0 space-y-4">
@@ -607,7 +699,20 @@ function ChangeRequestCard({
               {item.comment}
             </p>
             <p className="mt-3 text-label text-gray-600">Enviado el {fmtDate(item.submitted_at)}</p>
+            <p className="mt-1 text-label text-gray-500">
+              Última actualización: {fmtDateTime(item.updated_at || item.resolved_at || item.submitted_at)}
+            </p>
           </section>
+
+          {confirmsPublication && (
+            <PublishedRequestChecklist
+              key={`${item.id}:${item.publication?.render_fingerprint || ""}`}
+              requestId={item.id}
+              comment={item.comment}
+              onReadyChange={onChecklistChange}
+              onSeek={seekVideo}
+            />
+          )}
 
           {!isResolved && proposalEnabled && (
             <div ref={proposalRef} className="scroll-mt-4">
@@ -635,7 +740,7 @@ function ChangeRequestCard({
               <span className="text-emerald-300 font-medium">
                 {closedByPublication
                   ? `Resuelto al publicar la versión ${item.resolved_by_revision}`
-                  : "Resuelto"}
+                  : "Cerrado manualmente · no acredita una nueva publicación"}
               </span>
               {!closedByPublication && item.resolved_by && <> por <b>{item.resolved_by}</b></>}
               {" "}el {fmtDate(item.resolved_at)}
@@ -645,63 +750,76 @@ function ChangeRequestCard({
                 </p>
               )}
             </div>
-          ) : (
-            <section aria-label="Resolver pedido" className="rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06]">
-              <h3 className="px-4 py-3 text-label text-gray-300">Marcar como resuelto en el portal</h3>
-              <div className="space-y-2 border-t border-white/[0.06] p-4">
-                <p className="text-label text-gray-500">
-                  Cierra el pedido en el portal correspondiente, sin generar ni publicar otro video.
-                </p>
-                <input
-                  type="text"
-                  placeholder="Respuesta opcional"
-                  value={draft}
-                  onChange={(event) => onDraftChange(event.target.value)}
-                  maxLength={2000}
-                  className="w-full rounded-xl bg-surface-3/40 px-3 py-2 text-caption text-white ring-1 ring-white/[0.06] placeholder:text-gray-600 focus:outline-none focus:ring-brand/40"
-                />
-                <div className="flex justify-end">
+          ) : closeForm ? (
+            <section aria-label="Cerrar pedido" className="space-y-2 rounded-xl bg-white/[0.02] p-4 ring-1 ring-white/[0.06]">
+              <p className="text-label text-gray-400">
+                {view.primary.key === "close"
+                  ? "Escribí una nota para el cliente y tocá “Dar por resuelto”. El cliente la ve en el portal."
+                  : "Cierra el pedido en el portal sin generar ni publicar otro video. El cliente ve tu nota."}
+              </p>
+              <textarea
+                ref={closeRef}
+                placeholder="Nota para el cliente (obligatoria)"
+                aria-label="Motivo del cierre sin publicar"
+                required
+                rows={3}
+                value={draft}
+                onChange={(event) => onDraftChange(event.target.value)}
+                maxLength={2000}
+                className="w-full rounded-xl bg-surface-3/40 px-3 py-2 text-caption text-white ring-1 ring-white/[0.06] placeholder:text-gray-600 focus:outline-none focus:ring-brand/40"
+              />
+              {view.primary.key !== "close" && (
+                <div className="flex justify-end gap-2">
+                  <button type="button" onClick={() => setCloseOpen(false)}
+                    className="rounded-lg px-3 py-1.5 text-caption text-gray-400 hover:text-white">
+                    Cancelar
+                  </button>
                   <button
+                    type="button"
                     onClick={onResolve}
-                    disabled={resolving}
+                    disabled={resolving || !draft.trim() || !allows("resolve")}
                     className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
                   >
-                    {resolving ? "Guardando…" : "Marcar como resuelto"}
+                    {resolving ? "Guardando…" : "Confirmar cierre"}
                   </button>
                 </div>
-              </div>
+              )}
             </section>
-          )}
+          ) : null}
         </div>
       </div>
 
-      <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
-        {!isResolved && item.publication?.can_render && workflow.key !== "rendering" && primaryAction.onClick !== onReviewRender && (
-          <button type="button" onClick={onReviewRender} disabled={proposalBusy || publishing}
-            className="rounded-lg bg-white/10 px-3 py-2 text-caption text-white disabled:opacity-40">
-            Revisar letra y re-renderizar
-          </button>
-        )}
+      <footer className="sticky bottom-0 z-10 flex flex-wrap items-start justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
         {actionNotice && <div role={actionNotice.tone === "error" ? "alert" : "status"}
           aria-label="Estado de la acción"
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
           {actionNotice.text}
-        </div>}
-        <div className="min-w-0">
-          <p className="text-caption font-semibold text-white">{workflow.label}</p>
-          <p className="truncate text-label text-gray-500">
-            {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : "Acción recomendada para este pedido"}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {!isResolved && d.job_id && primaryAction.label !== "Editar letra" && (
+          {actionNotice.outcomeUnknown && (
+            <button type="button" onClick={() => reconcilePublication?.(item.id)}
+              className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15">
+              Consultar estado
+            </button>
+          )}
+          {actionNotice.actionHref && (
             <a
-              href={editorUrl}
-              className="rounded-xl px-3 py-2 text-caption font-medium text-gray-300 hover:bg-white/[0.06] hover:text-white"
+              href={actionNotice.actionHref}
+              className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15"
             >
-              Editar letra
+              {actionNotice.actionLabel || "Revisar el video"}
             </a>
           )}
+        </div>}
+        {qcNeedsReview && !actionNotice && (
+          <div role="status" aria-label="Revisión del video pendiente"
+            className="w-full rounded-lg bg-amber-400/[0.08] p-3 text-caption text-amber-100 ring-1 ring-amber-300/20">
+            <p className="font-semibold">La publicación está pausada</p>
+            <p className="mt-0.5 text-label text-amber-50/80">{qcReviewMessage}</p>
+          </div>
+        )}
+        <p className="min-w-0 flex-1 self-center text-label text-gray-500">
+          {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : ""}
+        </p>
+        <div className="ml-auto flex flex-col items-end gap-1.5">
           {primaryAction.href ? (
             <a
               href={primaryAction.href}
@@ -721,6 +839,27 @@ function ChangeRequestCard({
               {!primaryAction.disabled && <span className="ml-2 hidden text-[10px] opacity-60 sm:inline">⌘↵</span>}
             </button>
           )}
+          {view.secondary.length > 0 && (
+            <div role="group" aria-label="Otras acciones" className="flex flex-wrap justify-end gap-x-3 gap-y-1">
+              {view.secondary.map((link) => {
+                const linkClass = "text-label text-gray-400 underline-offset-2 hover:text-white hover:underline disabled:cursor-not-allowed disabled:opacity-50";
+                if (link.key === "edit") {
+                  return <a key={link.key} href={editorUrl} className={linkClass}>{link.label}</a>;
+                }
+                const onClick = link.key === "suggest" ? onGenerateProposal
+                  : link.key === "render" ? onReviewRender
+                    : link.key === "prepare_only" ? onPrepareOnly
+                      : () => setCloseOpen((open) => !open);
+                return (
+                  <button key={link.key} type="button" onClick={onClick} disabled={link.disabled}
+                    aria-expanded={link.key === "close" ? closeForm : undefined}
+                    className={linkClass}>
+                    {link.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
       </footer>
     </article>
@@ -728,6 +867,7 @@ function ChangeRequestCard({
 }
 
 const PROPOSAL_LABELS = {
+  interpreting: "Interpretando el pedido…",
   ready: "Lista para revisar",
   partial: "Propuesta parcial",
   needs_input: "Necesita intervención",
@@ -743,6 +883,13 @@ const MANUAL_LABELS = {
   background_review: "Cambio de fondo manual",
   audio_review: "Verificar identidad del audio",
   manual_review: "Interpretación manual requerida",
+};
+
+const BACKGROUND_BLOCK_REASONS = {
+  multi_scene_background_requires_scene_editor: "Este video usa varias escenas; el cambio debe hacerse escena por escena.",
+  background_constraints_exceed_prompt_limit: "Las condiciones obligatorias superan el límite del prompt. Revisá el alcance a mano; no vamos a recortar ni omitir restricciones del cliente.",
+  unresolved_visual_constraint: "Hay una restricción visual que necesita aclaración. Revisá el pedido completo y definí qué se debe conservar o excluir antes de regenerar.",
+  unresolved_request_requires_review: "Hay partes del pedido que no se pudieron interpretar con seguridad. Revisalas a mano antes de regenerar el fondo.",
 };
 
 function samePreviewSegment(left, right) {
@@ -908,6 +1055,31 @@ function LyricsProposalPreview({
   );
 }
 
+function clock(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "--:--";
+  return `${Math.floor(seconds / 60)}:${(seconds % 60).toFixed(1).padStart(4, "0")}`;
+}
+
+// Un cambio de tiempo: la línea y qué borde se mueve, con el valor anterior.
+function TimingChange({ operation }) {
+  const before = operation.current_segments?.[0] || {};
+  const after = operation.proposed_segments?.[0] || {};
+  const edges = [["start", "Aparece"], ["end", "Termina"]]
+    .filter(([key]) => Number(before[key]) !== Number(after[key]));
+  return (
+    <div>
+      <p className="text-caption text-white break-words">{before.text}</p>
+      {edges.map(([key, label]) => (
+        <p key={key} className="text-label text-gray-400">
+          {label} <span className="text-gray-500 line-through">{clock(before[key])}</span>{" "}
+          <span className="text-emerald-200">{clock(after[key])}</span>
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function ChangeRequestProposal({
   summary, proposal, requestComment, busy, applyEnabled, jobId, requestId,
   onGenerate, onLoad, onAdjust, onApply, onDismiss, onRegenerateBackground, onSeek,
@@ -921,18 +1093,36 @@ function ChangeRequestProposal({
   const [backgroundDrafts, setBackgroundDrafts] = useState({});
   const [saveStates, setSaveStates] = useState({});
   const saveTimersRef = useRef(new Map());
+  const draftBaselineRef = useRef({ id: null, values: {} });
 
   useEffect(() => {
-    setSelected(applicable.map((operation) => operation.id));
-    setTextDrafts(Object.fromEntries(applicable.map((operation) => [
+    if (!proposal) {
+      saveTimersRef.current.forEach(timer => clearTimeout(timer));
+      saveTimersRef.current.clear();
+      return;
+    }
+    const previous = draftBaselineRef.current;
+    const values = Object.fromEntries(applicable.map((operation) => [
       operation.id,
       operation.proposed_segments?.[0]?.text || "",
+    ]));
+    setSelected(current => previous.id === proposal?.id
+      ? current.filter(id => applicable.some(operation => operation.id === id))
+      : applicable.map(operation => operation.id));
+    setTextDrafts(current => Object.fromEntries(Object.entries(values).map(([id, value]) => [id,
+      previous.id === proposal?.id && current[id] != null && current[id] !== previous.values[id]
+        ? current[id] : value,
     ])));
+    draftBaselineRef.current = { id: proposal?.id, values };
+    // A timer captured the previous preview hash. Do not dispatch an old
+    // patch after a remote update; retain drafts for explicit review/blur.
+    saveTimersRef.current.forEach(timer => clearTimeout(timer));
+    saveTimersRef.current.clear();
     setBackgroundDrafts(Object.fromEntries(operations
       .filter((operation) => operation.visual_action === "regenerate_background")
       .map((operation) => [operation.id, operation.suggested_prompt || ""])));
     setSaveStates({});
-  }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [proposal?.id, proposal?.updated_at, proposal?.content_hash]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => () => {
     saveTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -951,7 +1141,7 @@ function ChangeRequestProposal({
     saveTimersRef.current.delete(operation.id);
     setSaveStates((current) => ({ ...current, [operation.id]: "saving" }));
     const result = await onAdjust(
-      proposal.id, operation.id, value, proposal.base_revision,
+      proposal.id, operation.id, value, proposal.base_revision, proposal.content_hash,
     );
     setSaveStates((current) => ({
       ...current,
@@ -977,26 +1167,18 @@ function ChangeRequestProposal({
 
   const effective = proposal || summary;
   const status = effective?.status;
+  const previewCurrent = ["ready", "partial"].includes(status)
+    && !!proposal?.content_hash && proposal?.lyrics_context?.matches_base === true
+    && (!summary?.content_hash || summary.content_hash === proposal.content_hash);
   const savedChecks = appliedTextChecks(proposal);
   const savedMatches = savedChecks.length > 0 && savedChecks.every(check => check.matches);
   const editorUrl = editorUrlWithRequest(
     jobId, requestId, ["applied", "partially_applied"].includes(status) ? effective?.id : null,
   );
 
-  if (!effective) {
-    return (
-      <div className="rounded-2xl bg-brand/[0.06] ring-1 ring-brand/20 p-4">
-        <p className="text-caption font-semibold text-white">Convertir el pedido en cambios revisables</p>
-        <p className="text-label text-gray-400 mt-1">
-          Revisá una propuesta de cambios basada en los tiempos y las frases del cliente antes de aplicarla.
-        </p>
-        <button type="button" onClick={onGenerate} disabled={busy}
-          className="mt-3 rounded-lg bg-brand px-3 py-2 text-caption text-white disabled:opacity-50">
-          {busy ? "Analizando este pedido…" : "Analizar este pedido"}
-        </button>
-      </div>
-    );
-  }
+  // Sin propuesta no hay nada que mostrar: pedirla a la IA es una ayuda
+  // opcional ("Pedir sugerencia a la IA") junto a la acción principal.
+  if (!effective) return null;
 
   if (!proposal) {
     return (
@@ -1049,17 +1231,42 @@ function ChangeRequestProposal({
         )}
       </div>
 
+      {status === "interpreting" && (
+        <div role="status" data-testid="change-request-interpreting"
+          className="flex items-center gap-3 rounded-button bg-white/[0.04] p-3 ring-1 ring-white/[0.08]">
+          <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/20 border-t-brand-light" aria-hidden="true" />
+          <p className="text-caption text-gray-300">
+            Leyendo el pedido y ubicando cada cambio en la letra. Tarda alrededor de un minuto; podés seguir con otra cosa.
+          </p>
+        </div>
+      )}
+
       {operations.map((operation) => {
         const currentText = (operation.current_segments || [])
           .map((row) => row?.text || "")
           .join(" / ");
-        const proposedText = textDrafts[operation.id]
-          ?? operation.proposed_segments?.[0]?.text ?? "";
+        const proposedText = operation.kind === "relayout"
+          ? (operation.proposed_segments || []).map((row) => row?.text || "").join(" / ")
+          : textDrafts[operation.id] ?? operation.proposed_segments?.[0]?.text ?? "";
         if (!operation.applicable) {
+          if (operation.status === "already_satisfied") {
+            return (
+              <div key={operation.id} className="rounded-button bg-white/[0.04] ring-1 ring-white/[0.1] p-3">
+                <p className="text-caption font-semibold text-gray-200">Ya coincide en la letra guardada</p>
+                {(operation.verified_segments || []).map((segment, index) => (
+                  <p key={segment._id || index} className="mt-2 text-caption text-gray-300 whitespace-pre-wrap">{segment.text}</p>
+                ))}
+                <p className="mt-2 text-label text-gray-400">Verificación textual de la revisión {proposal.lyrics_context?.revision ?? proposal.base_revision}. No confirma el render ni la publicación.</p>
+              </div>
+            );
+          }
           if (operation.visual_action === "regenerate_background") {
             const backgroundPrompt = backgroundDrafts[operation.id]
               ?? operation.suggested_prompt ?? "";
             const supported = operation.regeneration_supported !== false;
+            const blockedReasons = [...new Set(operation.warnings || [])]
+              .filter(reason => BACKGROUND_BLOCK_REASONS[reason]);
+            const multiScene = blockedReasons.includes("multi_scene_background_requires_scene_editor");
             return (
               <div
                 key={operation.id}
@@ -1111,17 +1318,21 @@ function ChangeRequestProposal({
                         operation.id,
                         backgroundPrompt,
                         operation.background_mode,
+                        proposal.content_hash,
                       )}
-                      disabled={busy || !backgroundPrompt.trim()}
+                      disabled={busy || !backgroundPrompt.trim() || !previewCurrent}
+                      title={!previewCurrent ? "Actualizá y revisá la comparación antes de generar" : undefined}
                       className="bg-sky-500 hover:bg-sky-400 text-white text-caption font-semibold px-3 py-2 rounded-button disabled:opacity-40"
                     >
                       {busy ? "Iniciando…" : "Regenerar fondo con este prompt"}
                     </button>
                   ) : (
                     <div>
-                      <p className="text-label text-amber-200">
-                        Este video usa varias escenas; el cambio debe hacerse escena por escena.
-                      </p>
+                      {(blockedReasons.length ? blockedReasons : ["unknown"]).map(reason => (
+                        <p key={reason} className="text-label text-amber-200 mt-1">
+                          {BACKGROUND_BLOCK_REASONS[reason] || "Este pedido requiere revisión manual antes de regenerar. Abrí el editor de fondo y contrastalo con el pedido original."}
+                        </p>
+                      ))}
                       {editorUrl && (
                         <a
                           href={editorUrl}
@@ -1129,7 +1340,7 @@ function ChangeRequestProposal({
                           rel="noopener noreferrer"
                           className="inline-flex mt-2 bg-white/[0.08] hover:bg-white/[0.14] text-white text-label font-medium px-2.5 py-1.5 rounded-button"
                         >
-                          Abrir editor de escenas
+                          {multiScene ? "Abrir editor de escenas" : "Abrir editor de fondo"}
                         </a>
                       )}
                     </div>
@@ -1143,6 +1354,10 @@ function ChangeRequestProposal({
               <p className="text-caption text-amber-200">
                 {MANUAL_LABELS[operation.kind] || "Revisión manual"}
               </p>
+              {operation.source_excerpt && <p className="mt-1 text-label text-gray-300 whitespace-pre-wrap">{operation.source_excerpt}</p>}
+              {operation.reason === "instruction_requires_manual_interpretation" && (
+                <p className="mt-1 text-label text-amber-100">No podemos distinguir con certeza la letra de las indicaciones. Conservamos el pedido completo: revisá esta parte en el editor.</p>
+              )}
               {operation.timecode_seconds != null && (
                 <p className="text-label text-gray-400">Cerca de {Math.floor(operation.timecode_seconds / 60)}:{String(Math.round(operation.timecode_seconds % 60)).padStart(2, "0")}</p>
               )}
@@ -1162,6 +1377,7 @@ function ChangeRequestProposal({
         const textEditable = (
           operation.current_segments?.length === 1
           && operation.proposed_segments?.length === 1
+          && operation.kind !== "timing"
         );
         return (
           <div key={operation.id} className="block rounded-button bg-black/20 ring-1 ring-white/[0.06] p-2">
@@ -1176,11 +1392,21 @@ function ChangeRequestProposal({
                 />
               )}
               <div className="min-w-0 flex-1">
+                {operation.origin === "interpreter" && operation.source_excerpt && (
+                  <p className="mb-1 text-label text-gray-400 break-words">
+                    <span className="text-gray-500">UMG: </span>«{operation.source_excerpt}»
+                  </p>
+                )}
+                {operation.kind === "timing" ? (
+                  <TimingChange operation={operation} />
+                ) : (
                 <p className="text-label text-gray-500 line-through break-words">{currentText}</p>
+                )}
                 {operation.status === "pending" && textEditable ? (
                   <div className="mt-1 flex gap-2">
                     <input
                       value={proposedText}
+                      disabled={busy || !previewCurrent}
                       onChange={(event) => updateTextDraft(operation, event.target.value)}
                       onBlur={() => saveTextDraft(operation, proposedText)}
                       className="min-w-0 flex-1 rounded-lg bg-surface-3/60 px-2.5 py-1.5 text-caption text-emerald-200 ring-1 ring-white/[0.08] focus:outline-none focus:ring-emerald-400/35"
@@ -1196,12 +1422,14 @@ function ChangeRequestProposal({
                             : saveStates[operation.id] === "pending" ? "Autoguardado pendiente" : ""}
                     </span>
                   </div>
-                ) : (
+                ) : operation.kind !== "timing" && (
                   <p className="text-caption text-emerald-200 break-words">{proposedText}</p>
                 )}
                 <p className="text-label text-gray-500 mt-1">
                   {operation.operator_adjusted
                     ? "Ajustado por operador"
+                    : operation.origin === "interpreter"
+                      ? (operation.why || "Interpretado del pedido")
                     : operation.kind === "remove_terminal_period"
                       ? "Formato determinístico"
                       : operation.kind === "merge_phrase"
@@ -1229,7 +1457,7 @@ function ChangeRequestProposal({
 
       {hasUnsavedDrafts && (
         <p className="text-label text-amber-200">
-          Estamos guardando tus ajustes antes de habilitar la aplicación.
+          Tenés ajustes sin guardar. Salí del campo para guardarlos y revisá la comparación antes de aplicar.
         </p>
       )}
 
@@ -1246,13 +1474,15 @@ function ChangeRequestProposal({
         {(status === "ready" || status === "partial") && applicable.length > 0 && (
           <button
             type="button"
-            onClick={() => onApply(proposal.id, selected, proposal.base_revision)}
+            onClick={() => onApply(proposal.id, selected, proposal.base_revision, proposal.content_hash)}
             disabled={(
-              busy || !applyEnabled || selected.length === 0 || hasUnsavedDrafts
+              busy || !applyEnabled || !previewCurrent || selected.length === 0 || hasUnsavedDrafts
             )}
             title={
               !applyEnabled
                 ? "La aplicación está deshabilitada por configuración"
+                : !proposal.content_hash
+                  ? "Actualizá la comparación para verificar su versión"
                 : hasUnsavedDrafts
                   ? "Guardá los ajustes de texto antes de aplicar"
                   : undefined
@@ -1282,6 +1512,11 @@ function ChangeRequestProposal({
           </button>
         )}
       </div>
+      {!proposal.content_hash && ["ready", "partial", "needs_input"].includes(status) && (
+        <button type="button" onClick={onLoad} disabled={busy} className="text-caption text-brand-light underline">
+          Actualizar comparación antes de aplicar
+        </button>
+      )}
     </section>
   );
 }

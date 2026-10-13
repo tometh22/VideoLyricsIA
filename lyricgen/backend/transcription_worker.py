@@ -523,6 +523,12 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 r.get("segments") or [], _stem, audio_duration=_dur,
                 rescue_skipped=_skip, include_leading=live_hint,
             )
+            # Fase 5.2: el stem se borra al salir; los huecos se guardan acá.
+            import line_signals_v2 as _ls2
+            if _ls2.enabled():
+                r.setdefault("postpass_stats", {})["voiced_gaps_v2"] = [
+                    dict(gap) for gap in (_vg or [])
+                ]
             _independent = r.get("_independent_asr_words") or []
             _lexical_verification = {
                 "total": 0, "verified": 0, "unverified": 0, "details": [],
@@ -667,9 +673,89 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
     return r
 
 
+def _bind_auto_repair_candidate(candidate, source_segments):
+    """Rebuild proposal deltas on the exact pre-retry snapshot.
+
+    Proposal emitters attach reviewer-only fields (for example ``review`` and
+    ``consensus_suggestion``). They are never copied into a machine mutation.
+    Only text/timing/word deltas are rebound after uniquely matching each row
+    by stable ID or its original timing and text.
+    """
+    if not isinstance(candidate, dict):
+        return None
+    current = candidate.get("current_segments")
+    proposed = candidate.get("proposed_segments")
+    if (
+        not isinstance(current, list) or not isinstance(proposed, list)
+        or not current or len(current) != len(proposed)
+    ):
+        return None
+    indexes = []
+    for row in current:
+        if not isinstance(row, dict):
+            return None
+        row_ids = [str(row[key]) for key in ("_id", "id", "segment_id") if row.get(key) is not None]
+        matches = []
+        for index, source in enumerate(source_segments):
+            if not isinstance(source, dict):
+                continue
+            source_ids = [str(source[key]) for key in ("_id", "id", "segment_id") if source.get(key) is not None]
+            if row_ids and source_ids:
+                if row_ids == source_ids:
+                    matches.append(index)
+            elif (
+                row.get("start") == source.get("start")
+                and row.get("end") == source.get("end")
+                and row.get("text") == source.get("text")
+            ):
+                matches.append(index)
+        if len(matches) != 1:
+            return None
+        indexes.append(matches[0])
+    if indexes != sorted(indexes) or len(set(indexes)) != len(indexes):
+        return None
+    bound_current = [dict(source_segments[index]) for index in indexes]
+    bound_proposed = []
+    for before, candidate_before, candidate_after in zip(
+        bound_current, current, proposed,
+    ):
+        if not isinstance(candidate_after, dict):
+            return None
+        after = dict(before)
+        for key in ("text", "start", "end", "words"):
+            if candidate_before.get(key) != candidate_after.get(key):
+                if key not in candidate_after:
+                    return None
+                after[key] = copy.deepcopy(candidate_after[key])
+        bound_proposed.append(after)
+    rebound = dict(candidate)
+    rebound["current_segments"] = bound_current
+    rebound["proposed_segments"] = bound_proposed
+    return rebound
+
+
+def _auto_repair_candidate_action(candidate):
+    current, proposed = candidate.get("current_segments"), candidate.get("proposed_segments")
+    text_changed = False
+    timing_changed = False
+    for before, after in zip(current or [], proposed or []):
+        text_changed = text_changed or before.get("text") != after.get("text")
+        timing_changed = timing_changed or any(
+            before.get(key) != after.get(key) for key in ("start", "end", "words")
+        )
+    if text_changed and not timing_changed:
+        return "content_reversible"
+    if timing_changed and not text_changed:
+        return "timing_reversible"
+    return None
+
+
 async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   language: str, antes_fmt: float | None,
-                                  timing_consistency_fn, *, live_hint: bool = False):
+                                  timing_consistency_fn, *, live_hint: bool = False,
+                                  source_audio_sha256: str = "",
+                                  source_audio_revision: int = 0,
+                                  source_segments_revision: int = 0):
     """Measure, retry only unsafe windows, and persist one final verdict."""
     from transcription_quality import POLICY_VERSION, calibration_identity, evaluate
     from line_evidence import annotate_provider_evidence
@@ -700,20 +786,65 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         reference_attestation=r.get("reference_attestation"),
     )
     retry_stats = {"attempted": False}
+    original_segments = copy.deepcopy(r.get("segments") or [])
+    from auto_repair_policy import (
+        candidate_has_independent_evidence, runtime_authorization,
+    )
+    auto_policy = runtime_authorization()
+    auto_trace = {
+        "schema": "lyrics-auto-repair-trace-v1",
+        "status": auto_policy["status"],
+        "attempted": False,
+        "applied_count": 0,
+        "abstained_count": 0,
+        "applied_actions": {"timing_reversible": 0, "content_reversible": 0},
+        "authorization_sha256": auto_policy.get("authorization_sha256"),
+        "source_audio_revision": int(source_audio_revision or 0),
+        "source_segments_revision": int(source_segments_revision or 0),
+    }
+    if auto_policy["status"] == "authorized" and not any(
+        auto_policy.get("actions", {}).values()
+    ):
+        auto_trace["status"] = "actions_disabled"
+    from transcription_quality import segments_hash as _segments_hash
+    auto_trace["source_segments_hash"] = _segments_hash(original_segments)
     try:
         from targeted_consensus import is_enabled, reprocess
         inline_retry_enabled = (
             os.environ.get("TRANSCRIPTION_QUALITY_INLINE_RETRY", "0")
             .strip().lower() in {"1", "true", "yes", "on"}
         )
+        auto_actions_enabled = any(auto_policy.get("actions", {}).values())
+        auto_content_enabled = auto_policy.get("actions", {}).get(
+            "content_reversible", False,
+        )
         if (
-            inline_retry_enabled
+            (inline_retry_enabled or auto_content_enabled)
             and initial.get("decision") != "pass" and windows and is_enabled()
         ):
-            candidate_result, retry_stats = await asyncio.to_thread(
-                reprocess, r, audio_path, windows,
-                language=language, job_id=job_id,
-            )
+            auto_trace["attempted"] = bool(auto_content_enabled)
+            try:
+                candidate_result, retry_stats = await asyncio.to_thread(
+                    reprocess, r, audio_path, windows,
+                    language=language, job_id=job_id,
+                )
+            except Exception as exc:
+                # Content auto-repair may invoke an optional provider even
+                # when inline quality retry is disabled. A provider outage in
+                # that advisory path must abstain and retain the original
+                # quality verdict; only a required inline retry failure is a
+                # quality-gate failure.
+                if inline_retry_enabled or not auto_content_enabled:
+                    raise
+                candidate_result = None
+                retry_stats = {
+                    "attempted": True,
+                    "failed": False,
+                    "declined": ["optional_auto_repair_unavailable"],
+                    "failure_code": type(exc).__name__,
+                }
+                auto_trace["status"] = "candidate_generation_failed"
+                auto_trace["abstained_count"] += len(windows)
             if POLICY_VERSION == "lyrics-quality-v6":
                 changed = (
                     isinstance(candidate_result, dict)
@@ -728,7 +859,8 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 # Suggestions/evidence may be measured, but v6 never adopts an
                 # inline result containing legacy in-place lyric mutations.
             else:
-                r = candidate_result
+                if inline_retry_enabled and not auto_actions_enabled:
+                    r = candidate_result
             if retry_stats.get("lines_replaced") or retry_stats.get("lines_inserted"):
                 r = timing_consistency_fn(r, job_id)
                 r = _medir_cobertura_final(
@@ -737,6 +869,87 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 )
                 post = r.get("postpass_stats") or {}
                 windows = post.get("quality_windows") or []
+
+            # V6 proposals are explicitly non-mutating. A separate signed
+            # action authorization is required before any local candidate can
+            # change the pre-editor snapshot.
+            if auto_actions_enabled and POLICY_VERSION == "lyrics-quality-v6":
+                from auto_repair_contract import apply_local_candidates
+                from quality_cache import sha256_file as _hash_audio_for_repair
+                if (
+                    source_audio_sha256
+                    and _hash_audio_for_repair(audio_path) != source_audio_sha256
+                ):
+                    auto_trace["status"] = "source_audio_changed"
+                    auto_trace["abstained_count"] += len(
+                        retry_stats.get("quality_proposal_windows") or []
+                    )
+                    raise RuntimeError("auto_repair_audio_snapshot_changed")
+                rebound_candidates = []
+                for raw_candidate in retry_stats.get("quality_proposal_windows") or []:
+                    bound = _bind_auto_repair_candidate(raw_candidate, original_segments)
+                    action = _auto_repair_candidate_action(bound) if bound else None
+                    if (
+                        action
+                        and auto_policy["actions"].get(action)
+                        and candidate_has_independent_evidence(raw_candidate, action)
+                    ):
+                        bound["action"] = action
+                        rebound_candidates.append(bound)
+                    else:
+                        auto_trace["abstained_count"] += 1
+                if (
+                    source_audio_sha256
+                    and _hash_audio_for_repair(audio_path) != source_audio_sha256
+                ):
+                    auto_trace["status"] = "source_audio_changed"
+                    auto_trace["abstained_count"] += len(rebound_candidates)
+                    rebound_candidates = []
+                applied = apply_local_candidates(original_segments, rebound_candidates)
+                auto_trace["abstained_count"] += len(applied["abstentions"])
+                candidate_count = len(applied["applied"])
+                if candidate_count:
+                    candidate_segments = applied["segments"]
+                    candidate_result_for_score = _medir_cobertura_final(
+                        {**r, "segments": candidate_segments}, job_id,
+                        antes_fmt, audio_path, strip_internal=False,
+                        live_hint=live_hint,
+                    )
+                    candidate_post = candidate_result_for_score.get("postpass_stats") or {}
+                    candidate_windows = candidate_post.get("quality_windows") or []
+                    candidate_quality = evaluate(
+                        candidate_segments, candidate_post.get("coverage_final"),
+                        unsafe_windows=candidate_windows,
+                        require_independent=require_independent,
+                        is_live=live_hint,
+                        reference_attestation=r.get("reference_attestation"),
+                    )
+                    old_score = initial.get("score")
+                    new_score = candidate_quality.get("score")
+                    old_window_count = len(windows)
+                    clear_improvement = candidate_quality.get("decision") == "pass"
+                    measured_improvement = (
+                        isinstance(old_score, (int, float))
+                        and isinstance(new_score, (int, float))
+                        and float(new_score) >= float(old_score) + 0.02
+                        and len(candidate_windows) < old_window_count
+                    )
+                    if clear_improvement or measured_improvement:
+                        r = candidate_result_for_score
+                        post, windows = candidate_post, candidate_windows
+                        auto_trace["status"] = "applied"
+                        auto_trace["applied_count"] = candidate_count
+                        for item in applied["applied"]:
+                            auto_trace["applied_actions"][item["action"]] += 1
+                        auto_trace["result_segments_hash"] = _segments_hash(candidate_segments)
+                    else:
+                        auto_trace["status"] = "candidate_not_improved"
+                        auto_trace["abstained_count"] += candidate_count
+                elif (
+                    auto_policy["status"] == "authorized"
+                    and auto_trace["status"] != "candidate_generation_failed"
+                ):
+                    auto_trace["status"] = "no_safe_candidate"
     except Exception as exc:
         logger.warning(
             "[QUALITY-GATE] targeted retry failed error_type=%s job=%s",
@@ -747,6 +960,133 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             "failure_reason": f"exception:{type(exc).__name__}",
             "declined": [f"exception:{type(exc).__name__}"],
         }
+        if auto_trace["attempted"] and auto_trace["status"] != "source_audio_changed":
+            auto_trace["status"] = "candidate_generation_failed"
+
+    # Timing evidence is generated independently from the ASR retry so a
+    # calibrated timing action does not depend on lexical uncertainty or a
+    # second-pass transcription being enabled.
+    if (
+        POLICY_VERSION == "lyrics-quality-v6"
+        and auto_policy.get("actions", {}).get("timing_reversible")
+    ):
+        auto_trace["attempted"] = True
+        try:
+            from pathlib import Path
+            from auto_repair_contract import apply_local_candidates
+            from timing_review_suggestions import (
+                build_timing_review_candidates, load_acoustic_track,
+            )
+            from quality_cache import sha256_file as _hash_audio_for_timing
+
+            current_auto_segments = copy.deepcopy(r.get("segments") or [])
+            if (
+                source_audio_sha256
+                and _hash_audio_for_timing(audio_path) != source_audio_sha256
+            ):
+                auto_trace["status"] = "source_audio_changed"
+                current_auto_segments = []
+            if current_auto_segments:
+                track = load_acoustic_track(Path(audio_path))
+                timing_candidates, timing_report = build_timing_review_candidates(
+                    current_auto_segments, track,
+                )
+                retry_stats["auto_repair_timing_report"] = {
+                    "proposal_count": len(timing_candidates),
+                    "abstention_reasons": timing_report.get(
+                        "abstention_reasons", {},
+                    ),
+                }
+                rebound_timing = []
+                for raw_candidate in timing_candidates:
+                    bound = _bind_auto_repair_candidate(
+                        raw_candidate, current_auto_segments,
+                    )
+                    if not bound or not candidate_has_independent_evidence(
+                        raw_candidate, "timing_reversible",
+                    ):
+                        auto_trace["abstained_count"] += 1
+                        continue
+                    bound["kind"] = "review_proposal_candidate"
+                    bound["action"] = "timing_reversible"
+                    rebound_timing.append(bound)
+                if (
+                    source_audio_sha256
+                    and _hash_audio_for_timing(audio_path) != source_audio_sha256
+                ):
+                    auto_trace["status"] = "source_audio_changed"
+                    auto_trace["abstained_count"] += len(rebound_timing)
+                    rebound_timing = []
+                timing_applied = apply_local_candidates(
+                    current_auto_segments, rebound_timing,
+                )
+                auto_trace["abstained_count"] += len(timing_applied["abstentions"])
+                if timing_applied["applied"]:
+                    before_quality = evaluate(
+                        current_auto_segments, post.get("coverage_final"),
+                        unsafe_windows=windows,
+                        require_independent=require_independent,
+                        is_live=live_hint,
+                        reference_attestation=r.get("reference_attestation"),
+                    )
+                    measured_result = _medir_cobertura_final(
+                        {**r, "segments": timing_applied["segments"]}, job_id,
+                        antes_fmt, audio_path, strip_internal=False,
+                        live_hint=live_hint,
+                    )
+                    measured_post = measured_result.get("postpass_stats") or {}
+                    measured_windows = measured_post.get("quality_windows") or []
+                    timing_quality = evaluate(
+                        timing_applied["segments"],
+                        measured_post.get("coverage_final"),
+                        unsafe_windows=measured_windows,
+                        require_independent=require_independent,
+                        is_live=live_hint,
+                        reference_attestation=r.get("reference_attestation"),
+                    )
+                    old_score, new_score = (
+                        before_quality.get("score"), timing_quality.get("score"),
+                    )
+                    accepted = (
+                        before_quality.get("decision") != "pass"
+                        and timing_quality.get("decision") == "pass"
+                    ) or (
+                        isinstance(old_score, (int, float))
+                        and isinstance(new_score, (int, float))
+                        and float(new_score) >= float(old_score) + 0.02
+                        and len(measured_windows) < len(windows)
+                    )
+                    if accepted:
+                        r = measured_result
+                        post, windows = measured_post, measured_windows
+                        auto_trace["status"] = "applied"
+                        auto_trace["applied_count"] += len(timing_applied["applied"])
+                        auto_trace["applied_actions"]["timing_reversible"] += len(
+                            timing_applied["applied"],
+                        )
+                        auto_trace["result_segments_hash"] = _segments_hash(
+                            timing_applied["segments"],
+                        )
+                    else:
+                        auto_trace["status"] = (
+                            "candidate_not_improved"
+                            if auto_trace["applied_count"] == 0
+                            else "applied"
+                        )
+                        auto_trace["abstained_count"] += len(
+                            timing_applied["applied"],
+                        )
+                elif auto_trace["applied_count"] == 0 and auto_trace["status"] == "authorized":
+                    auto_trace["status"] = "no_safe_candidate"
+        except Exception as exc:
+            logger.warning(
+                "[AUTO-REPAIR] timing candidate generation failed "
+                "error_type=%s job=%s",
+                _safe_exception_code(exc), job_id,
+            )
+            if auto_trace["applied_count"] == 0:
+                auto_trace["status"] = "timing_candidate_generation_failed"
+            auto_trace["abstained_count"] += 1
 
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
@@ -820,7 +1160,34 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         # Missing witnesses force router abstention rather than agreement.
         pass
     final["metrics"] = final_metrics
+    # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
+    # escritas sobre los segmentos finales antes de congelar la versión 0.
+    # Solo agrega claves: segments_hash y las decisiones no cambian.
+    try:
+        import line_signals_v2
+        if line_signals_v2.enabled():
+            line_signals_v2.attach(
+                r, final_metrics,
+                asr_words=r.get("_asr_words") or [],
+                independent_words=r.get("_independent_asr_words") or [],
+                voiced_gaps=(r.get("postpass_stats") or {}).get("voiced_gaps_v2") or [],
+                voiced_gap_warn_s=float(os.environ.get("VOICED_GAP_WARN_S", "10")),
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
+        logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
+                       job_id, _safe_exception_code(exc))
+    if auto_trace["status"] == "authorized":
+        auto_trace["status"] = (
+            "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
+        )
+    final["auto_repair"] = auto_trace
     r["transcription_quality"] = final
+    if auto_trace["applied_count"] > 0:
+        # Keep the exact machine output before automatic changes in the
+        # tenant-private evidence, so an untouched result can be restored.
+        from machine_evidence import snapshot_hash
+        r["_pre_auto_repair_segments"] = original_segments
+        auto_trace["source_snapshot_sha256"] = snapshot_hash(original_segments)
     if final["decision"] == "pass":
         logger.info("[QUALITY-GATE] PASS score=%s job=%s", final["score"], job_id)
     else:
@@ -842,6 +1209,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
+    r.pop("_pre_auto_repair_segments", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
     r.pop("_reconcile_capture", None)
@@ -851,6 +1219,37 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_lora_asr_family", None)
     r.pop("_lora_family_role", None)
     return r
+
+
+def _line_gap_assignment(job_id: str) -> dict | None:
+    """Brazo de la prueba del aire mínimo, o None. Nunca rompe la transcripción."""
+    try:
+        import line_gap_experiment
+        from database import Job, SessionLocal
+
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            return line_gap_experiment.assign(db, job) if job is not None else None
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — sin asignación = brazo A sin registro
+        logger.warning("[LINE_GAP_AB] job=%s sin asignación: %s", job_id, type(exc).__name__)
+        return None
+
+
+def _record_line_gap_exposure(job_id: str, assignment: dict, stats: dict) -> None:
+    try:
+        import line_gap_experiment
+        from database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            line_gap_experiment.record_exposure(db, job_id, assignment, stats)
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[LINE_GAP_AB] job=%s exposición sin registrar: %s", job_id, type(exc).__name__)
 
 
 def run_transcription_job(
@@ -882,6 +1281,31 @@ def run_transcription_job(
     from observability import set_job_log_context
     set_job_log_context(job_id)
     from reconcile_capture import record_result as _record_reconcile_result
+
+    # 0. Guard de reintento (incidente 2026-08-26, UMG Chile).
+    #
+    # `Retry(max=2, interval=10)` en queue_jobs re-encola el job cuando el
+    # work-horse muere — y muere por SIGKILL de `monitor_work_horse` a
+    # `job_timeout + 60s` si el proceso no cierra limpio. Hasta acá NO había
+    # ningún guard: el reintento volvía a poner el job en "transcribing" y
+    # rehacía TODO, pagando demucs + whisperX otra vez para tirar el
+    # resultado (el job ya estaba terminal). Medido: 3 corridas del mismo job
+    # en 65 min, las tres facturadas.
+    #
+    # Un fallo por deadline es determinista: si agotó 900s, los vuelve a
+    # agotar. Se descarta. Los transitorios (red, 5xx) siguen reintentándose,
+    # que es para lo que se puso el Retry.
+    if _should_discard_retry(job_id):
+        logger.warning(
+            "[TRANSCRIBE-WORKER] descarto reintento job=%s — el fallo previo "
+            "fue por deadline (determinista); reintentarlo sólo vuelve a "
+            "pagar Replicate", job_id,
+        )
+        return {
+            "job_id": job_id, "status": "discarded",
+            "reason": "non_retryable_previous_failure",
+        }
+
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
@@ -965,6 +1389,7 @@ def run_transcription_job(
     from quality_cache import sha256_file
     source_audio_sha256 = sha256_file(audio_path)
     source_audio_revision = 0
+    source_segments_revision = 0
     # Establish the immutable source identity before the expensive pipeline.
     # Direct browser PUTs necessarily start at a mutable upload key because
     # the server does not see their bytes; the first worker materialization
@@ -1011,6 +1436,7 @@ def run_transcription_job(
                 1, int(_identity_row.audio_revision or 0),
             )
         source_audio_revision = int(_identity_row.audio_revision or 0)
+        source_segments_revision = int(_identity_row.segments_revision or 0)
         _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
@@ -1143,7 +1569,8 @@ def run_transcription_job(
                 _record_reconcile_result(r, "post:_maybe_apply_approved_reuse")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
-                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title,
+                                            language=language or "")
                 _record_reconcile_result(r, "post:_maybe_ctc_retime")
             _post_lang = _resolve_postprocess_language(
                 language, r, job_id=job_id,
@@ -1185,6 +1612,9 @@ def run_transcription_job(
                 r, audio_path, job_id, _post_lang, _antes,
                 _maybe_timing_consistency,
                 live_hint=live or _looks_live(title, filename),
+                source_audio_sha256=source_audio_sha256,
+                source_audio_revision=source_audio_revision,
+                source_segments_revision=source_segments_revision,
             )
             if isinstance(r.get("catalog_reference"), dict):
                 quality = dict(r.get("transcription_quality") or {})
@@ -1205,7 +1635,17 @@ def run_transcription_job(
                 is_live=live or _looks_live(title, filename),
             )
 
-        result = asyncio.run(_run_with_retime())
+        # Prueba prospectiva del aire mínimo (LYRIC_MIN_GAP_AB_ENABLED): el
+        # brazo se fija una vez por job y viaja por ContextVar a los polish.
+        _gap_assignment = _line_gap_assignment(job_id)
+        if _gap_assignment is None:
+            result = asyncio.run(_run_with_retime())
+        else:
+            import lead_in as _gap_lead_in
+            _gap_stats: dict = {}
+            with _gap_lead_in.min_gap_override(int(_gap_assignment.get("gap_ms") or 0), _gap_stats):
+                result = asyncio.run(_run_with_retime())
+            _record_line_gap_exposure(job_id, _gap_assignment, _gap_stats)
     except Exception as exc:
         error_type = _safe_exception_code(exc)
         anchor_declined = str(exc) == "operator_reference_alignment_declined"
@@ -1239,9 +1679,14 @@ def run_transcription_job(
                 "automática. Revisá que corresponda a esta versión del audio "
                 "y reintentá.",
             )
+        # Clasificamos sobre la EXCEPCIÓN, no sobre el mensaje al usuario:
+        # `error_type` es sólo el nombre de la clase y perdería el texto
+        # ("exceeded wall-clock budget") que distingue un deadline de un
+        # fallo transitorio.
         return _fail(
             job_id,
             f"No pudimos completar la transcripción. Código: {error_type}.",
+            error_code=classify_error_code(f"{error_type}: {exc}"),
         )
 
     # 4. Persistir el resultado en el row.
@@ -1311,6 +1756,26 @@ def run_transcription_job(
                 row.input_audio_etag = source_audio_sha256
                 row.audio_revision = max(1, int(row.audio_revision or 0))
             current_revision = int(row.segments_revision or 0)
+            auto_trace = (
+                result.get("transcription_quality", {}).get("auto_repair", {})
+                if isinstance(result, dict)
+                and isinstance(result.get("transcription_quality"), dict)
+                else {}
+            )
+            if (
+                int(auto_trace.get("applied_count") or 0) > 0
+                and current_revision != source_segments_revision
+            ):
+                logger.warning(
+                    "[auto-repair-occ] repaired snapshot discarded job=%s "
+                    "expected_revision=%s actual_revision=%s",
+                    job_id, source_segments_revision, current_revision,
+                )
+                _persist_db.rollback()
+                return {
+                    "job_id": job_id, "status": "discarded",
+                    "reason": "source_segments_revision_changed",
+                }
             if current_revision > 0 and segments != row.segments_json:
                 # An operator edited while the ASR was running. Preserve the
                 # human version and do not attach a verdict for discarded data.
@@ -1488,11 +1953,89 @@ def run_transcription_job(
     return result
 
 
-def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
+# Códigos de fallo que NO tiene sentido reintentar: son deterministas en el
+# wall-clock, no baches transitorios. Si una corrida agotó su presupuesto de
+# 900s, la siguiente va a agotar los mismos 900s — reintentarla sólo quema
+# otro turno de worker y vuelve a pagar Replicate para tirar el resultado.
+# Incidente 2026-08-26 (UMG Chile): el mismo job corrió 3 veces (21:47, 22:18,
+# 22:52), las tres pagaron demucs + whisperX, y la 3ª siguió trabajando con el
+# job YA en estado terminal ("[TIMING] set_timing_source skipped — job is in
+# terminal state 'transcription_failed'").
+#
+# Lo que SÍ se reintenta: red, 5xx y cualquier otro error transitorio, que es
+# el caso para el que se puso `Retry(max=2)` originalmente ("whisper hiccup").
+_NON_RETRYABLE_ERROR_CODES = frozenset({
+    "transcription_deadline",   # presupuesto de wall-clock agotado
+    "transcription_cancelled",  # predicción cancelada por deadline
+})
+
+# Fragmentos que identifican un fallo por deadline en el texto de la excepción.
+# `JobTimeoutException` es la death penalty de RQ; el `TimeoutError` con
+# "exceeded wall-clock budget" lo emite `replicate_budget`.
+_DEADLINE_ERROR_FRAGMENTS = (
+    "jobtimeoutexception",
+    "exceeded wall-clock budget",
+    "task exceeded maximum timeout",
+)
+
+
+def classify_error_code(exc_or_msg) -> str:
+    """Mapea una excepción (o su texto) al `error_code` que se persiste.
+
+    Devuelve uno de `_NON_RETRYABLE_ERROR_CODES` cuando el fallo es un
+    agotamiento de presupuesto, o "transcription_unknown" en cualquier otro
+    caso (que sigue siendo reintentable).
+    """
+    text = str(exc_or_msg or "").lower()
+    if any(f in text for f in _DEADLINE_ERROR_FRAGMENTS):
+        return "transcription_deadline"
+    if "cancel" in text and "prediction" in text:
+        return "transcription_cancelled"
+    return "transcription_unknown"
+
+
+def _should_discard_retry(job_id: str) -> bool:
+    """True si este job ya falló por una causa que reintentar no arregla.
+
+    Lee el estado persistido en vez de inspeccionar la excepción del intento
+    anterior: RQ no le pasa nada al reintento, y el work-horse pudo haber
+    muerto por SIGKILL sin dejar rastro en memoria.
+
+    Fail-open a propósito: si no podemos leer el job, dejamos correr el
+    reintento. Un trabajo repetido es mucho más barato que negarle a un
+    operador una transcripción que sí habría salido.
+    """
+    try:
+        from database import SessionLocal
+        from jobs import get_job_model
+        db = SessionLocal()
+        try:
+            row = get_job_model(db, job_id)
+            if row is None:
+                return False
+            if str(row.status or "") != "transcription_failed":
+                return False
+            return str(row.error_code or "") in _NON_RETRYABLE_ERROR_CODES
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "[TRANSCRIBE-WORKER] no pude evaluar el guard de reintento "
+            "job=%s error_type=%s — dejo correr el reintento",
+            job_id, _safe_exception_code(exc),
+        )
+        return False
+
+
+def _fail(job_id: str, error_msg: str, tb: str = "",
+          error_code: str = "") -> dict:
     """Marca el job como transcription_failed con un mensaje para el frontend.
 
     ``tb`` se conserva sólo por compatibilidad de firma y se descarta. Un
     traceback puede incluir audio paths, respuestas ASR o letras.
+
+    ``error_code`` decide si un reintento de RQ vuelve a hacer el trabajo o lo
+    descarta — ver `_should_discard_retry`.
     """
     from jobs import update_job
     try:
@@ -1501,6 +2044,7 @@ def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
             status="transcription_failed",
             current_step="error",
             error=error_msg[:500],
+            error_code=(error_code or classify_error_code(error_msg))[:64],
         )
     except Exception as exc:
         logger.warning(

@@ -9,6 +9,7 @@
 const FEATURE_LABELS = {
   lyrics_animation: "Animación de letra",
   line_transition: "Transición de línea",
+  lyric_look: "Look de letra",
   effect: "Efecto FX",
   movement_style: "Movimiento de cámara",
   text_case: "Mayúsculas/minúsculas",
@@ -29,6 +30,12 @@ const VALUE_LABELS = {
   slide_side: "Slide lateral",
   wipe: "Wipe",
   dissolve_blur: "Dissolve blur",
+  // Looks de letra (lib/lyricLooks).
+  cosmico: "Look Cósmico",
+  cine: "Look Cine",
+  pincel: "Look Pincel",
+  pop70: "Look Pop 70s",
+  pelicula: "Look Película",
   upper: "MAYÚSCULAS",
   title: "Tipo Título",
   lower: "minúsculas",

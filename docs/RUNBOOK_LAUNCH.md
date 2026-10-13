@@ -196,8 +196,9 @@ Restart, o marcar como error vía SQL (query en el emergency runbook).
 
 ## Fuera de alcance (follow-ups conocidos)
 
-- **Audit de descargas del portal UMG** (`/api/deliveries/items`): hoy las
-  descargas van directo a R2 vía URL firmada minteada en el listado, que se
-  pollea — auditarlo ingenuamente inundaría la tabla. La solución correcta
-  es un endpoint de descarga per-click que audite ahí. Es feature, no
-  hardening; queda como follow-up.
+- **Audit de descargas del portal UMG**: cada click se registra en
+  `POST /api/deliveries/{id}/download/{file_type}` antes de emitir una URL
+  firmada de R2. Los eventos `delivery.download_attempt` aparecen en
+  `GET /admin/audit` con resultado, portal, entrega, archivo, IP y user-agent.
+  El portal usa un token compartido, por lo que no identifica al usuario por
+  nombre hasta que tenga cuentas individuales.

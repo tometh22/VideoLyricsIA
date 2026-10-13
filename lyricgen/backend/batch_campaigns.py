@@ -69,6 +69,7 @@ MAX_AUDIO_DURATION = float(os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600"))
 _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "transcribing"})
 _ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
+_POST_RENDER_REVIEW = frozenset({"pending_review", "done", "rejected"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _DISCARDABLE = _FAILURE | {"transcribed", "transcribed_pending"}
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -79,6 +80,14 @@ _ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES | {"discar
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _allows_song_review(campaign: BatchCampaign, job: Job) -> bool:
+    # Completion closes the initial batch, but delivered songs can still need
+    # corrections. Keep pause/cancel authoritative and never restart the feeder.
+    return campaign.status == "active" or (
+        campaign.status == "completed" and job.status in _POST_RENDER_REVIEW
+    )
 
 
 def art_track_feature_enabled() -> bool:
@@ -109,15 +118,25 @@ def _latest_semaforo_verdicts(
     wanted = set(job_ids)
     if not wanted:
         return {}
-    verdicts: dict[str, dict[str, Any]] = {}
-    for log in db.query(AuditLog).filter(
+    verdict_job = AuditLog.detail["job_id"].as_string()
+    ranked = db.query(
+        verdict_job.label("job_id"),
+        AuditLog.detail.label("detail"),
+        func.row_number().over(
+            partition_by=verdict_job, order_by=AuditLog.id.desc(),
+        ).label("verdict_rank"),
+    ).filter(
         AuditLog.action.in_(("semaforo.verdict.v2", "semaforo.verdict.v1")),
-    ).order_by(AuditLog.id.desc()).all():
-        detail = dict(log.detail or {})
-        verdict_job = str(detail.get("job_id") or "")
-        if verdict_job in wanted and verdict_job not in verdicts:
-            verdicts[verdict_job] = detail
-    return verdicts
+        verdict_job.in_(wanted),
+    ).subquery()
+    # Return one row per requested job instead of materializing the entire
+    # history of all campaigns in every API process.
+    return {
+        row.job_id: dict(row.detail or {})
+        for row in db.query(ranked.c.job_id, ranked.c.detail).filter(
+            ranked.c.verdict_rank == 1,
+        ).all()
+    }
 
 
 def _delivery_rank(
@@ -361,14 +380,14 @@ class CampaignCreate(BaseModel):
     expected_count: int = Field(default=0, ge=0, le=ITEM_LIMIT)
     default_render_params: dict[str, Any] = Field(default_factory=dict)
     kind: str = Field(default="lyric_video", pattern="^(lyric_video|art_track)$")
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class CampaignPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     status: str | None = None
     default_render_params: dict[str, Any] | None = None
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class SourceReferenceInput(BaseModel):
@@ -504,7 +523,11 @@ def list_campaigns(
     if current_user.get("role") != "admin":
         query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
-    return {"items": [_summary(db, row) for row in rows]}
+    from campaign_pipeline import pipeline_counts_bulk
+    pipelines = pipeline_counts_bulk(db, rows)
+    return {"items": [
+        {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
+    ]}
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -1245,8 +1268,6 @@ def approve_campaign_lyrics(
     """Bind one explicit song-level approval to the exact editor snapshot."""
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
-    if campaign.status != "active":
-        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     job = db.query(Job).filter(
         Job.job_id == job_id,
         Job.campaign_id == campaign.id,
@@ -1259,6 +1280,8 @@ def approve_campaign_lyrics(
     ).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Campaign job not found.")
+    if not _allows_song_review(campaign, job):
+        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     if not (
         body.lyrics_confirmed
         and body.timings_confirmed
@@ -1270,7 +1293,7 @@ def approve_campaign_lyrics(
         )
     quality = dict(job.transcription_quality or {})
     existing = quality.get("pre_background_approval") or {}
-    post_render_statuses = {"pending_review", "done", "rejected"}
+    post_render_statuses = _POST_RENDER_REVIEW
     preserves_rendered_status = job.status in post_render_statuses
     if job.status == "lyrics_approved" or preserves_rendered_status:
         try:
@@ -1307,6 +1330,42 @@ def approve_campaign_lyrics(
                 audio_sha256=str(job.input_audio_sha256 or ""),
                 audio_revision=int(job.audio_revision or 0),
             )
+            recovery_source = "editor_document.machine_evidence"
+            recovery_source_job_id = job.job_id
+            # Historical variants have no machine snapshot of their own. A
+            # post-render human approval may reuse the parent's immutable
+            # full-audio evidence only for the exact same tenant/audio/revision.
+            # Never replace invalid child evidence or inherit edited lyrics,
+            # a parent's human approval, or its mutable quality reference.
+            if (
+                recovered_reference is None
+                and job.parent_job_id
+                and preserves_rendered_status
+                and not job.machine_snapshot_required
+                and document_for_recovery.machine_evidence is None
+            ):
+                parent = db.query(Job).filter(
+                    Job.job_id == job.parent_job_id,
+                    Job.job_id != job.job_id,
+                    Job.tenant_id == job.tenant_id,
+                    Job.input_audio_sha256 == job.input_audio_sha256,
+                    Job.audio_revision == job.audio_revision,
+                ).first()
+                parent_document = (
+                    db.query(EditorDocument).filter(
+                        EditorDocument.job_id == parent.job_id,
+                        EditorDocument.tenant_id == job.tenant_id,
+                    ).first() if parent is not None else None
+                )
+                if parent_document is not None:
+                    recovered_reference, recovery_reason = recover_from_machine_evidence(
+                        parent_document.machine_evidence,
+                        original_segments=list(parent_document.original_segments or []),
+                        audio_sha256=str(job.input_audio_sha256 or ""),
+                        audio_revision=int(job.audio_revision or 0),
+                    )
+                    recovery_source = "parent_editor_document.machine_evidence"
+                    recovery_source_job_id = parent.job_id
             if recovered_reference is not None:
                 quality["reference_hypothesis"] = recovered_reference
                 quality.pop("reference_hypothesis_unavailable", None)
@@ -1321,7 +1380,8 @@ def approve_campaign_lyrics(
                         "audio_revision": int(job.audio_revision or 0),
                         "segments_revision": int(job.segments_revision or 0),
                         "reference_sha256": recovered_reference["reference_sha256"],
-                        "source": "editor_document.machine_evidence",
+                        "source": recovery_source,
+                        "source_job_id": recovery_source_job_id,
                     },
                 ))
             else:
@@ -1340,12 +1400,14 @@ def approve_campaign_lyrics(
     # review checkboxes above are necessary but not sufficient when the text
     # does not match the reference.
     from language_review import review_payload as _language_review_payload
+    from language_review import advisory as _language_staging_advisory
     _language_review = _language_review_payload(
         job.segments_json, job.transcription_quality, job.segments_revision,
     )
     if (
         _language_review["needs_language_review"]
         and not _language_review["language_review_resolved"]
+        and not _language_staging_advisory()
     ):
         raise HTTPException(
             status_code=409,
@@ -1380,6 +1442,7 @@ def approve_campaign_lyrics(
     if not reference_ok:
         raise HTTPException(status_code=409, detail={"code": reference_reason})
     from editor import approve_document
+    from lyric_review import LyricReviewPending, conflict_detail as lyric_review_conflict
     try:
         document, version = approve_document(
             db,
@@ -1390,6 +1453,8 @@ def approve_campaign_lyrics(
         )
     except LookupError:
         raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+    except LyricReviewPending as exc:
+        raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
     except MachineSnapshotMissing:
         raise HTTPException(
             status_code=409,
@@ -2608,6 +2673,14 @@ def reconcile_batch_campaigns() -> dict[str, int]:
                 campaign.updated_at = _now()
                 db.commit()
         promoted = len(event_ids)
+        try:
+            from art_track_campaigns import reconcile_stalled_delivery_batches
+            reconcile_stalled_delivery_batches(db)
+        except Exception:
+            # A stuck portal send is recoverable by hand (retry endpoint); it
+            # must never stop the transcription feeder above.
+            db.rollback()
+            logger.exception("[BATCH] stalled delivery sweep failed")
     finally:
         db.close()
     from transactional_outbox import dispatch_outbox_event
@@ -2621,11 +2694,17 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     """Keep campaign rendering bounded without consuming interactive quota."""
     if job.workload_class != "batch" or not job.campaign_id:
         return
-    require_prebackground_approval(job)
+    # Art-track campaigns intentionally have no lyrics, timing, reference
+    # hypothesis, or editor approval.  They still use this function for the
+    # shared render/review capacity gate, but applying the lyric approval gate
+    # here makes every queued batch art track fail with
+    # ``reference_hypothesis_missing`` before the renderer can start.
+    if not bool((job.render_params or {}).get("art_track")):
+        require_prebackground_approval(job)
     campaign = db.query(BatchCampaign).filter(
         BatchCampaign.id == job.campaign_id,
     ).with_for_update().first()
-    if campaign is None or campaign.status != "active":
+    if campaign is None or not _allows_song_review(campaign, job):
         raise HTTPException(status_code=409, detail="Campaign is not active.")
     final_review = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,

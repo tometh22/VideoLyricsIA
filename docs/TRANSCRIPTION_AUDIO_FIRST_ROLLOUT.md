@@ -27,13 +27,26 @@ collapsed Whisper while the generic pass nearly matched ROTOR.
   broad anchor coverage, and no output segment longer than 15 seconds.
 - A title-only LRCLIB candidate is accepted only after ASR and only when title,
   duration, and heard words agree.
+- The primary LRCLIB lookup requires the full song title after normalizing
+  known edition suffixes; a short title cannot select a longer, different song.
+  The same check applies to cached entries.
+- External lyrics must pass independent ASR attestation before they can replace
+  words or determine the whole-song structure. An unsafe candidate falls back
+  to the audio transcript even if the diagnostic setting is `observe` or `off`.
+- A live `local_only` verdict emits the audio transcript before any global
+  catalogue reconciliation, regardless of the other live policy switches.
+- A later Genius/Gemini gap refetch must pass the same audio attestation before
+  it can replace an already accepted lyric.
+- Catalogue text cannot prime first-pass ASR or choose its language before the
+  audio has been heard.
 
 ## Operational switches
 
 ```dotenv
 # Default: reference cannot prime first-pass ASR.
 WHISPER_REFERENCE_PROMPT_MODE=off
-# Rollback experiments: short (120 chars), full (legacy 800 chars).
+# The user-facing orchestrator ignores non-off prompt modes so its ASR
+# witness remains independent of metadata-based lyrics.
 
 # Default: align curated lines to Whisper word timestamps.
 LRCLIB_PLAIN_ALIGNER_ENABLED=1
@@ -78,8 +91,10 @@ Corpus:
 2. Require at least 100 jobs and no safety-gate regression.
 3. Canary user-facing output at 10%, then 50%, then 100%.
 4. Hold each stage for at least one full operator review cycle.
-5. Roll back by setting `WHISPER_REFERENCE_PROMPT_MODE=full` and/or
-   `LRCLIB_PLAIN_ALIGNER_ENABLED=0`; do not revert the instrumental-gap fix.
+5. Roll back via a coordinated release if the audio-first path regresses; the
+   catalogue prompt cannot be re-enabled for user-facing recognition.
+   The plain-line aligner can still be disabled with
+   `LRCLIB_PLAIN_ALIGNER_ENABLED=0`; keep the instrumental-gap fix.
 
 ## Observed regression result
 

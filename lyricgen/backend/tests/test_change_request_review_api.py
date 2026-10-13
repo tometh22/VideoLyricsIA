@@ -15,6 +15,10 @@ def manual_request(client, admin_token, approved_job, db, all_r2_files_present):
     job = approved_job
     job.segments_json = [{'start': 0, 'end': 3, 'text': 'Letra completa corregida a mano'}]
     job.bg_r2_key_cached = 'backgrounds/test.mp4'
+    db.flush()
+    db.refresh(job)
+    from tests.test_deliveries import _signed_umg_qc_report
+    job.delivery_qc = _signed_umg_qc_report(job, job.approved_by)
     db.commit()
     document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json)
     db.commit()
@@ -24,6 +28,21 @@ def manual_request(client, admin_token, approved_job, db, all_r2_files_present):
                                submitted_at=datetime.now(timezone.utc) - timedelta(minutes=2))
     db.add(cr); db.commit()
     return job, document, cr
+
+
+def test_change_request_list_can_reconcile_one_exact_request(client, admin_token, manual_request, db):
+    _, _, request = manual_request
+    sibling = DeliveryChangeRequest(delivery_id=request.delivery_id, comment='Otro pedido')
+    db.add(sibling)
+    db.commit()
+
+    response = client.get(
+        f'/admin/change-requests?status=all&change_request_id={request.id}&limit=1',
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert [item['id'] for item in response.json()['items']] == [request.id]
 
 
 def test_manual_review_render_uses_exact_saved_revision_and_deduplicates(client, admin_token, manual_request, db):
@@ -68,6 +87,10 @@ def test_publish_confirms_finished_cut_and_resolves_only_selected_request(client
     job.previous_versions = [{'archived_at': datetime.now(timezone.utc).isoformat()}]
     job.render_params = {'_rendered_segments_revision': document.revision,
                          '_rendered_at': datetime.now(timezone.utc).isoformat()}
+    from tests.test_deliveries import _signed_umg_qc_report
+    db.flush()
+    db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, job.approved_by)
     db.commit()
     body = dict(portal_id='argentina', change_request_id=cr.id,
                 reviewed_render_fingerprint=render_fingerprint(job), reviewed_editor_revision=document.revision)
@@ -162,3 +185,62 @@ def test_approved_background_permission_is_not_granted_to_regular_users(client, 
     enqueue.assert_not_called()
     db.expire_all()
     assert job.status == 'done'
+
+
+def _published_without_ticking(client, admin_token, manual_request, db):
+    """A send published the corrected cut but left the request open."""
+    job, document, cr = manual_request
+    now = datetime.now(timezone.utc)
+    document.updated_at = now
+    job.render_params = {'_rendered_segments_revision': document.revision, '_rendered_at': now.isoformat()}
+    db.commit()
+    delivery = db.get(Delivery, cr.delivery_id)
+    assert delivery.published_render_fingerprint == render_fingerprint(job)
+    delivery.content_updated_at = now
+    db.commit()
+    return job, document, cr, delivery
+
+
+def test_cut_published_without_ticking_closes_as_publication_in_one_click(client, admin_token, manual_request, db):
+    job, document, cr, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    listed = client.get(f'/admin/change-requests?status=all&change_request_id={cr.id}&limit=1',
+                        headers=auth(admin_token)).json()['items'][0]
+    assert listed['publication']['answers_request'] is True
+    assert 'confirm_publication' in listed['workflow']['allowed_actions']
+
+    stale = client.post(f'/admin/change-requests/{cr.id}/confirm-publication', headers=auth(admin_token),
+                        json={'reviewed_render_fingerprint': 'another-cut',
+                              'reviewed_editor_revision': document.revision})
+    assert stale.status_code == 409, stale.text
+
+    body = {'reviewed_render_fingerprint': render_fingerprint(job),
+            'reviewed_editor_revision': document.revision, 'confirmed_items': 2}
+    response = client.post(f'/admin/change-requests/{cr.id}/confirm-publication',
+                           headers=auth(admin_token), json=body)
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    closed = db.get(DeliveryChangeRequest, cr.id)
+    assert closed.resolution_source == 'publication'
+    assert closed.resolved_by_revision == delivery.published_revision
+    assert closed.resolution_note == f'Resuelto al publicar la versión {delivery.published_revision}.'
+    from database import AuditLog
+    audit = (db.query(AuditLog).filter(AuditLog.action == 'delivery.change_request.resolve')
+             .order_by(AuditLog.id.desc()).first())
+    assert audit.detail['source'] == 'publication_confirmed' and audit.detail['confirmed_items'] == 2
+    assert listed['workflow']['label'] == 'Publicado · revisá cada punto del pedido'
+    again = client.post(f'/admin/change-requests/{cr.id}/confirm-publication',
+                        headers=auth(admin_token), json=body)
+    assert again.json()['already_resolved'] is True
+
+
+def test_publication_close_refused_when_no_fix_was_saved_after_request(client, admin_token, manual_request, db):
+    job, document, cr, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    document.updated_at = cr.submitted_at - timedelta(minutes=5)
+    db.commit()
+    response = client.post(f'/admin/change-requests/{cr.id}/confirm-publication', headers=auth(admin_token),
+                           json={'reviewed_render_fingerprint': render_fingerprint(job),
+                                 'reviewed_editor_revision': document.revision})
+    assert response.status_code == 409, response.text
+    assert response.json()['detail']['reason'] == 'no_fix_after_request'
+    db.expire_all()
+    assert db.get(DeliveryChangeRequest, cr.id).resolved_at is None

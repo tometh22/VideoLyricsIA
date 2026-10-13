@@ -117,6 +117,109 @@ def _load_model():
     return model
 
 
+# The languages the product transcribes (mirrors
+# ``transcription_language.SUPPORTED_LANGUAGES``). Audio language ID is only
+# allowed to choose among these: Whisper LID on a stem or a guitar intro has
+# been seen to answer Nynorsk / Welsh for Spanish songs (3-sep, 9-sep), and a
+# forced alignment must never be steered by that.
+_FALLBACK_LANGUAGES = ("es", "en", "pt", "fr", "it", "de")
+
+# Seconds of audio per LID window (Whisper's fixed 30 s context) and where in
+# the song to take them: a single window at 0 s is often an instrumental
+# intro, so average three windows spread across the body of the song.
+_LID_WINDOW_POSITIONS = (0.25, 0.5, 0.75)
+
+
+def _supported_languages() -> tuple[str, ...]:
+    try:
+        from transcription_language import SUPPORTED_LANGUAGES
+    except Exception:  # noqa: BLE001 — the module must stay importable alone
+        return _FALLBACK_LANGUAGES
+    return tuple(sorted(SUPPORTED_LANGUAGES)) or _FALLBACK_LANGUAGES
+
+
+def _mel_windows(model, audio_path: str):
+    """Batched log-mel windows (n, n_mels, 3000) for Whisper LID, or ``None``."""
+    import torch
+    import whisper
+
+    audio = whisper.load_audio(audio_path)
+    total = len(audio)
+    if total == 0:
+        return None
+    window = whisper.audio.N_SAMPLES
+    if total <= window:
+        starts = [0]
+    else:
+        starts = sorted({int((total - window) * f) for f in _LID_WINDOW_POSITIONS})
+    mels = [
+        whisper.log_mel_spectrogram(
+            whisper.pad_or_trim(audio[start:start + window]),
+            model.dims.n_mels,
+        )
+        for start in starts
+    ]
+    return torch.stack(mels).to(model.device)
+
+
+def detect_language(model, audio_path: str, *, job_id: str = "") -> str | None:
+    """Audio language ID restricted to the product's languages.
+
+    stable-ts refuses to align without a language (``TypeError: expected
+    argument for language``) and the lexical detector in
+    ``transcription_language`` abstains on most real lyrics — it returns
+    nothing for a clean three-line Spanish verse. Staging job daa625bed6f1
+    (IKV "DJ Droga", 3-oct) declined on stem and mix for exactly that reason.
+    Never raises: ``None`` means "no usable language".
+    """
+    try:
+        mel = _mel_windows(model, audio_path)
+        if mel is None:
+            return None
+        _tokens, probs = model.detect_language(mel)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LOCAL-ALIGN] language detection failed: %s: %s (job=%s)",
+            type(exc).__name__, str(exc)[:200], job_id,
+        )
+        return None
+    if isinstance(probs, dict):
+        probs = [probs]
+    allowed = _supported_languages()
+    totals = {code: 0.0 for code in allowed}
+    for window in probs or []:
+        for code in allowed:
+            try:
+                totals[code] += float(window.get(code, 0.0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+    best = max(allowed, key=lambda code: totals[code])
+    if totals[best] <= 0.0:
+        return None
+    logger.info(
+        "[LOCAL-ALIGN] language from audio: %s (mean p=%.2f over %d window(s), job=%s)",
+        best, totals[best] / max(len(probs or []), 1), len(probs or []), job_id,
+    )
+    return best
+
+
+def detect_audio_language(audio_path: str, *, job_id: str = "") -> str | None:
+    """``detect_language`` with the shared model. Callers should pass the
+    untouched MIX: LID on a Demucs stem is what answered Nynorsk/English for
+    Spanish songs (3-sep). Never raises."""
+    if not audio_path or not os.path.exists(audio_path) or not is_enabled():
+        return None
+    try:
+        model = _load_model()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LOCAL-ALIGN] language detection unavailable: %s: %s (job=%s)",
+            type(exc).__name__, str(exc)[:200], job_id,
+        )
+        return None
+    return detect_language(model, audio_path, job_id=job_id)
+
+
 def _segments_of(result) -> list[dict]:
     try:
         data = result.to_dict()
@@ -142,21 +245,35 @@ def local_forced_align(
     t0 = time.time()
     try:
         model = _load_model()
+        # stable-ts raises ``TypeError: expected argument for language`` on a
+        # multilingual model when ``language`` is empty, and the caller's
+        # lexical detector abstains on most lyrics — so never hand it None.
+        language = (str(language).strip().lower() if language else "") or None
+        if not language:
+            language = detect_language(model, audio_path, job_id=job_id)
+        if not language:
+            logger.warning(
+                "[LOCAL-ALIGN] decline: no language for the aligner (job=%s)",
+                job_id,
+            )
+            return None
         # ``original_split`` keeps the operator's line breaks as the segment
         # boundaries — without it stable-ts re-splits on punctuation and the
         # caller's line-count check rejects the result.
         result = model.align(
             audio_path,
             "\n".join(clean),
-            language=language or None,
+            language=language,
             original_split=True,
             verbose=None,
             stream=False,
         )
     except Exception as exc:  # noqa: BLE001 — every failure is a decline
+        # The message matters: "TypeError" alone hid a missing language for
+        # weeks (job daa625bed6f1). Lyric text never reaches this message.
         logger.warning(
-            "[LOCAL-ALIGN] decline on error: %s (job=%s)",
-            type(exc).__name__, job_id,
+            "[LOCAL-ALIGN] decline on error: %s: %s (job=%s)",
+            type(exc).__name__, str(exc)[:200], job_id,
         )
         return None
 
@@ -226,6 +343,8 @@ def local_forced_align(
 
 __all__ = [
     "local_forced_align",
+    "detect_language",
+    "detect_audio_language",
     "is_enabled",
     "model_name",
     "min_median_prob",

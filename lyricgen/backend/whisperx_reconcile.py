@@ -54,6 +54,44 @@ _TAIL_LINE_GAP_S = 1.2   # silencio que corta una línea (fallback por palabras)
 _TAIL_LINE_MAX_S = 6.0   # largo máximo de una línea recuperada
 
 
+def _keep_anchored_words_enabled() -> bool:
+    """WHISPERX_RECONCILE_KEEP_WORDS (apagada por defecto).
+
+    Con la bandera, cada línea reconciliada conserva las palabras de la
+    ventana donde ``wordstamps_to_segments`` la ancló, con su ``score``. Sin
+    ella se re-pegan por posición (``words[cur:cur+wc]``), que se corre en
+    cuanto el alineado salta o repite una palabra, y sin ``score``, así que
+    ``normalize_words`` las borra después: el 95 % de las líneas WhisperX
+    reconciliadas de staging llegaba al editor sin palabras (5-oct-2026).
+    """
+    return os.environ.get(
+        "WHISPERX_RECONCILE_KEEP_WORDS", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Parecido mínimo entre la línea y sus palabras para conservarlas: el mismo
+# umbral con el que `wordstamps_to_segments` ancla una línea. Una línea que no
+# ancló cae en la ventana del cursor y sus palabras pueden ser de otra línea.
+_KEEP_WORDS_MIN_MATCH = 0.5
+
+
+def _anchored_words(seg: dict) -> list[dict] | None:
+    """Las palabras que trae la línea si describen su texto; si no, None."""
+    from forced_align import _norm, _phonetic_ratio
+
+    words = [w for w in (seg.get("words") or []) if isinstance(w, dict) and "start" in w]
+    line_tokens = [t for t in (_norm(x) for x in str(seg.get("text") or "").split()) if t]
+    word_tokens = [t for t in (_norm(w.get("word", "")) for w in words) if t]
+    if not words or not line_tokens or len(word_tokens) != len(line_tokens):
+        return None
+    line_set, word_set = set(line_tokens), set(word_tokens)
+    union = len(line_set | word_set)
+    jaccard = len(line_set & word_set) / union if union else 0.0
+    if max(jaccard, _phonetic_ratio(line_tokens, word_tokens)) < _KEEP_WORDS_MIN_MATCH:
+        return None
+    return words
+
+
 def _gap_recovery_enabled() -> bool:
     return os.environ.get(
         "RECONCILE_GAP_RECOVERY_ENABLED", "1"
@@ -294,27 +332,35 @@ def reconcile(wx_segs: list[dict],
         )
         return None
 
-    # Re-attach per-word stamps to each reconciled line so the editor can
-    # still do word-level karaoke. We just bucket the same `words` again by
-    # position so the words inside line N align with line N's text.
-    line_word_counts = [len(ln.split()) for ln in lines if ln]
-    cur = 0
-    for i, seg in enumerate(out):
-        # `out` may have fewer entries than lines (drop on monotonic clamp);
-        # we can't reliably re-attach in that case, so leave words off.
-        try:
-            wc = line_word_counts[i]
-        except IndexError:
-            break
-        span = words[cur:cur + wc]
-        cur += wc
-        if span and all(isinstance(w, dict) and "start" in w for w in span):
-            seg["words"] = [
-                {"word": w.get("word", "").strip(),
-                 "start": float(w.get("start", seg["start"])),
-                 "end": float(w.get("end", seg["end"]))}
-                for w in span
-            ]
+    if _keep_anchored_words_enabled():
+        for seg in out:
+            kept = _anchored_words(seg)
+            if kept is None:
+                seg.pop("words", None)
+            else:
+                seg["words"] = kept
+    else:
+        # Re-attach per-word stamps to each reconciled line so the editor can
+        # still do word-level karaoke. We just bucket the same `words` again by
+        # position so the words inside line N align with line N's text.
+        line_word_counts = [len(ln.split()) for ln in lines if ln]
+        cur = 0
+        for i, seg in enumerate(out):
+            # `out` may have fewer entries than lines (drop on monotonic clamp);
+            # we can't reliably re-attach in that case, so leave words off.
+            try:
+                wc = line_word_counts[i]
+            except IndexError:
+                break
+            span = words[cur:cur + wc]
+            cur += wc
+            if span and all(isinstance(w, dict) and "start" in w for w in span):
+                seg["words"] = [
+                    {"word": w.get("word", "").strip(),
+                     "start": float(w.get("start", seg["start"])),
+                     "end": float(w.get("end", seg["end"]))}
+                    for w in span
+                ]
 
     logger.info(
         "[RECONCILE] %s/%s lines reconciled (%.0f%% coverage) — adopting reference text + whisperX timing",

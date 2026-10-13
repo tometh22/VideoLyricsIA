@@ -19,7 +19,11 @@ def _digest(value: str) -> str:
 
 @pytest.fixture(autouse=True)
 def publication_storage(monkeypatch):
-    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+    import storage
+    monkeypatch.setattr(storage, 'copy_object', lambda *_, **kwargs: True)
+    monkeypatch.setattr(storage, 'object_identity', lambda key: (
+        {'status': 'exists', 'etag': 'synthetic-version', 'size': 100}
+        if storage.object_exists(key.split('.published-', 1)[0]) else {'status': 'missing'}))
 
 
 @pytest.fixture(autouse=True)
@@ -39,10 +43,11 @@ def clean_art_rows():
         db.close()
 
 
-def _create(client, token):
+def _create(client, token, *, destination="argentina", render_params=None):
     response = client.post(
         "/batch/campaigns", headers={"Authorization": f"Bearer {token}"},
-        json={"name": "Art tracks AR", "expected_count": 2, "kind": "art_track", "destination_portal": "argentina"},
+        json={"name": "Art tracks AR", "expected_count": 2, "kind": "art_track", "destination_portal": destination,
+              "default_render_params": render_params or {}},
     )
     assert response.status_code == 200, response.text
     return response.json()["id"]
@@ -73,9 +78,26 @@ def test_art_manifest_deduplicates_shared_cover_and_blocks_ambiguous(client, adm
         db.close()
 
 
-def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_token, monkeypatch):
+def test_art_manifest_rejects_duplicate_technical_codes_without_server_error(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign_id = _create(client, admin_token)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    response = client.post(
+        f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
+        json={"covers": [], "audios": [
+            {"filename": "one.mp3", "technical_code": "ARF123", "size_bytes": 1000, "sha256": _digest("one")},
+            {"filename": "two.mp3", "technical_code": "arf123", "size_bytes": 1000, "sha256": _digest("two")},
+        ]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "duplicate_technical_code"
+
+
+def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_token, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign_id = _create(client, admin_token, destination="files",
+                          render_params={"art_track_preset": "colombia_static"})
     auth = {"Authorization": f"Bearer {admin_token}"}
     manifest = client.post(
         f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
@@ -105,8 +127,15 @@ def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_
     try:
         job = db.query(Job).filter(Job.campaign_id == campaign_id).one()
         assert job.render_params["art_track"] is True
+        assert job.render_params["art_track_preset"] == "colombia_static"
         assert job.status == "queued"
         assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "transcription.enqueue").count() == 0
+        event = db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "pipeline.enqueue").one()
+        assert event.payload["pipeline_kwargs"]["art_track_preset"] == "colombia_static"
+        # The outbox must not include kwargs that the worker pipeline rejects.
+        from inspect import signature
+        from pipeline import run_pipeline
+        signature(run_pipeline).bind_partial(**event.payload["pipeline_kwargs"])
     finally:
         db.close()
     again = client.post(f"/batch/art-track-campaigns/{campaign_id}/start-rendering", headers=auth)
@@ -231,6 +260,44 @@ def _campaign_for(client, admin_token, name):
         db.close()
 
 
+@pytest.mark.parametrize('edit_during_copy', [False, True])
+def test_bulk_copy_releases_transactions_and_rechecks_revision(client, admin_token, monkeypatch, edit_during_copy):
+    import art_track_campaigns as atc
+    import database
+    from database import Delivery
+    monkeypatch.setenv('BATCH_CAMPAIGN_ENABLED', '1')
+    campaign = _campaign_for(client, admin_token, 'Bounded publication')
+    jid = _seed_campaign_job(campaign, umg_spec=None, s3_keys={
+        'video': 't/j/lyric_video.mp4', 'short': 't/j/short.mp4', 'thumbnail': 't/j/thumbnail.jpg'})
+    op = _run_bulk_delivery(client, admin_token, campaign.id, 'transaction-test-' + str(edit_during_copy))
+    sessions = []
+    original = database.SessionLocal
+    def session():
+        value = original()
+        sessions.append(value)
+        return value
+    def copy(tenant, job_id, kinds):
+        assert len(sessions) == 2 and all(not s.in_transaction() for s in sessions)
+        if edit_during_copy:
+            with original() as other:
+                job = other.query(Job).filter_by(job_id=job_id).one()
+                job.segments_revision = int(job.segments_revision or 0) + 1
+                other.commit()
+        return {kind: 'pinned/' + kind for kind in kinds}
+    monkeypatch.setattr(atc, 'SessionLocal', session)
+    monkeypatch.setattr(database, 'DeliveriesSessionLocal', session)
+    monkeypatch.setattr('delivery_snapshots.copy_snapshot', copy)
+    monkeypatch.setattr(atc.storage, 'is_enabled', lambda: True)
+    monkeypatch.setattr(atc.storage, 'object_exists', lambda key: not key.endswith('.mov'))
+    atc.process_delivery_batch(op)
+    with original() as check:
+        row = check.query(DeliveryBatchItem).filter_by(delivery_batch_id=op).one()
+        assert row.status == ('failed' if edit_during_copy else 'sent')
+        if edit_during_copy:
+            assert row.error_code == 'stale_approval'
+            assert check.query(Delivery).filter_by(job_id=jid).first() is None
+
+
 def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     client, admin_token, monkeypatch,
 ):
@@ -286,11 +353,10 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     enqueue.assert_not_called()
 
 
-def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
+def test_bulk_publish_defers_prores_until_a_portal_download_request(
     client, admin_token, monkeypatch,
 ):
-    """Con spec sí se puede: se publica el entregable y se encola el transcode,
-    así el archivo aparece en vez de quedar prometido para siempre."""
+    """Campaign delivery publishes MP4 outputs and leaves ProRes on demand."""
     from database import Delivery
     import art_track_campaigns as atc
 
@@ -314,10 +380,57 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
 
     db = SessionLocal()
     try:
-        assert db.query(Delivery).filter(Delivery.job_id == job_id).first() is None
+        delivery = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert delivery.file_types == ["video", "short", "thumbnail"]
+        assert delivery.published_file_keys["video"]
         item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op).one()
-        assert item.error_code == 'deliverables_not_ready'
+        assert item.status == "sent"
+        operation = db.get(DeliveryBatch, op)
+        assert operation.status == "completed"
+        assert operation.sent_count == 1
     finally:
         db.close()
-    assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
-    assert all(c.kwargs == {"force": True} for c in enqueue.call_args_list)
+    enqueue.assert_not_called()
+
+
+def test_publicar_por_campana_no_sombrea_el_fingerprint_de_aprobacion(
+    client, admin_token, monkeypatch,
+):
+    """Regresión de un bug que me comí escribiendo esto.
+
+    `art_track_campaigns._fingerprint()` es la función que valida que la
+    aprobación siga siendo la misma. Bautizar una variable LOCAL con ese
+    nombre dentro de `process_delivery_batch` la sombrea en todo el scope, y
+    su uso anterior —el gate `stale_approval`— explota con UnboundLocalError.
+    O sea: el chequeo de que nadie re-renderizó desde que se aprobó deja de
+    correr, que es justo el que protege al cliente de recibir otra cosa.
+    """
+    from database import Delivery
+    import art_track_campaigns as atc
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign_for(client, admin_token, "Scope")
+    job_id = _seed_campaign_job(
+        campaign,
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+                 "thumbnail": "t/j/thumbnail.jpg",
+                 "umg_master": "t/j/umg_master.mov",
+                 "umg_short": "t/j/umg_short.mov"},
+    )
+    op = _run_bulk_delivery(client, admin_token, campaign.id, "scope-guard-000001")
+
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", return_value=True),
+        patch.object(atc, "enqueue_prores_prewarm"),
+    ):
+        atc.process_delivery_batch(op)          # con el bug: UnboundLocalError
+        atc.process_delivery_batch(op)          # y de nuevo, ahora por la rama de update
+
+    db = SessionLocal()
+    try:
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert row.published_render_fingerprint
+    finally:
+        db.close()

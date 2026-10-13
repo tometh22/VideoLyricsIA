@@ -85,7 +85,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return true;
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ replaceSegments = false } = {}) => {
     if (!enabled || !jobId || !request) return null;
     setLoading(true);
     setError(null);
@@ -96,8 +96,23 @@ export function useEditorDocument({ jobId, enabled, request }) {
       });
       if (!result.ok) throw result.error;
       const body = result.body;
-      applyDocument(body);
-      return body;
+      const current = documentRef.current;
+      const sameJob = Boolean(current) && current.job_id === body.job_id;
+      // A diagnostic refresh does not replace the controlled lyric rows.
+      // Keep their original save base when another editor changed the song:
+      // advancing only the revision would authorize autosaving the old rows
+      // over that correction. The next save must go through the normal CAS
+      // conflict/three-way merge. Explicit callers replacing the visible rows
+      // can adopt the new snapshot and revision together.
+      const preserveBase = sameJob && !replaceSegments
+        && !segmentsEquivalent(current.segments || [], body.segments || []);
+      const next = preserveBase
+        ? { ...current, ...(body.lock ? { lock: body.lock } : {}) }
+        : body;
+      applyDocument(next);
+      // A delayed GET must not expose an older snapshot to a caller that
+      // will replace its visible rows after this promise resolves.
+      return documentRef.current;
     } catch (err) {
       if (mountedRef.current) {
         setError(String(err));
@@ -203,6 +218,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
             revision: body.revision,
             segments,
             updated_at: body.saved_at,
+            ...(body.lyric_review ? { lyric_review: body.lyric_review } : {}),
           };
           documentRef.current = next;
           return next;
@@ -218,6 +234,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
         versionId: body.version_id,
         applied: body.applied !== false,
         segments,
+        lyricReview: body.lyric_review || null,
       };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
@@ -303,9 +320,34 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return { ok: true, document: body };
   }, [applyDocument, document, jobId, request]);
 
+  const undoAutoRepair = useCallback(async () => {
+    const response = await request(`/editor/${jobId}/auto-repair/undo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_revision: revisionRef.current }),
+    });
+    const body = await responseBody(response);
+    if (response.status === 409) {
+      return { ok: false, reason: "stale-revision" };
+    }
+    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+    applyDocument({ ...documentRef.current, ...body });
+    return { ok: true, document: body };
+  }, [applyDocument, jobId, request]);
+
+  // Actualiza campos derivados del documento (p. ej. la revisión rápida al
+  // pegar la letra oficial) sin tocar revisión ni letra.
+  const updateDocument = useCallback((fields) => {
+    const current = documentRef.current;
+    if (!current || !mountedRef.current) return;
+    const next = { ...current, ...fields };
+    documentRef.current = next;
+    setDocument(next);
+  }, []);
+
   return {
     document, loading, error, errorStatus, lock,
     revisionRef, load, save, reconcile,
-    listVersions, restoreVersion,
+    listVersions, restoreVersion, undoAutoRepair, updateDocument,
   };
 }

@@ -49,7 +49,62 @@ def runtime_timing_config() -> dict[str, float | int | bool]:
         "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
         "lyric_lead_in_ms": _int_env("LYRIC_LEAD_IN_MS"),
         "stable_pitch_tail_enabled": _bool_env("STABLE_PITCH_TAIL_ENABLED"),
+        "lyric_min_gap_ms": _int_env("LYRIC_MIN_GAP_MS"),
+        "lyric_min_gap_ab_enabled": _bool_env("LYRIC_MIN_GAP_AB_ENABLED"),
+        "lyric_min_gap_ab_arm_b_ms": _int_env("LYRIC_MIN_GAP_AB_ARM_B_MS", 300),
     }
+
+
+# Variables de timing con el default EFECTIVO de quien las consume. El
+# `timing_config` de arriba conserva su forma (es la que se compara para la
+# paridad), pero normaliza "sin setear" a 0: LYRIC_LEAD_IN_MS aparecía como 0
+# aunque whisperx_transcribe aplicaba 80 ms. Esta vista lo distingue.
+TIMING_ENV = (
+    # (clave, variable, tipo, default efectivo, consumidor)
+    ("lyric_hold_s", "LYRIC_HOLD_S", "float", 0.5, "lead_in.hold_seconds"),
+    ("lyric_lead_in_s", "LYRIC_LEAD_IN_S", "float", 0.0, "lead_in.lead_seconds"),
+    ("lyric_lead_in_ms", "LYRIC_LEAD_IN_MS", "int", 80, "whisperx_transcribe._apply_lead_in"),
+    ("stable_pitch_tail_enabled", "STABLE_PITCH_TAIL_ENABLED", "bool", False,
+     "transcription_worker._medir_cobertura_final"),
+    ("lyric_min_gap_ms", "LYRIC_MIN_GAP_MS", "int", 0, "lead_in.min_gap_seconds"),
+    ("lyric_min_gap_ab_enabled", "LYRIC_MIN_GAP_AB_ENABLED", "bool", False,
+     "line_gap_experiment.enabled"),
+    ("lyric_min_gap_ab_arm_b_ms", "LYRIC_MIN_GAP_AB_ARM_B_MS", "int", 300,
+     "line_gap_experiment.arm_b_ms"),
+)
+_LEAD_IN_S_CAP = 0.15        # lead_in._MAX_LEAD_S
+
+
+def runtime_timing_config_effective() -> dict[str, dict]:
+    """Valor efectivo y origen de cada variable de timing.
+
+    ``origin``: ``env`` (seteada y válida), ``default`` (sin setear),
+    ``empty`` (seteada vacía) o ``invalid`` (no parsea; vale el default).
+    Informativo: no participa del gate de paridad.
+    """
+    out: dict[str, dict] = {}
+    for key, env, kind, default, consumer in TIMING_ENV:
+        raw = os.environ.get(env)
+        value, origin = default, "default"
+        if raw is not None and not raw.strip():
+            origin = "empty"
+        elif raw is not None:
+            text = raw.strip()
+            try:
+                if kind == "bool":
+                    value = text.lower() in {"1", "true", "yes", "on"}
+                elif kind == "int":
+                    value = max(0, int(float(text)))
+                else:
+                    value = max(0.0, float(text))
+                    if key == "lyric_lead_in_s":
+                        value = min(value, _LEAD_IN_S_CAP)
+                origin = "env"
+            except (TypeError, ValueError):
+                origin = "invalid"
+        out[key] = {"env": env, "value": value, "origin": origin,
+                    "raw": raw, "consumer": consumer}
+    return out
 
 
 def timing_config_parity(
@@ -78,12 +133,31 @@ def timing_config_parity(
         for config in configurations.values()
     }
     match = not missing and len(identities) == 1
+    # Vista informativa de valores efectivos: no cambia `match`. Los workers
+    # de un release anterior no la publican y quedan en `effective_unreported`.
+    effective = {"api": runtime_timing_config_effective()}
+    effective_unreported: list[str] = []
+    for row in release_rows or []:
+        label = f"{row.get('service') or 'worker'}:{row.get('worker') or 'unknown'}"
+        if isinstance(row.get("timing_config_effective"), dict):
+            effective[label] = row["timing_config_effective"]
+        else:
+            effective_unreported.append(label)
+    effective_values = {
+        json.dumps({k: (v or {}).get("value") for k, v in config.items()},
+                   sort_keys=True, separators=(",", ":"))
+        for config in effective.values()
+    }
     return {
         "match": match,
         "api": configurations["api"],
         "participants": len(configurations),
         "missing": sorted(missing),
         "configurations": configurations,
+        "effective_api": effective["api"],
+        "effective_match": len(effective_values) == 1,
+        "effective_unreported": sorted(effective_unreported),
+        "effective_configurations": effective,
     }
 
 
@@ -654,6 +728,14 @@ def worker_fleet_coherence(
     }
 
 
+def _gate_switch(module: str, function: str) -> bool:
+    """Read an operator gate switch for /health without ever breaking it."""
+    try:
+        return bool(getattr(__import__(module), function)())
+    except Exception:
+        return False
+
+
 def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
     """Lightweight report of runtime health.
 
@@ -684,6 +766,9 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
             in ("1", "true", "yes", "on"),
             "youtube_publish": os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower()
             in ("1", "true", "yes", "on"),
+            # Approval gates an operator has switched off: visible, never silent.
+            "delivery_qc_gates_off": _gate_switch("delivery_qc_runtime", "delivery_gates_off"),
+            "language_review_advisory": _gate_switch("language_review", "advisory"),
         },
     }
     try:

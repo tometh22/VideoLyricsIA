@@ -34,8 +34,8 @@ import time
 from urllib.parse import urlencode
 
 import requests
-from jose import jwt
-from jose.exceptions import ExpiredSignatureError, JWTError
+import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError as JWTError
 
 # Reuso de los helpers Fernet de Drive — misma key, mismo formato.
 from drive_oauth import encrypt_token, decrypt_token, DriveTokenDecryptError
@@ -100,7 +100,8 @@ def build_state_token(user_id: int) -> str:
 def verify_state_token(state: str) -> int:
     secret, alg = _state_secret()
     try:
-        payload = jwt.decode(state, secret, algorithms=[alg])
+        from auth import JWT_DECODE_OPTIONS
+        payload = jwt.decode(state, secret, algorithms=[alg], options=JWT_DECODE_OPTIONS)
     except ExpiredSignatureError:
         raise YoutubeOAuthError("State token expirado. Reintentá conectar YouTube.")
     except JWTError as e:

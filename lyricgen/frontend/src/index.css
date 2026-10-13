@@ -740,3 +740,9 @@ body .text-gray-600 { color: #777D90; }
   .job-detail-command { top: 64px; margin-inline: -4px; }
   .editor-primary-cta { right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); left: 12px; width: auto; justify-content: center; }
 }
+
+/* Campaign song drawer: slides in from the right edge. */
+@keyframes genly-slide-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}

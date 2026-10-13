@@ -1,7 +1,1094 @@
 # Changelog
 
+## [1.1.124] - 2026-10-09
+
+### Security
+
+- El JWT pasa de `python-jose` (sin mantenimiento; CVE-2026-85394 sin versión corregida) a PyJWT 2.15. Los tokens emitidos antes siguen valiendo, así que nadie pierde la sesión. Se siguen exigiendo HS256 y el vencimiento, y un `iat` apenas en el futuro (diferencia de reloj entre réplicas) se acepta como antes. Se retiran las excepciones de `python-jose` y `ecdsa`.
+
+## [1.1.123] - 2026-10-08
+
+### Added
+
+- Tabla interna `review_signal_records` (revisión Alembic `c1d3e5f7a9b2`) que guarda, tal como se calcularon, los puntos de la revisión rápida (una fila por punto, job y revisión del editor) y las propuestas de `repetition_reconcile`, tanto las aplicadas como las declinadas con el motivo del gate. Con el gate de mutación cerrado, el post-pass corre en sombra sólo para registrar lo que habría hecho, como declinado con motivo `mutation_not_authorized`, sin cambiar el resultado del job. Sirve para medir después cuántos errores de texto reportados por el cliente ya estaban marcados por cada señal. Detrás de `REVIEW_SIGNALS_PERSIST_ENABLED`, apagada por defecto. La escritura se hace en segundo plano, sin duplicados y sin frenar al editor ni al pipeline: si falla, se registra en el log y el proceso sigue. Nada del producto lee esta tabla.
+
+## [1.1.122] - 2026-10-08
+
+### Added
+
+- Evento de medición `editor_audio_played`: qué tramos del audio sonaron de verdad en el editor. Acumula los intervalos reproducidos (un salto abre un tramo nuevo, la pausa no cuenta, los tramos que se tocan se fusionan) y los envía como pares `[inicio_ms, fin_ms]` (hasta 64 por evento) junto con el tiempo reproducido, la velocidad y la duración del audio: cada 30 s mientras suena, 5 s después de una pausa o del final, al aprobar y al ocultar o cerrar la pestaña. Solo números: nunca texto de la letra. El backend valida los pares con un validador dedicado (enteros, inicio < fin, dentro de 0..86.400.000).
+- `scripts/report_listening_coverage.py` (solo lectura): por operador y por canción, % de líneas de la primera versión aprobada que se escucharon antes de aprobar y % de la canción reproducida.
+
+### Fixed
+
+- Los eventos del editor guardan la hora en que ocurrieron (`occurred_at`). El cliente nunca la mandaba y quedaba vacía; si falta o es implausible (posterior a la llegada o de más de 24 h antes) se usa la hora de llegada.
+- Los eventos del editor de un admin de plataforma sobre canciones de otro tenant ya no se descartan. El editor le permite trabajar sobre esas canciones, pero `/analytics/events` buscaba el job sólo dentro del tenant del usuario y rechazaba en silencio todos sus seeks, aperturas, guardados y aprobaciones. No cambia el editor ni lo que ve el operador.
+
+## [1.1.121] - 2026-10-08
+
+### Added
+
+- `CHANGE_REQUEST_PUBLISH_GUARD_ENABLED` (apagada por defecto): publicar o re-enviar una canción cuya letra aprobada es anterior a un pedido de cambio que sigue abierto (incluidas variantes y regenerados de la misma canción) se rechaza con `change_request_newer_than_version` y la lista de pedidos. Vale para el envío por campaña (canción por canción: las demás siguen), para "Enviar a UMG" y para la publicación desde Cambios. "Publicar igual" exige un motivo y queda auditado. Un pedido sólo visual se compara contra el último render, no contra la letra. El diálogo de envío muestra las canciones frenadas con sus pedidos y ofrece "Publicar igual" con motivo obligatorio.
+- Con la misma variable, un pedido de texto ya no se cierra "por publicación" si el texto pedido no aparece en la letra publicada (cerca del tiempo citado o en cualquier parte de la canción, sin distinguir mayúsculas, tildes ni puntuación): queda abierto, se registra qué frases faltan y la publicación sigue igual. Los pedidos de timing, visuales o de prosa sin texto extraíble se cierran como hasta ahora.
+
+## [1.1.120] - 2026-10-08
+
+### Added
+
+- `WHISPERX_RECONCILE_KEEP_WORDS` (apagada por defecto): cada línea de WhisperX reconciliada con la letra de referencia conserva las palabras de la ventana donde se ancló, con su score. Antes se volvían a pegar por posición, se corrían en cuanto el alineado saltaba una palabra y, sin score, el pipeline las borraba: el 95 % de esas líneas llegaba al editor sin palabras. Una línea cuyas palabras no describen su texto queda sin palabras, como hoy. No cambia el texto ni el inicio ni el fin de ninguna línea. La clave entra en la huella de configuración del pipeline.
+
+## [1.1.119] - 2026-10-07
+
+### Fixed
+
+- Las copias históricas de videos pueden recuperar la referencia de letra desde la evidencia inmutable de audio completo de su original, si coinciden cuenta, archivo y revisión del audio. Se admiten las hipótesis de audio completo capturadas sin referencia previa. La recuperación mantiene la aprobación humana de cada versión y rechaza evidencia dañada, snapshots faltantes obligatorios y audio diferente.
+
+## [1.1.118] - 2026-10-07
+
+### Added
+
+- Evento de medición `editor_line_structure_changed` cada vez que el operador parte o une una línea. Registra cómo se resolvió el timing (palabras reales, palabras que ya no coinciden con el texto, uno solo de los dos lados con palabras o línea sin palabras), qué lo disparó (Enter, botón, división masiva, diálogo de wrap, referencia o Backspace en línea vacía) y la duración de la línea. Solo contadores y enums: nunca texto de la letra. No cambia cómo se parte ni cómo se une.
+
+## [1.1.117] - 2026-10-06
+
+### Fixed
+
+- Los efectos reactivos, incluido pulso de graves, renderizan canciones con cientos de beats sin exceder la profundidad del parser de FFmpeg. La máscara conserva todos los pulsos y su intensidad, y se calcula sobre una imagen pequeña antes de ampliarla al tamaño del video.
+
+### Added
+
+- Preset reutilizable UMG de foto fija inspirada en la letra, Poppins Bold en mayúsculas y reparto equilibrado entre bokeh, luces, polvo de luz, chispas, confeti, película y pulso de graves. El ayudante por API guarda estilos, verifica las aprobaciones existentes y envía una selección fija por tandas, con progreso persistente y reanudación sin duplicados.
+
+## [1.1.116] - 2026-10-06
+
+### Fixed
+
+- El editor conserva la revisión asociada a la letra en pantalla cuando una consulta de diagnóstico encuentra cambios de otra sesión. El siguiente guardado combina las versiones antes de escribir, evitando que una copia anterior sobrescriba una corrección completa. Las acciones que reemplazan la letra adoptan el texto y su revisión juntos.
+
+## [1.1.115] - 2026-10-05
+
+### Added
+
+- `CTC_ALIGN_UNKNOWN_LANG_JOB_ES` (apagada por defecto): el alineado CTC acepta una letra cuyo idioma el detector de texto no puede decidir ("unknown", típico de textos cortos o repetitivos) si el job está en español. El piso de mediana de score sigue declinando un idioma equivocado; un texto detectado como inglés sigue fuera.
+
+## [1.1.114] - 2026-10-05
+
+### Changed
+
+- `/health` muestra, para cada variable de timing, el valor efectivo, su origen (`env`, `default`, `empty` o `invalid`) y el valor crudo, en `timing_config_parity.effective_*`. Antes, "sin setear" y "0" se veían iguales: `LYRIC_LEAD_IN_MS` aparecía en 0 aunque se aplicaban 80 ms. La vista es informativa y no cambia el gate de paridad.
+
+## [1.1.113] - 2026-10-05
+
+### Fixed
+
+- Permitir aprobar y re-renderizar correcciones de videos ya generados en campañas completadas. Las campañas pausadas o canceladas siguen bloqueadas, y se conservan la aprobación de letra/audio/revisión y los límites de generación y revisión final. No se reabre la campaña ni se inicia una nueva tanda de transcripciones.
+
+## [1.1.112] - 2026-10-05
+
+### Added
+
+- Aire mínimo antes de la línea siguiente (`LYRIC_MIN_GAP_MS`, apagado por defecto). Con un valor mayor a 0, el fin de una línea se recorta para dejar ese aire, sin cortar más de 0,10 s de la última palabra ni dejar la línea en menos de 0,3 s, y sin tocar líneas bloqueadas. Con 0 el comportamiento es el de siempre.
+- Prueba prospectiva A/B del aire mínimo en campañas UMG nuevas de staging (`LYRIC_MIN_GAP_AB_ENABLED`). La asignación alterna por job y queda en el registro de auditoría: brazo A sin cambios, brazo B con 300 ms. Los jobs ya aprobados nunca participan.
+
+## [1.1.111] - 2026-10-05
+
+### Added
+
+- Con `EVIDENCE_PERSIST_V2` (apagada por defecto), cada línea de máquina guarda señales que antes se calculaban y se descartaban:
+  - parecido entre el texto y lo que oyó el ASR;
+  - canto sin cartel antes y después de la línea;
+  - milisegundos por carácter (línea truncada);
+  - mediana y mínimo del score por palabra;
+  - un marcador positivo de la validación de timing por palabra.
+
+  El acuerdo del consenso dirigido por línea queda en el registro de auditoría. Es solo escritura: no cambia texto, timing ni decisiones.
+
+## [1.1.109] - 2026-10-03
+
+### Fixed
+
+- Los renders y correcciones de campañas con una especificación UMG conservan su resolución y fps exigidos aunque el perfil heredado del trabajo diga `youtube`. Evita que un video de 29,97 fps vuelva a salir a 24 fps al corregirlo.
+
+## [1.1.108] - 2026-10-03
+
+### Fixed
+
+- El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+
+## [1.1.107] - 2026-10-03
+
+### Fixed
+
+- El alineado CTC ya no estira una palabra a través de un silencio cuando una
+  sola de sus letras queda del otro lado de la pausa. Sobre el stem vocal, si
+  entre dos letras de la misma palabra hay al menos 0,8 s seguidos sin voz, la
+  palabra se queda con el tramo cantado y su borde se ajusta a la voz medida
+  (Carajo "Hacerse Cargo": el primer "Bien" del puente pasa de 109,16–112,88 a
+  111,85–112,88 y el "bien" del final de 178,12–184,76 a 178,12–180,05, en vez
+  de engancharse a un "¡No!" gritado fuera de la letra). Texto, orden y
+  cantidad de palabras no cambian. No aplica al alinear sobre la mezcla.
+  Ajustable con `CTC_UNVOICED_SPLIT_GAP_S` y desactivable con
+  `CTC_UNVOICED_SPLIT_ENABLED=0`.
+- El recorte de bordes de baja confianza ahora ajusta la palabra a la región
+  de voz que más se superpone con ella, no a la primera que toca (que solía
+  ser la cola de la línea anterior y dejaba el recorte sin efecto).
+
+## [1.1.106] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: cerrar un pedido cuyo video corregido ya está publicado exige
+  revisarlo punto por punto. El panel separa el pedido en sus puntos, muestra
+  qué dice el video en cada tiempo citado y "Dar por resuelto" se habilita
+  sólo cuando están todos marcados. Que exista un corte corregido no prueba
+  que tenga todas las correcciones (5 de 10 pedidos del 3-oct estaban
+  incompletos).
+
+## [1.1.105] - 2026-10-03
+
+### Fixed
+
+- El alineado forzado local (cuarta etapa de re-sincronizar letra) ya no
+  declina siempre con `TypeError` cuando el detector léxico no reconoce el
+  idioma de la letra: stable-ts exige un idioma y recibía `None`. Ahora el
+  idioma se detecta una vez sobre el audio mezclado (nunca sobre el stem),
+  restringido a los seis idiomas soportados (job daa625bed6f1, IKV
+  "DJ Droga"). El log de declinación incluye el mensaje del error.
+
+## [1.1.104] - 2026-10-03
+
+### Fixed
+
+- "Dividir" en el editor de letra ya no borra el timing por palabra: cada mitad
+  conserva sus palabras y el corte cae en la pausa real del canto (por ejemplo
+  "Aprendamos a perdonar" / "y seremos perdonados"), en vez de partir por ancho
+  de pantalla y repartir el tiempo por cantidad de letras. Aplica también a
+  "Dividir todas" y al aviso de 3 líneas.
+
+## 1.1.103 — 2026-10-03
+
+- Todos los lyrics y art tracks ofrecen ProRes a pedido en ambos portales, incluso sin master guardado o Job local.
+- La exportación conserva resolución/FPS del MP4 publicado y descarga automáticamente al terminar.
+- Los masters usan la identidad de la fuente; una corrección no puede reutilizar el caché del corte anterior. El modo de último render sigue activo.
+- Publicar un video no genera ProRes de forma masiva; se conservan aprobación, aislamiento por país y auditoría de descargas.
+
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [1.1.102] - 2026-10-03
+
+### Changed
+
+- Build downloadable ZIP bundles on disk and stream them in bounded chunks;
+  release staged sources after archiving and clean up after interrupted sends.
+- Query only the latest campaign verdict for each requested job and the latest
+  heartbeat in the current editor session instead of loading full histories.
+- Document a staging-only acoustic-feature cache retention canary and its
+  performance, memory and rollback checks.
+
+## [1.1.101] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: un pedido cuyo video corregido ya se publicó (por ejemplo desde
+  el envío de una campaña sin tildar el pedido) se cierra con un clic,
+  "Confirmar y dar por resuelto", y queda registrado como resuelto por la
+  versión publicada. Antes sólo se podía cerrar "sin publicar" con una nota.
+- Cambios UMG: en canciones de campaña, "Generar el video corregido" fallaba
+  con `lyrics_and_timing_approval_missing`; ahora lleva al editor a aprobar
+  letra y timing, que es lo que genera el video.
+- Campañas: la bandeja muestra "Publicado: falta cerrar el pedido" en vez de
+  "Sin atender", y el envío al portal tiene "Marcar todos" para los pedidos que
+  resuelve.
+
+## [1.1.100] - 2026-10-03
+
+### Fixed
+
+- Un fallo temporal del proveedor de ASR opcional ya no deja fuera de servicio
+  todo el worker de calidad durante el arranque.
+
+## [1.1.99] - 2026-10-02
+
+### Fixed
+
+- El portal informa cuando falla la preparación ProRes, permite reintentar sin
+  reutilizar un job fallido de RQ y solo confirma que está listo cuando el
+  master se verificó en R2.
+
+## [1.1.98] - 2026-10-02
+
+### Added
+
+- Aprobación masiva de videos en QC desde la selección de la campaña, con una
+  confirmación única, progreso y reintento de los que fallen. Tras aprobar,
+  la selección pasa a la etapa de envío para publicarlos juntos al portal.
+- La publicación de Art Tracks crea el registro de acceso en el portal sin
+  copiar el MP4 en R2; el ProRes queda disponible para generación bajo demanda.
+
+## [1.1.97] - 2026-10-02
+
+### Fixed
+
+- El botón para generar ProRes en el portal UMG aparece también en videos de
+  campañas que no son Art Tracks cuando el MP4 publicado está disponible.
+
+## [1.1.96] - 2026-10-02
+
+### Added
+
+- Versioned static source for the shared Argentina and Chile UMG portals,
+  with separate Art Tracks and Other Videos sections. Versions are filtered
+  independently so a song with both formats appears in both sections.
+- Art Track ProRes preparation button compatible with the staging campaign
+  API; the Vercel rewrite targets the live Railway staging API domain.
+- Portal build option to preserve the live access hash and help content while
+  updating the page, avoiding a password rotation during deployment.
+
+### Fixed
+
+- Download and ProRes preparation endpoints now reject hidden deliveries and
+  files outside the published set, including requests made with a direct URL.
+- ProRes progress polling now completes shared portal deliveries whose source
+  Job belongs to the other environment.
+
+## [1.1.95] - 2026-10-02
+
+### Fixed
+
+- Las entregas UMG antiguas con video publicado y sin entrada `umg_master` ahora muestran la opción para generar el ProRes desde el portal. La solicitud agrega el master a la versión publicada cuando termina.
+- Las campañas difieren la transcodificación ProRes hasta que el cliente la solicita y permiten definir resolución, fps y perfil del master al crear el trabajo.
+
+## [1.1.94] - 2026-10-02
+
+### Added
+
+- Optional mail to UMG when a correction they asked for is published (`umg_publication_notice.py`,
+  `emails.send_umg_publication_notice`). OFF by default and with no recipients: nothing is sent until the owner sets
+  `UMG_PUBLISH_NOTIFY_ENABLED=1` and `UMG_PUBLISH_NOTIFY_RECIPIENTS_ARGENTINA` / `_CHILE` (or
+  `UMG_PUBLISH_NOTIFY_RECIPIENTS`; at most 10 valid addresses). Only a publication that closed client requests and
+  whose files are visible to the client notifies (a plain re-send or a hidden delivery stays silent). The mail names the
+  version and the portal, quotes what they asked for (escaped, capped) and links to the portal. Outside production the
+  existing staging gate still applies: an address only receives from staging if it is in `EMAIL_STAGING_ALLOWLIST`.
+
+### Fixed
+
+- Reintentar automáticamente las solicitudes de publicación UMG y consulta del estado ProRes cuando la conexión con la API se interrumpe transitoriamente. Si no se puede confirmar el envío, el aviso pide verificar el portal antes de reintentar.
+
+## [1.1.93] - 2026-10-01
+
+### Added
+
+- `scripts/railway_share_pipeline_config.py`: moves the pipeline/calibration/timing variables of a Railway
+  environment into SHARED variables referenced by every service (`${{shared.KEY}}`), so the fleet runtime token
+  cannot drift again. Dry run by default; only shares a key when every service holds the same value; writes
+  with skipDeploys and verifies that the rendered value of every key is unchanged (nothing restarts, a later
+  deploy resolves to the same values); idempotent; retries network blips. Applied on 2026-10-01 to staging
+  (34 keys, 6 services) and production (30 keys, 4 services); `check_fleet_config_parity.py` stays OK in both.
+  New keys that must stay uniform are added by running the tool again.
+
+## [1.1.92] - 2026-10-01
+
+### Added
+
+- `scripts/check_fleet_config_parity.py`: compares the pipeline/calibration environment (the inputs of the fleet
+  runtime token) across the services of a Railway environment and exits 1 listing the keys that differ. Production
+  had drifted (quality-worker missing 15 variables, `CTC_ALIGN_MIN_MED_SCORE` set on some services only), which made
+  quality jobs silently discard with `runtime_identity_mismatch` and `/health` report `fleet_runtime_token_mismatch`.
+  The production services were aligned the same day; run the check before every promotion.
+
+## [1.1.91] - 2026-10-01
+
+### Added
+
+- Production-capable switches for the two approval gates that did not exist in the
+  production line, so a promotion can keep production's behaviour until the QC redesign
+  is ready: `DELIVERY_QC_GATES_OFF` (delivery QC/preflight never blocks, any environment)
+  and `LANGUAGE_REVIEW_ADVISORY` (the language review warns but never answers 409 on
+  approve / approve-lyrics, any environment). Both are explicit operator env vars,
+  default OFF (gates stay active), and are reported in `/health` under `features`
+  (`delivery_qc_gates_off`, `language_review_advisory`). The older staging-only switches
+  (`DELIVERY_QC_STAGING_GATES_OFF`, `LANGUAGE_REVIEW_STAGING_ADVISORY`) keep working and
+  stay inert outside staging. Reports are still generated and shown; they only stop gating.
+
+## [1.1.90] - 2026-10-01
+
+### Fixed
+
+Alignment of the production line (`tometh22/umg-chile-portal`) and `main` with staging:
+the hotfixes that existed only there are now in staging, ported by hand (a plain
+`git merge main` would duplicate tables and leave the app unable to start).
+
+- Portal listing (`/api/deliveries/items`, from production `ace4063b`): the handler is no
+  longer `async` (it did synchronous DB/Redis/R2 work on the event loop), all database
+  state is read and the session released BEFORE any Redis/R2 I/O (PostgreSQL kills idle
+  transactions after about a minute), the size cache uses one `mget` and a pipelined
+  `setex`, and the HEAD fan-out has a hard 12 s deadline on the bounded metadata client.
+  Keeps staging's client visibility rules, `files_hidden` and revision fields.
+- Transcription retries (`main` #1218): a failure by deadline is deterministic, so the
+  RQ retry of a job whose previous attempt hit the deadline is discarded instead of
+  re-running (and re-billing) demucs + WhisperX; transient failures still retry. Failures
+  now carry an `error_code`.
+- ASGI replay (`main` #1220): the replay `receive` now propagates the real client
+  disconnect instead of waiting forever, which could hang SSE endpoints.
+- Provenance (`main` #1219): `ai_provenance.duration_ms` is split into queue time and
+  inference time (`predict_time_ms`, `queue_time_ms`). New idempotent Alembic revision
+  `ba888d1665d8`, re-chained behind `e5a7c9b1d3f6` (single head); the workers wait for
+  its columns at startup.
+- Gap-refetch gate (production `d8c45331`): `_reference_is_live` can no longer be unbound.
+
+## [1.1.89] - 2026-10-01
+
+### Security
+
+- `transformers` 4.57.6 -> 5.18.0 (exact pin). The 4.x series ended at 4.57.6, which
+  is affected by CVE-2026-80047, and every fix only exists in 5.x, so this is a
+  major upgrade. The 6 temporary exceptions for `transformers` are removed from
+  `security_exceptions.json` (the audit gate now passes with the 9 that remain,
+  all `torch`/`ecdsa`). `safetensors` lower bound raised to 0.8.0 (what 5.x needs);
+  `huggingface-hub` moves to 1.x transitively.
+- Validation: on the real pinned CTC model (`jonatasgrosman/wav2vec2-large-xlsr-53-spanish`
+  at its immutable revision) the emissions on a fixed 20 s signal are bit-for-bit
+  identical to 4.57.6 (max abs diff 0.0, same vocabulary and blank id); the 227
+  alignment/LoRA/anchor tests pass; the LoRA path (`PeftModel` + the ASR pipeline with
+  word timestamps + `processor.save_pretrained`) loads and runs. No code change was
+  needed.
+
+## [1.1.88] - 2026-10-01
+
+### Added
+
+- Per-delivery control of what the CLIENT sees (Admin > Cambios UMG, "Qué ve el
+  cliente"): **Automático** (default) hides the delivery while it has unpublished
+  changes and shows it again when it is published, **Siempre visible** keeps the
+  newest cut available, **Oculto** keeps it out of the portal until an operator
+  changes it. The portal keeps the card (and the client's requests) and only drops
+  the files (`files_hidden`). Only an edit IN FLIGHT (`editing`, `prores_pending`)
+  auto-hides: a frozen snapshot is never hidden and a dead edit (`edit_failed`) is
+  not either, so the operator is never left without a way out. A stale
+  professional master is never served, even when forced visible. Previously
+  issued signed links keep working until they expire (7 days). Publishing a
+  manually hidden delivery now says so ("OJO: el cliente todavía no la ve"), and a
+  hidden delivery cannot have a master prepared from the portal.
+- Admin switch "Publicar sin copiar archivos": picks copy-the-files or no-copies
+  publication without a Railway edit or deploy. Deployment-wide, so it asks for
+  confirmation and only the super admin can change it. The panel choice overrides
+  `PUBLISH_LATEST_POINTER`, which remains only the default.
+- Campaigns: songs the client cannot see at all (hidden in EVERY portal they are
+  published to) are reported as `portal_hidden` and worded accordingly ("Oculto
+  para el cliente", "el cliente no ve el video hasta que lo publiques").
+
+### Database
+
+- `deliveries.client_visibility VARCHAR(10)`: nullable, no default, added with
+  `IF NOT EXISTS` (Alembic `e5a7c9b1d3f6`). The portal rows live in the production
+  database, so the column must exist there before staging reads it; code that
+  ignores it keeps working. Also a local `system_settings` table (never the shared
+  portal database).
+
+### Changed
+
+- No-copies publication wording no longer promises the client sees the new cut as
+  soon as it renders: with the automatic mode they see it when it is published.
+
+## [1.1.87] - 2026-10-01
+
+### Fixed
+
+- Publishing a correction is now ONE click even when the professional (ProRes)
+  master is missing: "Publicar en el portal y dar por resuelto" starts the master,
+  shows its progress, asks the server again by itself and publishes the same
+  reviewed cut when it is ready (15 minutes maximum, then it hands control back
+  with a clear message). The button stays disabled while it waits, and the old
+  "Preparar el archivo profesional" step is now a small "Solo preparar" link and
+  "Elegir formato y publicar" for legacy deliveries without a saved format.
+- A second click can no longer start a second multi-GB transcode: operator-driven
+  prewarm requests (enable-prores, publish, portal prepare, lazy download) return
+  the live job instead of enqueueing again. The edit pipeline keeps its re-run.
+- After a successful publication the screen no longer replaces "Publicada la
+  versión N" with "preparation finished, this does not publish".
+
+- Campaigns: deliveries published before fingerprints existed (legacy rows) were
+  never flagged as outdated, so a corrected video looked up to date under
+  "Entregada". They are now detected with the same evidence the admin screen uses
+  (the job was overwritten after the portal last received it).
+
+### Changed
+
+- Songs with a cut newer than the portal's are split by what the operator must do
+  next: "Listas para reenviar" (approved, only need sending) and "Corte nuevo sin
+  aprobar" (approve first). The banner says how many of each and links to each
+  list, the filter has both options, every song carries a matching mark
+  ("Listo para reenviar" / "Falta aprobar el corte nuevo"), and the Entregada tab
+  shows how many of its songs need resending. The pipeline flags expose
+  `resend_ready` and `resend_review`.
+
+## [1.1.86] - 2026-09-30
+
+### Changed
+
+- Admin > Cambios UMG shows a three-step correction flow (Corregir, Generar el
+  video nuevo, Publicar) with ONE primary button per state named after what it
+  does ("Corregir en el editor", "Generar el video corregido", "Publicar en el
+  portal y dar por resuelto"). AI suggestions become an optional helper,
+  closing without publishing is a small collapsed link that still requires a
+  reason, and publication errors explain what happened and what to do instead
+  of the generic "El servidor no aceptó la publicación". QC/preflight wording
+  only appears when the gate is actually blocking.
+- The client change inbox in campaigns shows the same three steps per request.
+- Wording about what the client sees follows `publication_mode`: it no longer
+  says "the portal keeps the previous cut" when the portal serves the newest
+  render, and the campaign banner and chips are decided per song.
+- Review fixes: Ctrl/Cmd+Enter on a focused secondary button no longer runs the
+  primary action (publishing); the "render submitted" notice picks its wording
+  after the publication mode is known; a confirmed portal send forgets its
+  idempotency key and a deduplicated one says so; a retry the server refuses is
+  explained in words and only offered once the send stopped or stalled; an open
+  close-form is not inherited by another request.
+
+## [1.1.85] - 2026-09-30
+
+### Fixed
+
+- Campaign portal sends: a song that raises no longer stops the songs after it
+  (each song is isolated, processed in a stable order, and a failure marked
+  earlier is no longer rolled back by a later crash); `stale_approval` is not
+  offered a retry that can never succeed; an unreachable Redis is no longer read
+  as "no job" (no re-queue on a guess); the stalled-send sweeper skips locked
+  operations and moves on from ones it cannot re-queue; the list of requests a
+  send may close is capped.
+- A client request can only be closed by a publication if it was submitted
+  before the editor save that holds the fix and before the render finished, and
+  the job has an editor document; the inbox uses the same rule.
+- The change-request notification subject can no longer be broken by a newline
+  in the artist or song.
+- An accepted `/edit` now marks the job's deliveries as changing immediately, so
+  the old broadcast master and the client's approval do not look current while a
+  re-render is in flight. The portal hides a stale ProRes master for any row
+  marked stale (any reason), independent of the publication mode, because
+  staging and production share the deliveries database.
+- A job whose R2 files an active portal delivery without a snapshot still
+  serves can no longer be deleted (single and bulk); a clear 409 explains why.
+- `portal_serves_latest` is decided per delivery (a frozen snapshot keeps
+  serving the old cut) instead of by the global publication flag.
+
+## [1.1.84] - 2026-09-30
+
+### Added
+
+- `PUBLISH_LATEST_POINTER` (off by default): publish to a client portal without
+  copying any file. The portal then serves the job's newest render, publishing
+  becomes a few database writes instead of minutes and several GB of copies per
+  portal, and nothing is frozen before a re-render. ProRes masters stay hidden
+  while a re-render is in flight so the client never gets the old master next
+  to a new MP4. Existing snapshots are untouched until their next publication.
+- The campaign pipeline and `/admin/change-requests` report `publication_mode`;
+  the campaign UI says "corte nuevo sin registrar" instead of "portal
+  desactualizado" when the portal already serves the newest render.
+
+## [1.1.83] - 2026-09-30
+
+### Added
+
+- Campaigns get a "Cambios del cliente" view with the client change requests of
+  that campaign (portal, step, wait against a 48 business hour goal, the
+  client's own approval), a banner with how many songs have a cut newer than
+  the client portal, and "Cerrar con nota" for the campaign owner and admins.
+- A campaign portal send can close the client requests the operator ticks
+  (and only those), with a note the client reads. Every id is validated with
+  one rule at send time and again by the worker; nothing is closed by default.
+  New local column `delivery_batch_items.change_request_intent` (additive
+  migration `d3f5a7c9e1b4`, also required by the worker schema gate).
+- Everything is behind `CAMPAIGN_CHANGE_REQUESTS_ENABLED` and
+  `CAMPAIGN_CHANGE_REQUEST_ACTIONS`, both off by default.
+
+## [1.1.82] - 2026-09-30
+
+### Added
+
+- Staging-only kill switches so corrections can be published while delivery
+  QC is being redesigned: `DELIVERY_QC_STAGING_GATES_OFF=1` stops the delivery
+  QC/preflight gate from blocking approval and publication, and
+  `LANGUAGE_REVIEW_STAGING_ADVISORY=1` stops the language review from returning
+  `language_review_unresolved` on approve and approve-lyrics. Both are inert
+  unless `ENVIRONMENT` is exactly `staging` and default to off; reports are still
+  generated and shown.
+
+## [1.1.81] - 2026-09-30
+
+### Fixed
+
+- Regenerating a background from the editor opened with "Editar letra" in
+  Cambios no longer answers 409: the proposal fence only applies when the
+  request carries a proposal, operation or preview hash. The edit idempotency
+  key now includes the edit type and a per-submit nonce.
+- A campaign send to a client portal fails per song instead of aborting: an
+  ambiguous replacement or an unexpected error marks only that song, the
+  operation ends as partial, can be retried (`POST /delivery-operations/{id}/retry`)
+  and the reconciler re-queues one that lost its worker. The backend now
+  enforces the campaign's fixed portal and audits each published song.
+- The client change-request notification names the portal (Argentina/Chile),
+  links straight to the request and can also reach the campaign owner
+  (`CHANGE_REQUEST_NOTIFY_OWNER`, off by default).
+- Admin > Cambios orders by the latest lifecycle change so a reopened request
+  is no longer pushed below the list cut.
+
+### Added
+
+- Campaign cards show how many client change requests are open and how long
+  the oldest has waited.
+
+## [1.1.80] - 2026-09-30
+
+### Fixed
+
+- Hide content hashes stored as technical codes in campaign lists and the song
+  drawer header instead of showing them as if they were catalog codes.
+
+## [1.1.79] - 2026-09-30
+
+### Added
+
+- UMG change requests written in free prose are now turned into concrete,
+  reviewable lyric changes. The strict parser only understood quoted
+  "cambiar X por Y" and converted 4 of 77 instructions in requests
+  #112-#131; a model (Gemini 2.5 Pro via Vertex) now reads the comment with
+  the numbered lines and proposes rewrites, line splits/joins and timing
+  moves. A deterministic validator only offers what the client wrote: any
+  word that enters or leaves must be in the comment, the change must fall
+  near a cited time, and timing comes from the heard words, never from the
+  model. On the 20 requests: 136 applicable changes instead of 4, manual
+  items 73 -> 17; where UMG wrote the exact text it wanted, the proposal
+  contains it in 86 of 95 items (the operators' saved lyrics: 56). Nothing
+  is applied automatically: the admin request panel shows each change with
+  the client's words and applies the selected ones. The interpretation runs
+  in the background (~1 min, status "interpreting") behind
+  `CHANGE_REQUEST_INTERPRETER_ENABLED`; a model failure leaves the request as
+  before.
+
+### Fixed
+
+- Revisión rápida no longer proposes a single automatic ear's text as a fix.
+  On staging "El Cigarrito" it offered "pito → pido" (Chilean slang) and
+  "de a vara → de habara". Measured over 298 approved songs, single-ear
+  points were ~1 false alarm per song and, on the 136 UMG change requests,
+  found the right place 48 times but the right text only 6. They now read
+  "Escuchá este tramo": the line stays as is, the doubtful words are
+  underlined, the ear's version goes in the reason, and Enter plays the
+  audio instead of applying anything.
+- Differences that are the same sound cut differently ("a vara"/"habara")
+  are no longer raised unless the official lyrics say so.
+- Timing suggestions left the panel (52 alerts, 1 real request); timing is
+  reviewed in "Ajustar tiempos".
+- When nothing blocks approval, suggestions stay behind "Ver N sugerencias
+  (opcional)" instead of taking the main card.
+
+## [1.1.78] - 2026-09-30
+
+### Fixed
+
+- Add a short-lived, exact job allowlist for staging UMG manual review during
+  urgent Chile corrections. The existing Argentina campaign preflight bypass
+  remains separate; Chile still requires a fresh report and objective checks.
+
+## [1.1.77] - 2026-09-30
+
+### Fixed
+
+- Track the latest change request update through submission, resolution, and
+  reopening, and show its date and time in the admin queue.
+
+## [1.1.76] - 2026-09-30
+
+### Added
+
+- Add a static Art Track preset for catalog deliveries: cover on the left,
+  title and artist on the right, a blurred cover background, and no waveform.
+  Keep the animated waveform preset available as a separate option.
+- Expose the preset in single-song uploads, campaigns, and the Art Track editor,
+  with high-quality ProRes export and individual campaign master downloads.
+- **Revisión rápida** in the lyrics editor: one panel lists everything that
+  should be decided before approving, each with a one-click fix, the audio
+  of that moment and a preview of how the line will read. Built from the 20
+  UMG change requests of 2026-09-29 (136 items, Argentina and Chile), where
+  the dominant error was a machine mishearing that passed review untouched.
+  Sources, all already stored or cached (no new paid calls):
+  - words heard by the machine and the whole-song witness that the lyrics
+    lost ("Falta texto", e.g. "dormite ya", the leading "Que");
+  - where two independent ears (Gemini without reference, the witness,
+    official lyrics) agree against the screen ("Se escucha distinto"),
+    with alternatives when they disagree;
+  - official lyrics from the campaign sheet, the lrclib cache (fetched in
+    the background when missing) or pasted by the operator, used only for
+    comparison;
+  - corrections already made in other songs of the same artist;
+  - UMG style rules: question marks on non-questions and exclamations,
+    title spelling, inconsistent accents, joined words and missing spaces,
+    a lonely word on screen;
+  - a chorus corrected in only some of its repetitions (suggestion, since
+    the corrected copy may itself carry a typo).
+  Identical fixes are grouped ("se corrigen juntas" across every chorus).
+  Only points with two agreeing sources or an objective rule block
+  approval (409 `lyric_review_pending` on /generate, /edit and campaign
+  lyric approval); single-source points are non-blocking suggestions.
+  Keyboard: A apply, N keep, E listen, J/K move. Decisions are stored on
+  the line (`qa_dismissed`). Songs where the ears fail are flagged as
+  difficult. Backtest: 102 of the 136 requested changes had a point in the
+  panel; over 313 approved staging songs 77 % would have no blocking point
+  (p90 2, max 5).
+- `docs/UMG_GUIA_ESTILO_LETRAS.md`: UMG lyric style guide derived from the
+  131 portal change requests, also reachable from the panel.
+
+- **Campañas as a pipeline**: every campaign screen counts the same unit
+  (the song) with one stage per song — Audio, Letra, Lista, Generando,
+  QC video, Aprobada, Entregada (+ Atención, Descartadas) — from a new
+  read-only `GET /batch/campaigns/{id}/pipeline`; the campaign list carries
+  the same counts through bulk queries. Variants never add songs and
+  "Entregada" is decided by the current cut published in a portal.
+- Campaign workspace: pipeline bar, one song table with one primary action
+  per row, song drawer (history, versions, portal, metadata), floating bulk
+  bar (generate, send, assign style, discard/restore, retry), QC focus
+  player with "Aprobar y siguiente" and keyboard shortcuts, 3-step creation
+  wizard, browser folder upload (resumable, SHA-256 dedup, CSV metadata),
+  visual style editor and a settings tab (general, upload, style, contract,
+  activity). Snapshots are cached between tabs and cleared on logout.
+- `/admin/cola` now opens the campaign's lyric stage ("Revisión de letras").
+
+### Fixed
+
+- Preserve the legal `℗` mark when a selected font lacks the glyph, and keep
+  compatible frame rates on the fast ProRes conversion path.
+
+- Applying a change request whose quote is only part of the line no longer
+  overwrites the whole line; only the quoted span is replaced ("…se fundió,
+  dormite ya", "Que hace un año atrás").
+
+### Changed (adversarial review, 2026-09-30)
+
+- Review panel redesigned for zero-mouse review: one card at a time with a
+  word diff (added in green, removed struck through, punctuation-only
+  changes marked per sign), Enter/⌫/1–3/E/J/K/M/Z/? keys that never leak to
+  the editor's own shortcuts, optional auto-listen, the lyric line of the
+  active point highlighted (and flashed green after applying), undo that
+  brings the point back, a failed fix that stays visible instead of
+  vanishing, and an "Aprobar" button that turns into "Faltan N · Revisar".
+- Visual pass: the panel follows the Genly design system (neutral surfaces,
+  violet only for the primary action, green/red only for what enters and
+  leaves the line, one progress bar); shortcuts, compared sources and the
+  UMG guide live behind "?". Official lyrics enter through a single dialog
+  shared with "Pegar letra oficial", with two explicit outcomes: Comparar
+  (nothing changes) or Reemplazar y re-sincronizar.
+- Fixes are applied by line identity and word position: correcting one
+  repetition in a line no longer changes the other, a stale point never
+  lands on a neighbouring line, merges keep word timings, chorus copies
+  keep their punctuation.
+- Precision: official-lyrics veto on sound-alike ears, phonetic
+  corroboration, spelling-only differences only with the official lyrics,
+  real questions and legitimate accent pairs no longer flagged,
+  question/orphan points keyed by line, stable dismissal keys, NFC input.
+  New suggestions: line breaks like the official lyrics and timing (a line
+  that leaves before its last sung word).
+- Safety and performance: bounded alignment (a 400-line repetitive song
+  went from 45 s to under 1 s), review computed outside row locks and off
+  the event loop and cached by content, lrclib fetched without holding a
+  DB connection (max 2 at a time, own cache namespace) and never for batch
+  campaigns (audio-only rule), correction memory scoped to the tenant,
+  review reads in a savepoint, official-lyrics paste recorded as a product
+  event.
+- Change requests: a partial client quote replaces only its span, but a
+  quote that only drops words (or matches the whole line) still replaces
+  the line; leading ¿¡ and trailing punctuation are kept.
+
+### Configuration
+
+- `LYRIC_REVIEW_MODE`: `enforce` (default), `observe` (show without
+  blocking) or `off`.
+- `LYRIC_REVIEW_ENFORCE_TENANTS`: comma-separated tenants where approval is
+  blocked; when unset, only batch campaigns block and everything else shows
+  the panel without blocking.
+- `LYRIC_REVIEW_FETCH_OFFICIAL`: `1` (default) fetches missing official
+  lyrics from lrclib in the background; `0` disables it.
+
+## [1.1.75] - 2026-09-30
+
+### Fixed
+
+- Return the live UMG approval gate from the job status endpoint, so an
+  authorized campaign-scoped staging bypass is reflected in the review UI.
+- Label the temporary preflight bypass clearly and hide stale-cut findings
+  while preserving the independent lyric, file, and ProRes gates.
+
+## [1.1.74] - 2026-09-30
+
+### Changed
+
+- Add a temporary, staging-only UMG preflight bypass requiring the existing
+  exact-campaign allowlist and UTC expiry. The bypass is separately switched,
+  audited at approval and publication, and leaves independent language,
+  required-file and ProRes checks in place.
+
+## [1.1.73] - 2026-09-29
+
+### Added
+
+- Preserve the private transcription snapshot before any automatic lyric or
+  timing repair and let an operator undo the repair while the song remains
+  untouched. The undo is versioned, reanalyzed, and excluded from human
+  correction training data. The editor refreshes quality after undo instead
+  of showing windows from the replaced version, and records undo usage.
+
+### Safety
+
+- Automatic repair still requires its existing signed acoustic calibration
+  authorization and remains disabled until that evidence is available.
+
+## [1.1.72] - 2026-09-29
+
+### Changed
+
+- Add a temporary, campaign-allowlisted staging exception for generic UMG
+  REVIEW/NOT_RUN signoffs. Fresh QC, objective blocking failures, language
+  review, render assets and ProRes freshness remain enforced; each bypass is
+  recorded in approval and delivery audit events.
+
+## [1.1.71] - 2026-09-29
+
+### Fixed
+
+- Refresh UMG delivery QC automatically when ProRes configuration changes its
+  input fingerprint, then continue publication when the same reviewed render
+  still passes. A changed or failing render returns the operator to the exact
+  check that needs attention.
+
+## [1.1.70] - 2026-09-28
+
+### Fixed
+
+- Keep the UMG publish confirmation visible when a follow-up request-list
+  refresh fails, show live publish progress, and allow operators to reconcile
+  an uncertain response against the exact change request before retrying.
+
+## [1.1.69] - 2026-09-28
+
+### Fixed
+
+- Treat aliases of one recognition provider as one evidence family for lyric
+  auto-repair. Optional candidate-provider errors now abstain without changing
+  the original transcription verdict.
+
+### Added
+
+- Add a private, read-only Agus calibration queue with audio/checkpoint
+  verification, blind clip review, controls and separate diagnostic handling
+  for inserted or deleted lines. Operator edits remain hints, never gold labels
+  or permission for automatic changes.
+
+## [1.1.68] - 2026-09-28
+
+### Fixed
+
+- Reject LRCLIB results and cached lyrics whose title does not match the
+  requested song, including the incident where "Hoy" selected "Hoy Es Adios".
+- Require independent audio evidence before external lyrics can replace
+  transcription, including the legacy fallback and gap-driven re-fetch paths.
+- Keep live recordings on audio-owned structure when catalogue attestation is
+  local-only, regardless of live policy switch settings.
+- Log the selected catalogue record and audio/catalogue durations for future
+  incident diagnosis.
+
+## [1.1.67] - 2026-09-28
+
+### Added
+
+- Add a pre-editor lyric and timing auto-repair path with local-only candidate
+  contracts, per-action signed calibration authorization, stale audio/segment
+  guards, and a concise editor summary. Automatic changes remain disabled
+  until an independently calibrated authorization is configured.
+
+## [1.1.66] - 2026-09-28
+
+### Fixed
+- Preserve job state in UMG preflight refreshes so a completed analysis can satisfy the current-render readiness gate.
+- Keep the refresh action available whenever the UMG gate requires a fresh preflight.
+
+## [1.1.65] - 2026-09-28
+
+### Fixed
+- Keep UMG publication unavailable until the current render has a valid preflight, and send the operator directly to the required review.
+
+## [1.1.64] - 2026-09-27
+
+### Fixed
+- Replace eight individual UMG checklist signatures with one audited review of the exact current render; explain publication blockers and distinguish unverified OCR from a pass.
+
+## [1.1.63] - 2026-09-27
+
+### Fixed
+- Route UMG publication QC blocks to the current video's review checklist and return to the same change request afterward.
+
+## [1.1.62] - 2026-09-18
+
+### Fixed
+- Corrected background variants replace the unique ancestor delivery with an open request in the chosen portal, retaining the delivery/request identity and archiving duplicate portal rows without deleting videos or files.
+- Campaign publication releases transactions during large media copies and rechecks approval/publication identity before committing, matching the individual publisher; publication revisions increment only once.
+- Clarify variant replacement in the publication picker and retain the current portal as the default destination when updating.
+
+## [1.1.61] - 2026-09-18
+
+### Fixed
+
+- Release database transactions while copying large portal files, then
+  revalidate the approved cut and destination before publishing atomically.
+- Preserve legacy portal files without holding idle database locks, and
+  never replace a publication completed concurrently by another operator.
+
+## [1.1.60] - 2026-09-18
+
+### Fixed
+
+- Unify UMG correction review, exact-revision render approval and explicit
+  publication from the editor and Changes. Expose manual resolution clearly.
+- Pin published portal files independently from new renders, with an additive
+  deliveries schema update and fail-closed publication copies.
+- Reconcile campaign publication progress, refresh history after completion,
+  and resolve older requests when a corrected cut is published.
+- Allow platform administrators to regenerate approved backgrounds from the
+  editor, retaining scene, permission and publication safeguards.
+
+## [1.1.59] - 2026-09-17
+
+### Fixed
+
+- Verify saved UMG corrections across regenerated editor-local line IDs by
+  falling back to unique unchanged timing. Do not match another chorus by text
+  alone or accept ambiguous line timings as proof of an applied correction.
+
+## [1.1.58] - 2026-09-17
+
+### Fixed
+
+- Isolate the remaining processing-job reaper contract test from the advisory
+  lock held by lifespan daemons in the full suite; retain row-state assertions.
+- Keep request analysis accessible beside the original comment even when a
+  professional master is pending; do not mark unanalysed request steps complete.
+- Keep UMG preview playback running when polling renews signed media URLs;
+  reload only for a new object/render and expose an explicit media retry.
+- Prepare configured ProRes masters with their saved format without invoking
+  publication or requiring a pending-review render to be approved first.
+  Show persistent acknowledgement and errors beside the action button.
+- Keep saved-proposal details available and compare them against the current
+  server lyric. Distinguish saved text from rendered video, and allow a fresh
+  analysis when the saved text no longer matches the requested correction.
+
+## [1.1.57] - 2026-09-17
+
+### Fixed
+
+- Recover applied UMG proposals from existing request-only editor links, so
+  saved corrections can be approved without changing their text again.
+  Validate the request, job and saved revision before enabling that render.
+- Open the latest saved lyric correction instead of an older approved version.
+  Reloading and approving now preserves the corrected phrase in the render
+  payload; browser regressions cover both legacy and durable editors.
+
+## [1.1.56] - 2026-09-17
+
+### Fixed
+
+- Preserve the exact applied UMG proposal when opening the lyric editor after
+  reloading the change-request queue, so reviewing an already-saved correction
+  triggers the intended re-render instead of reporting "No cambiaste nada".
+- Let legacy UMG deliveries configure and regenerate their professional ProRes
+  master while the completed video is in `pending_review`, while continuing to
+  reject jobs that are still rendering.
+
+## [1.1.55] - 2026-09-17
+
+### Added
+
+- Turn Cambios UMG into a dedicated full-width review workspace with a
+  persistent request queue, video and timestamp context, editable diff,
+  autosave status, workflow progress and a fixed primary action.
+
+### Fixed
+
+- Render a UMG lyric proposal that was already saved before opening the
+  editor, even when there is no additional browser-side diff.
+- Validate the exact request and applied proposal used to enqueue a render,
+  make retries idempotent, and preserve that provenance in the render outbox.
+- Return operators to the exact UMG request after submitting or completing a
+  render instead of reopening the lyric editor without context.
+
+## [1.1.54] - 2026-09-16
+
+### Added
+
+- Let operators regenerate visual backgrounds directly from a UMG change
+  request, with an editable prompt and explicit preview before starting the
+  existing re-render flow.
+- Let legacy UMG deliveries restore their missing ProRes configuration from
+  the change-request card, then prepare the professional master and refresh
+  publication status automatically.
+
+### Changed
+
+- Parse multi-line UMG instructions as one reviewable request and preserve
+  continuation text instead of dropping it after the first timestamp.
+- Make delivery preflight findings concise and non-blocking unless an actual
+  enforced approval gate fails.
+
+### Fixed
+
+- Always open post-render lyric edits from the latest approved revision, even
+  when a newer unapproved autosave exists on the server.
+- Archive incompatible browser drafts without blocking the editor behind a
+  technical recovery dialog.
+- Enable publishing corrected legacy deliveries after a real re-render; the
+  new publication advances the revision, clears the old client approval and
+  resolves the associated request. Failed renders remain blocked.
+
+## [1.1.53] - 2026-09-16
+
+### Added
+
+- Turn UMG requests for a complete phrase on one screen into reviewable
+  structural proposals when consecutive lyric fragments exactly match the
+  client-supplied phrase and timestamps.
+- Add a direct background-editor action to visual change requests, keeping
+  image regeneration behind an explicit operator preview.
+
+### Security
+
+- Require human selection for structural merges, preserve the phrase's outer
+  timing boundaries, and leave ambiguous or non-exact matches manual.
+- Recalculate pending proposals created by an older parser without rewriting
+  already applied proposal history.
+
+## [1.1.52] - 2026-09-16
+
+### Changed
+
+- Promote UMG change requests to a dedicated, full-width Admin section with a
+  visible pending-count badge, so operators can review the original request,
+  current lyric and proposed result without competing with the live pipeline.
+- Keep the live pipeline focused in the `Ahora` section and isolate editorial
+  request data from the health and jobs polling lifecycle.
+
+## [1.1.51] - 2026-09-16
+
+### Added
+
+- Show each change request beside the complete current lyric and a live preview
+  of the resulting lyric before applying it. Selected operations and edited
+  replacement text update the preview immediately, with changed lines shown
+  against their originals and timestamps for context.
+
+### Changed
+
+- Require proposal edits to be saved before application so the reviewed
+  preview is exactly the version that will be written.
+
+### Security
+
+- Mark a proposal stale in the read response when its bound lyric revision or
+  content hash no longer matches the editor document, preventing an outdated
+  contextual preview from being applied.
+
+## [1.1.50] - 2026-09-16
+
+### Added
+
+- Add a revision- and audio-bound assistant for Universal delivery change
+  requests. It understands the portal's real `timestamp + corrected lyric`
+  lists, explicit replacements, repeated occurrences and terminal-period
+  cleanup; operators can review, edit and selectively apply the diff from
+  Operación without requiring official lyrics.
+- Persist proposal lifecycle, decisions and idempotency in
+  `change_request_proposals`, keeping ambiguous timing, structure, background
+  and audio instructions review-only. Applying a proposal does not resolve the
+  customer request: the existing re-render and publish step remains the only
+  automatic closure point.
+- Surface reference-free Delivery QC review signals for fragmented lyric
+  cards, inconsistent near-repetitions and cards ending before their final
+  stored word timestamp.
+
+### Security
+
+- Bind every proposal to the external request hash, editor revision and
+  segment/audio identities; reject stale or conflicting writes and keep raw
+  lyric text out of product analytics. Both analysis and application remain
+  independently kill-switchable.
+
+## [1.1.49] - 2026-09-16
+
+### Fixed
+
+- Refuse an on-demand ProRes preparation when the enterprise queue already
+  has work waiting. That endpoint enqueues a multi-GB ffmpeg onto the same
+  queue that serves client renders, and does it with the queue-depth guard
+  deliberately bypassed — right for one human click waiting on a file, wrong
+  for an avalanche. Measured on 2026-09-16 there are 178 missing files across
+  both portals, so 178 buttons one click away, with production's rate limiter
+  not throttling anything. Falls open when the queue cannot be read: a
+  monitoring problem must not stop a client from asking for their file.
+
+## [1.1.48] - 2026-09-16
+
+### Fixed
+
+- Bring the three portal commits production has been running into staging:
+  on-demand ProRes preparation from the portal, its cross-environment variant
+  for deliveries published from staging into the shared production portal,
+  and the per-portal listing cache separation. Staging was a regression
+  against production — promoting it would have removed features the client
+  uses today, and the portal's "descargar" button on a missing ProRes would
+  have started answering 404.
+
+## [1.1.47] - 2026-09-16
+
+### Fixed
+
+- Build the delivery fingerprint from evidence that a render finished, not
+  from its inputs. Touching `segments_revision`, `render_params` or
+  `umg_spec` without re-rendering moved it, and publishing then cleared the
+  client's approval and auto-closed their open change requests over a video
+  nobody touched — reproduced on 29 rows. Conversely `/retry` and
+  `edit_art_track` re-render from scratch and touch none of those, so a whole
+  correction was reported as "the same cut". `completed_at` separates them.
+- Catch a `/retry` in the ProRes gate. Those paths never archive the previous
+  deliverables, so the staleness rule saw nothing and the pre-retry broadcast
+  master could be published beside the new MP4 — the 2026-08-03 incident
+  through another door. The publish path and the admin panel now also prove a
+  re-render by comparing the render's completion against the publication.
+- Write the freshness columns when publishing in bulk. Every row published by
+  a campaign was born with no fingerprint, so drift detection was dead on
+  exactly the rows the campaign view lists, and a campaign re-publish never
+  cleared the "applying changes" flag.
+- Drop `force=True` from the bulk ProRes prewarm. It deliberately bypasses the
+  queue-depth guard, and this path can publish up to 500 songs at once — a
+  thousand multi-GB transcodes ahead of every client render on the same queue.
+  The portal's on-demand button, which is a human click, keeps it.
+
+### Improved
+
+- Tell a ProRes that is generated on demand from a file nothing will create.
+  The daily audit was about to report 28 "phantoms" for a state the product
+  chose on purpose, and an alert that cries without reason stops being read.
+- Stop the audit from reporting a green day when it failed entirely or
+  checked zero objects, always write its metrics so "clean" is
+  distinguishable from "never ran", order the rows it truncates, and stop
+  re-running the whole ~1000-object pass on every API deploy.
+
+## [1.1.46] - 2026-09-16
+
+### Fixed
+
+- Identify the portal scope in `GET /api/deliveries/items`. The Chile portal
+  fails closed when the listing does not say which portal it is for — by
+  design, so umgchile.genly.pro can never render a stale backend's global
+  listing — and production already returned the field while staging did not.
+  Promoting staging would therefore have shown the client zero deliveries and
+  an error. Verified live before and after.
 
 ## [1.1.45] - 2026-09-15
 
@@ -26,6 +1113,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fail-closed ending. Two negative controls over the same audio still decline
   — another song's lyric (Color Esperanza) and the same lyric duplicated to
   80 lines. Kill switch: `ANCHOR_LOCAL_ALIGN_ENABLED=0`.
+
+## [1.1.45] - 2026-09-15
+
+### Added
+
+- Audit what the portal promises, once a day, in the reaper's single-runner
+  cycle. Two classes of failure were invisible until someone asked about
+  something else: a row advertising a file that is not in R2 (28 of 34 Chile
+  deliveries on 2026-09-15), and a delivery whose render changed after it was
+  published. It only reports — repairing a deliverable is always a decision
+  with a human in it, because the row can lie in both directions. Rows with
+  no fingerprint and jobs owned by another environment are counted as
+  unevaluable rather than flagged, and an R2 network failure is never
+  reported as a missing file.
+
+### Improved
+
+- Show the published version, the in-flight state and "atendido en la versión
+  N" on the client portal, and make a missing ProRes read as the download it
+  is — clicking it generates the file and then starts the download, instead of
+  asking for a second click three minutes later.
 
 ## [1.1.44] - 2026-09-15
 

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import difflib
 import hashlib
+import json
 import re
+import unicodedata
 from typing import Any, Iterable
 
-from change_request_parser import fold_text, parse_change_request
+from change_request_parser import parse_change_request
 from editor import normalize_segments, segments_content_hash
 from transcription_quality import segments_hash
 
@@ -17,6 +20,29 @@ MANUAL_KINDS = {
     "manual_review", "timing_review", "structure_review",
     "background_review", "audio_review",
 }
+
+
+def proposal_content_hash(payload: dict) -> str:
+    """Bind the exact preview, independently of lifecycle/audit mutations."""
+    value = {key: payload.get(key) for key in (
+        "schema_version", "parser_version", "request_sha256", "base_revision",
+        "segments_content_hash", "audio_revision", "audio_sha256",
+    )}
+    value["operations"] = [
+        {key: item for key, item in row.items() if key != "status"}
+        for row in (payload.get("operations") or [])
+    ]
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _identity(value: str) -> str:
+    return unicodedata.normalize("NFC", str(value or "")).strip()
+
+
+def _lexical_character(value: str) -> bool:
+    return bool(value) and (value.isalnum() or value == "_"
+                            or unicodedata.category(value).startswith("M"))
 
 
 def request_hash(comment: str) -> str:
@@ -39,13 +65,84 @@ def _at_time(segments: list[dict], value: float) -> tuple[int, dict] | None:
         <= float(row.get("end") or 0) + 0.20
     ]
     if containing:
-        return min(containing, key=lambda item: abs(_segment_midpoint(item[1]) - value))
+        return containing[0] if len(containing) == 1 else None
     if not segments:
         return None
-    nearest = min(
-        enumerate(segments), key=lambda item: abs(_segment_midpoint(item[1]) - value),
-    )
-    return nearest if abs(_segment_midpoint(nearest[1]) - value) <= 2.5 else None
+    nearby = [(index, row) for index, row in enumerate(segments)
+              if abs(_segment_midpoint(row) - value) <= 2.5]
+    return nearby[0] if len(nearby) == 1 else None
+
+
+_ELLIPSIS = re.compile(r"^(?:\.{2,}|…)\s*|\s*(?:\.{2,}|…)$")
+
+
+def _fold_word(word: str) -> str:
+    folded = unicodedata.normalize("NFKD", word.lower())
+    return "".join(ch for ch in folded if ch.isalnum() and not unicodedata.combining(ch))
+
+
+def _replace_quoted_fragment(current: str, requested: str) -> str:
+    """Aplica la cita del cliente sólo sobre el tramo que cita.
+
+    UMG escribe "0:44 Tu garantía de reloco se fundió" o
+    "...HACE UN AÑO ATRÁS...": citan el pedazo que corrigen, no la línea
+    entera. Reemplazar la línea completa borraba lo que quedaba fuera de la
+    cita ("dormite ya", el "Que" inicial; pedidos 112/113 del 29-09-2026).
+
+    Es un fragmento sólo si es claramente más corto que la línea (o trae
+    "…") y coincide con ella en la primera y la última palabra. Si no, es la
+    línea completa que pide el cliente, incluso para BORRAR palabras
+    ("Hace un año atrás te fuiste" sin el "Que").
+    """
+    literal = requested
+    has_ellipsis = bool(_ELLIPSIS.search(requested))
+    requested = _ELLIPSIS.sub("", _ELLIPSIS.sub("", requested)).strip()
+    cur_words, req_words = current.split(), requested.split()
+    if not cur_words or not req_words:
+        return literal
+    if not has_ellipsis and len(req_words) > 0.8 * len(cur_words):
+        return literal
+    if len(req_words) >= len(cur_words):
+        return literal
+    target = "".join(_fold_word(w) for w in req_words)
+    best = None
+    for size in range(max(1, len(req_words) - 1), min(len(cur_words), len(req_words) + 2) + 1):
+        for start in range(0, len(cur_words) - size + 1):
+            window = cur_words[start:start + size]
+            if not has_ellipsis and (
+                _fold_word(window[0]) != _fold_word(req_words[0])
+                or _fold_word(window[-1]) != _fold_word(req_words[-1])
+            ):
+                continue
+            joined = "".join(_fold_word(w) for w in window)
+            ratio = difflib.SequenceMatcher(a=joined, b=target, autojunk=False).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, start, size)
+    if best is None or best[0] < 0.6 or best[2] == len(cur_words):
+        return literal
+    _, start, size = best
+    def surface(word: str) -> str:
+        return re.sub(r"[^\w']", "", unicodedata.normalize("NFC", word).lower())
+    if [surface(w) for w in cur_words[start:start + size]] == [surface(w) for w in req_words]:
+        # La cita ya está tal cual en la línea: lo único que puede estar
+        # pidiendo es sacar el resto ("Yo te quiero mucho" sin el otro "mucho").
+        return literal
+    replacement = requested
+    letters = [c for c in requested if c.isalpha()]
+    if letters and all(c.isupper() for c in letters) and not current.isupper():
+        replacement = requested.lower()
+        if start == 0 and cur_words[0][:1].isupper():
+            replacement = replacement[:1].upper() + replacement[1:]
+    if start == 0 and cur_words[0].lstrip("¿¡\"'(«")[:1].isupper() and replacement[:1].islower():
+        replacement = replacement[:1].upper() + replacement[1:]
+    first, last = cur_words[start], cur_words[start + size - 1]
+    leading = re.match(r"^[¿¡\"'(«]+", first)
+    if leading and not re.match(r"^[¿¡\"'(«]", replacement):
+        replacement = leading.group(0) + replacement
+    trailing = re.search(r"[,;:.!?»\")]+$", last)
+    if trailing and not re.search(r"[,;:.!?»\")]$", replacement):
+        replacement += trailing.group(0)
+    return " ".join(cur_words[:start] + [replacement] + cur_words[start + size:])
 
 
 def _replace_text(current: str, expected: str | None, requested: str) -> str | None:
@@ -54,16 +151,34 @@ def _replace_text(current: str, expected: str | None, requested: str) -> str | N
     if not requested:
         return None
     if not expected:
-        return requested
+        return _replace_quoted_fragment(current, requested)
     expected = str(expected).strip()
-    if fold_text(current) == fold_text(expected):
+    if _identity(current) == _identity(expected):
         return requested
     # Substring replacement is allowed only when the exact client-supplied
     # text exists. Accent-folded fuzzy containment is review-only because it
     # cannot identify safe character offsets without guessing.
-    match = re.search(re.escape(expected), current, flags=re.IGNORECASE)
-    if not match:
+    # Exact literal offsets and lexical boundaries; accent/case folding is only
+    # useful to suggest manual candidates, never to authorize a mutation.
+    pattern = (r"(?<!\w)" if expected[:1].isalnum() else "") + re.escape(expected)
+    pattern += r"(?!\w)" if expected[-1:].isalnum() else ""
+    matches = list(re.finditer(pattern, current))
+    # Python's \w excludes combining marks; a regex boundary alone would allow
+    # si -> no inside decomposed sí and leave the accent attached to new text.
+    matches = [match for match in matches
+               if not (_lexical_character(expected[:1]) and match.start() > 0
+                       and _lexical_character(current[match.start() - 1]))
+               and not (_lexical_character(expected[-1:]) and match.end() < len(current)
+                        and _lexical_character(current[match.end()]))
+               and not (match.start() > 0 and current[match.start() - 1] in "\u200c\u200d")
+               and not (match.end() < len(current) and (
+                   unicodedata.category(current[match.end()]).startswith("M")
+                   or unicodedata.category(current[match.end()]) == "Cf"
+                   or "\U0001f3fb" <= current[match.end()] <= "\U0001f3ff"
+                   or "\U0001f1e6" <= current[match.end()] <= "\U0001f1ff"))]
+    if len(matches) != 1:
         return None
+    match = matches[0]
     return current[:match.start()] + requested + current[match.end():]
 
 
@@ -81,7 +196,7 @@ def _text_targets(
     elif expected:
         exact = [
             (index, row) for index, row in enumerate(segments)
-            if fold_text(str(row.get("text") or "")) == fold_text(str(expected))
+            if _identity(row.get("text")) == _identity(expected)
         ]
         if len(exact) == 1:
             primary = exact[0]
@@ -92,10 +207,10 @@ def _text_targets(
 
     candidates = [primary]
     if scope == "all_matching":
-        needle = fold_text(str(expected or primary[1].get("text") or ""))
+        needle = _identity(expected or primary[1].get("text") or "")
         candidates = [
             (index, row) for index, row in enumerate(segments)
-            if fold_text(str(row.get("text") or "")) == needle
+            if _identity(row.get("text")) == needle
         ]
     targets: list[tuple[int, dict, str]] = []
     for index, row in candidates:
@@ -109,6 +224,8 @@ def _text_operation(
     *, instruction: dict, index: int, current: dict, proposed_text: str,
 ) -> dict:
     proposed = {**deepcopy(current), "text": proposed_text}
+    for key in ("words", "word_timestamps", "tokens"):
+        proposed.pop(key, None)
     current_rows = [deepcopy(current)]
     proposed_rows = [proposed]
     group_key = instruction.get("id")
@@ -125,6 +242,8 @@ def _text_operation(
         "confidence": instruction.get("confidence") or "medium",
         "scope": instruction.get("scope") or "single",
         "source_excerpt": instruction.get("source_excerpt"),
+        "source_start": instruction.get("source_start"),
+        "source_end": instruction.get("source_end"),
         "timecode_seconds": instruction.get("timecode_seconds"),
         "start": float(current.get("start") or 0),
         "end": float(current.get("end") or 0),
@@ -133,6 +252,7 @@ def _text_operation(
         "current_segments_hash": segments_content_hash(current_rows),
         "proposed_segments_hash": segments_content_hash(proposed_rows),
         "warnings": [],
+        "word_alignment_invalidated": any(key in current for key in ("words", "word_timestamps", "tokens")),
     }
 
 
@@ -140,7 +260,7 @@ def _merge_phrase_target(
     segments: list[dict], instruction: dict,
 ) -> tuple[int, list[dict]] | None:
     """Find an exact contiguous fragment sequence around the client timestamp."""
-    requested = fold_text(str(instruction.get("requested_text") or ""))
+    requested = _identity(instruction.get("requested_text"))
     timecode = instruction.get("timecode_seconds")
     if not requested or timecode is None:
         return None
@@ -154,21 +274,18 @@ def _merge_phrase_target(
         last = min(primary_index, len(segments) - size)
         for start in range(first, last + 1):
             window = segments[start:start + size]
-            joined = fold_text(" ".join(str(row.get("text") or "") for row in window))
+            if any(float(b["start"]) - float(a["end"]) > 0.75
+                   or float(b["start"]) < float(a["end"])
+                   for a, b in zip(window, window[1:])):
+                continue
+            joined = _identity(" ".join(str(row.get("text") or "") for row in window))
             if joined == requested:
                 candidates.append((start, window))
     if not candidates:
         return None
     # Prefer the least invasive exact window, then the one whose midpoint is
     # closest to the timestamp supplied by UMG.
-    return min(candidates, key=lambda item: (
-        len(item[1]),
-        abs(
-            (float(item[1][0].get("start") or 0)
-             + float(item[1][-1].get("end") or 0)) / 2
-            - float(timecode)
-        ),
-    ))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _merge_phrase_operation(
@@ -201,6 +318,8 @@ def _merge_phrase_operation(
         "confidence": instruction.get("confidence") or "high",
         "scope": "single",
         "source_excerpt": instruction.get("source_excerpt"),
+        "source_start": instruction.get("source_start"),
+        "source_end": instruction.get("source_end"),
         "timecode_seconds": instruction.get("timecode_seconds"),
         "start": proposed["start"],
         "end": proposed["end"],
@@ -214,7 +333,12 @@ def _merge_phrase_operation(
 
 def _period_operations(segments: list[dict], instruction: dict) -> list[dict]:
     rows: list[dict] = []
-    for index, current in enumerate(segments):
+    targets = list(enumerate(segments))
+    if instruction.get("scope") != "all_matching":
+        at = instruction.get("timecode_seconds")
+        target = _at_time(segments, float(at)) if at is not None else None
+        targets = [target] if target else []
+    for index, current in targets:
         text = str(current.get("text") or "")
         if not re.search(r"\.(?:[\"'”’)]*)\s*$", text):
             continue
@@ -250,6 +374,8 @@ def _manual_operation(instruction: dict) -> dict:
         "confidence": instruction.get("confidence") or "low",
         "scope": instruction.get("scope") or "single",
         "source_excerpt": instruction.get("source_excerpt"),
+        "source_start": instruction.get("source_start"),
+        "source_end": instruction.get("source_end"),
         "timecode_seconds": instruction.get("timecode_seconds"),
         "reason": instruction.get("reason") or "manual_review_required",
         "current_segments": [],
@@ -274,7 +400,7 @@ def _background_prompt_operation(
     artist = str(context.get("artist") or "").strip()
     song_title = str(context.get("song_title") or "").strip()
     genre = str(context.get("genre") or "").strip()
-    client_request = " ".join(str(comment or "").strip().split())
+    client_request = str(instruction.get("source_excerpt") or "").strip()
 
     parts: list[str] = []
     if current_prompt:
@@ -291,13 +417,14 @@ def _background_prompt_operation(
         parts.append(f"Crear una nueva composición visual para {identity}.")
     else:
         parts.append("Crear una composición visual completamente nueva para el lyric video.")
-    if client_request:
-        parts.append(f"Requisito obligatorio del cliente: {client_request}.")
-    parts.append(
+    mandatory = (
+        f"Requisito obligatorio del cliente: {client_request}. "
         "No incluir texto, subtítulos, logos ni marcas de agua en el fondo. "
         "Cumplir literalmente todas las exclusiones indicadas por el cliente."
     )
-    suggested_prompt = " ".join(parts)[:4000]
+    constraints_fit = len(mandatory) <= 4000
+    optional = " ".join(parts)
+    suggested_prompt = mandatory + (" " + optional[:max(0, 3999 - len(mandatory))] if constraints_fit and optional else "")
     scene_plan = context.get("scene_plan")
     multi_scene = bool(
         isinstance(scene_plan, dict) and scene_plan.get("scenes")
@@ -306,6 +433,8 @@ def _background_prompt_operation(
     if mode not in {"veo", "imagen"}:
         mode = "veo"
     warnings = ["human_video_review_required_before_publish"]
+    if not constraints_fit:
+        warnings.append("background_constraints_exceed_prompt_limit")
     if multi_scene:
         warnings.append("multi_scene_background_requires_scene_editor")
     return {
@@ -318,11 +447,13 @@ def _background_prompt_operation(
         "status": "pending",
         "applicable": False,
         "visual_action": "regenerate_background",
-        "regeneration_supported": not multi_scene,
+        "regeneration_supported": not multi_scene and constraints_fit,
         "automatic_apply_allowed": False,
         "confidence": instruction.get("confidence") or "medium",
         "scope": "single",
         "source_excerpt": instruction.get("source_excerpt"),
+        "source_start": instruction.get("source_start"),
+        "source_end": instruction.get("source_end"),
         "reason": "background_prompt_requires_operator_confirmation",
         "current_prompt": current_prompt,
         "suggested_prompt": suggested_prompt,
@@ -334,17 +465,65 @@ def _background_prompt_operation(
     }
 
 
+def _spans_overlap(item: dict, spans: list[tuple[int, int]]) -> bool:
+    start, end = item.get("source_start"), item.get("source_end")
+    if start is None or end is None:
+        return False
+    return any(a < end and start < b for a, b in spans)
+
+
+def _merge_interpretation(
+    operations: list[dict], unresolved: list[dict], interpretation: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Suma los cambios que interpretó el modelo (change_request_interpreter)
+    a los del parser estricto: lo determinístico gana sobre la misma línea y
+    un pendiente manual desaparece sólo si su texto quedó cubierto."""
+    claimed = {segments_content_hash([row]) for op in operations for row in op.get("current_segments") or []}
+    added = []
+    for op in interpretation.get("operations") or []:
+        rows = op.get("current_segments") or []
+        if not rows or any(segments_content_hash([row]) in claimed for row in rows):
+            continue
+        claimed.update(segments_content_hash([row]) for row in rows)
+        added.append(op)
+    spans = [(op["source_start"], op["source_end"]) for op in added
+             if op.get("source_start") is not None and op.get("source_end") is not None]
+    remaining = [item for item in unresolved if not _spans_overlap(item, spans)]
+    covered_manual = [(item.get("source_start"), item.get("source_end")) for item in remaining]
+    for item in interpretation.get("manual") or []:
+        if item.get("reason") == "visual":
+            continue  # el fondo lo resuelve su propio flujo
+        if item.get("source_start") is not None and any(
+                a is not None and a == item["source_start"] for a, _ in covered_manual):
+            continue
+        remaining.append({
+            "id": _operation_id("interp-manual", item.get("quote"), item.get("reason")),
+            "kind": "manual_review", "origin": "interpreter", "status": "pending",
+            "applicable": False, "automatic_apply_allowed": False,
+            "reason": f"interpreter_{item.get('reason') or 'unclear'}",
+            "why": item.get("why", ""), "source_excerpt": item.get("quote", ""),
+            "source_start": item.get("source_start"), "source_end": item.get("source_end"),
+            "timecode_seconds": None, "confidence": "low", "scope": "single",
+            "current_segments": [], "proposed_segments": [], "warnings": [],
+        })
+    return [*operations, *added], remaining
+
+
 def build_proposal(
     *, comment: str, segments: Iterable[dict], base_revision: int,
     audio_revision: int = 0, audio_sha256: str = "",
     background_context: dict | None = None,
+    interpretation: dict | None = None,
 ) -> dict:
     current = normalize_segments([dict(row) for row in segments])
     parsed = parse_change_request(comment)
     operations: list[dict] = []
     unresolved: list[dict] = []
     visual_operations: list[dict] = []
+    satisfied: list[dict] = []
     structural_targets: set[str] = set()
+    visual_instructions = [row for row in parsed["instructions"] if row.get("kind") == "background_review"]
+    visual_constraints = [row for row in parsed["instructions"] if row.get("reason") == "unresolved_visual_constraint"]
     for instruction in parsed["instructions"]:
         kind = instruction.get("kind")
         if kind == "replace_text":
@@ -358,6 +537,13 @@ def build_proposal(
                     for index, row, proposed in targets
                 )
             else:
+                at = instruction.get("timecode_seconds")
+                target = _at_time(current, float(at)) if at is not None else None
+                if target and _identity(target[1].get("text")) == _identity(instruction.get("requested_text")):
+                    satisfied.append({**_manual_operation(instruction), "status": "already_satisfied",
+                                      "reason": "already_satisfied", "warnings": [],
+                                      "verified_segments": [deepcopy(target[1])]})
+                    continue
                 unresolved.append({
                     **_manual_operation(instruction),
                     "reason": "lyric_target_not_found",
@@ -373,6 +559,13 @@ def build_proposal(
                         instruction=instruction, index=index, current_rows=rows,
                     ))
                     structural_targets.add(target_hash)
+                else:
+                    existing = next(item for item in operations if item.get("kind") == "merge_phrase"
+                                    and item.get("current_segments_hash") == target_hash)
+                    existing.setdefault("additional_source_spans", []).append({
+                        "start": instruction.get("source_start"), "end": instruction.get("source_end"),
+                        "excerpt": instruction.get("source_excerpt"), "instruction_id": instruction.get("id"),
+                    })
             else:
                 unresolved.append({
                     **_manual_operation(instruction),
@@ -390,28 +583,63 @@ def build_proposal(
                     "warnings": ["no_terminal_period_found"],
                 })
         elif kind == "background_review":
-            visual_operations.append(_background_prompt_operation(
-                instruction,
-                comment=comment,
-                background_context=background_context,
-            ))
+            if not visual_operations:
+                visual_sources = sorted([*visual_instructions, *visual_constraints], key=lambda row: row["source_start"])
+                combined = {**instruction, "source_excerpt": "\n".join(row["source_excerpt"] for row in visual_sources)}
+                visual = _background_prompt_operation(combined, comment=comment, background_context=background_context)
+                visual["source_spans"] = [{"start": row["source_start"], "end": row["source_end"]} for row in visual_sources]
+                if visual_constraints:
+                    visual["regeneration_supported"] = False
+                    visual["warnings"].append("unresolved_visual_constraint")
+                visual_operations.append(visual)
+        elif kind == "layout_context":
+            if not any(row.get("kind") == "merge_phrase" for row in parsed["instructions"]):
+                unresolved.append(_manual_operation({**instruction, "kind": "structure_review"}))
         else:
             unresolved.append(_manual_operation(instruction))
 
+    if interpretation:
+        operations, unresolved = _merge_interpretation(operations, unresolved, interpretation)
+
+    # Detect competing claims before presenting a jointly applicable selection.
+    claims: dict[str, list[dict]] = {}
+    for operation in operations:
+        for row in operation["current_segments"]:
+            claims.setdefault(segments_content_hash([row]), []).append(operation)
+    conflicts = {item["id"] for values in claims.values() if len(values) > 1 for item in values}
+    unresolved.extend({**item, "applicable": False, "automatic_apply_allowed": False,
+                       "reason": "conflicting_operations", "warnings": ["conflicting_operations"]}
+                      for item in operations if item["id"] in conflicts)
+    operations = [item for item in operations if item["id"] not in conflicts]
+    layout_sources = [{"start": row["source_start"], "end": row["source_end"],
+                       "excerpt": row["source_excerpt"]}
+                      for row in parsed["instructions"] if row["kind"] == "layout_context"]
+    if layout_sources:
+        for item in [*operations, *unresolved]:
+            if item.get("kind") == "merge_phrase":
+                item["layout_source_spans"] = layout_sources
+    # Unknown prose may contain another visual constraint without our vocabulary.
+    # Never generate from an incomplete request; operator first disambiguates it.
+    if any(item.get("kind") == "manual_review" for item in unresolved):
+        for item in visual_operations:
+            item["regeneration_supported"] = False
+            if "unresolved_request_requires_review" not in item["warnings"]:
+                item["warnings"].append("unresolved_request_requires_review")
     applicable_count = len(operations)
     visual_count = len(visual_operations)
     actionable_count = applicable_count + sum(
         bool(row.get("regeneration_supported")) for row in visual_operations
     )
-    if actionable_count and unresolved:
+    if (actionable_count or satisfied) and unresolved:
         status = "partial"
-    elif actionable_count:
+    elif actionable_count or satisfied:
         status = "ready"
     else:
         status = "needs_input"
     return {
         "schema_version": SCHEMA_VERSION,
-        "parser_version": parsed["schema_version"],
+        "parser_version": parsed["schema_version"] + (
+            f"+{interpretation.get('schema')}" if interpretation else ""),
         "status": status,
         "request_sha256": request_hash(comment),
         "base_revision": int(base_revision),
@@ -419,11 +647,14 @@ def build_proposal(
         "segments_content_hash": segments_content_hash(current),
         "audio_revision": int(audio_revision or 0),
         "audio_sha256": str(audio_sha256 or ""),
-        "operations": [*operations, *visual_operations, *unresolved],
-        "operation_count": len(operations) + visual_count + len(unresolved),
+        "operations": [*operations, *visual_operations, *unresolved, *satisfied],
+        "operation_count": len(operations) + visual_count + len(unresolved) + len(satisfied),
         "applicable_count": applicable_count,
         "visual_action_count": visual_count,
         "unresolved_count": len(unresolved),
+        "satisfied_count": len(satisfied),
+        "source_coverage": parsed["coverage"],
+        "coverage_complete": parsed["coverage_complete"],
     }
 
 
@@ -479,9 +710,9 @@ def apply_operations(
         before = operation.get("current_segments") or []
         after = operation.get("proposed_segments") or []
         kind = operation.get("kind")
-        if not before or len(after) != 1:
+        if not before or not after or (len(after) != 1 and kind != "relayout"):
             raise ValueError("change request operations need source segments and one result")
-        if kind != "merge_phrase" and len(before) != 1:
+        if kind not in {"merge_phrase", "relayout"} and len(before) != 1:
             raise ValueError("text change request operations must replace one segment")
         before_hash = segments_content_hash(before)
         after_hash = segments_content_hash(after)
@@ -501,6 +732,30 @@ def apply_operations(
                 or float(proposed.get("end") or 0) != float(ordered[-1].get("end") or 0)
             ):
                 raise ValueError("structural merge changed phrase boundaries")
+        if kind == "relayout":
+            # Re-cortar una frase o sumar una línea cantada: las líneas nuevas
+            # quedan en orden, sin superponerse entre sí ni con las vecinas.
+            outer_start = min(float(row.get("start") or 0) for row in before)
+            outer_end = max(float(row.get("end") or 0) for row in before)
+            before_hashes = {segments_content_hash([row]) for row in before}
+            others = [row for row in current if segments_content_hash([row]) not in before_hashes]
+            lower = max((float(row.get("end") or 0) for row in others
+                         if float(row.get("end") or 0) <= outer_start + 1e-6), default=0.0)
+            upper = min((float(row.get("start") or 0) for row in others
+                         if float(row.get("start") or 0) >= outer_end - 1e-6), default=float("inf"))
+            spans = [(float(row.get("start") or 0), float(row.get("end") or 0)) for row in after]
+            if (spans[0][0] < lower - 1e-6 or spans[-1][1] > upper + 1e-6
+                    or any(a[1] > b[0] + 1e-6 or a[0] >= a[1] for a, b in zip(spans, spans[1:]))
+                    or spans[-1][0] >= spans[-1][1]):
+                raise ValueError("structural relayout left the phrase span")
+        if kind == "timing":
+            old, new = before[0], after[0]
+            if _identity(old.get("text")) != _identity(new.get("text")):
+                raise ValueError("timing change request changed text")
+            if (abs(float(new.get("start") or 0) - float(old.get("start") or 0)) > 6
+                    or abs(float(new.get("end") or 0) - float(old.get("end") or 0)) > 6
+                    or float(new.get("start") or 0) >= float(new.get("end") or 0)):
+                raise ValueError("timing change request moved the line too far")
         claimed.update(before_row_hashes)
 
     result = [row for row in current if segments_content_hash([row]) not in claimed]
@@ -509,7 +764,7 @@ def apply_operations(
     result = normalize_segments(result)
     # Plain text operations must never move the timeline. Structural merges
     # deliberately replace adjacent fragments by their exact outer span.
-    if not any(row.get("kind") == "merge_phrase" for row in selected):
+    if not any(row.get("kind") in {"merge_phrase", "relayout", "timing"} for row in selected):
         before_timing = [(row["start"], row["end"]) for row in current]
         after_timing = [(row["start"], row["end"]) for row in result]
         if before_timing != after_timing:

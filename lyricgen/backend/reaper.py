@@ -115,6 +115,20 @@ _DELIVERY_RETENTION_SWEEP_INTERVAL_S = int(os.environ.get(
 ))
 _last_delivery_retention_sweep_ts = 0.0
 
+# Auditoría de integridad de las entregas del portal, en el mismo ritmo
+# diario y bajo el mismo runner único. Pregunta dos cosas que nadie miraba:
+# si el archivo que la fila promete existe en R2, y si el render cambió
+# después de publicarse. Las dos veces que fallaron (2026-09-15: 28 masters
+# fantasma en el portal de Chile, y una entrega sirviendo un corte anterior)
+# nos enteramos de casualidad, preguntando por otra cosa.
+_DELIVERY_AUDIT_INTERVAL_S = int(os.environ.get(
+    "REAPER_DELIVERY_AUDIT_INTERVAL_S", str(24 * 3600),
+))
+# Arranca "ya corrida": con 0.0 la auditoría salía en el primer ciclo de
+# CADA deploy, o sea ~1000 HEAD a R2 por cada release en vez de una vez al
+# día. El primer reporte llega al día siguiente, que es el ritmo que tiene.
+_last_delivery_audit_ts = time.time()
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -1200,6 +1214,8 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
     # Keep a dedicated checked-out connection for the entire sweep instead.
     lock_connection = None
     got_lock = False
+    delivery_audit_due = False
+    sweep_completed = False
     try:
         # Try to take the advisory lock. pg_try_advisory_lock is non-
         # blocking; if another replica already has it, returns false
@@ -1271,11 +1287,9 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             except Exception as e:
                 logger.warning("[REAPER] stale multipart sweep failed: %s", e)
 
-        # Retain UMG portal deliverables for 60 days by default. This marks
-        # expired rows hidden and removes only the five published output
-        # names; source audio under inputs/ remains available to edit and
-        # re-render. The helper uses DeliveriesSessionLocal, which points at
-        # the production portal DB when DELIVERIES_DATABASE_URL is set.
+        # Protective retention inventory only: no row hiding or object
+        # deletion. DeliveriesSessionLocal may point at the real portal DB;
+        # destructive retention requires coordinated shared-domain ownership.
         global _last_delivery_retention_sweep_ts
         if time.time() - _last_delivery_retention_sweep_ts >= _DELIVERY_RETENTION_SWEEP_INTERVAL_S:
             _last_delivery_retention_sweep_ts = time.time()
@@ -1286,6 +1300,14 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     logger.info("[REAPER] delivery retention sweep: %s", _rep)
             except Exception as e:
                 logger.warning("[REAPER] delivery retention sweep failed: %s", e)
+
+        # Decide scheduling while this replica owns the sweep, but do NOT
+        # perform network HEAD requests while its work transaction/lock
+        # connection remain open. The audit runs after cleanup in finally.
+        # Cadence is process-local, not a cross-environment singleton promise.
+        global _last_delivery_audit_ts
+        if time.time() - _last_delivery_audit_ts >= _DELIVERY_AUDIT_INTERVAL_S:
+            delivery_audit_due = True
 
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
@@ -1360,6 +1382,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             db.rollback()
             logger.warning("[REAPER] review reminder sweep failed: %s", e)
         if not stuck and not orphans and not stalled:
+            sweep_completed = True
             return 0
         # reap_stuck_job returns False when its in-function race guard
         # (re-fetch + recheck status under FOR UPDATE) detects the worker
@@ -1382,6 +1405,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # care about "what got reaped this cycle", not which sweep flagged
         # it. de-dup above already guaranteed no overlap.
         stuck = stuck + orphans + stalled
+        sweep_completed = True
     finally:
         # Release through the exact dedicated connection that acquired the
         # session-level lock. Closing it is the final fail-safe.
@@ -1399,6 +1423,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             finally:
                 lock_connection.close()
         db.close()
+        if delivery_audit_due and sweep_completed:
+            _last_delivery_audit_ts = time.time()
+            try:
+                from delivery_integrity import audit_active_deliveries, log_audit
+                log_audit(audit_active_deliveries())
+            except Exception as exc:
+                logger.warning("[REAPER] delivery integrity audit failed: %s", type(exc).__name__)
 
     # Side-effect notifications happen AFTER the DB commit so a failed
     # email/Sentry call never rolls back a successful reap.

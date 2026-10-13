@@ -2,7 +2,7 @@
 
 import uuid
 
-from database import Job, ProductEvent
+from database import AuditLog, Job, ProductEvent
 
 
 def _me(client, token):
@@ -23,8 +23,10 @@ def _job(db, owner, *, status="COMPLETE"):
         progress=100,
         delivery_qc={
             "schema_version": "genly-delivery-qc-runtime-v1",
+            "report_id": "synthetic-viewed-report",
             "status": status,
             "mode": "observe",
+            "segments_revision": 0,
             "decision": "REVIEW",
             "summary": {"open_count": 1, "fail_count": 0, "warn_count": 1},
             "issues": [{
@@ -38,6 +40,15 @@ def _job(db, owner, *, status="COMPLETE"):
     )
     db.add(job)
     db.commit()
+    db.refresh(job)
+    from delivery_qc_runtime import delivery_qc_source_fingerprint
+    input_fingerprint = delivery_qc_source_fingerprint(job)
+    job.delivery_qc = {
+        **job.delivery_qc,
+        "source_fingerprint": input_fingerprint,
+        "job_input_fingerprint": input_fingerprint,
+    }
+    db.commit()
     return job
 
 
@@ -48,7 +59,7 @@ def test_reviewer_decision_persists_and_closes_issue(client, user_token, db):
     response = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "acknowledged", "reason": "audio_preview_checked"},
+        json={"decision": "acknowledged", "reason": "audio_preview_checked", "expected_report_id": "synthetic-viewed-report"},
     )
 
     assert response.status_code == 200, response.text
@@ -111,7 +122,7 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     rejected = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "acknowledged"},
+        json={"decision": "acknowledged", "expected_report_id": "synthetic-viewed-report"},
     )
     assert rejected.status_code == 422
     assert rejected.json()["detail"] == (
@@ -121,7 +132,7 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     signed = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "resolved_manual", "reason": "full_video_reviewed"},
+        json={"decision": "resolved_manual", "reason": "full_video_reviewed", "expected_report_id": "synthetic-viewed-report"},
     )
     assert signed.status_code == 200, signed.text
     issue = signed.json()["delivery_qc"]["issues"][0]
@@ -130,13 +141,119 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     assert issue["operator_decision"]["decided_at"]
 
 
+def test_full_video_attestation_resolves_checklist_once_for_current_render(
+    client, user_token, db,
+):
+    from delivery_qc_runtime import MANDATORY_REVIEW_CHECKS, qc_input_fingerprint
+
+    owner = _me(client, user_token)
+    job = _job(db, owner)
+    job.delivery_profile = "umg"
+    job.umg_spec = {"frame_size": "HD", "fps": 29.97}
+    report = dict(job.delivery_qc)
+    report["issues"] = [*report["issues"], *[
+        {
+            "issue_id": f"manual-{code}", "code": code,
+            "summary": label, "status": "OPEN", "severity": "FAIL",
+            "result_status": "REVIEW", "manual_verification_required": True,
+            "blocking": False,
+        }
+        for code, label, _description in MANDATORY_REVIEW_CHECKS
+    ]]
+    fingerprint = qc_input_fingerprint(job)
+    report.update({
+        "job_input_fingerprint": fingerprint,
+        "source_fingerprint": fingerprint,
+        "report_id": "current-render-1",
+    })
+    job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/review-attestation",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"confirmed": True, "expected_report_id": "current-render-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    updated = response.json()["delivery_qc"]
+    manual_rows = [row for row in updated["issues"] if row.get("manual_verification_required")]
+    assert len(manual_rows) == len(MANDATORY_REVIEW_CHECKS)
+    assert all(row["status"] == "RESOLVED_MANUAL" for row in manual_rows)
+    assert all(row["operator_decision"]["user_id"] == owner["id"] for row in manual_rows)
+    assert updated["approval"]["can_approve"] is True
+    event = db.query(ProductEvent).filter(
+        ProductEvent.job_id == job.job_id,
+        ProductEvent.name == "delivery_qc_review_attestation",
+    ).one()
+    assert event.properties["issue_count"] == len(MANDATORY_REVIEW_CHECKS)
+    audit = db.query(AuditLog).filter(
+        AuditLog.user_id == owner["id"],
+        AuditLog.action == "delivery_qc.review_attestation",
+    ).one()
+    assert audit.detail["report_id"] == "current-render-1"
+
+
+def test_full_video_attestation_rejects_stale_render_and_does_not_sign(
+    client, user_token, db,
+):
+    owner = _me(client, user_token)
+    job = _job(db, owner)
+    response = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/review-attestation",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"confirmed": True, "expected_report_id": "old-render"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_preview_changed"
+    assert not any(row.get("manual_verification_required") for row in job.delivery_qc["issues"])
+
+
+def test_full_video_attestation_cannot_override_an_objective_failure(
+    client, user_token, db,
+):
+    from delivery_qc_runtime import MANDATORY_REVIEW_CHECKS, qc_input_fingerprint
+
+    owner = _me(client, user_token)
+    job = _job(db, owner)
+    job.delivery_profile = "umg"
+    job.umg_spec = {"frame_size": "HD"}
+    report = dict(job.delivery_qc)
+    report["issues"] = [*report["issues"], {
+        "issue_id": "objective-fail", "code": "MEDIA_DURATION_MISMATCH",
+        "summary": "Duración distinta a la especificación", "status": "OPEN",
+        "severity": "FAIL", "result_status": "FAIL", "blocking": True,
+    }, *[
+        {"issue_id": f"manual-{code}", "code": code, "status": "OPEN",
+         "severity": "FAIL", "result_status": "REVIEW", "blocking": False,
+         "manual_verification_required": True}
+        for code, _label, _description in MANDATORY_REVIEW_CHECKS
+    ]]
+    fingerprint = qc_input_fingerprint(job)
+    report.update({"job_input_fingerprint": fingerprint, "source_fingerprint": fingerprint,
+                   "report_id": "render-with-failure"})
+    job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/review-attestation",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"confirmed": True, "expected_report_id": "render-with-failure"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "blocking_fail_requires_correction_and_new_preflight"
+    assert all(row["status"] == "OPEN" for row in job.delivery_qc["issues"] if row.get("manual_verification_required"))
+
+
 def test_external_qc_result_is_admin_only_and_persists(
     client, admin_token, user_token, db,
 ):
     owner = _me(client, user_token)
     job = _job(db, owner)
     path = f"/jobs/{job.job_id}/delivery-qc/external-result"
-    payload = {"source": "umg", "report_id": "umg-2026-08-28", "finding_count": 0}
+    payload = {"source": "umg", "report_id": "umg-2026-08-28", "finding_count": 0,
+               "expected_report_id": "synthetic-viewed-report"}
 
     forbidden = client.post(
         path,
@@ -176,6 +293,7 @@ def test_external_qc_findings_are_normalized_and_become_a_regression_case(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
             "source": "umg", "report_id": "umg-regression-1",
+            "expected_report_id": "synthetic-viewed-report",
             "finding_count": 1,
             "findings": [{
                 "description": 'Misspelled in lyrics, "JAMAS" should be "JAMÁS"',

@@ -10,10 +10,13 @@ de Torch y la rueda Linux `+cpu` del índice de PyTorch.
 Las excepciones actuales se limitan al motor CTC: `torch`/`torchaudio` 2.8 no
 pueden subir mientras se use `torchaudio.functional.forced_align`, eliminado en
 2.9. Los modelos remotos están restringidos en `ctc_align.py` a un ID conocido,
-un commit SHA inmutable y `trust_remote_code=False`. `transformers` permanece en
-la rama 4 hasta validar su major 5 con el benchmark de alineación. `ecdsa` llega
-por `python-jose`, pero los tokens de la aplicación aceptan sólo HS256.
+un commit SHA inmutable y `trust_remote_code=False`. `transformers` se subió a la
+5.18.0 el 1-oct-2026 (la serie 4 terminó en 4.57.6, afectada, y las correcciones
+sólo existen en la 5.x): se validó con el modelo real, cuyas emisiones CTC
+resultaron idénticas bit a bit a las de 4.57.6, y quedó sin excepciones. El JWT pasó de `python-jose`
+(sin mantenimiento; CVE-2026-85394) a PyJWT ≥ 2.15.0 el 9-oct-2026, y con eso se
+fueron las excepciones de `python-jose` y `ecdsa`.
 
 Propietario: backend/video. Vencimiento máximo: 2026-10-31. Antes de esa fecha
-hay que vendorizar el Viterbi de forced-align o reemplazar el alineador, migrar
-el JWT a una librería mantenida y volver a generar el baseline por ID.
+hay que vendorizar el Viterbi de forced-align o reemplazar el alineador y volver
+a generar el baseline por ID.

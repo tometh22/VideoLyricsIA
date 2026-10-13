@@ -366,7 +366,16 @@ def _rhythm_envelope(rhythm: EffectRhythm | None, decay: float = 0.16) -> str:
         f"{strength:.3f}*(1-abs(T-{beat:.4f})/{decay:.3f}),0)"
         for beat, strength in pairs
     ]
-    return f"min(1,0.10+{'+'.join(pulses)})"
+    # FFmpeg's expression parser recurses through a flat addition chain. A
+    # normal song with hundreds of beats exceeds its depth limit. Preserve
+    # every selected beat while keeping the expression tree logarithmic.
+    def balanced_sum(terms):
+        if len(terms) == 1:
+            return terms[0]
+        midpoint = len(terms) // 2
+        return f"({balanced_sum(terms[:midpoint])}+{balanced_sum(terms[midpoint:])})"
+
+    return f"min(1,0.10+{balanced_sum(pulses)})"
 
 
 def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
@@ -377,8 +386,12 @@ def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
         return f"[{raw_label}]null[{out_label}];"
     env = _rhythm_envelope(rhythm)
     return (
-        f"color=c=white:s={width}x{height}:r=30,format=gray,"
-        f"geq=lum='255*({env})',format=gbrp[beatmask];"
+        # The envelope depends only on time. Evaluate it on four pixels,
+        # then expand the uniform mask instead of evaluating hundreds of
+        # beat expressions separately for every output pixel.
+        f"color=c=white:s=2x2:r=30,format=gray,"
+        f"geq=lum='255*({env})',scale={width}:{height}:flags=neighbor,"
+        f"format=gbrp[beatmask];"
         f"[{raw_label}][beatmask]blend=all_mode=multiply:shortest=1"
         f"[{out_label}];"
     )
@@ -927,7 +940,8 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
                        custom_colors: str = "",
                        beat_bpm: float | None = None,
                        rhythm: EffectRhythm | None = None,
-                       fx_input_index: int = 2):
+                       fx_input_index: int = 2,
+                       grade_override: str | None = None):
     """Build the video filter for the single-pass libass render.
 
     Returns (filter_str, use_complex, extra_inputs):
@@ -947,7 +961,9 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
     """
     subs = (f"subtitles={ass_basename}:fontsdir={_escape_filter_path(font_dir)}"
             if ass_basename else "")
-    grade = grade_filter(style, custom_colors)
+    # A lyric look carries its own grade chain (lyric_looks.Look.grade).
+    grade = (grade_override if grade_override is not None
+             else grade_filter(style, custom_colors))
     fx = effect_path(effect)
 
     # A selected effect must never collapse into the cheap no-effect branch.

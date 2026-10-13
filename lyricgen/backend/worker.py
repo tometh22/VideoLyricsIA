@@ -195,12 +195,17 @@ class WarmOnlyWorker(_RQWorker):
         # este worker está vivo. Si la huella no se puede calcular, se manda
         # vacía y el gate cae a comparar el SHA — nunca se cae el heartbeat.
         try:
-            from observability import backend_code_fingerprint, runtime_timing_config
+            from observability import (
+                backend_code_fingerprint, runtime_timing_config,
+                runtime_timing_config_effective,
+            )
             _fingerprint = backend_code_fingerprint()
             _timing_config = runtime_timing_config()
+            _timing_config_effective = runtime_timing_config_effective()
         except Exception:
             _fingerprint = "unknown"
             _timing_config = None
+            _timing_config_effective = None
         try:
             from queue_jobs import _transcription_quality_runtime_token
             _runtime_token = _transcription_quality_runtime_token()
@@ -235,6 +240,9 @@ class WarmOnlyWorker(_RQWorker):
             # same timing constants. /health/ready compares this canonical
             # payload and fails closed on mismatch or missing publication.
             "timing_config": _timing_config,
+            # Valor efectivo y origen (env / default / empty / invalid) de cada
+            # variable de timing. Informativo: no entra en la paridad.
+            "timing_config_effective": _timing_config_effective,
             "rq_payload_version": RQ_PAYLOAD_VERSION,
             "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
             "environment": (

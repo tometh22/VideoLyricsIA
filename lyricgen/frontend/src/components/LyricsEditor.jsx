@@ -16,6 +16,10 @@ import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookFontLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
+import { makeLookResolvedPin, pickLookVariantFields } from "../lib/lyricLookVariants";
+import { useLookVariant } from "../hooks/useLookVariant";
+import LookVariantPanel from "./LookVariantPanel";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
@@ -26,7 +30,9 @@ import {
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
-import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
+import { planSegmentSplit, tokenSpans } from "../lib/splitWords";
+import { lineStructureProperties, mergeTimingMode, splitTimingMode } from "../lib/lineStructureEvent";
+import { PLAYBACK_EVENT_NAME, createPlaybackCoverage, playbackEventProperties } from "../lib/playbackCoverage";
 import useLocalStorage from "../hooks/useLocalStorage";
 import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
@@ -35,6 +41,9 @@ import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
+import LyricReviewPanel from "./LyricReviewPanel";
+import { applyReviewItem, dismissReviewItem, validItems } from "../lib/lyricReview";
+import { findAlertLineIndex } from "../lib/heardWords";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 import CatalogReference from "./CatalogReference";
 
@@ -664,6 +673,23 @@ export default function LyricsEditor({
   // espacio y NO apagan silenciosamente al ASS path.
   lyricsAnimation = "none",
   lineTransition = "none",
+  // Look de letra ("" = sin look). Con look, font/animación/transición los
+  // define el look y sus selects quedan deshabilitados (lib/lyricLooks).
+  lyricLook = "",
+  // Variante del look (lib/lyricLookVariants): { lyricGenre, lyricVariant,
+  // lyricFontMain, lyricFontKey, lyricColor, lyricAltColor, lyricAccentColor }
+  // + la canción para /resolve y /detect-genre. Cada cambio del panel
+  // «Variante» sale por onLookVariantChange(field, value); lo que /resolve
+  // eligió sale como onLookVariantChange("lookResolved", pin).
+  lookVariant = null,
+  lookArtist = "",
+  lookSongTitle = "",
+  onLookVariantChange = null,
+  // Edición: el video se renderizó SIN fondo generado porque su look pinta
+  // todo el cuadro (render_params.background_owned_by_look). Si el operador
+  // elige un look que sí usa fondo (o "Sin look") avisamos que lo regenere en
+  // «Fondo». Sólo informa; no cambia el payload.
+  backgroundOwnedByLook = false,
   transcribeJobId = null,
   segmentsRevision = 0,
   // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
@@ -675,6 +701,7 @@ export default function LyricsEditor({
   // transcribeJobId sigan keyando el store correctamente.
   storeKey = null,
   onPersistSegments = null,
+  onAutoRepairUndone = null,
   editorRequest = null,
   saveQueue = null,
   // Descarta caches/draft locales y vuelve a hidratar la versión canónica
@@ -757,6 +784,7 @@ export default function LyricsEditor({
   // onTransitionChange (que controlaba el legacy lyric_transition).
   onAnimationChange = null,
   onLineTransitionChange = null,
+  onLyricLookChange = null,
   // UX specialist 2026-05-24: status del pre-gen del fondo (useBackgroundPreview).
   // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
   // null/undefined → no se renderiza el chip (modo /edit modal post-render).
@@ -961,6 +989,17 @@ export default function LyricsEditor({
   // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
   const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
   const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  const [selectedLook, setSelectedLook] = useState(normalizeLyricLook(lyricLook));
+  // Panel «Variante» (columna tipográfica standalone). Estado local sembrado
+  // del job, como el resto de la tipografía de esta columna.
+  const [variantValues, setVariantValues] = useState(() => ({
+    ...pickLookVariantFields(lookVariant || {}),
+    lyricColor: (lookVariant && lookVariant.lyricColor) || "#FFFFFF",
+  }));
+  const setVariantField = (field, value) => {
+    setVariantValues((v) => ({ ...v, [field]: value }));
+    onLookVariantChange?.(field, value);
+  };
   // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
   // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
   // se queda con el seed inicial y no refleja los cambios que el operador
@@ -973,7 +1012,30 @@ export default function LyricsEditor({
     setSelectedContrast(textContrast || "medium");
     setSelectedAnimation(lyricsAnimation || "none");
     setSelectedLineTransition(lineTransition || "none");
-  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition]);
+    setSelectedLook(normalizeLyricLook(lyricLook));
+  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition, lyricLook]);
+  const showLookVariant = !hideTypographyControls && !hideInternalPreview && !!getLyricLook(selectedLook);
+  const editorLookVariant = useLookVariant({
+    look: selectedLook,
+    genre: variantValues.lyricGenre,
+    variant: variantValues.lyricVariant,
+    fontMain: variantValues.lyricFontMain,
+    fontKey: variantValues.lyricFontKey,
+    color: variantValues.lyricColor,
+    altColor: variantValues.lyricAltColor,
+    accentColor: variantValues.lyricAccentColor,
+    jobId: transcribeJobId,
+    artist: lookArtist,
+    songTitle: lookSongTitle,
+    lyricsText: Array.isArray(segments) ? segments.map((sg) => (sg && sg.text) || "").filter(Boolean).join("\n") : "",
+    enabled: showLookVariant,
+  });
+  const editorLookResolved = editorLookVariant.resolved;
+  useEffect(() => {
+    if (!editorLookResolved || !onLookVariantChange) return;
+    onLookVariantChange("lookResolved", makeLookResolvedPin(editorLookResolved));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorLookResolved]);
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -1003,6 +1065,7 @@ export default function LyricsEditor({
   // another write merely advanced the revision.
   saveConflictRef.current = false;
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [autoRepairUndoBusy, setAutoRepairUndoBusy] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
   const unsafeNavigationIdsRef = useRef(new Set());
@@ -1157,14 +1220,18 @@ export default function LyricsEditor({
     editorSessionIdRef.current = globalThis.crypto?.randomUUID?.()
       || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
-  const trackEditorEvent = useCallback((name, properties = {}) => {
+  const trackEditorEvent = useCallback((name, properties = {}, { keepalive = false } = {}) => {
     if (!editorRequest || !transcribeJobId) return;
     editorRequest("/analytics/events", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      ...(keepalive ? { keepalive: true } : {}),
       body: JSON.stringify({ events: [{
         name,
         job_id: transcribeJobId,
+        // Sin esto el backend guardaba occurred_at NULL en todos los eventos
+        // del editor y sólo quedaba la hora de llegada (created_at).
+        occurred_at: new Date().toISOString(),
         properties: { ...properties, session_id: editorSessionIdRef.current },
       }] }),
     }).catch(() => {});
@@ -2823,6 +2890,55 @@ export default function LyricsEditor({
     trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
   }, [trackEditorEvent]);
 
+  // Medición de escucha (`editor_audio_played`, lib/playbackCoverage.js):
+  // qué tramos del audio sonaron antes de aprobar. Sólo telemetría; no toca
+  // la reproducción. Se envía cada 30 s mientras suena, 5 s después de una
+  // pausa (agrupa play/pausa rápidos), al aprobar y al ocultar o cerrar.
+  const playbackCoverageRef = useRef(null);
+  if (!playbackCoverageRef.current) playbackCoverageRef.current = createPlaybackCoverage();
+  const playbackFlushTimerRef = useRef(null);
+  const flushPlaybackCoverage = useCallback((flushReason, { keepalive = false } = {}) => {
+    if (playbackFlushTimerRef.current) {
+      window.clearTimeout(playbackFlushTimerRef.current);
+      playbackFlushTimerRef.current = null;
+    }
+    // Al desmontar, el ref del <audio> ya es null; el último elemento montado
+    // todavía sabe la duración.
+    const audio = audioRef.current || lastMountedAudioRef.current;
+    const tracker = playbackCoverageRef.current;
+    if (audio && !audio.paused) tracker.advance(audio.currentTime, Date.now(), audio.playbackRate);
+    const properties = playbackEventProperties(tracker.drain(), {
+      durationS: audio?.duration, flushReason,
+    });
+    if (properties) trackEditorEvent(PLAYBACK_EVENT_NAME, properties, { keepalive });
+  }, [trackEditorEvent]);
+  const schedulePlaybackFlush = useCallback((flushReason) => {
+    if (playbackFlushTimerRef.current) return;
+    playbackFlushTimerRef.current = window.setTimeout(() => {
+      playbackFlushTimerRef.current = null;
+      flushPlaybackCoverage(flushReason);
+    }, 5_000);
+  }, [flushPlaybackCoverage]);
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    const interval = window.setInterval(() => flushPlaybackCoverage("interval"), 30_000);
+    return () => window.clearInterval(interval);
+  }, [flushPlaybackCoverage, isPlaying]);
+  useEffect(() => {
+    const flushHidden = () => flushPlaybackCoverage("hidden", { keepalive: true });
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") flushHidden();
+    };
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pagehide", flushHidden);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("pagehide", flushHidden);
+      // SPA: salir del editor desmonta antes de pagehide.
+      flushPlaybackCoverage("unmount", { keepalive: true });
+    };
+  }, [flushPlaybackCoverage]);
+
   const playGuidedWindow = useCallback((qualityWindow) => {
     const audio = audioRef.current;
     if (!audio || !qualityWindow || audio.readyState < 1) return;
@@ -2867,6 +2983,162 @@ export default function LyricsEditor({
     });
   }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
 
+  // Revisión rápida (lyric_review.py): lo que falta, lo que se escucha
+  // distinto y el estilo UMG. El servidor la recalcula en cada guardado; acá
+  // se ocultan al instante los puntos que el revisor ya resolvió hasta que el
+  // servidor confirme la letra nueva.
+  const lyricReview = durableEditor.document?.lyric_review || null;
+  const lyricReviewMode = lyricReview?.mode || "enforce";
+  const [reviewResolvedIds, setReviewResolvedIds] = useState(() => new Set());
+  const [reviewFailedIds, setReviewFailedIds] = useState(() => new Set());
+  const [reviewDecisions, setReviewDecisions] = useState([]);
+  const [reviewStatus, setReviewStatus] = useState("");
+  const [reviewActiveSegId, setReviewActiveSegId] = useState(null);
+  const [reviewAppliedSegIds, setReviewAppliedSegIds] = useState(() => new Set());
+  const [reviewAutoPlayRaw, setReviewAutoPlayRaw] = useLocalStorage("genly.lyricReview.autoplay", "1");
+  const reviewAutoPlay = reviewAutoPlayRaw !== "0";
+  const reviewPanelRef = useRef(null);
+  // La letra oficial entra por un solo lugar: comparar (no toca la letra) o
+  // reemplazar y re-sincronizar.
+  const canCompareOfficial = Boolean(editorV2Enabled && lyricReview && editorRequest);
+  useEffect(() => {
+    // Cuando la letra en pantalla es exactamente la que revisó el servidor,
+    // él manda: lo que siga apareciendo vuelve a mostrarse (p. ej. tras
+    // deshacer). Mientras haya cambios sin guardar, se respeta lo resuelto.
+    const present = new Set((lyricReview?.items || []).map((item) => item?.id));
+    const synced = segmentsEquivalent(
+      durableEditor.document?.segments || [],
+      sanitizeSegmentsForPersistence(editedRef.current),
+    );
+    setReviewResolvedIds((previous) => {
+      if (!previous.size) return previous;
+      return synced ? new Set() : new Set([...previous].filter((id) => present.has(id)));
+    });
+    setReviewFailedIds((previous) => (previous.size && synced ? new Set() : previous));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lyricReview]);
+  const pendingReviewItems = useMemo(() => (
+    lyricReviewMode === "off" ? []
+      : validItems(lyricReview?.items).filter((item) => !reviewResolvedIds.has(item.id))
+  ), [lyricReview, lyricReviewMode, reviewResolvedIds]);
+  const pendingRequiredReview = pendingReviewItems.filter((item) => item.required).length;
+  const reviewBlocksApproval = lyricReviewMode === "enforce" && pendingRequiredReview > 0;
+  const focusLyricReview = useCallback((scroll = true) => {
+    const panel = reviewPanelRef.current;
+    if (!panel) return;
+    if (scroll) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    panel.focus({ preventScroll: true });
+  }, []);
+  // Con puntos obligatorios, el panel toma el teclado al abrir la canción
+  // (sin mover la página ni robar el foco de un campo en el que se escribe).
+  const reviewAutoFocused = useRef(false);
+  useEffect(() => {
+    if (reviewAutoFocused.current || !reviewBlocksApproval) return;
+    const tag = (document.activeElement?.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    reviewAutoFocused.current = true;
+    window.requestAnimationFrame(() => focusLyricReview(false));
+  }, [focusLyricReview, reviewBlocksApproval]);
+  const lineIdForReviewItem = useCallback((item, segments = editedRef.current) => {
+    const occurrence = item?.occurrences?.[0];
+    if (!occurrence) return null;
+    const index = findAlertLineIndex(segments, {
+      line_segment_id: occurrence.line_segment_id, start: occurrence.start, end: occurrence.end,
+    });
+    return index === -1 ? null : segments[index]?._id ?? null;
+  }, []);
+  const activateReviewItem = useCallback((item, { scroll = true } = {}) => {
+    const id = item ? lineIdForReviewItem(item) : null;
+    setReviewActiveSegId(id);
+    if (scroll && id != null) rowRefs.current[id]?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [lineIdForReviewItem]);
+  const recordReviewDecision = useCallback((item, decision, next, lineIds = []) => {
+    pushEditHistory();
+    setEdited(next);
+    setReviewResolvedIds((previous) => new Set(previous).add(item.id));
+    setReviewFailedIds((previous) => {
+      if (!previous.has(item.id)) return previous;
+      const copy = new Set(previous);
+      copy.delete(item.id);
+      return copy;
+    });
+    setReviewDecisions((previous) => [...previous, item.id]);
+    setFlushCounter((count) => count + 1);
+    if (lineIds.length) {
+      setReviewAppliedSegIds(new Set(lineIds));
+      window.setTimeout(() => setReviewAppliedSegIds(new Set()), 1200);
+    }
+    trackEditorEvent("editor_lyric_review_decision", {
+      decision, kind: item.kind, required: Boolean(item.required),
+      sources: item.sources, occurrences: (item.occurrences || []).length,
+    });
+    window.requestAnimationFrame(() => reviewPanelRef.current?.focus({ preventScroll: true }));
+  }, [pushEditHistory, setEdited, trackEditorEvent]);
+  const applyLyricReview = useCallback((item, alternative = null) => {
+    const current = editedRef.current;
+    const result = applyReviewItem(current, item, {
+      alternative,
+      mint: () => ({
+        _id: current.reduce((max, segment) => Math.max(max, segment._id), -1) + 1,
+        segment_id: mintSegmentId(),
+      }),
+    });
+    if (!result.applied) {
+      // El punto se queda: la revisora lo corrige a mano (M) o lo descarta.
+      setReviewFailedIds((previous) => new Set(previous).add(item.id));
+      setReviewStatus("No se pudo aplicar: la línea cambió. Corregila a mano o marcá que está bien así.");
+      trackEditorEvent("editor_lyric_review_decision", { decision: "apply_failed", kind: item.kind });
+      return;
+    }
+    recordReviewDecision(item, alternative ? "apply_alternative" : "apply", result.segments, result.lines);
+    setReviewStatus(`Aplicado${result.applied > 1 ? ` en ${result.applied} líneas` : ""} · Z para deshacer`);
+  }, [recordReviewDecision, trackEditorEvent]);
+  const dismissLyricReview = useCallback((item) => {
+    recordReviewDecision(item, "dismiss", dismissReviewItem(editedRef.current, item));
+    setReviewStatus(`${item.dismiss || "Está bien así"} · Z para deshacer`);
+  }, [recordReviewDecision]);
+  const undoLyricReview = useCallback(() => {
+    const last = reviewDecisions[reviewDecisions.length - 1];
+    if (!last) return;
+    undoEdit();
+    setReviewDecisions((previous) => previous.slice(0, -1));
+    setReviewResolvedIds((previous) => {
+      const copy = new Set(previous);
+      copy.delete(last);
+      return copy;
+    });
+    setFlushCounter((count) => count + 1);
+    setReviewStatus("Deshecho");
+  }, [reviewDecisions, undoEdit]);
+  const editLyricReviewByHand = useCallback((item) => {
+    const id = lineIdForReviewItem(item);
+    if (id == null) return;
+    const row = rowRefs.current[id];
+    row?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    row?.querySelector?.('input[aria-label^="Letra de la línea"]')?.focus();
+  }, [lineIdForReviewItem]);
+  const playLyricReview = useCallback((item) => playGuidedWindow({
+    id: item.id, start: item.start, end: item.end,
+  }), [playGuidedWindow]);
+  const pasteOfficialLyrics = useCallback(async (text) => {
+    if (!editorRequest || !transcribeJobId) return false;
+    try {
+      const response = await editorRequest(`/editor/${transcribeJobId}/official-lyrics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) throw new Error(`http-${response.status}`);
+      const body = await response.json();
+      durableEditor.updateDocument({ lyric_review: body.lyric_review });
+      setReviewStatus("Letra oficial cargada: se usa sólo para comparar, tu letra no cambió.");
+      return true;
+    } catch {
+      toast({ message: "No pudimos guardar la letra oficial. Reintentá.", tone: "error" });
+      return false;
+    }
+  }, [durableEditor, editorRequest, toast, transcribeJobId]);
+
   useEffect(() => () => {
     // Removing the media element stops playback. Do not call pause() on every
     // src change: React reuses the element, so that cleanup could pause the
@@ -2900,7 +3172,7 @@ export default function LyricsEditor({
   }, [selectTimingWorkspace, timingWorkspaceMode]);
 
   const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false } = {}) => {
-    const nextDocument = await durableEditor.load();
+    const nextDocument = await durableEditor.load({ replaceSegments: syncSegments });
     if (syncSegments && Array.isArray(nextDocument?.segments)) {
       setEdited(reseedPreservingIds(
         editedRef.current,
@@ -3180,7 +3452,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (draftRecoveryRef.current) return;
+      if (draftRecoveryRef.current || e.defaultPrevented) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || document.activeElement?.isContentEditable;
       if (editing) return;
@@ -3284,6 +3556,15 @@ export default function LyricsEditor({
   // no romper índices durante la mutación.
   const autoSplitAllFromReference = () => {
     if (mergeableSegments.length === 0) return;
+    trackLineStructure("split", "reference", mergeableSegments.map((m) => {
+      const seg = edited.find((s) => s._id === m._id);
+      const [lineA, lineB] = m.splitLines;
+      const tokA = tokenSpans(lineA).length;
+      const plan = seg && tokA > 0 && tokA + tokenSpans(lineB).length === tokenSpans(seg.text).length
+        ? planSegmentSplit(seg, { splitTokenIndex: tokA })
+        : null;
+      return seg ? { mode: splitTimingMode(seg, plan || { timing: "char_ratio" }), start: seg.start, end: seg.end } : null;
+    }));
     pushEditHistory();
     setEdited((prev) => {
       // Map id → splitLines para lookup rápido
@@ -3304,19 +3585,34 @@ export default function LyricsEditor({
           result.push(seg);
           continue;
         }
+        // Word-aware when the reference lines re-tokenize the segment 1:1:
+        // each half keeps its own slice of `words` + the real boundary time.
+        // (Before, both halves inherited the parent's FULL `words` array.)
+        const tokA = tokenSpans(lineA).length;
+        const plan = tokA > 0 && tokA + tokenSpans(lineB).length === tokenSpans(seg.text).length
+          ? planSegmentSplit(seg, { splitTokenIndex: tokA })
+          : null;
+        const { words: _parentWords, ...segNoWords } = seg;
+        if (plan?.a.words && plan?.b.words) {
+          result.push(
+            { ...segNoWords, _id: nextId++, segment_id: mintSegmentId(), text: lineA, start: plan.a.start, end: plan.a.end, words: plan.a.words },
+            { ...segNoWords, _id: nextId++, segment_id: mintSegmentId(), text: lineB, start: plan.b.start, end: plan.b.end, words: plan.b.words },
+          );
+          continue;
+        }
         const ratio = lineA.length / totalChars;
         const dur = Math.max(0.6, seg.end - seg.start);
         const midTime = seg.start + dur * ratio;
         const gap = 0.05;
         result.push({
-          ...seg,
+          ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineA,
           end: Math.max(seg.start + 0.3, midTime - gap),
         });
         result.push({
-          ...seg,
+          ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineB,
@@ -3474,94 +3770,70 @@ export default function LyricsEditor({
     return estimateWrappedLines(displayText, fontCss, sizePx, tier.maxWidthPx);
   }, [font, textCase, fontScale]);
 
-  // Split a segment into two. When `charOffset` is given (operator pressed Enter
-  // at the cursor) AND the segment carries per-word timing, the split is
-  // WORD-AWARE: each half inherits the REAL start/end of its words — no re-sync.
-  // Otherwise (the "✂ Dividir" button, which has no cursor, or a segment with no
-  // word timing) we fall back to the canvas wrap-boundary + char-ratio timing
-  // and DROP the now-meaningless `words` array from both halves (keeping the
-  // parent's full `words` on each child was the old bug → wrong per-word timing).
-  const splitSegAt = (id, charOffset) => {
+  // Split a segment into two (lib/splitWords.planSegmentSplit decides where,
+  // which words go to each half and the boundary time):
+  // - `charOffset` given (operator pressed Enter at the caret): cut there,
+  //   snapped to a word boundary when the line carries word timing.
+  // - no cursor ("✂ Dividir", "Dividir todas", the wrap dialog): cut at the
+  //   longest sung pause among balanced cuts, else the most balanced cut.
+  // Each half keeps ITS slice of `words`; line 1 ends at its last word's end
+  // and line 2 starts at its first word's start. Only when the words can't be
+  // mapped onto the text (text rewritten after alignment) do we fall back to
+  // char-ratio timing and drop `words`. Outer bounds stay the line's own.
+  // Both halves get a fresh `_id` + `segment_id` (a shared segment_id makes
+  // the three-way merge return the same row twice → dedupe deletes lyrics).
+  // Evento de medición (`editor_line_structure_changed`): una acción del
+  // operador = un evento. Las masivas lo mandan una vez y parten con
+  // trigger null.
+  const trackLineStructure = (structureOp, trigger, items) => {
+    const properties = lineStructureProperties(structureOp, trigger, items);
+    if (properties) trackEditorEvent("editor_line_structure_changed", properties);
+  };
+  const splitTelemetryItem = (id, charOffset) => {
+    const seg = edited.find((s) => s._id === id);
+    if (!seg) return null;
+    return { mode: splitTimingMode(seg, planSegmentSplit(seg, { charOffset })), start: seg.start, end: seg.end };
+  };
+  const splitSegAt = (id, charOffset, trigger = "caret") => {
+    if (trigger) trackLineStructure("split", trigger, [splitTelemetryItem(id, charOffset)]);
     pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
       const seg = prev[idx];
+      const plan = planSegmentSplit(seg, { charOffset });
+      if (!plan) return prev; // never create an empty line
       const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const nextId2 = nextId1 + 1;
-
-      // ── WORD-ACCURATE PATH (Enter at cursor, segment has word timing) ──
-      if (charOffset != null && Array.isArray(seg.words) && seg.words.length > 1) {
-        const r = splitWordsAtCharOffset(seg.text, seg.words, charOffset);
-        if (r) {
-          const aStart = firstWordStart(r.wordsA);
-          const aEnd = lastWordEnd(r.wordsA);
-          const bStart = firstWordStart(r.wordsB);
-          const bEnd = lastWordEnd(r.wordsB);
-          const s1 = {
-            ...seg, _id: nextId1, segment_id: mintSegmentId(),
-            text: r.textA, words: r.wordsA,
-            start: aStart != null ? aStart : seg.start,
-            end: aEnd != null ? aEnd : seg.end,
-          };
-          const s2 = {
-            ...seg, _id: nextId2, segment_id: mintSegmentId(),
-            text: r.textB, words: r.wordsB,
-            start: bStart != null ? bStart : s1.end + 0.05,
-            end: bEnd != null ? bEnd : seg.end,
-          };
-          if (!(s2.start > s1.end)) s2.start = s1.end + 0.02; // monotonic safety
-          return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
-        }
-        // r === null (degenerate / text edited so tokens≠words) → char-ratio below
-      }
-
-      // ── FALLBACK: char-ratio (no word timing, or unaligned text) ──
-      const fullText = seg.text || "";
-      let cut = charOffset; // cursor split point when present
-      if (cut == null) {
-        // Button path: keep the old behaviour — split at the canvas wrap boundary.
-        const displayText = applyCase(fullText, textCase);
-        const tier = getTier(displayText);
-        const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
-        const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
-        const wlist = fullText.split(" ");
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
-        ctx.font = `bold ${sizePx}px ${fontCss}`;
-        const spaceW = ctx.measureText(" ").width;
-        let lineW = 0;
-        let splitIdx = Math.floor(wlist.length / 2);
-        for (let wi = 0; wi < wlist.length - 1; wi++) {
-          const ww = ctx.measureText(applyCase(wlist[wi], textCase)).width;
-          lineW = lineW > 0 ? lineW + spaceW + ww : ww;
-          if (lineW > tier.maxWidthPx) { splitIdx = wi > 0 ? wi : 1; break; }
-          splitIdx = wi + 1;
-        }
-        cut = wlist.slice(0, splitIdx).join(" ").length + 1; // +1 for the space
-      }
-      const part1 = fullText.slice(0, cut).trim();
-      const part2 = fullText.slice(cut).trim();
-      if (!part1 || !part2) return prev; // never create an empty line
-      // Char ratio (long words take longer to sing → matches the vocal pause
-      // better than word-count). Drop the stale `words` array from both halves.
-      const ratio = part1.length / Math.max(1, part1.length + part2.length);
-      const midTime = seg.start + (seg.end - seg.start) * ratio;
-      const gap = 0.05;
-      const { words: _dropWords, ...segNoWords } = seg;
-      const s1 = { ...segNoWords, _id: nextId1, segment_id: mintSegmentId(), text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
-      const s2 = { ...segNoWords, _id: nextId2, segment_id: mintSegmentId(), text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
-      return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
+      const { words: _parentWords, ...segNoWords } = seg;
+      const half = (newId, part) => ({
+        ...segNoWords, _id: newId, segment_id: mintSegmentId(),
+        text: part.text, start: part.start, end: part.end,
+        ...(part.words ? { words: part.words } : {}),
+      });
+      return [
+        ...prev.slice(0, idx), half(nextId1, plan.a), half(nextId1 + 1, plan.b),
+        ...prev.slice(idx + 1),
+      ];
     });
   };
   // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
-  const splitSeg = (id) => splitSegAt(id, null);
+  const splitSeg = (id) => splitSegAt(id, null, "button");
+  const splitSegs = (ids, trigger) => {
+    trackLineStructure("split", trigger, (ids || []).map((id) => splitTelemetryItem(id, null)));
+    (ids || []).forEach((id) => splitSegAt(id, null, null));
+  };
 
   // Merge a line with the NEXT line: concatenate text + per-word timing,
   // start = first.start, end = second.end. If only one side has `words` we
   // can't fabricate timing for the gap → drop words (karaoke falls back to
   // uniform distribution, consistent with the split fallback).
-  const mergeSeg = (id) => {
+  const mergeSeg = (id, trigger = "button") => {
+    const mergeIdx = edited.findIndex((s) => s._id === id);
+    if (mergeIdx !== -1 && mergeIdx < edited.length - 1) {
+      const first = edited[mergeIdx];
+      const second = edited[mergeIdx + 1];
+      trackLineStructure("merge", trigger, [{ mode: mergeTimingMode(first, second), start: first.start, end: second.end }]);
+    }
     recordEditorAction("merge", { id });
     pushEditHistory();
     setEdited((prev) => {
@@ -3721,8 +3993,8 @@ export default function LyricsEditor({
   const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
-    () => normalizeUnsafeWindows(transcriptionQuality),
-    [transcriptionQuality],
+    () => normalizeUnsafeWindows(qualityRefreshPending ? null : transcriptionQuality),
+    [qualityRefreshPending, transcriptionQuality],
   );
   const focusedQualityReview = !requireLineReview
     && transcriptionQuality?.decision === "review_required"
@@ -4009,6 +4281,11 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
+    if (reviewBlocksApproval) {
+      focusLyricReview();
+      setReviewStatus(`Para aprobar, resolvé ${pendingRequiredReview === 1 ? "este punto" : `estos ${pendingRequiredReview} puntos`}.`);
+      return;
+    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -4115,6 +4392,15 @@ export default function LyricsEditor({
         });
         return;
       }
+      // El guardado recién hecho es la verdad: si la letra que se va a
+      // aprobar todavía tiene puntos obligatorios, se deciden antes.
+      if (saveResult?.lyricReview?.mode === "enforce"
+        && validItems(saveResult.lyricReview.items).some((item) => item.required)) {
+        setReviewResolvedIds(new Set());
+        focusLyricReview();
+        setReviewStatus("Para aprobar, resolvé los puntos de la revisión rápida.");
+        return;
+      }
       let approvalResult = null;
       let currentSave = saveResult;
       let approvalSegments = cleaned.map(({ _id, ...rest }) => rest);
@@ -4207,6 +4493,10 @@ export default function LyricsEditor({
 
   const handleApprove = async (options = {}) => {
     if (approveInFlightRef.current) return;
+    // Lo escuchado hasta acá sale ANTES que la aprobación: el reporte de
+    // cobertura sólo cuenta tramos registrados antes de la primera versión
+    // aprobada.
+    flushPlaybackCoverage("approve");
     approveInFlightRef.current = true;
     setIsApproving(true);
     try {
@@ -4449,6 +4739,9 @@ export default function LyricsEditor({
           onTimeUpdate={(e) => {
             const time = e.currentTarget.currentTime;
             playbackTimeRef.current = time;
+            if (!e.currentTarget.paused) {
+              playbackCoverageRef.current.advance(time, Date.now(), e.currentTarget.playbackRate);
+            }
             if (e.currentTarget.paused) {
               lastPublishedTimeRef.current = time;
               setCurrentTime(time);
@@ -4484,7 +4777,16 @@ export default function LyricsEditor({
               }
             }
           }}
-          onPlay={() => {
+          onSeeking={(e) => {
+            playbackCoverageRef.current.seek(e.currentTarget.currentTime, Date.now(), {
+              playing: !e.currentTarget.paused,
+            });
+            if (playbackCoverageRef.current.isFull()) flushPlaybackCoverage("full");
+          }}
+          onPlay={(e) => {
+            playbackCoverageRef.current.start(
+              e.currentTarget.currentTime, Date.now(), e.currentTarget.playbackRate,
+            );
             audioPlayingRef.current = true;
             if (pendingAudioRecoveryRef.current && !sourceSwapInProgressRef.current) {
               pendingAudioRecoveryRef.current.shouldPlay = true;
@@ -4493,6 +4795,8 @@ export default function LyricsEditor({
           }}
           onPause={(e) => {
             const time = e.currentTarget.currentTime;
+            playbackCoverageRef.current.stop(time, Date.now());
+            schedulePlaybackFlush(playbackCoverageRef.current.isFull() ? "full" : "pause");
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
@@ -4509,6 +4813,8 @@ export default function LyricsEditor({
           }}
           onEnded={(e) => {
             const time = e.currentTarget.currentTime;
+            playbackCoverageRef.current.stop(time, Date.now());
+            schedulePlaybackFlush("ended");
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
@@ -4520,6 +4826,7 @@ export default function LyricsEditor({
           onError={(event) => {
             const media = event.currentTarget;
             const failedAt = Number(media.currentTime) || playbackTimeRef.current || 0;
+            playbackCoverageRef.current.stop(playbackTimeRef.current, Date.now());
             const mediaErrorCode = media.error?.code || null;
             const shouldResume = audioPlayingRef.current;
             const failedLocalAudio = usingLocalAudio && audioUrl === blobAudioUrl;
@@ -4685,11 +4992,20 @@ export default function LyricsEditor({
             data-quality-review-required={campaignQualityReview ? "true" : "false"}
             data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
-            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
+            data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
+            title={reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
+            className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
+              ? "bg-surface-2 text-white ring-1 ring-white/15 hover:bg-surface-3"
+              : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
           >
+            {reviewBlocksApproval && !isApproving && (
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-300/15 px-1.5 text-[11px] font-bold tabular-nums text-amber-200">{pendingRequiredReview}</span>
+            )}
             {isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
-              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+              : reviewBlocksApproval
+                ? "Faltan para aprobar · Revisar"
+                : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>
@@ -4701,8 +5017,15 @@ export default function LyricsEditor({
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
           <section role="dialog" aria-modal="true" aria-labelledby="paste-lyrics-title"
             className="w-full max-w-2xl rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
-            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</h2>
-            <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{canCompareOfficial ? "Letra oficial" : (t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar")}</h2>
+            {canCompareOfficial ? (
+              <ul className="mt-2 space-y-1 text-sm text-ink-secondary">
+                <li><strong className="font-medium text-white">Comparar</strong>: la Revisión rápida marca las palabras que se escuchan distinto. Tu letra y los tiempos no cambian.</li>
+                {canReanchor && <li><strong className="font-medium text-white">Reemplazar</strong>: pisa el texto con esta letra y re-sincroniza con el audio.</li>}
+              </ul>
+            ) : (
+              <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            )}
             {sourceReference?.text && (
               <button type="button" data-testid="paste-lyrics-use-sheet" onClick={() => { setPasteText(sourceReference.text); setPasteStructure(null); }}
                 className="mt-3 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-white ring-1 ring-white/10">{t("editor.paste_lyrics_use_sheet") || "Usar la letra de la planilla"}</button>
@@ -4737,10 +5060,25 @@ export default function LyricsEditor({
                   className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
                   {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Confirmar letra y re-sincronizar")}
                 </button>
-              ) : (
+              ) : (canReanchor || !canCompareOfficial) && (
                 <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
-                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                  className={canCompareOfficial
+                    ? "rounded-lg px-4 py-2 text-sm font-medium text-white ring-1 ring-white/15 hover:bg-white/[0.06] disabled:opacity-50"
+                    : "rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"}>
                   {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_submit") || "Reemplazar letra y re-sincronizar")}
+                </button>
+              )}
+              {canCompareOfficial && !pasteStructure && (
+                <button type="button" data-testid="paste-lyrics-compare" disabled={pasteBusy || !pasteText.trim()}
+                  onClick={async () => {
+                    if (await pasteOfficialLyrics(pasteText)) {
+                      setPasteOpen(false);
+                      setPasteText("");
+                      reviewPanelRef.current?.focus({ preventScroll: true });
+                    }
+                  }}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white hover:bg-brand-light disabled:opacity-50">
+                  Comparar
                 </button>
               )}
             </div>
@@ -4855,6 +5193,28 @@ export default function LyricsEditor({
       <CompleteReviewerCandidate candidate={durableEditor.document?.reviewer_candidate}
         currentRevision={durableEditor.document?.revision} currentSegments={edited}
         onSeek={(start) => seekTo(start, true)} />
+
+      {editorV2Enabled && lyricReview && (
+        <LyricReviewPanel
+          ref={reviewPanelRef}
+          review={lyricReview}
+          items={pendingReviewItems}
+          failedIds={reviewFailedIds}
+          decidedCount={reviewDecisions.length}
+          status={reviewStatus}
+          playingId={guidedPlayingWindowId}
+          autoPlay={reviewAutoPlay}
+          onToggleAutoPlay={() => setReviewAutoPlayRaw(reviewAutoPlay ? "0" : "1")}
+          onPlay={playLyricReview}
+          onApply={applyLyricReview}
+          onDismiss={dismissLyricReview}
+          onEdit={editLyricReviewByHand}
+          onUndo={undoLyricReview}
+          canUndo={reviewDecisions.length > 0}
+          onActivate={activateReviewItem}
+          onOpenOfficial={editorRequest ? openPasteLyrics : null}
+        />
+      )}
 
       {durableEditor.document?.quality_proposal && (
         <div className="mb-4">
@@ -5348,7 +5708,7 @@ export default function LyricsEditor({
                   </p>
                   <button
                     type="button"
-                    onClick={() => { pushEditHistory(); wrap2SegIds.forEach((id) => splitSeg(id)); }}
+                    onClick={() => { pushEditHistory(); splitSegs(wrap2SegIds, "bulk"); }}
                     className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.1] hover:text-white transition-colors"
                   >
                     {t("editor.wrap2_banner_split_all") || "Dividir todas"}
@@ -5804,20 +6164,111 @@ export default function LyricsEditor({
           </div>
         )}
       </div>
+      {editorV2Enabled && durableEditor.document?.auto_repair_undo_available && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-2 text-xs text-gray-200">
+          <span>Esta canción recibió una mejora automática. Podés volver a la versión anterior.</span>
+          <button
+            type="button"
+            disabled={autoRepairUndoBusy || isDirty || Boolean(draftRecovery)}
+            onClick={async () => {
+              setAutoRepairUndoBusy(true);
+              try {
+                const result = await durableEditor.undoAutoRepair();
+                if (!result?.ok) {
+                  if (result?.reason === "stale-revision") {
+                    await reconcileQualityProposalDocument({ syncSegments: true });
+                    toast({ message: "La canción cambió mientras la tenías abierta. Recargamos la versión actual.", tone: "warning" });
+                  } else {
+                    toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });
+                  }
+                  return;
+                }
+                setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(result.document.segments || [])));
+                setIsDirty(false);
+                setSaveStatus("saved");
+                const nextQuality = qualityFromEditorPayload(result.document);
+                if (nextQuality) {
+                  transcriptionQualityRef.current = nextQuality;
+                  setTranscriptionQuality(nextQuality);
+                }
+                setQualityRefresh({ jobId: transcribeJobId, revision: result.document.revision });
+                onAutoRepairUndone?.(result.document);
+                toast({ message: "Mejora automática deshecha. La versión corregida quedó en el historial.", tone: "success" });
+                trackEditorEvent("editor_auto_repair_undone", { to_revision: result.document.revision });
+              } catch {
+                toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });
+              } finally {
+                setAutoRepairUndoBusy(false);
+              }
+            }}
+            className="rounded-lg bg-sky-400/15 px-3 py-1.5 font-semibold text-sky-200 hover:bg-sky-400/25 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {autoRepairUndoBusy ? "Deshaciendo…" : "Deshacer mejora automática"}
+          </button>
+          {(isDirty || draftRecovery) && <span className="text-amber-300">Guardá o descartá tus cambios actuales primero.</span>}
+        </div>
+      )}
       <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
           {!hideTypographyControls && !hideInternalPreview && (viewMode !== "advanced" || previewDockOpen) && (
           <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
+            {/* Look de letra — atajo: define tipografía, animación y
+                transición; tamaño/mayúsculas/contraste siguen editables. */}
+            <div className="flex items-center gap-2 px-1">
+              <span className="text-[11px] text-ink-tertiary shrink-0">{t("upload.look_section") || "Look"}</span>
+              <select
+                value={selectedLook}
+                onChange={(e) => {
+                  const v = normalizeLyricLook(e.target.value);
+                  // Otro look = otro pool de variantes: el número no aplica.
+                  if (v !== selectedLook && variantValues.lyricVariant !== "" && variantValues.lyricVariant != null) {
+                    setVariantField("lyricVariant", "");
+                  }
+                  setSelectedLook(v); onLyricLookChange?.(v);
+                }}
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                data-testid="editor-lyric-look"
+                aria-label={t("upload.look_section") || "Look"}
+              >
+                {lyricLookOptions(t).map((o) => (
+                  <option key={o.code || "none"} value={o.code} style={{ fontFamily: o.css }}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            {getLyricLook(selectedLook) && (
+              <p className="px-1 text-[10px] text-amber-300/80" data-testid="editor-look-locked">
+                {lookLockedNote(t, selectedLook)} {lookFontLockedNote(t, selectedLook)}
+              </p>
+            )}
+            {showLookVariant && (
+              <LookVariantPanel
+                t={t}
+                className="px-1 py-2 rounded-md bg-surface-2/40 ring-1 ring-white/[0.06]"
+                testIdPrefix="editor-variant"
+                catalog={editorLookVariant.catalog}
+                resolved={editorLookResolved}
+                detected={editorLookVariant.detected}
+                loading={editorLookVariant.loading}
+                values={variantValues}
+                onChange={setVariantField}
+              />
+            )}
+            {backgroundOwnedByLook && !lookOwnsBackground(selectedLook) && (
+              <p className="px-1 text-[10px] text-amber-300/90" data-testid="editor-look-needs-bg" role="status">
+                {t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo»."}
+              </p>
+            )}
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
             <div className="flex items-center gap-2 px-1">
               <span className="text-[11px] text-ink-tertiary shrink-0">Tipografía</span>
               <select
                 value={selectedFont}
+                disabled={!!getLyricLook(selectedLook)}
                 onChange={(e) => { setSelectedFont(e.target.value); onFontChange?.(e.target.value); }}
-                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 style={{ fontFamily: FONT_CSS_BY_CODE[selectedFont] }}
                 title="Probar otra tipografía — se ve en el preview al instante"
               >
@@ -5853,8 +6304,9 @@ export default function LyricsEditor({
               <div className="flex items-center gap-1.5">
                 <span className="text-ink-tertiary">Animación</span>
                 <select value={selectedAnimation}
+                  disabled={!!getLyricLook(selectedLook)}
                   onChange={(e) => { setSelectedAnimation(e.target.value); onAnimationChange?.(e.target.value); }}
-                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                   {LYRICS_ANIMATIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
                 </select>
               </div>
@@ -5862,8 +6314,9 @@ export default function LyricsEditor({
               <div className="flex items-center gap-1.5">
                 <span className="text-ink-tertiary">Transición</span>
                 <select value={selectedLineTransition}
+                  disabled={!!getLyricLook(selectedLook)}
                   onChange={(e) => { setSelectedLineTransition(e.target.value); onLineTransitionChange?.(e.target.value); }}
-                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                   {LINE_TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
                 </select>
               </div>
@@ -6199,6 +6652,8 @@ export default function LyricsEditor({
                     : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && (showIndividualReviewSignal || isUnsafeMarker) ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
+                  ${reviewAppliedSegIds.has(seg._id) ? "ring-1 ring-emerald-300/50 bg-emerald-400/[0.06]"
+                    : reviewActiveSegId === seg._id ? "ring-1 ring-brand-light/60 bg-brand/[0.06]" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">
@@ -6310,7 +6765,7 @@ export default function LyricsEditor({
                           const i = edited.findIndex((s) => s._id === seg._id);
                           if (i > 0) {
                             e.preventDefault();
-                            mergeSeg(edited[i - 1]._id);
+                            mergeSeg(edited[i - 1]._id, "backspace_empty");
                           }
                         }
                       }}
@@ -6457,7 +6912,7 @@ export default function LyricsEditor({
                           )}
                           <button
                             onClick={() => splitSeg(seg._id)}
-                            title="Divide en dos en el wrap (reparte el tiempo proporcionalmente). Tip: apretá Enter en el cursor para partir exactamente ahí conservando el timing por palabra."
+                            title="Divide en dos en la pausa más natural del canto, conservando el timing por palabra. Tip: apretá Enter en el cursor para partir exactamente ahí."
                             className="text-[10px] text-brand hover:text-brand-light transition-colors
                               flex items-center gap-0.5 px-2 py-0.5 rounded-lg
                               bg-brand/5 hover:bg-brand/15 ring-1 ring-brand/20"
@@ -6579,7 +7034,7 @@ export default function LyricsEditor({
           window.setTimeout(() => rowRefs.current[firstId]?.scrollIntoView?.({ block: "center", behavior: "smooth" }), 0);
         }}
         onAutoSplit={() => {
-          wrapWarning?.ids?.forEach((id) => splitSeg(id));
+          splitSegs(wrapWarning?.ids, "wrap_dialog");
           setWrapWarning(null);
         }}
         onApproveAnyway={() => {

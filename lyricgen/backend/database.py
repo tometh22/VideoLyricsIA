@@ -95,9 +95,16 @@ DATABASE_URL = os.environ.get(
     "postgresql://genly:genly@localhost:5432/genly",
 )
 
-# Handle Heroku-style postgres:// URLs
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def _normalize_postgres_driver(url: str) -> str:
+    """Pin generic Postgres URLs to the installed psycopg2 DBAPI."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+DATABASE_URL = _normalize_postgres_driver(DATABASE_URL)
 
 # Pool sizing is *per-process*. The formula that has to hold under
 # burst is:
@@ -202,10 +209,7 @@ def get_db():
 # get_db → prod y dev quedan byte-a-byte iguales que hoy. NO se corre
 # create_all contra este engine: la DB externa (prod) es dueña de su schema.
 DELIVERIES_DATABASE_URL = os.environ.get("DELIVERIES_DATABASE_URL", "").strip()
-if DELIVERIES_DATABASE_URL.startswith("postgres://"):
-    DELIVERIES_DATABASE_URL = DELIVERIES_DATABASE_URL.replace(
-        "postgres://", "postgresql://", 1
-    )
+DELIVERIES_DATABASE_URL = _normalize_postgres_driver(DELIVERIES_DATABASE_URL)
 
 # El added_by_user_id de deliveries es FK NOT NULL a users.id de la DB
 # destino. Un user id de staging no existe en prod → al escribir en la DB
@@ -271,8 +275,7 @@ def deliveries_added_by(default_user_id):
 # SOLO LECTURA por convención: no se corre create_all contra este engine y
 # ningún camino de escritura lo usa.
 PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
-if PEER_DATABASE_URL.startswith("postgres://"):
-    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+PEER_DATABASE_URL = _normalize_postgres_driver(PEER_DATABASE_URL)
 
 if (
     PEER_DATABASE_URL
@@ -1042,6 +1045,9 @@ class DeliveryBatchItem(Base):
     error_code = Column(String(120), nullable=True)
     error_detail = Column(String(500), nullable=True)
     receipt = Column(JSONB, nullable=True)
+    # Client requests this send was reviewed to close (ids + reviewed cut). The
+    # worker re-validates each one before resolving; never resolves on its own.
+    change_request_intent = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -1413,6 +1419,11 @@ class Delivery(Base):
     # publish. Non-null means "do not treat this download as final".
     stale_since = Column(DateTime(timezone=True), nullable=True)
     stale_reason = Column(String(40), nullable=True)
+    # What the CLIENT may see of this row. NULL/'auto': hidden while the delivery
+    # has unpublished changes, shown again on publish. 'visible' / 'hidden' are
+    # the operator's manual override (delivery_snapshots.is_hidden_from_client).
+    # Lives on the shared row because the portal is served by another backend.
+    client_visibility = Column(String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -1438,6 +1449,7 @@ class Delivery(Base):
                 self.stale_since.isoformat() if self.stale_since else None
             ),
             "stale_reason": self.stale_reason,
+            "client_visibility": self.client_visibility or "auto",
         }
 
 
@@ -1462,6 +1474,11 @@ class DeliveryChangeRequest(Base):
     submitted_at = Column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )
+    # Keep the latest lifecycle change after reopening clears resolved_at.
+    updated_at = Column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+        nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+    )
     # Set when the operator marks the request handled (re-rendered,
     # edited, dismissed). Null = still pending.
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -1484,6 +1501,7 @@ class DeliveryChangeRequest(Base):
             "delivery_id": self.delivery_id,
             "comment": self.comment,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
             "resolved_by_revision": self.resolved_by_revision,
@@ -1523,6 +1541,16 @@ class Invoice(Base):
             "period_end": self.period_end.isoformat() if self.period_end else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class SystemSetting(Base):
+    """Operator-editable switches that used to be Railway env vars (local DB only)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String(80), primary_key=True)
+    value = Column(String(200), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_by_user_id = Column(Integer, nullable=True)
 
 
 class UserSettings(Base):
@@ -1904,6 +1932,16 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Desglose de `duration_ms` (incidente 2026-08-26/28). El total mide la
+    # ventana entera de la llamada, así que una corrida lenta es ambigua entre
+    # "el modelo tardó" y "esperamos GPU" — dos problemas con soluciones
+    # opuestas. Medido sobre 238 corridas de demucs: la degradación de agosto
+    # fue 100% cola (predict_time mediana 87,6s idéntica antes y después;
+    # cola de 23,5s a 204,3s, picos de 1824s).
+    # NULL cuando el proveedor no expone el desglose (OpenAI, Vertex) o en
+    # filas anteriores a la migración.
+    predict_time_ms = Column(Integer, nullable=True)
+    queue_time_ms = Column(Integer, nullable=True)
     # Only pre-submit Veo budget reservations use this lease. Once the worker
     # crosses the provider POST boundary it is cleared and the row remains in
     # the rolling ceiling as actual/ambiguous spend via response_summary.
@@ -2464,6 +2502,53 @@ class StatusComponentEvent(Base):
     )
 
 
+class ReviewSignalRecord(Base):
+    """Señales de revisión automática tal como se calcularon, para medirlas.
+
+    Dos señales se calculaban y se perdían: los puntos de la revisión rápida
+    (``lyric_review``, que vivían sólo en una caché LRU del proceso) y las
+    propuestas de ``repetition_reconcile`` (las que un gate declinaba sólo
+    iban al log). Esta tabla las guarda para poder cruzarlas después con los
+    pedidos de cambio del cliente (precisión/recall por señal).
+
+    Sólo se escribe con ``REVIEW_SIGNALS_PERSIST_ENABLED=1`` y en un hilo
+    aparte (``review_signals.py``); nada del producto la lee. Sin FK a
+    ``jobs`` a propósito: el insert no toma locks sobre la fila del job (que
+    el aprobar del editor tiene ``FOR UPDATE``). ``dedupe_key`` evita
+    duplicados cuando el mismo punto se recalcula para la misma revisión.
+    """
+    __tablename__ = "review_signal_records"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_review_signal_records_dedupe_key"),
+        Index("ix_review_signal_records_job_id", "job_id"),
+        Index("ix_review_signal_records_kind_created", "kind", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False)
+    tenant_id = Column(String(100), nullable=True)
+    # lyric_review_item | repetition_proposal
+    kind = Column(String(32), nullable=False)
+    # heard_different, missing, question_marks… | repetition_insert,
+    # repetition_reassign, repetition_group
+    item_type = Column(String(40), nullable=False)
+    # proposed | declined | applied
+    decision = Column(String(16), nullable=False)
+    reason = Column(String(80), nullable=True)
+    # Identidad de lo que se miró: revisión del editor (lyric_review), hash de
+    # los segmentos de entrada y release del código que lo calculó.
+    editor_revision = Column(Integer, nullable=True)
+    segments_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=True)
+    # Línea al momento del cálculo (puede moverse después).
+    line_index = Column(Integer, nullable=True)
+    start_s = Column(Float, nullable=True)
+    end_s = Column(Float, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    dedupe_key = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
@@ -2597,6 +2682,7 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS client_visibility VARCHAR(10)",
         "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
         "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).

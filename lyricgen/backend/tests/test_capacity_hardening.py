@@ -290,6 +290,36 @@ def test_explicit_prores_action_bypasses_optional_prewarm_limits(monkeypatch):
     fake_q_enterprise.enqueue.assert_called_once()
 
 
+def test_portal_delivery_prewarm_uses_snapshot_without_job_db(monkeypatch):
+    import queue_jobs
+
+    fake_q_enterprise = MagicMock()
+    fake_q_enterprise.enqueue.return_value.id = "portal-prewarm:test"
+    monkeypatch.setattr(
+        queue_jobs, "_init_redis",
+        lambda: (object(), object(), fake_q_enterprise),
+    )
+
+    result = queue_jobs.enqueue_delivery_prores_prewarm(
+        "stagingjob1", "umg_master", "universal_music", frame_size=None,
+    )
+
+    assert result == "portal-prewarm:test"
+    call = fake_q_enterprise.enqueue.call_args
+    assert call.args[0] == "prores.ensure_prores_exists"
+    job_id, file_type, snapshot, tenant_id = call.kwargs["args"]
+    assert (job_id, file_type, tenant_id) == (
+        "stagingjob1", "umg_master", "universal_music",
+    )
+    assert snapshot["umg_spec"] == {
+        "frame_size": "HD", "fps": 24.0, "prores_profile": 3,
+    }
+    assert snapshot["s3_keys"]["video"] == (
+        "universal_music/stagingjob1/lyric_video.mp4"
+    )
+    assert call.kwargs["job_id"] == "portal-prewarm:stagingjob1:umg_master"
+
+
 # ---------------------------------------------------------------------------
 # P5 — disk capacity gate on /upload
 # ---------------------------------------------------------------------------

@@ -12,8 +12,6 @@ import {
   editorRevisionConflictDetail,
   isEditorRevisionConflict,
 } from "./editorRevisionConflict";
-import { fetchWithTimeout } from "../fetchWithTimeout";
-import { requestIdempotencyKey } from "./idempotency";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -95,6 +93,9 @@ export function translateBackendError(raw, t) {
     ].includes(raw.code))
   ) {
     return "La referencia de audio de esta canción no coincide con la versión que estás revisando. Tus cambios quedaron guardados; recargá antes de volver a aprobar.";
+  }
+  if (raw && typeof raw === "object" && raw.code === "lyric_review_pending") {
+    return raw.message || "Quedan puntos de la revisión rápida por decidir. Abrí el editor, aplicá cada arreglo o marcá que está bien así, y volvé a aprobar.";
   }
   if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
     return tr("edit.error_already_editing") ||
@@ -184,12 +185,11 @@ export function campaignApprovalFailure(response, payload, t) {
 // {ok, status, data, cancelled} so the caller decides what to do.
 // cancelled=true means the operator declined the confirm prompt.
 async function postEditWithRetry(jobId, payload, { confirmYoutubeDrift, t } = {}) {
-  const idempotencyKey = requestIdempotencyKey(`edit-${jobId}`);
-  let res = await fetchWithTimeout(`${API}/edit/${jobId}`, {
+  let res = await fetch(`${API}/edit/${jobId}`, {
     method: "POST",
-    headers: { ...authHeaders(), "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+    headers: { ...authHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }, 15_000);
+  });
   let data = await res.json().catch(() => ({}));
   if (
     res.status === 409 &&
@@ -206,17 +206,11 @@ async function postEditWithRetry(jobId, payload, { confirmYoutubeDrift, t } = {}
     if (!confirmFn(msg)) {
       return { ok: false, cancelled: true };
     }
-    // `allow_youtube_drift` changes the payload intentionally, so it gets a
-    // fresh key rather than conflicting with the first declined request.
-    res = await fetchWithTimeout(`${API}/edit/${jobId}`, {
+    res = await fetch(`${API}/edit/${jobId}`, {
       method: "POST",
-      headers: {
-        ...authHeaders(),
-        "Content-Type": "application/json",
-        "Idempotency-Key": requestIdempotencyKey(`edit-${jobId}-youtube-drift`),
-      },
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ ...payload, allow_youtube_drift: true }),
-    }, 15_000);
+    });
     data = await res.json().catch(() => ({}));
   }
   return { ok: res.ok, status: res.status, data };
@@ -240,6 +234,7 @@ export async function submitLyricsEdit({
   textContrast,
   lyricsAnimation,
   lineTransition,
+  lyricLook,
   force = false,
   confirmYoutubeDrift,
   t,
@@ -260,11 +255,13 @@ export async function submitLyricsEdit({
     ...(textContrast != null ? { text_contrast: textContrast } : {}),
     ...(lyricsAnimation != null ? { lyrics_animation: lyricsAnimation } : {}),
     ...(lineTransition != null ? { line_transition: lineTransition } : {}),
+    // null/undefined = sin cambio; "" = sacar el look.
+    ...(lyricLook != null ? { lyric_look: lyricLook } : {}),
   };
   if (!force) {
     const typographyChanged =
       font != null || textCase != null || textContrast != null ||
-      lyricsAnimation != null || lineTransition != null;
+      lyricsAnimation != null || lineTransition != null || lyricLook != null;
     const layoutDelta = layoutChanged(baselineSegments, payloadSegments);
     const textChanged = !segmentsUnchanged(baselineSegments, payloadSegments);
     if (!typographyChanged && !layoutDelta && !textChanged) {

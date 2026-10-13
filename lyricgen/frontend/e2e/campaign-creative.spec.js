@@ -1,68 +1,17 @@
 import { test, expect } from "@playwright/test";
 import { installEditorHarness } from "./editor-harness";
+import { installCampaignApi, song } from "./campaign-harness";
 
 async function harness(page) {
-  await installEditorHarness(page, { jobId: "chilejob0001", role: "admin", editorV2: true });
-  const campaign = { id: "chile1", name: "Campaña Chile", kind: "lyric_video", status: "active", registered_count: 39 };
-  let head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-lite-generate-001", veo_models: [{ id: "veo-3.1-lite-generate-001", label: "Veo Lite" }], operations: [], fields: {
-    font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton", "poppins-bold"] },
-    font_scale: { label: "Tamaño de letra", group: "Letra", kind: "number", min: .6, max: 1.5, step: .05 },
-    effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
-    movement_style: { label: "Movimiento", group: "Movimiento y efectos", kind: "select", options: ["", "foto-parallax", "estandar"] },
-  }, items: Array.from({ length: 39 }, (_, n) => ({ id: `i${n}`, job_id: `chilejob${String(n + 1).padStart(4, "0")}`, ordinal: n + 1,
-    title: `Canción ${n + 1}`, artist: "Artista Chile", status: n === 0 ? "lyrics_approved" : "transcribed_pending", settings: {} })) };
-  const calls = { previews: [], generations: [], approvals: [] };
-  const videos = [];
-  await page.route("**/*", async route => {
-    const req = route.request(), path = new URL(req.url()).pathname;
-    const json = value => route.fulfill({ contentType: "application/json", body: JSON.stringify(value) });
-    if (path === "/service-status/summary") return json({ status: "operational", incidents: [] });
-    if (path.endsWith("/review-queue")) return json({ campaign, items: [], campaign_totals: { songs: 39, approved: 1 }, pages: 1, scope: { total: 0 }, counters: {} });
-    if (path === "/batch/campaigns/chile1") return json(campaign);
-    if (path === "/batch/campaigns/chile1/creative") return json(head);
-    if (path === "/backgrounds") return json([]);
-    if (path.endsWith("/creative/report")) return json({ campaign_id: "chile1", name: campaign.name, at: new Date().toISOString(), contract: head.plan.contract || {}, groups: [], videos, history: [] });
-    if (path.endsWith("/creative/preview")) {
-      const body = req.postDataJSON(); calls.previews.push(body);
-      return json({ preview_id: "frozen-39", counts: [20, 19], rounded: true, skipped: [], changes: head.items.map((item, n) => ({ item_id: item.id, artist: item.artist, title: item.title, group: body.groups[n < 20 ? 0 : 1].name, before: {}, after: body.groups[n < 20 ? 0 : 1].settings })) });
-    }
-    if (path.endsWith("/creative/apply")) {
-      expect(req.postDataJSON()).toEqual({ preview_id: "frozen-39" });
-      const body = calls.previews.at(-1);
-      head = { ...head, plan: { revision: 1, groups: body.groups, mode: body.mode, contract: { agreement: body.agreement, rounding_note: body.rounding_note, revision: 1, item_ids: body.item_ids } },
-        items: head.items.map((item, n) => ({ ...item, settings: body.groups[n < 20 ? 0 : 1].settings,
-          assignment: { revision: 1, group_name: body.groups[n < 20 ? 0 : 1].name } })) };
-      return json({ revision: 1 });
-    }
-    if (path === "/status/chilejob0001") return json({ job_id: "chilejob0001", status: "lyrics_approved", segments_revision: 7, segments_json: [{ start: 0, end: 2, text: "Letra aprobada" }] });
-    if (path === "/media-token/chilejob0001/thumbnail" || path === "/media-token/chilejob0001/video") return json({ token: "e2e-media-token" });
-    if (path === "/preview/chilejob0001/thumbnail") return route.fulfill({ status: 302, headers: { location: "/fx_samples/foto_viva.jpg" } });
-    if (path === "/preview/chilejob0001/video") return route.fulfill({ status: 302, headers: { location: "/escenas_demo.mp4" } });
-    if (path === "/approve/chilejob0001") {
-      calls.approvals.push(req.postDataJSON());
-      Object.assign(videos[0], { status: "done", approved_at: new Date().toISOString() });
-      return json({ ok: true, status: "done", job_id: "chilejob0001" });
-    }
-    if (path === "/generate") {
-      calls.generations.push(req.postData()); head.items[0].status = "queued";
-      videos.push({ job_id: "chilejob0001", artist: "Artista Chile", title: "Canción 1", status: "pending_review", created_at: new Date().toISOString(),
-        assignment: head.items[0].assignment, settings: head.items[0].settings, evidence: { video_sha256: "e2e-video-v1" }, compliance: "pending",
-        video_url: "/download/chilejob0001/video", open_path: "/videos/chilejob0001" });
-      return json({ job_id: "chilejob0001", status: "queued" });
-    }
-    return route.fallback();
-  });
-  return calls;
+  await installEditorHarness(page, { jobId: "song-1", role: "admin", editorV2: true });
+  const songs = Array.from({ length: 39 }, (_, n) => song(n + 1, n === 0 ? "ready" : "lyrics", { artist: "Artista Chile" }));
+  return installCampaignApi(page, { id: "chile1", name: "Campaña Chile", songs });
 }
 
-test("39-song contract assignment survives reload, generates only approved selections and has its own video history", async ({ page }) => {
-  const calls = await harness(page);
-  const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
-  await page.addLocatorHandler(announcement, async () => { await announcement.getByRole("button", { name: "Cancelar" }).click(); });
-  await page.goto("/campaigns/chile1?view=creative");
-  await page.getByRole("button", { name: /Seleccionar resultados/ }).click();
-  await expect(page.getByText("39 seleccionadas")).toBeVisible();
-  await page.getByRole("button", { name: /Configurar estilos y reparto/ }).click();
+test("39-song contract assignment survives reload, generates only approved songs and reports compliance", async ({ page }) => {
+  const api = await harness(page);
+  await page.goto("/campaigns/chile1?view=config&section=style");
+  await expect(page.getByText("39 canciones en este reparto")).toBeVisible();
   await page.getByLabel("Requisito del grupo 1").selectOption("photo_effect");
   await page.getByLabel("Nombre del grupo 1").fill("Foto fija con efecto");
   await page.getByLabel("Cantidad del grupo 1").fill("50");
@@ -70,46 +19,40 @@ test("39-song contract assignment survives reload, generates only approved selec
   await page.getByLabel("Nombre del grupo 2").fill("Fondo Veo");
   await page.getByLabel("Cantidad del grupo 2").fill("50");
   await page.getByLabel("Requisito del grupo 2").selectOption("veo");
-  await expect(page.getByText("Modelo de fondo: Veo Lite")).toBeVisible();
+  await expect(page.getByText("Modelo de fondo: Veo Lite.")).toBeVisible();
   await expect(page.getByLabel("Modelo del grupo 2")).toHaveCount(0);
   await page.getByLabel("Registrar este reparto como acuerdo contractual").check();
   await page.getByLabel("Acuerdo contractual", { exact: true }).fill("Contrato Chile: mitad foto con efecto, mitad Veo");
   await page.getByLabel("Aceptación del redondeo").fill("Aceptado 20 fotos y 19 Veo");
   await page.getByLabel("Motivo del cambio").fill("Acuerdo de campaña");
+  await page.screenshot({ path: "test-results/campaign-style-settings.png", fullPage: true });
   await page.getByRole("button", { name: "Ver reparto antes de guardar" }).click();
   await expect(page.getByText(/20 \(51.28%\)/)).toBeVisible();
-  expect(calls.generations).toHaveLength(0);
-  expect(calls.previews[0].item_ids).toHaveLength(39);
-  expect(calls.previews[0].groups[0].settings.effect).toBe("bokeh");
-  expect(calls.previews[0].groups[1].model).toBe("veo-3.1-lite-generate-001");
+  expect(api.generations).toHaveLength(0);
+  expect(api.lastPreview.item_ids).toHaveLength(39);
+  expect(api.lastPreview.groups[0].settings.effect).toBe("bokeh");
+  expect(api.lastPreview.groups[1].model).toBe("veo-3.1-lite-generate-001");
   await page.getByRole("button", { name: "Guardar esta asignación" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.reload();
-  await page.getByRole("button", { name: /Configurar estilos y reparto/ }).click();
   await expect(page.getByLabel("Nombre del grupo 1")).toHaveValue("Foto fija con efecto");
-  await page.getByRole("button", { name: /Seleccionar resultados/ }).click();
-  await page.getByRole("button", { name: "Preparar generación de 1 aprobadas seleccionadas" }).click();
-  await page.getByRole("button", { name: "Confirmar generación", exact: true }).click();
-  await expect(page.getByRole("status").filter({ hasText: "1 trabajo enviado" })).toBeVisible();
-  expect(calls.generations).toHaveLength(1);
-  expect(calls.generations[0]).toContain('name="effect"\r\n\r\nbokeh');
-  expect(calls.generations[0]).toContain('name="campaign_creative_revision"\r\n\r\n1');
-  expect(calls.generations[0]).toContain('name="base_revision"\r\n\r\n7');
-  await page.getByRole("button", { name: /3. Revisar videos/ }).click();
-  await expect(page).toHaveURL(/view=history/);
-  await expect(page.getByRole("heading", { name: "Videos de esta campaña (1)" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Canción 1", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Reproducir", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "Reproducir Canción 1" })).toBeVisible();
-  await expect(page.locator("video")).toBeVisible();
-  await page.getByRole("button", { name: "Cerrar", exact: true }).click();
-  await page.getByRole("button", { name: "Aprobar", exact: true }).click();
-  await page.getByRole("button", { name: "Confirmar aprobación" }).click();
-  await expect(page.getByText("Canción 1 quedó aprobado.")).toBeVisible();
-  expect(calls.approvals).toEqual([{ notes: "Aprobado desde el historial de campaña" }]);
-  await page.screenshot({ path: "test-results/chile-campaign-video-history.png", fullPage: true });
-  await page.getByRole("button", { name: "Contrato y cumplimiento", exact: true }).click();
+
+  await page.getByRole("tab", { name: /^Lista/ }).click();
+  await expect(page.getByText("Foto fija con efecto", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Generar · Canción 1" }).click();
+  const dialog = page.getByRole("dialog", { name: "Confirmar generación" });
+  await expect(dialog).toContainText("Foto fija con efecto");
+  await dialog.getByRole("button", { name: "Confirmar generación", exact: true }).click();
+  await expect(page.getByText(/1 trabajo enviado/)).toBeVisible();
+  expect(api.generations).toHaveLength(1);
+  expect(api.generations[0]).toContain('name="effect"\r\n\r\nbokeh');
+  expect(api.generations[0]).toContain('name="campaign_creative_revision"\r\n\r\n1');
+  expect(api.generations[0]).toContain('name="base_revision"\r\n\r\n7');
+  await expect(page.getByRole("tab", { name: /^Generando/ })).toContainText("1");
+
+  await page.goto("/campaigns/chile1?view=config&section=contract");
   await expect(page.getByText("Contrato Chile: mitad foto con efecto, mitad Veo")).toBeVisible();
+  await page.screenshot({ path: "test-results/chile-campaign-contract.png", fullPage: true });
 });
 
 test("individual campaign typography autosaves and reopens without approving or generating", async ({ page }) => {
@@ -162,6 +105,13 @@ test("printed campaign reports paginate outside the scrolling app and do not hid
   await harness(page);
   const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
   await page.addLocatorHandler(announcement, async () => announcement.getByRole("button", { name: "Cancelar" }).click());
+  await page.goto("/campaigns/chile1?view=config&section=style");
+  await page.getByLabel("Registrar este reparto como acuerdo contractual").check();
+  await page.getByLabel("Acuerdo contractual", { exact: true }).fill("Contrato impreso");
+  await page.getByLabel("Motivo del cambio").fill("Acuerdo");
+  await page.getByRole("button", { name: "Ver reparto antes de guardar" }).click();
+  await page.getByRole("button", { name: "Guardar esta asignación" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.goto("/campaigns/chile1?view=contract");
   await page.locator("#campaign-contract-report").waitFor();
   await page.locator("#campaign-contract-report").evaluate(report => {
@@ -186,6 +136,8 @@ test("printed campaign reports paginate outside the scrolling app and do not hid
   expect(layout.background).toBe("rgb(255, 255, 255)");
   expect(layout.documentHeight).toBeGreaterThan(1500);
   await page.pdf({ path: "test-results/campaign-contract-print.pdf", format: "A4", printBackground: true });
+  await page.emulateMedia({ media: "screen" });
   await page.goto("/campaigns/chile1?view=history");
-  await expect(page.getByRole("heading", { name: "Videos de esta campaña (0)" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Video por revisar" })).toBeVisible();
+  await expect(page.getByText("No hay videos por revisar")).toBeVisible();
 });

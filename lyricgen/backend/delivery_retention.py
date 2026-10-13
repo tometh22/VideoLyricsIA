@@ -1,154 +1,139 @@
-"""Retention for files published to the UMG delivery portals.
+"""Protective, read-only retention inventory for published portal artifacts.
 
-Portal entries are intentionally soft-deleted first so an operator can
-remove a delivery without making the R2 bytes unrecoverable immediately.
-This module is the delayed hard-delete path: after the configured retention
-period it hides old entries and removes only the rendered delivery objects.
-Source audio lives under ``inputs/`` and is never touched here because it is
-needed by the editor and by re-render/retry flows.
+The former cleanup deleted mutable outputs before committing row changes and
+could race publication or a reaper in another environment. Until shared-domain
+ownership, references and deletion policy are coordinated, this release never
+hides deliveries or deletes objects (including when dry_run=False is passed).
+The old production reaper is NOT fixed by deploying this module to staging.
 """
-
 from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import storage
 from database import Delivery, DeliveriesSessionLocal
 
-
 logger = logging.getLogger("genly.delivery_retention")
-
 DEFAULT_RETENTION_DAYS = 60
-RETENTION_DAYS = max(
-    int(os.environ.get("DELIVERY_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS))),
-    1,
-)
-
-# Keep this list deliberately separate from the generic job cleanup. These
-# are the only output names the delivery portal publishes today. In
-# particular, never delete an entire tenant/job prefix: inputs and editor
-# previews must survive portal retention.
+RETENTION_DAYS = max(int(os.environ.get("DELIVERY_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS))), 1)
 DELIVERY_FILENAMES = {
-    "umg_master": "umg_master.mov",
-    "umg_short": "umg_short.mov",
-    "video": "lyric_video.mp4",
-    "short": "short.mp4",
-    "thumbnail": "thumbnail.jpg",
+    "umg_master": "umg_master.mov", "umg_short": "umg_short.mov",
+    "video": "lyric_video.mp4", "short": "short.mp4", "thumbnail": "thumbnail.jpg",
 }
 
 
 def _delivery_keys(delivery: Delivery) -> list[str]:
+    """Inventory published references; partial snapshots never fall back.
+
+    Include even extra snapshot entries conservatively: this is a reference
+    inventory, not a list of objects authorized for deletion.
+    """
+    keys = getattr(delivery, "published_file_keys", None)
+    if keys is not None:
+        return list(dict.fromkeys(key for key in keys.values()
+                                  if isinstance(key, str) and key.strip())) if isinstance(keys, dict) else []
     tenant = storage._safe_filename(delivery.tenant_snapshot)
     job_id = storage._safe_filename(delivery.job_id)
-    keys = []
-    for file_type in delivery.file_types or []:
-        filename = DELIVERY_FILENAMES.get(file_type)
-        if filename:
-            keys.append(f"{tenant}/{job_id}/{storage._safe_filename(filename)}")
-    return keys
+    return [f"{tenant}/{job_id}/{storage._safe_filename(DELIVERY_FILENAMES[ft])}"
+            for ft in delivery.file_types or [] if ft in DELIVERY_FILENAMES]
+
+
+def _aware(value):
+    return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 
 
 def _is_expired(delivery: Delivery, cutoff: datetime) -> bool:
-    """Return whether a row is ready for hard cleanup.
+    """Report the existing age rule only; do not change retention policy.
 
-    Active rows expire from the portal based on publish time. Rows manually
-    removed earlier expire based on the removal time, giving the team the
-    full retention window for accidental deletes and re-downloads.
+    This legacy rule ignores content_updated_at. Therefore an old row recently
+    republished is only a candidate for policy review, never a deletion order.
     """
-    anchor = delivery.removed_at or delivery.added_at
-    return bool(anchor and anchor < cutoff)
+    anchor = _aware(delivery.removed_at or delivery.added_at)
+    return bool(anchor and anchor < _aware(cutoff))
 
 
-def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int | str]:
-    """Hide and delete deliveries older than ``DELIVERY_RETENTION_DAYS``.
+def cleanup_expired_deliveries(*, now: datetime | None = None, dry_run: bool = True) -> dict:
+    """Read-only inventory, backwards-compatible entry point for the reaper.
 
-    The caller (the single-runner reaper) supplies cross-replica locking.
-    The function remains idempotent: a failed object delete leaves its row
-    eligible for the next pass, and deleting an already absent R2 object is
-    harmless.
+    would_expire: rows matched by the old age rule (not rows to hide).
+    would_delete: unique references the old rule would consider (NOT safe).
+    protected: all distinct known artifact references, including old snapshots.
+    unknown: rows with incomplete/invalid identity or publication metadata.
+    No storage calls, DB commit, row mutation, deletion or new deletion policy.
     """
-    if not storage.is_enabled():
-        return {
-            "status": "r2_disabled",
-            "scanned": 0,
-            "expired": 0,
-            "hidden": 0,
-            "deleted": 0,
-            "failed": 0,
-        }
+    import database
 
-    now = now or datetime.now(timezone.utc)
+    shared = bool(database.DELIVERIES_DATABASE_URL)
+    report = {
+        "status": "shared_database_protected" if shared else "dry_run",
+        "dry_run": True, "execution_requested": not dry_run,
+        "scanned": 0, "expired": 0, "would_expire": 0, "would_delete": 0,
+        "hidden": 0, "deleted": 0, "failed": 0, "protected": 0,
+        "protected_deliveries": 0, "unknown": 0, "shared_references": 0,
+        "snapshot_deliveries": 0, "retention_days": RETENTION_DAYS,
+        "policy": "inventory_only_pending_shared_domain_retention_review",
+        "complete": False,
+    }
+    if not dry_run and not shared:
+        report["status"] = "destructive_cleanup_blocked"
+    now = _aware(now or datetime.now(timezone.utc))
     cutoff = now - timedelta(days=RETENTION_DAYS)
     db = DeliveriesSessionLocal()
     try:
         deliveries = db.query(Delivery).all()
-        expired = [d for d in deliveries if _is_expired(d, cutoff)]
-
-        # If old duplicate rows exist for a job but a newer row is still
-        # visible, keep the objects: the R2 key is job-scoped and deleting it
-        # would break the active portal version.
-        protected_job_ids = {
-            d.job_id for d in deliveries if not _is_expired(d, cutoff)
-        }
-
-        hidden = 0
-        deleted = 0
-        failed = 0
-        for delivery in expired:
-            if delivery.job_id in protected_job_ids:
-                if delivery.removed_at is None:
-                    delivery.removed_at = now
-                    hidden += 1
-                logger.info(
-                    "[DELIVERY-RETENTION] kept R2 files for expired row %s; "
-                    "job %s still has a newer portal row",
-                    delivery.id,
-                    delivery.job_id,
-                )
-                continue
-
-            delete_failed = False
-            for key in _delivery_keys(delivery):
-                try:
-                    storage.delete_object(key)
-                    deleted += 1
-                except Exception:
-                    # Keep going so one transient R2 error does not prevent
-                    # the remaining files from being reclaimed. The row
-                    # stays eligible and the next daily pass retries it.
-                    failed += 1
-                    delete_failed = True
-                    logger.exception(
-                        "[DELIVERY-RETENTION] failed to delete %s (delivery=%s)",
-                        key,
-                        delivery.id,
-                    )
-            # Do not advance the retention anchor when an R2 delete failed:
-            # an active row remains visible until all its objects are safely
-            # reclaimed, and an already-removed row remains eligible on the
-            # next daily pass instead of being postponed another 60 days.
-            if not delete_failed and delivery.removed_at is None:
-                delivery.removed_at = now
-                hidden += 1
-
-        if hidden:
-            db.commit()
-        else:
-            db.rollback()
-
-        result = {
-            "status": "ok",
-            "scanned": len(deliveries),
-            "expired": len(expired),
-            "hidden": hidden,
-            "deleted": deleted,
-            "failed": failed,
-            "retention_days": RETENTION_DAYS,
-        }
-        if expired:
-            logger.info("[DELIVERY-RETENTION] sweep: %s", result)
-        return result
+        references = Counter()
+        old_candidates = set()
+        for row in deliveries:
+            report["scanned"] += 1
+            report["protected_deliveries"] += 1
+            snapshot = getattr(row, "published_file_keys", None)
+            types = row.file_types or []
+            unknown = not types or not (row.tenant_snapshot and row.job_id)
+            if snapshot is not None:
+                report["snapshot_deliveries"] += 1
+                unknown = unknown or not isinstance(snapshot, dict)
+                if isinstance(snapshot, dict):
+                    unknown = unknown or any(not isinstance(snapshot.get(ft), str)
+                                             or not snapshot[ft].strip() for ft in types)
+            else:
+                unknown = unknown or any(ft not in DELIVERY_FILENAMES for ft in types)
+            if not (row.removed_at or row.added_at):
+                unknown = True
+            keys = _delivery_keys(row)
+            references.update(set(keys))
+            if _is_expired(row, cutoff):
+                report["would_expire"] += 1
+                old_candidates.update(keys)
+            if unknown:
+                report["unknown"] += 1
+        report["expired"] = report["would_expire"]
+        report["would_delete"] = len(old_candidates)
+        report["protected"] = len(references)
+        report["shared_references"] = sum(count > 1 for count in references.values())
+        report["complete"] = True
+    except Exception as exc:
+        report["status"] = "inventory_failed"
+        report["failed"] = 1
+        report["error"] = type(exc).__name__
     finally:
-        db.close()
+        try:
+            db.rollback()
+        except Exception as exc:
+            report.update(status="inventory_failed", complete=False, failed=1,
+                          error=type(exc).__name__)
+        finally:
+            # A failed rollback (e.g. disconnected DB) must still return the
+            # connection/session resources; cleanup itself performs no writes.
+            try:
+                db.close()
+            except Exception as exc:
+                report.update(status="inventory_failed", complete=False, failed=1,
+                              error=type(exc).__name__)
+    logger.info("[DELIVERY-RETENTION] read-only inventory status=%s scanned=%s "
+                "would_expire=%s protected=%s unknown=%s; no changes executed",
+                report["status"], report["scanned"], report["would_expire"],
+                report["protected"], report["unknown"])
+    return report

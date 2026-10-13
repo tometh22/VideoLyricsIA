@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-const REASON = { autosave: "Autoguardado", manual: "Edición manual", restore: "Restauración", approve: "Aprobada", conflict: "Conflicto preservado", migration: "Migración" };
+const REASON = { autosave: "Autoguardado", manual: "Edición manual", restore: "Restauración", auto_repair_undo: "Mejora automática deshecha", approve: "Aprobada", conflict: "Conflicto preservado", migration: "Migración" };
 
 export default function VersionHistory({ open, loadVersions, onRestore, onClose }) {
   const [versions, setVersions] = useState([]);
