@@ -581,3 +581,33 @@ it("never confirms a publication close without the reviewed cut identity", async
   expect(mocks.fetchJson.mock.calls.some(([url]) => url.endsWith("/confirm-publication"))).toBe(false);
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "error" });
 });
+
+it("exposes the exact text rejection and sends human review only on explicit confirmation", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  const token = "a".repeat(64);
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (!url.endsWith("/confirm-publication")) return previous(url, opts);
+    const body = JSON.parse(opts.body);
+    if (body.text_review_token) return Promise.resolve({ ok: true, resolved_by_revision: 6 });
+    return Promise.reject(Object.assign(new Error("La frase no coincide"), { status: 409, detail: {
+      code: "requested_text_not_found", missing: ["me despirerta por las noches"], review_token: token,
+      message: "Revisá el pedido contra el video.",
+    } }));
+  });
+  const publication = { render_fingerprint: "cut-6", editor_revision: 141 };
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85, publication, 5));
+  expect(result.current.crPublishNotice.textReview).toEqual({ token, missing: ["me despirerta por las noches"],
+    renderFingerprint: "cut-6", editorRevision: 141 });
+  const calls = () => mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith("/confirm-publication"));
+  expect(calls()).toHaveLength(1); // no automatic retry or typo replacement
+  expect(JSON.parse(calls()[0][1].body)).not.toHaveProperty("text_review_token");
+  await act(() => result.current.confirmChangeRequestPublication(85, publication, 5,
+    { token, reason: "Revisé despierta en el video; el pedido tiene un typo." }));
+  expect(JSON.parse(calls()[1][1].body)).toMatchObject({ text_review_token: token,
+    text_review_reason: "Revisé despierta en el video; el pedido tiene un typo.",
+    reviewed_render_fingerprint: "cut-6", reviewed_editor_revision: 141, confirmed_items: 5 });
+  expect(result.current.crPublishNotice.text).toContain("revisión manual");
+  expect(result.current.crPublishNotice.textReview).toBeUndefined();
+});

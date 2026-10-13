@@ -22778,6 +22778,8 @@ class ConfirmPublicationRequest(BaseModel):
     resolution_note: str = Field(default='', max_length=2000)
     # Points of the request the operator ticked against the cut (audit only).
     confirmed_items: int | None = Field(default=None, ge=1, le=200)
+    text_review_token: str | None = Field(default=None, min_length=64, max_length=64)
+    text_review_reason: str = Field(default='', max_length=2000)
 
 
 @app.post('/admin/change-requests/{cr_id}/confirm-publication')
@@ -22818,22 +22820,41 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
             or body.reviewed_editor_revision != int(document.revision or 0)):
         raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    manual_text_review = None
     import change_request_publish_guard as _cr_guard
+    if body.text_review_token and not _cr_guard.enabled():
+        raise HTTPException(status_code=409, detail='La comprobación cambió. Actualizá y revisá el pedido antes de cerrar.')
     if _cr_guard.enabled():
-        # "Resuelto al publicar" exige que el texto pedido esté en la letra
-        # publicada. Si falta, el pedido sigue abierto; cerrarlo a mano con un
-        # motivo sigue disponible.
+        # Exact matching remains the default. A failed match may be a typo
+        # in the customer's comment; accept only an explicit human review of
+        # the same discrepancies, bound to this published cut with a reason.
         _closable, _kept = _cr_guard.text_gate(db, job, [cr])
+        if body.text_review_token and not _kept:
+            raise HTTPException(status_code=409, detail='Las diferencias del pedido cambiaron. Actualizá y revisá el pedido antes de cerrar.')
         if _kept:
-            db.add(_cr_guard.text_not_found_audit(
-                current_user['id'], job, _kept[0], 'publication_confirmed', delivery_id=delivery.id,
-            ))
-            db.commit()
-            raise HTTPException(status_code=409, detail={
-                'code': _cr_guard.TEXT_NOT_FOUND, 'missing': _kept[0]['missing'],
-                'message': 'La letra publicada no tiene el texto pedido: ' + ' · '.join(
-                    f'«{text}»' for text in _kept[0]['missing'][:5]) + '. Corregí y volvé a publicar.',
-            })
+            review_token = _cr_guard.text_review_token(
+                cr, delivery_freshness.render_fingerprint(job), int(document.revision or 0), _kept[0],
+            )
+            if body.text_review_token != review_token:
+                db.add(_cr_guard.text_not_found_audit(
+                    current_user['id'], job, _kept[0], 'publication_confirmed', delivery_id=delivery.id,
+                ))
+                db.commit()
+                raise HTTPException(status_code=409, detail={
+                    'code': _cr_guard.TEXT_NOT_FOUND, 'missing': _kept[0]['missing'],
+                    'review_token': review_token,
+                    'message': 'No pude comprobar estas frases del pedido en la letra publicada: ' + ' · '.join(
+                        f'«{text}»' for text in _kept[0]['missing'][:5])
+                        + '. Revisá el video. Si el pedido tiene un error, podés confirmar el cierre con un motivo.',
+                })
+            reason = body.text_review_reason.strip()
+            if not reason or not body.confirmed_items:
+                raise HTTPException(status_code=422, detail={
+                    'code': 'text_review_reason_required',
+                    'message': 'Revisá todos los puntos del pedido y explicá las diferencias antes de cerrar.',
+                })
+            manual_text_review = {'reason': reason, 'missing': _kept[0]['missing'],
+                                  'review_token': review_token}
     now = datetime.now(timezone.utc)
     revision = delivery.published_revision or 1
     note = body.resolution_note.strip()
@@ -22842,7 +22863,8 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     cr.resolved_by_user_id = deliveries_added_by(current_user['id'])
     cr.resolved_by_revision = revision
     cr.resolution_source = 'publication'
-    cr.resolution_note = note or f'Resuelto al publicar la versión {revision}.'
+    cr.resolution_note = (f'Revisión manual de la versión {revision}: {manual_text_review["reason"]}'
+                          if manual_text_review else note or f'Resuelto al publicar la versión {revision}.')
     ddb.commit()
     db.add(AuditLog(user_id=current_user['id'], action='delivery.change_request.resolve', detail={
         'change_request_id': cr_id, 'delivery_id': delivery.id, 'job_id': delivery.job_id,
@@ -22850,6 +22872,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         'render_fingerprint': body.reviewed_render_fingerprint,
         'editor_revision': body.reviewed_editor_revision,
         'confirmed_items': body.confirmed_items,
+        **({'manual_text_review': manual_text_review} if manual_text_review else {}),
     }))
     db.commit()
     return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
