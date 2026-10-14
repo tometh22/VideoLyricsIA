@@ -201,6 +201,104 @@ def _published_without_ticking(client, admin_token, manual_request, db):
     return job, document, cr, delivery
 
 
+def _human_publication_body(client, admin_token, request):
+    listed = client.get(f'/admin/change-requests?status=all&change_request_id={request.id}&limit=1',
+                        headers=auth(admin_token)).json()['items'][0]
+    return {'reviewed_render_fingerprint': listed['publication']['render_fingerprint'],
+            'reviewed_editor_revision': listed['publication']['editor_revision'],
+            'publication_review_token': listed['published_review']['review_token'],
+            'publication_review_reason': 'Revisé el video del portal y todas las correcciones están atendidas.',
+            'confirmed_published_review': True, 'confirmed_items': 1}
+
+
+@pytest.mark.parametrize('problem', ['older_save', 'newer_document', 'art_track', 'later_request', 'prores', 'text'])
+def test_human_can_resolve_one_reviewed_publication_despite_automatic_evidence(
+        client, admin_token, manual_request, db, monkeypatch, problem):
+    from database import AuditLog, EditorVersion
+    job, document, request, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    sibling = DeliveryChangeRequest(delivery_id=delivery.id, comment='Otro pedido')
+    db.add(sibling)
+    delivery.approved_at = datetime.now(timezone.utc)
+    delivery.approved_by_label = 'Cliente'
+    if problem == 'older_save': document.updated_at = request.submitted_at - timedelta(minutes=5)
+    if problem == 'newer_document': document.revision += 1
+    if problem == 'art_track':
+        job.render_params = {'art_track': True}
+        db.delete(document)
+    if problem == 'later_request': request.submitted_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    if problem == 'prores':
+        job.s3_keys = {'video': 'working-video', 'short': 'working-short'}
+        job.previous_versions = [{'archived_at': datetime.now(timezone.utc).isoformat()}]
+    if problem == 'text':
+        monkeypatch.setenv('CHANGE_REQUEST_PUBLISH_GUARD_ENABLED', '1')
+        request.comment = '0:00 Texto distinto al pedido publicado'
+        version = db.query(EditorVersion).filter_by(job_id=job.job_id, revision=document.revision).one()
+        version.segments = document.current_segments
+        version.is_approved = True
+    db.commit()
+    publication_before = dict(delivery.published_file_keys)
+    fingerprint_before = delivery.published_render_fingerprint
+    body = _human_publication_body(client, admin_token, request)
+    response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                           headers=auth(admin_token), json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()['human_review'] is True
+    db.expire_all()
+    assert request.resolution_source == 'publication'
+    assert request.resolved_by_revision == delivery.published_revision
+    assert body['publication_review_reason'] in request.resolution_note
+    assert sibling.resolved_at is None
+    assert job.status == 'done'
+    assert delivery.published_file_keys == publication_before
+    assert delivery.published_render_fingerprint == fingerprint_before
+    assert delivery.approved_by_label == 'Cliente' and delivery.approved_at is not None
+    audit = db.query(AuditLog).filter_by(action='delivery.change_request.resolve').order_by(AuditLog.id.desc()).first()
+    assert audit.detail['source'] == 'published_human_review'
+    assert audit.detail['reason'] == body['publication_review_reason']
+
+
+@pytest.mark.parametrize('changed', ['comment', 'revision', 'fingerprint', 'files', 'render'])
+def test_human_publication_receipt_rejects_changed_request_or_cut(
+        client, admin_token, manual_request, db, changed):
+    job, _, request, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    body = _human_publication_body(client, admin_token, request)
+    if changed == 'comment': request.comment = 'Nuevo punto del pedido'
+    if changed == 'revision': delivery.published_revision += 1
+    if changed == 'fingerprint': delivery.published_render_fingerprint = 'different'
+    if changed == 'files': delivery.published_file_keys = {'video': 'different-published.mp4'}
+    if changed == 'render': job.edit_count += 1
+    db.commit()
+    response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                           headers=auth(admin_token), json=body)
+    assert response.status_code == 409, response.text
+    assert response.json()['detail']['code'] == 'published_review_changed'
+    db.expire_all()
+    assert request.resolved_at is None
+
+
+@pytest.mark.parametrize('missing', ['publication_review_reason', 'confirmed_published_review', 'confirmed_items'])
+def test_human_publication_review_requires_reason_and_explicit_confirmation(
+        client, admin_token, manual_request, db, missing):
+    _, _, request, _ = _published_without_ticking(client, admin_token, manual_request, db)
+    body = _human_publication_body(client, admin_token, request)
+    del body[missing]
+    response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                           headers=auth(admin_token), json=body)
+    assert response.status_code == 422, response.text
+    db.expire_all()
+    assert request.resolved_at is None
+
+
+def test_human_publication_review_is_admin_only(client, admin_token, user_token, manual_request, db):
+    _, _, request, _ = _published_without_ticking(client, admin_token, manual_request, db)
+    body = _human_publication_body(client, admin_token, request)
+    response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                           headers=auth(user_token), json=body)
+    assert response.status_code == 403
+    db.expire_all()
+    assert request.resolved_at is None
+
+
 def test_cut_published_without_ticking_closes_as_publication_in_one_click(client, admin_token, manual_request, db):
     job, document, cr, delivery = _published_without_ticking(client, admin_token, manual_request, db)
     listed = client.get(f'/admin/change-requests?status=all&change_request_id={cr.id}&limit=1',

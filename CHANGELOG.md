@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.128] - 2026-10-14
+
+### Fixed
+
+- **Resolver con revisión humana** permite cerrar un pedido cuyo video corregido ya está en el portal, aunque el editor, ProRes o el control textual no puedan acreditar el cambio. Muestra la versión publicada, exige revisar cada punto, un motivo visible al cliente y confirmación explícita. La decisión queda vinculada al pedido y a esa publicación; si cambian, hay que revisar otra vez. Cierra sólo el pedido elegido y conserva la aprobación independiente del cliente, los archivos y los demás pedidos.
+
 ## [1.1.127] - 2026-10-14
 
 ### Fixed

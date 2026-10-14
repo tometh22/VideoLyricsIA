@@ -582,6 +582,24 @@ it("never confirms a publication close without the reviewed cut identity", async
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "error" });
 });
 
+it("sends an explicit human publication decision without publishing another version", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.endsWith("/confirm-publication")
+    ? Promise.resolve({ ok: true, human_review: true, resolved_by_revision: 6 }) : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85,
+    { render_fingerprint: "candidate", editor_revision: 141 }, 5,
+    { publicationToken: "b".repeat(64), reason: "Revisé la versión publicada." }));
+  const posts = mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith("/confirm-publication"));
+  expect(posts).toHaveLength(1);
+  expect(JSON.parse(posts[0][1].body)).toMatchObject({ publication_review_token: "b".repeat(64),
+    publication_review_reason: "Revisé la versión publicada.", confirmed_published_review: true, confirmed_items: 5 });
+  expect(JSON.parse(posts[0][1].body)).not.toHaveProperty("text_review_token");
+  expect(mocks.fetchJson.mock.calls.some(([url]) => /from-job|\/approve\//.test(url))).toBe(false);
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok" });
+});
+
 it("exposes the exact text rejection and sends human review only on explicit confirmation", async () => {
   const previous = mocks.fetchJson.getMockImplementation();
   const token = "a".repeat(64);
