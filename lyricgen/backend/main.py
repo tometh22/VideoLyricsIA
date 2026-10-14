@@ -2874,7 +2874,7 @@ def _validate_background_file_on_disk(filename: str, path: str) -> None:
 
 
 def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_id: str,
-                            persist_cache: bool = True):
+                            persist_cache: bool = True, unique_filename: bool = False):
     """Materializa el fondo subido por el usuario: valida (extensión +
     magic bytes + tamaño), escribe a disco, sube a R2 y — clave del fix
     2026-06-11 — persiste la key en `bg_r2_key_cached` para que los edits
@@ -2902,7 +2902,8 @@ def _save_custom_background(background_file, job_dir: str, job_id: str, tenant_i
                 "Use MP4, MOV, JPG or PNG."
             ),
         )
-    bg_filename = f"bg_custom{bg_ext}"
+    from uuid import uuid4
+    bg_filename = f"bg_custom-{uuid4().hex}{bg_ext}" if unique_filename else f"bg_custom{bg_ext}"
     bg_path = os.path.join(job_dir, bg_filename)
     with open(bg_path, "wb") as f:
         shutil.copyfileobj(background_file.file, f)
@@ -3205,6 +3206,7 @@ def _commit_pipeline_publication(
     style: str,
     plan: str,
     tenant_id: str,
+    after_commit=None,
     **pipeline_kwargs,
 ) -> dict:
     """Atomically persist a job mutation and its durable RQ publication."""
@@ -3229,14 +3231,17 @@ def _commit_pipeline_publication(
         pipeline_kwargs=pipeline_kwargs,
     )
     event_id = event.id
+    publication_job_id = job.job_id
     db.commit()
+    if after_commit is not None:
+        after_commit()
     delivery = dispatch_outbox_event(
         event_id, pipeline_publisher=enqueue_pipeline,
     )
     if delivery.get("status") != "dispatched":
         logger.warning(
             "[OUTBOX] pipeline publication pending job=%s event=%s status=%s",
-            job.job_id, event_id, delivery.get("status"),
+            publication_job_id, event_id, delivery.get("status"),
         )
         try:
             from queue_jobs import ensure_job_outbox_reconciler_scheduled
@@ -19446,6 +19451,14 @@ async def retry_job(
     }
 
 
+def _art_track_edit_identity(job):
+    """Fence inputs while slow storage work runs without a DB transaction."""
+    return (job.user_id, job.tenant_id, job.status, job.artist, job.song_title,
+            job.input_r2_key, job.bg_r2_key_cached, delivery_freshness.render_fingerprint(job),
+            json.dumps(job.render_params or {}, sort_keys=True),
+            json.dumps(job.umg_spec or {}, sort_keys=True))
+
+
 @app.post("/jobs/{job_id}/edit-art-track")
 async def edit_art_track(
     job_id: str,
@@ -19458,6 +19471,25 @@ async def edit_art_track(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Save an Art Track with a recoverable database-disconnect response."""
+    try:
+        return await _edit_art_track_impl(
+            job_id, background_file, effect, song_title, artist, label_line,
+            art_track_preset, current_user, db,
+        )
+    except OperationalError as exc:
+        if not any(marker in str(exc).lower() for marker in _TRANSIENT_DB_MARKERS):
+            raise
+        db.rollback()
+        logger.warning('[ART-EDIT] database disconnected while saving job=%s', job_id)
+        raise HTTPException(status_code=503, detail={
+            'code': 'art_track_save_unconfirmed',
+            'message': 'No pudimos confirmar el guardado. Tus cambios siguen en el formulario; revisá el estado del video antes de reintentar.',
+        }) from exc
+
+
+async def _edit_art_track_impl(job_id, background_file, effect, song_title, artist,
+                              label_line, art_track_preset, current_user, db):
     """Editar un Art Track ya generado sin rehacerlo desde cero: cambiar la
     portada (cover), el efecto de partículas, el título/artista y la línea
     legal ℗/©, y re-renderizar.
@@ -19475,7 +19507,6 @@ async def edit_art_track(
     archivo nuevo; si no, se reusa la actual.
     """
     from database import Job as JobModel, AuditLog
-    from jobs import merge_render_params
 
     # Platform admins can already review/approve jobs across tenants. Apply
     # that same authority to art-track corrections; regular users stay scoped.
@@ -19525,9 +19556,19 @@ async def edit_art_track(
             status_code=422,
             detail="Source audio no longer available — please re-generate the video.",
         )
-    try:
-        import storage as _storage
-        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
+    expected_identity = _art_track_edit_identity(job)
+    source_audio_key = job.input_r2_key
+    owner_tenant = job.tenant_id
+    cached_cover_key = job.bg_r2_key_cached
+    had_deliverables = bool(job.s3_keys)
+    # Staging saves failed after 120 seconds with a dead SSL connection at
+    # outbox creation; the upload client's HEAD can wait that long. Release
+    # the transaction before storage/Redis I/O, then reload and fence below.
+    db.rollback()
+    import storage as _storage
+    if _storage.is_enabled():
+        audio_status = await _bounded_storage_probe(_storage.object_status_bounded, source_audio_key)
+        if audio_status == 'missing':
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -19535,13 +19576,11 @@ async def edit_art_track(
                     "Volvé a generar el video."
                 ),
             )
-    except HTTPException:
-        raise
-    except Exception as _exc:
-        logger.warning(
-            "[ART-EDIT] R2 pre-check failed for %s key=%r — proceeding: %s",
-            job_id, job.input_r2_key, _exc,
-        )
+        if audio_status != 'exists':
+            raise HTTPException(status_code=503, detail={
+                'code': 'art_track_storage_unavailable',
+                'message': 'No pudimos comprobar el audio original. Tus cambios siguen en el formulario; reintentá en unos segundos.',
+            })
 
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -19556,39 +19595,50 @@ async def edit_art_track(
                 status_code=400,
                 detail="Art track cover must be an image (.jpg/.jpeg/.png).",
             )
-        _bg_path, new_bg_r2_key = _save_custom_background(
-            background_file, job_dir, job_id, job.tenant_id,
+        _bg_path, new_bg_r2_key = await asyncio.to_thread(
+            _save_custom_background, background_file, job_dir, job_id, owner_tenant,
+            persist_cache=False, unique_filename=True,
         )
-    bg_r2_key = new_bg_r2_key or job.bg_r2_key_cached
+    bg_r2_key = new_bg_r2_key or cached_cover_key
     if not bg_r2_key:
         raise HTTPException(
             status_code=422,
             detail="No cover image on file — please upload a cover.",
         )
 
+    # Cancelling old prewarms also calls Redis; keep it outside the database
+    # transaction instead of letting another slow dependency age the session.
+    from queue_jobs import cancel_rq_job
+    for file_type in ('umg_master', 'umg_short'):
+        try:
+            await asyncio.to_thread(cancel_rq_job, f'prewarm:{job_id}:{file_type}')
+        except Exception as exc:
+            logger.warning('edit_art_track: prewarm cancel skipped job=%s error_type=%s', job_id, type(exc).__name__)
+
+    job = job_query.populate_existing().with_for_update().first()
+    if job is None or _art_track_edit_identity(job) != expected_identity:
+        raise HTTPException(status_code=409, detail='El video cambió mientras guardabas. Revisá el estado actual antes de reintentar.')
+    owner = db.query(User).filter(User.id == job.user_id).first()
+    if owner is None:
+        raise HTTPException(status_code=409, detail='Job owner no longer exists')
+
     # Persistir los ejes editables en render_params (autoritativo: vacío =
     # limpiar). Así el re-render y cualquier /retry futuro los re-dibujan.
     effect_val = "" if art_track_preset == "colombia_static" else (effect or "").strip()
     label_val = (label_line or "").strip()
-    merge_render_params(job_id, {
+    job.render_params = {**(job.render_params or {}),
         "art_track": True,
         "effect": effect_val,
         "label_line": label_val,
         "art_track_preset": art_track_preset,
-    })
+    }
+    job.bg_r2_key_cached = bg_r2_key
 
     # Título/artista viven en columnas; se actualizan solo si vinieron.
     if song_title is not None:
         job.song_title = song_title.strip()
     if artist is not None:
         job.artist = artist.strip()
-
-    # Mismo motivo que en /retry: el portal sirve estas mismas keys y el
-    # reset de abajo borra la evidencia de que ya había entregables.
-    if job.s3_keys:
-        delivery_freshness.mark_deliveries_stale(
-            job_id, delivery_freshness.STALE_EDITING,
-        )
 
     # Reset del row a estado de re-render limpio (mismo patrón que /retry),
     # para que los entregables viejos no queden pegados si el nuevo render
@@ -19610,15 +19660,6 @@ async def edit_art_track(
     job.approved_at = None
     job.last_progress_at = datetime.now(timezone.utc)
 
-    # Cancelar prewarms de ProRes de la corrida anterior (mismo hazard que
-    # /retry: publicarían un .mov viejo tras limpiar s3_keys).
-    try:
-        from queue_jobs import cancel_rq_job
-        for _ft in ("umg_master", "umg_short"):
-            cancel_rq_job(f"prewarm:{job_id}:{_ft}")
-    except Exception as _exc:
-        logger.warning("edit_art_track: prewarm cancel skipped for %s: %s", job_id, _exc)
-
     _audit_cross_tenant_access(db, current_user, job, "edit_art_track", commit=False)
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -19637,6 +19678,9 @@ async def edit_art_track(
         style=job.style or "oscuro",
         plan=owner.plan_id or "100",
         tenant_id=job.tenant_id,
+        after_commit=(lambda: delivery_freshness.mark_deliveries_stale(
+            job_id, delivery_freshness.STALE_EDITING,
+        )) if had_deliverables else None,
         delivery_profile=job.delivery_profile or "youtube",
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",

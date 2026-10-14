@@ -12,7 +12,7 @@ enqueue lleva art_track=True + effect + label_line + el cover cacheado.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -200,6 +200,7 @@ def test_admin_corrects_other_tenant_art_track_under_original_owner(
     assert enq.call_args.kwargs["art_track"] is True
     if replace_cover:
         assert save_cover.call_args.args[3] == owner["tenant_id"]
+        assert save_cover.call_args.kwargs == {"persist_cache": False, "unique_filename": True}
         assert enq.call_args.kwargs["bg_r2_key"] == cover_key
     else:
         save_cover.assert_not_called()
@@ -228,3 +229,147 @@ def test_regular_user_cannot_edit_other_tenant_art_track(client, admin_token, us
     assert res.status_code == 404
     assert not enq.called
     assert _read_job(job_id).status == "pending_review"
+
+
+@pytest.mark.parametrize("probe_result,status,code", [
+    ("unavailable", 503, "art_track_storage_unavailable"),
+    (None, 503, "art_track_storage_unavailable"),
+    ("missing", 422, None),
+])
+def test_storage_preflight_distinguishes_unavailable_from_missing(
+        client, admin_token, probe_result, status, code):
+    import storage
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid, status="done", effect="snow")
+    with patch("storage.is_enabled", return_value=True), patch(
+        "main._bounded_storage_probe", new_callable=AsyncMock, return_value=probe_result,
+    ) as probe, patch("storage.object_exists") as unbounded, patch("main.enqueue_pipeline") as enqueue:
+        res = client.post(f"/jobs/{job_id}/edit-art-track",
+                          headers={"Authorization": f"Bearer {admin_token}"},
+                          data={"artist": "Changed", "effect": "bokeh"})
+    assert res.status_code == status, res.text
+    if code:
+        assert res.json()["detail"]["code"] == code
+    probe.assert_awaited_once_with(storage.object_status_bounded, _read_job(job_id).input_r2_key)
+    unbounded.assert_not_called()
+    enqueue.assert_not_called()
+    row = _read_job(job_id)
+    assert (row.artist, row.status, row.render_params["effect"]) == ("Amanda Pujó", "done", "snow")
+
+
+def test_disconnect_rolls_back_entire_edit_and_returns_cors_error(client, admin_token, db):
+    from database import Job, JobOutboxEvent
+    from sqlalchemy.exc import OperationalError
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid, status="done", effect="snow")
+    row = db.query(Job).filter(Job.job_id == job_id).one()
+    row.s3_keys = {"video": "published.mp4"}
+    db.commit()
+    error = OperationalError("SELECT outbox", {}, Exception("SSL connection has been closed unexpectedly"))
+    with patch("transactional_outbox.create_pipeline_outbox_event", side_effect=error), patch(
+        "main.enqueue_pipeline"
+    ) as enqueue, patch("main.delivery_freshness.mark_deliveries_stale") as stale, patch(
+        "main._save_custom_background", return_value=("/tmp/cover.jpg", "new-cover.jpg")
+    ):
+        res = client.post(f"/jobs/{job_id}/edit-art-track",
+                          headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://localhost:5173"},
+                          data={"artist": "Changed", "effect": "bokeh", "label_line": "New label"},
+                          files={"background_file": ("cover.jpg", b"cover", "image/jpeg")})
+    assert res.status_code == 503, res.text
+    assert res.json()["detail"]["code"] == "art_track_save_unconfirmed"
+    assert res.headers.get("access-control-allow-origin") in ("*", "http://localhost:5173")
+    enqueue.assert_not_called()
+    stale.assert_not_called()
+    row = _read_job(job_id)
+    assert row.artist == "Amanda Pujó"
+    assert row.status == "done"
+    assert row.render_params == {"art_track": True, "effect": "snow"}
+    assert row.bg_r2_key_cached.endswith("bg_custom.jpg")
+    assert row.s3_keys == {"video": "published.mp4"}
+    assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job_id).count() == 0
+
+
+def test_external_io_has_no_open_transaction_and_stale_marker_follows_commit(
+        client, admin_token, db):
+    import main
+    from database import Job, JobOutboxEvent, SessionLocal
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid, status="done")
+    row = db.query(Job).filter(Job.job_id == job_id).one()
+    row.s3_keys = {"video": "published.mp4"}
+    db.commit()
+    seen = []
+
+    async def probe(*args):
+        assert not db.in_transaction()
+        seen.append("storage")
+        return "exists"
+
+    def cancel(*args):
+        assert not db.in_transaction()
+        seen.append("redis")
+
+    def mark(*args):
+        assert not db.in_transaction()
+        with SessionLocal() as check:
+            assert check.query(Job).filter(Job.job_id == job_id).one().status == "editing"
+            assert check.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job_id).count() == 1
+        seen.append("committed")
+
+    main.app.dependency_overrides[main.get_db] = lambda: db
+    try:
+        with patch("storage.is_enabled", return_value=True), patch(
+            "main._bounded_storage_probe", side_effect=probe
+        ), patch("queue_jobs.cancel_rq_job", side_effect=cancel), patch(
+            "main.delivery_freshness.mark_deliveries_stale", side_effect=mark
+        ), patch("main.enqueue_pipeline"):
+            res = client.post(f"/jobs/{job_id}/edit-art-track",
+                              headers={"Authorization": f"Bearer {admin_token}"},
+                              data={"artist": "Changed"})
+        assert res.status_code == 200, res.text
+        assert seen == ["storage", "redis", "redis", "committed"]
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+
+
+def test_concurrent_edit_during_preflight_is_not_overwritten(client, admin_token):
+    from database import Job, SessionLocal
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid, status="done")
+
+    async def probe(*args):
+        with SessionLocal() as concurrent:
+            row = concurrent.query(Job).filter(Job.job_id == job_id).one()
+            row.artist = "Other operator's correction"
+            concurrent.commit()
+        return "exists"
+
+    with patch("storage.is_enabled", return_value=True), patch(
+        "main._bounded_storage_probe", side_effect=probe
+    ), patch("main.enqueue_pipeline") as enqueue:
+        res = client.post(f"/jobs/{job_id}/edit-art-track",
+                          headers={"Authorization": f"Bearer {admin_token}"},
+                          data={"artist": "Outdated correction"})
+    assert res.status_code == 409, res.text
+    enqueue.assert_not_called()
+    row = _read_job(job_id)
+    assert row.artist == "Other operator's correction"
+    assert row.status == "done"
+
+
+def test_disconnect_after_commit_reports_uncertain_save_without_duplicate_render(client, admin_token, db):
+    from database import JobOutboxEvent
+    from sqlalchemy.exc import OperationalError
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid, status="done")
+    error = OperationalError("SELECT outbox", {}, Exception("SSL connection has been closed unexpectedly"))
+    with patch("transactional_outbox.dispatch_outbox_event", side_effect=error), patch("main.enqueue_pipeline") as enqueue:
+        res = client.post(f"/jobs/{job_id}/edit-art-track",
+                          headers={"Authorization": f"Bearer {admin_token}"},
+                          data={"artist": "Saved correction"})
+    assert res.status_code == 503, res.text
+    assert res.json()["detail"]["code"] == "art_track_save_unconfirmed"
+    assert _read_job(job_id).artist == "Saved correction"
+    assert _read_job(job_id).status == "editing"
+    assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job_id).count() == 1
+    enqueue.assert_not_called()
