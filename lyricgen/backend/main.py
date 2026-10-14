@@ -19477,12 +19477,12 @@ async def edit_art_track(
     from database import Job as JobModel, AuditLog
     from jobs import merge_render_params
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    # Platform admins can already review/approve jobs across tenants. Apply
+    # that same authority to art-track corrections; regular users stay scoped.
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(JobModel.tenant_id == current_user["tenant_id"])
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -19505,6 +19505,10 @@ async def edit_art_track(
             status_code=403,
             detail="Art Track no está habilitado para tu cuenta.",
         )
+
+    owner = db.query(User).filter(User.id == job.user_id).first()
+    if owner is None:
+        raise HTTPException(status_code=409, detail="Job owner no longer exists")
 
     # Estados editables = los mismos que habilitan el panel de edición en el
     # front (JobDetail.canEditLyrics): revisión pendiente / listo / rechazado.
@@ -19553,7 +19557,7 @@ async def edit_art_track(
                 detail="Art track cover must be an image (.jpg/.jpeg/.png).",
             )
         _bg_path, new_bg_r2_key = _save_custom_background(
-            background_file, job_dir, job_id, current_user["tenant_id"],
+            background_file, job_dir, job_id, job.tenant_id,
         )
     bg_r2_key = new_bg_r2_key or job.bg_r2_key_cached
     if not bg_r2_key:
@@ -19615,6 +19619,7 @@ async def edit_art_track(
     except Exception as _exc:
         logger.warning("edit_art_track: prewarm cancel skipped for %s: %s", job_id, _exc)
 
+    _audit_cross_tenant_access(db, current_user, job, "edit_art_track", commit=False)
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.edit_art_track",
@@ -19630,8 +19635,8 @@ async def edit_art_track(
         mp3_path=None,
         artist=job.artist,
         style=job.style or "oscuro",
-        plan=current_user.get("plan", "100"),
-        tenant_id=current_user.get("tenant_id", ""),
+        plan=owner.plan_id or "100",
+        tenant_id=job.tenant_id,
         delivery_profile=job.delivery_profile or "youtube",
         input_r2_key=job.input_r2_key,
         song_title=job.song_title or "",

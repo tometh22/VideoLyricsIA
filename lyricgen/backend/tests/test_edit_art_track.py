@@ -170,18 +170,61 @@ def test_edit_rejects_while_processing(client, admin_token):
     assert not enq.called
 
 
-def test_edit_art_track_404_other_tenant(client, admin_token):
-    """No se puede editar un job de otro tenant (el endpoint filtra por tenant,
-    sin bypass de admin). user_id válido (FK a users) pero tenant ajeno."""
-    uid, _tid = _admin_identity(client, admin_token)
-    job_id = _seed_art_track_job(uid, "some-other-tenant")
+@pytest.mark.parametrize("replace_cover", [False, True])
+def test_admin_corrects_other_tenant_art_track_under_original_owner(
+        client, admin_token, user_token, db, replace_cover):
+    from database import AuditLog, User
+    actor_id, actor_tenant = _admin_identity(client, admin_token)
+    owner = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    owner_row = db.query(User).filter(User.id == owner["id"]).one()
+    owner_row.plan_id = "1000"
+    db.commit()
+    assert owner["tenant_id"] != actor_tenant
+    job_id = _seed_art_track_job(owner["id"], owner["tenant_id"], status="done")
+    cover_key = f"inputs/{owner['tenant_id']}/{job_id}/new-cover.jpg"
+
+    with patch("main.enqueue_pipeline") as enq, patch(
+        "main._save_custom_background", return_value=("/tmp/cover.jpg", cover_key)
+    ) as save_cover:
+        res = client.post(
+            f"/jobs/{job_id}/edit-art-track",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            data={"artist": "Coti Ft. Enrique Iglesias"},
+            files={"background_file": ("cover.jpg", b"cover", "image/jpeg")} if replace_cover else None,
+        )
+
+    assert res.status_code == 200, res.text
+    assert enq.call_args.kwargs["tenant_id"] == owner["tenant_id"]
+    assert enq.call_args.kwargs["plan"] == "1000"
+    assert enq.call_args.kwargs["artist"] == "Coti Ft. Enrique Iglesias"
+    assert enq.call_args.kwargs["art_track"] is True
+    if replace_cover:
+        assert save_cover.call_args.args[3] == owner["tenant_id"]
+        assert enq.call_args.kwargs["bg_r2_key"] == cover_key
+    else:
+        save_cover.assert_not_called()
+    row = _read_job(job_id)
+    assert row.status == "editing"
+    assert row.tenant_id == owner["tenant_id"]
+    assert row.user_id == owner["id"]
+    audit = db.query(AuditLog).filter(AuditLog.action == "admin.cross_tenant_access").all()
+    assert any(event.user_id == actor_id and event.detail == {
+        "job_id": job_id, "job_tenant": owner["tenant_id"], "kind": "edit_art_track",
+    } for event in audit)
+
+
+def test_regular_user_cannot_edit_other_tenant_art_track(client, admin_token, user_token, monkeypatch):
+    uid, tid = _admin_identity(client, admin_token)
+    job_id = _seed_art_track_job(uid, tid)
+    monkeypatch.setenv("ART_TRACK_GLOBALLY_ENABLED", "1")
 
     with patch("main.enqueue_pipeline") as enq:
         res = client.post(
             f"/jobs/{job_id}/edit-art-track",
-            headers={"Authorization": f"Bearer {admin_token}"},
+            headers={"Authorization": f"Bearer {user_token}"},
             data={"effect": "bokeh"},
         )
 
     assert res.status_code == 404
     assert not enq.called
+    assert _read_job(job_id).status == "pending_review"

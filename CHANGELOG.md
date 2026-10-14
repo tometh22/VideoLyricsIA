@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.127] - 2026-10-14
+
+### Fixed
+
+- Los administradores pueden corregir art tracks de otra cuenta, igual que al revisarlos y aprobarlos. La edición ya no falla con «Job not found»; la portada y el render conservan la cuenta y el plan del dueño original. El acceso queda auditado y los usuarios regulares siguen limitados a su propia cuenta.
+
 ## [1.1.126] - 2026-10-13
 
 ### Fixed
