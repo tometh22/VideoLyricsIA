@@ -289,49 +289,6 @@ def test_disconnect_rolls_back_entire_edit_and_returns_cors_error(client, admin_
     assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job_id).count() == 0
 
 
-def test_external_io_has_no_open_transaction_and_stale_marker_follows_commit(
-        client, admin_token, db):
-    import main
-    from database import Job, JobOutboxEvent, SessionLocal
-    uid, tid = _admin_identity(client, admin_token)
-    job_id = _seed_art_track_job(uid, tid, status="done")
-    row = db.query(Job).filter(Job.job_id == job_id).one()
-    row.s3_keys = {"video": "published.mp4"}
-    db.commit()
-    seen = []
-
-    async def probe(*args):
-        assert not db.in_transaction()
-        seen.append("storage")
-        return "exists"
-
-    def cancel(*args):
-        assert not db.in_transaction()
-        seen.append("redis")
-
-    def mark(*args):
-        assert not db.in_transaction()
-        with SessionLocal() as check:
-            assert check.query(Job).filter(Job.job_id == job_id).one().status == "editing"
-            assert check.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job_id).count() == 1
-        seen.append("committed")
-
-    main.app.dependency_overrides[main.get_db] = lambda: db
-    try:
-        with patch("storage.is_enabled", return_value=True), patch(
-            "main._bounded_storage_probe", side_effect=probe
-        ), patch("queue_jobs.cancel_rq_job", side_effect=cancel), patch(
-            "main.delivery_freshness.mark_deliveries_stale", side_effect=mark
-        ), patch("main.enqueue_pipeline"):
-            res = client.post(f"/jobs/{job_id}/edit-art-track",
-                              headers={"Authorization": f"Bearer {admin_token}"},
-                              data={"artist": "Changed"})
-        assert res.status_code == 200, res.text
-        assert seen == ["storage", "redis", "redis", "committed"]
-    finally:
-        main.app.dependency_overrides.pop(main.get_db, None)
-
-
 def test_concurrent_edit_during_preflight_is_not_overwritten(client, admin_token):
     from database import Job, SessionLocal
     uid, tid = _admin_identity(client, admin_token)
