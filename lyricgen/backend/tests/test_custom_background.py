@@ -123,6 +123,25 @@ def test_save_custom_background_persists_cached_key(tmp_path, monkeypatch):
     assert persisted == {"bg_r2_key_cached": "inputs/umg/j2/bg_custom.png"}
 
 
+def test_staged_covers_do_not_overwrite_the_current_input(tmp_path, monkeypatch):
+    import main
+    monkeypatch.setattr(main.storage, "is_enabled", lambda: True)
+    uploaded = []
+
+    def upload(path, tenant, job_id, filename):
+        uploaded.append(filename)
+        return f"inputs/{tenant}/{job_id}/{filename}"
+
+    monkeypatch.setattr(main.storage, "upload_input", upload)
+    monkeypatch.setattr(main, "update_job", lambda *args, **kwargs: pytest.fail("staged cover persisted too early"))
+    for _ in range(2):
+        main._save_custom_background(_fake_upload("cover.png", PNG_BYTES), str(tmp_path),
+                                     "j2", "umg", persist_cache=False, unique_filename=True)
+    assert len(set(uploaded)) == 2
+    assert all(name.startswith("bg_custom-") and name.endswith(".png") for name in uploaded)
+    assert "bg_custom.png" not in uploaded
+
+
 # ---------------------------------------------------------------------------
 # 3. /retry preserva el fondo humano + 4. edits rápidos habilitados
 # ---------------------------------------------------------------------------

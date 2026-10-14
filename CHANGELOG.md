@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.129] - 2026-10-14
+
+### Fixed
+
+- Guardar una edición de Art Track libera la transacción de base de datos antes de consultar storage, subir la portada o cancelar prewarms. La comprobación del audio tiene un límite de dos segundos y distingue una caída del servicio de un archivo ausente. Título, artista, portada, parámetros y orden de render se guardan juntos; una edición concurrente se rechaza y el portal se marca para actualizar sólo después del guardado.
+- Ante una desconexión, el formulario conserva los cambios y explica cuándo hay que revisar el estado antes de reintentar. No reenvía automáticamente una operación cuyo resultado no se pudo confirmar y evita renders duplicados por doble clic.
+
 ## [1.1.128] - 2026-10-14
 
 ### Fixed
