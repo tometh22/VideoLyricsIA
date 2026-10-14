@@ -22497,6 +22497,7 @@ async def admin_list_change_requests(
 
     from delivery_qc_runtime import delivery_readiness_gate
 
+    from published_request_review import review_context as published_review_context
     items = []
     for cr in crs:
         d = deliveries_by_id.get(cr.delivery_id)
@@ -22566,6 +22567,7 @@ async def admin_list_change_requests(
             # importa después de corregir: ¿lo que el cliente puede bajar
             # AHORA es lo que acabo de arreglar?
             "publication": publication,
+            "published_review": published_review_context(job, d, cr),
             "delivery_qc_gate": (
                 delivery_readiness_gate(
                     job, job.delivery_qc, for_umg_delivery=True,
@@ -22785,6 +22787,9 @@ class ConfirmPublicationRequest(BaseModel):
     confirmed_items: int | None = Field(default=None, ge=1, le=200)
     text_review_token: str | None = Field(default=None, min_length=64, max_length=64)
     text_review_reason: str = Field(default='', max_length=2000)
+    publication_review_token: str | None = Field(default=None, min_length=64, max_length=64)
+    publication_review_reason: str = Field(default='', max_length=2000)
+    confirmed_published_review: bool = False
 
 
 @app.post('/admin/change-requests/{cr_id}/confirm-publication')
@@ -22798,23 +22803,71 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     The portal is then current, so no publication can close it any more, and a
     manual close would claim "nothing was published". This records the truth:
     resolved by the published revision, bound to the exact cut the operator
-    reviewed. Same evidence rule as the panel (``published_answer``).
+    reviewed. The default follows ``published_answer``; an explicit human
+    attestation may instead bind the closure to the identified publication
+    when editor/text evidence cannot establish that the request is attended.
     """
     if current_user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='Admin only')
     cr = (ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id)
-          .with_for_update().first())
+          .first())
     if cr is None:
         raise HTTPException(status_code=404, detail='Change request not found')
     if cr.resolved_at is not None:
         return {'ok': True, 'already_resolved': True, 'resolved_at': cr.resolved_at.isoformat(),
                 'updated_at': cr.updated_at.isoformat() if cr.updated_at else None}
-    delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).first()
+    delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).with_for_update().first()
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=409, detail='Change request delivery is unavailable')
+    # Publication takes Delivery before Request. Use that same lock order so
+    # a reviewer cannot deadlock against a simultaneous portal update.
+    cr = (ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id)
+          .populate_existing().with_for_update().first())
+    if cr is None or cr.delivery_id != delivery.id:
+        raise HTTPException(status_code=409, detail='El pedido cambió. Actualizá antes de cerrar.')
+    if cr.resolved_at is not None:
+        return {'ok': True, 'already_resolved': True, 'resolved_at': cr.resolved_at.isoformat(),
+                'updated_at': cr.updated_at.isoformat() if cr.updated_at else None}
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     document = (db.query(EditorDocument).filter(EditorDocument.job_id == delivery.job_id).first()
                 if job is not None else None)
+    if body.publication_review_token:
+        from published_request_review import review_context
+        context = review_context(job, delivery, cr)
+        if context is None or context['review_token'] != body.publication_review_token:
+            raise HTTPException(status_code=409, detail={
+                'code': 'published_review_changed',
+                'message': 'El pedido o la versión publicada cambió. Actualizá y revisá el video antes de cerrar.',
+            })
+        reason = body.publication_review_reason.strip()
+        if (not reason or not body.confirmed_items or not body.confirmed_published_review
+                or body.text_review_token):
+            raise HTTPException(status_code=422, detail={
+                'code': 'published_review_required',
+                'message': 'Revisá cada punto en la versión publicada, confirmá la revisión y escribí el motivo.',
+            })
+        # The human may attest an already corrected publication even when
+        # editor timestamps/text matching cannot prove it. This closes ONLY
+        # this request; it never approves, renders or publishes a job.
+        now = datetime.now(timezone.utc)
+        revision = context['published_revision']
+        cr.resolved_at = now
+        cr.updated_at = now
+        cr.resolved_by_user_id = deliveries_added_by(current_user['id'])
+        cr.resolved_by_revision = revision
+        cr.resolution_source = 'publication'
+        cr.resolution_note = f'Revisión humana de la versión {revision} publicada: {reason}'
+        ddb.commit()
+        db.add(AuditLog(user_id=current_user['id'], action='delivery.change_request.resolve', detail={
+            'change_request_id': cr_id, 'job_id': delivery.job_id,
+            'source': 'published_human_review', 'revision': revision,
+            'published_render_fingerprint': delivery.published_render_fingerprint,
+            'confirmed_items': body.confirmed_items,
+            'reason': reason, 'review_token': body.publication_review_token,
+        }))
+        db.commit()
+        return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
+                'resolved_by_revision': revision, 'human_review': True}
     from change_request_workflow import published_answer
     ok, reason = published_answer(job, document, delivery, cr)
     if not ok:

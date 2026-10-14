@@ -552,14 +552,17 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           reviewed_render_fingerprint: publication.render_fingerprint,
           reviewed_editor_revision: publication.editor_revision,
           ...(Number.isInteger(confirmedItems) && confirmedItems > 0 ? { confirmed_items: confirmedItems } : {}),
-          ...(textReview ? { text_review_token: textReview.token,
+          ...(textReview?.publicationToken ? {
+            publication_review_token: textReview.publicationToken,
+            publication_review_reason: textReview.reason, confirmed_published_review: true,
+          } : textReview ? { text_review_token: textReview.token,
             text_review_reason: textReview.reason } : {}),
         }),
       });
       if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
       setCrPublishNotice({ requestId: id, tone: "ok", text: data.already_resolved
         ? "El pedido ya figura cerrado."
-        : `Pedido resuelto ${textReview ? "con revisión manual de" : "con"} la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
+        : `Pedido resuelto ${textReview?.publicationToken ? "con revisión humana de" : textReview ? "con revisión manual de" : "con"} la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
       await loadChangeRequests();
     } catch (err) {
       const unknown = mutationOutcomeUnknown(err);

@@ -14,6 +14,8 @@ If the cut is already published, **Dar por resuelto** checks the requested text.
 
 Approved background edits: the editor now honors the same platform-admin permission as Changes (done/rejected as well as pending_review), including AI, library and uploaded backgrounds. Other roles keep their existing permissions. Multi-scene jobs must use the scene editor; neither route can overwrite the timeline with one background. Generation remains an explicit action and does not resolve/publish the request.
 
+**Resolver con revisión humana** is also available whenever the request has an identified, playable publication. It opens the actual **published** video, rather than the operator's candidate or current editor lyrics. The admin must tick every requested point, enter a client-visible reason and explicitly confirm the request is attended. This can close an already corrected publication despite older editor timestamps, a newer draft, missing working ProRes or literal text differences. It does not require sending another version merely to record the human decision. The API binds the decision to the request, portal, published revision/fingerprint/file keys and current render; a change requires a fresh review. Legacy mutable publications are eligible only when their render identity is current. The audit records `published_human_review`, actor, reason and published revision; unrelated requests, files and client approval are preserved. A published video that still lacks a requested correction must be corrected and published before the operator confirms this action.
+
 ## Publication modes: frozen copy vs pointer to the newest render
 
 `PUBLISH_LATEST_POINTER` (default off) chooses how publishing treats files:

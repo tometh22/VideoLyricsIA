@@ -74,6 +74,19 @@ function renderPanelItems(items, props = {}) {
   );
 }
 
+it("offers human resolution even when the normal flow requires ProRes or another render", () => {
+  const confirm = vi.fn();
+  renderPanel({
+    publication: { ...BASE_PUBLICATION, needs_publish: true, prores_pending: ["umg_master"], render_matches_editor: false },
+    published_review: { review_token: "a".repeat(64), published_revision: 6 },
+    delivery: { ...REQUEST.delivery, video_url: "https://example.test/candidate.mp4", published_video_url: "https://example.test/published-6.mp4" },
+  }, { confirmChangeRequestPublication: confirm });
+  fireEvent.click(screen.getByRole("button", { name: "Resolver con revisión humana" }));
+  expect(screen.getByLabelText("Versión publicada para revisión humana")).toHaveAttribute("src", "https://example.test/published-6.mp4");
+  expect(screen.getByRole("button", { name: "Confirmar pedido resuelto" })).toBeDisabled();
+  expect(confirm).not.toHaveBeenCalled();
+});
+
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
   it.each([null, {}, { job_status: "done" }])("does not invent a published revision from %j", publication => {
