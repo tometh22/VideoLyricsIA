@@ -9,6 +9,7 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
 export default function useFinanzas() {
   const [entries, setEntries] = useState([]);
   const [ops, setOps] = useState({ deliveries: [], received: [], reviewers: [], change_requests: [], lead_time: [] });
+  const [autoCosts, setAutoCosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [since, setSince] = useState(null);
@@ -43,6 +44,15 @@ export default function useFinanzas() {
     return () => { active = false; };
   }, [effectiveSince, until]);
 
+  useEffect(() => {
+    let active = true;
+    fetchJson(`${API}/admin/finance/auto-costs?since=${effectiveSince}&until=${until}`)
+      .then((data) => active && setAutoCosts(data.costs || []))
+      // Sin recolector la planilla funciona igual, con carga manual.
+      .catch(() => active && setAutoCosts([]));
+    return () => { active = false; };
+  }, [effectiveSince, until]);
+
   const mutate = useCallback(async (fn) => {
     setError(null);
     try {
@@ -70,7 +80,7 @@ export default function useFinanzas() {
     : createEntry({ period: months[0], section: "parametros", concept: "Parámetros del reparto", payload }));
 
   return {
-    entries, ops, loading, error, setError,
+    entries, ops, autoCosts, loading, error, setError,
     contracts, params, months,
     since: effectiveSince, setSince, until, setUntil,
     createEntry, updateEntry, deleteEntry, importEntries, saveParams,

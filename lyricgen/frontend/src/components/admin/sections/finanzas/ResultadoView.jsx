@@ -7,7 +7,7 @@
 // salen del sistema (entregas, trabajo imputado) no.
 import { useMemo, useState } from "react";
 
-import { BASIS_LABELS, groupRows, monthLabel } from "./finanzasModel";
+import { BASIS_LABELS, groupRows, monthChecklist, monthLabel } from "./finanzasModel";
 
 const usd = (v) => {
   const n = Number(v) || 0;
@@ -38,14 +38,18 @@ export function BasisBadge({ basis }) {
 function EditableCell({ value, entries, onSave, onCreate }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
-  const many = (entries?.length || 0) > 1;
+  const real = (entries || []).filter((e) => !e.synthetic);
+  const synthetic = (entries || []).find((e) => e.synthetic);
+  const many = real.length > 1;
   const evidence = (entries || []).map((e) => [e.concept, e.evidence, e.note].filter(Boolean).join(" · ")).filter(Boolean).join("\n");
+  const incomplete = synthetic?.coverage && synthetic.coverage.days < synthetic.coverage.expected;
   if (editing) {
     const commit = async () => {
       setEditing(false);
       const n = draft.trim() === "" ? null : Number(draft.replace(",", "."));
       if (n !== null && !Number.isFinite(n)) return;
-      if (entries?.length === 1) await onSave(entries[0], n);
+      // Editar un valor automático lo convierte en uno cargado a mano.
+      if (real.length === 1) await onSave(real[0], n);
       else if (n !== null) await onCreate(n);
     };
     return (
@@ -67,8 +71,10 @@ function EditableCell({ value, entries, onSave, onCreate }) {
   }
   return (
     <td
-      className={`px-2 py-1.5 text-right tabular-nums ${many ? "text-gray-300 cursor-help" : "cursor-pointer hover:bg-white/[0.04]"} ${value ? "text-gray-200" : "text-gray-600"}`}
-      title={many ? `${entries.length} renglones: editalos en Movimientos\n${evidence}` : evidence || "Clic para cargar"}
+      className={`px-2 py-1.5 text-right tabular-nums ${many ? "text-gray-300 cursor-help" : "cursor-pointer hover:bg-white/[0.04]"} ${value ? (synthetic && !real.length ? "text-sky-200/90 italic" : "text-gray-200") : "text-gray-600"}`}
+      title={many ? `${real.length} renglones: editalos en Movimientos\n${evidence}`
+        : synthetic && !real.length ? `${evidence}\nAutomático. Clic para reemplazarlo por un valor cargado a mano.`
+          : evidence || "Clic para cargar"}
       onClick={() => {
         if (many) return;
         setDraft(value ? String(Math.round(value * 100) / 100) : "");
@@ -76,6 +82,7 @@ function EditableCell({ value, entries, onSave, onCreate }) {
       }}
     >
       {value ? usd(value) : "·"}
+      {incomplete && <span className="ml-1 text-amber-300" title="Mes incompleto en el recolector">•</span>}
     </td>
   );
 }
@@ -205,8 +212,30 @@ function GroupRows({ section, entries, months, onSave, onCreate }) {
   );
 }
 
-export default function ResultadoView({ f, pnl }) {
-  const { months, entries, params } = f;
+function Checklist({ month, f, effective }) {
+  const items = monthChecklist({ month, entries: f.entries, effective, autoCosts: f.autoCosts });
+  const pending = items.filter((i) => !i.ok).length;
+  return (
+    <div className="glass rounded-card p-3 mb-4">
+      <p className="text-caption text-gray-300 mb-2">
+        Cierre de <span className="text-white font-semibold">{monthLabel(month)}</span>
+        {pending ? <span className="ml-2 text-amber-300">{pending} pendiente{pending > 1 ? "s" : ""}</span> : <span className="ml-2 text-accent">completo</span>}
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {items.map((i) => (
+          <span key={i.label} title={i.detail} className={`px-2 py-0.5 rounded-md text-label ring-1 ${i.ok ? "ring-accent/30 text-accent" : "ring-amber-400/30 text-amber-300"}`}>
+            {i.ok ? "✓" : "!"} {i.label}
+            <span className="ml-1 text-gray-500">{i.detail}</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default function ResultadoView({ f, pnl, effective }) {
+  const { months, params } = f;
+  const entries = effective || f.entries;
   const save = (id, body) => f.updateEntry(id, body);
   const create = (body) => f.createEntry(body);
   const piezas = Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].ingresoEntregas]));
@@ -214,6 +243,8 @@ export default function ResultadoView({ f, pnl }) {
     : params.resta_trabajo === "agus_y_tomi" ? "se resta Agus + operación de Tomi" : "se resta Agus";
 
   return (
+    <div>
+    <Checklist month={months[months.length - 1]} f={f} effective={entries} />
     <div className="glass rounded-card p-4 overflow-x-auto">
       <table className="w-full min-w-[720px] text-gray-300">
         <thead>
@@ -260,6 +291,10 @@ export default function ResultadoView({ f, pnl }) {
           <GroupRows section="pago_socio" entries={entries} months={months} onSave={save} onCreate={create} />
         </tbody>
       </table>
+      <p className="mt-3 text-label text-gray-600">
+        <span className="text-sky-200/90 italic">Celeste</span> = automático (recolector diario, gasto recurrente o letras aprobadas por operador). Lo cargado a mano lo reemplaza.
+      </p>
+    </div>
     </div>
   );
 }

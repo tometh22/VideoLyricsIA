@@ -46,6 +46,12 @@ export const DEFAULT_PARAMS = {
   resta_trabajo: "ninguno",
   solo_dias_habiles: true,
   reserva_meses: 0,
+  // Pesos por dólar para mostrar la parte del socio en ARS.
+  tipo_cambio: 0,
+  // Operadores pagados por canción: [{ usuario, nombre, tarifa_cancion }].
+  // Con esto la mano de obra del mes sale sola de las letras aprobadas.
+  operadores: [],
+  comision_operadores: 0,
 };
 
 const MONTH_NAMES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
@@ -173,6 +179,93 @@ export function teamLabor(months, params, today = new Date()) {
     };
   }
   return out;
+}
+
+const providerKey = (p) => String(p || "").toLowerCase().split(/[—(\-]/)[0].trim();
+
+/**
+ * Renglones efectivos de la planilla: los cargados a mano + los que salen
+ * solos. Lo cargado a mano SIEMPRE pisa a lo automático del mismo proveedor y
+ * mes (una factura verificada vale más que el recolector).
+ *
+ *   - "api": costos del recolector diario (Railway, Google Cloud, R2, Replicate).
+ *   - "recurrente": un renglón con payload.recurrente se repite cada mes
+ *     siguiente (hasta payload.hasta o el mes actual).
+ *   - "operadores": letras aprobadas por cada operador × su tarifa por
+ *     canción, más la comisión.
+ */
+export function effectiveEntries({ entries, autoCosts = [], reviewers = [], params, months, today = new Date() }) {
+  const manual = entries.filter((e) => e.section !== "contrato" && e.section !== "parametros");
+  const has = (section, month, key) => manual.some(
+    (e) => e.section === section && e.period === month && providerKey(e.provider).startsWith(key),
+  );
+  const out = [...entries];
+  for (const c of autoCosts) {
+    if (!months.includes(c.month) || has("costo_directo", c.month, providerKey(c.provider))) continue;
+    out.push({
+      id: null, synthetic: "api", period: c.month, section: "costo_directo", category: c.category,
+      provider: c.provider, amount_usd: c.amount_usd, basis: "api",
+      coverage: { days: c.days, expected: c.expected_days },
+      evidence: `recolector diario: ${c.days} de ${c.expected_days} días`,
+    });
+  }
+  const last = currentPeriod(today);
+  for (const e of manual) {
+    if (!e.payload?.recurrente) continue;
+    const hasta = e.payload.hasta && e.payload.hasta < last ? e.payload.hasta : last;
+    for (const m of months) {
+      if (m <= e.period || m > hasta || has(e.section, m, providerKey(e.provider))) continue;
+      out.push({ ...e, id: null, synthetic: "recurrente", period: m, evidence: `se repite desde ${monthLabel(e.period)}` });
+    }
+  }
+  const ops = (params.operadores || []).filter((o) => o.usuario && Number(o.tarifa_cancion) > 0);
+  for (const m of months) {
+    if (!ops.length || has("mano_obra", m, "upwork")) continue;
+    let subtotal = 0;
+    for (const o of ops) {
+      const n = reviewers.filter((r) => r.month === m && r.reviewer === o.usuario).reduce((a, r) => a + num(r.canciones), 0);
+      if (!n) continue;
+      const amount = round2(n * num(o.tarifa_cancion));
+      subtotal += amount;
+      out.push({
+        id: null, synthetic: "operadores", period: m, section: "mano_obra", category: "Operadores",
+        provider: `Upwork — ${o.nombre || o.usuario}`, amount_usd: amount, basis: "sistema",
+        evidence: `${n} letras aprobadas × US$ ${o.tarifa_cancion}`,
+      });
+    }
+    if (subtotal && num(params.comision_operadores)) {
+      out.push({
+        id: null, synthetic: "operadores", period: m, section: "mano_obra", category: "Operadores",
+        provider: "Upwork — comisiones", amount_usd: round2(subtotal * num(params.comision_operadores)), basis: "sistema",
+        evidence: `${Math.round(num(params.comision_operadores) * 1000) / 10}% sobre ${subtotal.toFixed(2)}`,
+      });
+    }
+  }
+  return out;
+}
+
+/** Qué falta para cerrar un mes. */
+export function monthChecklist({ month, entries, effective, autoCosts = [] }) {
+  const items = [];
+  const manualIn = (key, section = "costo_directo") => entries.some(
+    (e) => e.section === section && e.period === month && providerKey(e.provider).startsWith(key),
+  );
+  for (const [key, label] of [["railway", "Railway"], ["google cloud", "Google Cloud"], ["cloudflare r2", "Cloudflare R2"], ["replicate", "Replicate"]]) {
+    const auto = autoCosts.find((c) => c.month === month && providerKey(c.provider).startsWith(key));
+    if (manualIn(key)) items.push({ label, ok: true, detail: "cargado a mano" });
+    else if (auto) {
+      const full = auto.days >= auto.expected_days;
+      items.push({ label, ok: full, detail: `automático, ${auto.days} de ${auto.expected_days} días` });
+    } else items.push({ label, ok: false, detail: "sin datos: falta el recolector o cargarlo a mano" });
+  }
+  items.push(manualIn("openai")
+    ? { label: "OpenAI", ok: true, detail: "cargado" }
+    : { label: "OpenAI", ok: false, detail: "cargalo desde platform.openai.com → Usage (sin API para la cuenta de Genly)" });
+  const labor = effective.filter((e) => e.section === "mano_obra" && e.period === month);
+  items.push({ label: "Operadores", ok: true, detail: labor.length ? `${labor.length} renglones${labor.some((e) => e.synthetic) ? " (automático)" : ""}` : "sin operadores pagos este mes" });
+  const estructura = effective.filter((e) => e.section === "estructura" && e.period === month);
+  items.push({ label: "Estructura", ok: estructura.length > 0, detail: estructura.length ? `${estructura.length} renglones` : "sin gastos de estructura" });
+  return items;
 }
 
 function sumBy(entries, section, month) {

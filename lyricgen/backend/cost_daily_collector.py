@@ -433,11 +433,11 @@ def _replicate_day(day: date) -> DayResult:
     except Exception as e:                                    # noqa: BLE001
         return DayResult("replicate", day, "error", [], str(e))
 
-    total = sum(s for _, s in per_model.values()) * rate
+    total = sum(s * bs.replicate_rate(m, rate) for m, (_, s) in per_model.items())
     rows = [_row("total", "total", total, behavior="variable", estimate=True,
-                 detail=f"segundos de compute × ${rate}/s (tarifa mezclada)")]
+                 detail=f"segundos de compute × tarifa del hardware de cada modelo (resto a ${rate}/s)")]
     for model, (n, secs) in per_model.items():
-        rows.append(_row("sku", model[:255], secs * rate, qty=secs,
+        rows.append(_row("sku", model[:255], secs * bs.replicate_rate(model, rate), qty=secs,
                          unit="segundos", behavior="variable", estimate=True,
                          detail=f"{n} predicciones"))
     _check_dims_sum_to_total(rows, "replicate", day)

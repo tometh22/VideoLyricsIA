@@ -33,6 +33,7 @@ from database import (
     AuditLog,
     BatchCampaign,
     BatchCampaignItem,
+    CostDaily,
     Delivery,
     DeliveryChangeRequest,
     FinanceEntry,
@@ -411,3 +412,76 @@ def operations(
         "change_requests": change_rows,
         "change_requests_open": open_now,
     }
+
+
+# ---------------------------------------------------------------------------
+# Costos automáticos (recolector diario)
+# ---------------------------------------------------------------------------
+
+# Fuentes del recolector que se pueden usar tal cual. OpenAI queda afuera
+# hasta que el recolector lea la organización de Genly: hoy su admin key es de
+# otra organización y suma gasto ajeno. `fixed` tampoco: la estructura se carga
+# como renglones recurrentes.
+AUTO_SOURCES = {
+    "railway": ("Infraestructura", "Railway"),
+    "r2": ("Infraestructura", "Cloudflare R2"),
+    "gcp": ("IA", "Google Cloud (Vertex)"),
+    "replicate": ("IA", "Replicate"),
+}
+
+
+@router.get("/auto-costs")
+def auto_costs(
+    since: str = Query(..., description="YYYY-MM"),
+    until: str = Query(..., description="YYYY-MM"),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Costo por mes y fuente desde ``cost_daily`` (filas ``total`` diarias).
+
+    Devuelve también cuántos días tiene cada mes, para que la planilla marque
+    un mes incompleto en vez de mostrar un total bajo como si fuera cierto.
+    """
+    for value in (since, until):
+        if not PERIOD_RE.match(value):
+            raise HTTPException(status_code=422, detail="since/until deben ser YYYY-MM")
+    start = datetime.strptime(since, "%Y-%m").date()
+    y, m = map(int, until.split("-"))
+    end = datetime(y + (m == 12), (m % 12) + 1, 1).date()
+    rows = (
+        db.query(CostDaily.day, CostDaily.source, CostDaily.amount_usd,
+                 CostDaily.is_estimate, CostDaily.fetched_at)
+        .filter(
+            CostDaily.grain == "day",
+            CostDaily.dim_type == "total",
+            CostDaily.day >= start,
+            CostDaily.day < end,
+            CostDaily.source.in_(list(AUTO_SOURCES)),
+        )
+        .all()
+    )
+    agg: dict[tuple, dict] = {}
+    for day, source, amount, estimate, fetched in rows:
+        key = (day.strftime("%Y-%m"), source)
+        bucket = agg.setdefault(key, {"amount_usd": 0.0, "days": set(), "estimate": False, "fetched_at": None})
+        bucket["amount_usd"] += float(amount or 0.0)
+        bucket["days"].add(day)
+        bucket["estimate"] = bucket["estimate"] or bool(estimate)
+        if fetched and (bucket["fetched_at"] is None or fetched > bucket["fetched_at"]):
+            bucket["fetched_at"] = fetched
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for (month, source), v in sorted(agg.items()):
+        my, mm = map(int, month.split("-"))
+        first = datetime(my, mm, 1).date()
+        nxt = datetime(my + (mm == 12), (mm % 12) + 1, 1).date()
+        # Días esperados: hasta ayer en el mes en curso (el de hoy no cerró).
+        expected = (min(nxt, today) - first).days
+        category, provider = AUTO_SOURCES[source]
+        out.append({
+            "month": month, "source": source, "category": category, "provider": provider,
+            "amount_usd": round(v["amount_usd"], 2), "days": len(v["days"]),
+            "expected_days": max(expected, 0), "estimate": v["estimate"],
+            "fetched_at": v["fetched_at"].isoformat() if v["fetched_at"] else None,
+        })
+    return {"since": since, "until": until, "costs": out}

@@ -38,6 +38,18 @@ function Row({ e, onSave, onDelete }) {
           {Object.entries(BASIS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
       </td>
+      <td className="py-1 text-center">
+        <input
+          type="checkbox"
+          title="Se repite todos los meses siguientes"
+          checked={!!draft.payload?.recurrente}
+          onChange={(ev) => {
+            const payload = { ...(draft.payload || {}), recurrente: ev.target.checked };
+            setDraft({ ...draft, payload });
+            onSave(e.id, { payload });
+          }}
+        />
+      </td>
       <td className="py-1">{text("evidence", "w-56")}</td>
       <td className="py-1">{text("note", "w-48")}</td>
       <td className="py-1 text-right">
@@ -104,11 +116,11 @@ export default function MovimientosView({ f }) {
             <tr className="text-label uppercase tracking-[0.08em] text-gray-500 text-left">
               <th className="py-1 font-medium">Mes</th><th className="font-medium">Sección</th><th className="font-medium">Categoría</th>
               <th className="font-medium">Proveedor</th><th className="font-medium">Concepto</th><th className="font-medium text-right">USD</th>
-              <th className="font-medium">Base</th><th className="font-medium">Evidencia</th><th className="font-medium">Nota</th><th />
+              <th className="font-medium">Base</th><th className="font-medium" title="Se repite todos los meses">Mensual</th><th className="font-medium">Evidencia</th><th className="font-medium">Nota</th><th />
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && <tr><td colSpan={10} className="py-3 text-caption text-gray-600">Sin renglones. Importá el CSV de la planilla o agregá uno.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={11} className="py-3 text-caption text-gray-600">Sin renglones. Importá el CSV de la planilla o agregá uno.</td></tr>}
             {rows.map((e) => <Row key={`${e.id}-${e.updated_at}`} e={e} onSave={f.updateEntry} onDelete={f.deleteEntry} />)}
           </tbody>
         </table>

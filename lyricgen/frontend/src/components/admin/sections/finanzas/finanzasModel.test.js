@@ -9,8 +9,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  allocateContracts, buildPnl, contractStatus, csvToEntries, entriesToCsv,
-  monthsBetween, partnerScenarios, workDays, DEFAULT_PARAMS,
+  allocateContracts, buildPnl, contractStatus, csvToEntries, effectiveEntries, entriesToCsv,
+  monthChecklist, monthsBetween, partnerScenarios, workDays, DEFAULT_PARAMS,
 } from "./finanzasModel";
 
 // Números ficticios: los términos reales no viven en el repo.
@@ -103,3 +103,41 @@ describe("utilidades", () => {
     expect(back[0]).toMatchObject({ provider: "OpenAI", concept: 'Whisper, "clave de prueba"', amount_usd: 12.34 });
   });
 });
+
+describe("renglones automáticos", () => {
+  const months = ["2026-09", "2026-10"];
+  const auto = [
+    { month: "2026-09", source: "railway", category: "Infraestructura", provider: "Railway", amount_usd: 300, days: 30, expected_days: 30 },
+    { month: "2026-10", source: "railway", category: "Infraestructura", provider: "Railway", amount_usd: 50, days: 10, expected_days: 14 },
+  ];
+
+  it("lo cargado a mano pisa al recolector del mismo proveedor y mes", () => {
+    const entries = [{ id: 1, section: "costo_directo", period: "2026-09", provider: "Railway", amount_usd: 310 }];
+    const eff = effectiveEntries({ entries, autoCosts: auto, params: DEFAULT_PARAMS, months, today: TODAY });
+    const railway = eff.filter((e) => providerIs(e, "Railway"));
+    expect(railway.map((e) => [e.period, e.amount_usd, !!e.synthetic])).toEqual([["2026-09", 310, false], ["2026-10", 50, true]]);
+    const check = monthChecklist({ month: "2026-10", entries, effective: eff, autoCosts: auto });
+    expect(check.find((i) => i.label === "Railway").ok).toBe(false);
+    expect(check.find((i) => i.label === "OpenAI").ok).toBe(false);
+  });
+
+  it("un gasto recurrente se repite hasta que se carga otro", () => {
+    const entries = [{ id: 2, section: "estructura", period: "2026-08", provider: "GitHub Pro", amount_usd: 4, payload: { recurrente: true } },
+      { id: 3, section: "estructura", period: "2026-10", provider: "GitHub Pro", amount_usd: 5 }];
+    const eff = effectiveEntries({ entries, params: DEFAULT_PARAMS, months, today: TODAY });
+    const gh = eff.filter((e) => e.provider === "GitHub Pro" && months.includes(e.period));
+    expect(gh.map((e) => [e.period, e.amount_usd])).toEqual([["2026-10", 5], ["2026-09", 4]]);
+  });
+
+  it("operadores: letras aprobadas × tarifa + comisión, salvo que el mes ya tenga Upwork cargado", () => {
+    const params = { ...DEFAULT_PARAMS, operadores: [{ usuario: "op1", nombre: "Uno", tarifa_cancion: 0.5 }], comision_operadores: 0.1 };
+    const reviewers = [{ month: "2026-09", reviewer: "op1", canciones: 20 }, { month: "2026-10", reviewer: "op1", canciones: 8 }];
+    const entries = [{ id: 4, section: "mano_obra", period: "2026-10", provider: "Upwork — Uno", amount_usd: 7 }];
+    const eff = effectiveEntries({ entries, reviewers, params, months, today: TODAY });
+    const sep = eff.filter((e) => e.section === "mano_obra" && e.period === "2026-09");
+    expect(sep.map((e) => e.amount_usd)).toEqual([10, 1]);
+    expect(eff.filter((e) => e.section === "mano_obra" && e.period === "2026-10").map((e) => e.amount_usd)).toEqual([7]);
+  });
+});
+
+const providerIs = (e, name) => e.provider === name && e.section === "costo_directo";

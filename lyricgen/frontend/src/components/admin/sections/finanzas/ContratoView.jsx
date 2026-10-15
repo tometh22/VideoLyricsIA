@@ -6,6 +6,7 @@ import KpiCard from "../../primitives/KpiCard";
 import { contractStatus, monthLabel, partnerScenarios } from "./finanzasModel";
 
 const money = (v) => `US$ ${(Number(v) || 0).toLocaleString("es-AR", { maximumFractionDigits: 0 })}`;
+const pesos = (v) => `$ ${(Number(v) || 0).toLocaleString("es-AR", { maximumFractionDigits: 0 })}`;
 const field = "bg-surface-3/60 ring-1 ring-white/[0.08] rounded px-2 py-1 text-caption text-white focus:outline-none focus:ring-brand/40";
 
 function Bar({ label, used, cap, capAlDia, received }) {
@@ -92,6 +93,22 @@ function ParamsForm({ params, onSave }) {
       ))}
       {row("Contar solo días hábiles", <input type="checkbox" checked={!!p.solo_dias_habiles} onChange={(e) => setP({ ...p, solo_dias_habiles: e.target.checked })} />)}
       {row("Reserva (meses de costos)", <input className={`${field} w-20 text-right`} value={p.reserva_meses} onChange={set("reserva_meses")} />)}
+      {row("Tipo de cambio (ARS por US$)", <input className={`${field} w-24 text-right`} value={p.tipo_cambio} onChange={set("tipo_cambio")} />, "para ver el reparto en pesos")}
+      <div className="pt-2 border-t border-white/[0.06] space-y-1.5">
+        <p className="text-caption text-gray-300">Operadores pagos por canción
+          <span className="block text-label text-gray-600">la mano de obra del mes sale sola de sus letras aprobadas</span>
+        </p>
+        {(p.operadores || []).map((o, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <input className={`${field} w-24`} placeholder="usuario" value={o.usuario || ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, usuario: e.target.value } : x)) })} />
+            <input className={`${field} w-20`} placeholder="nombre" value={o.nombre || ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, nombre: e.target.value } : x)) })} />
+            <input className={`${field} w-16 text-right`} placeholder="US$" value={o.tarifa_cancion ?? ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, tarifa_cancion: Number(e.target.value) } : x)) })} />
+            <button type="button" className="text-label text-gray-600 hover:text-red-300" onClick={() => setP({ ...p, operadores: p.operadores.filter((_, j) => j !== i) })}>✕</button>
+          </div>
+        ))}
+        <button type="button" className="text-label text-brand-light hover:text-white" onClick={() => setP({ ...p, operadores: [...(p.operadores || []), { usuario: "", nombre: "", tarifa_cancion: 0 }] })}>+ operador</button>
+        {row("Comisión de la plataforma", <input className={`${field} w-20 text-right`} value={p.comision_operadores} onChange={set("comision_operadores")} />, "0,08 = 8%")}
+      </div>
       <button
         type="button"
         onClick={() => { const { entryId: _ignored, ...payload } = p; onSave(payload); }}
@@ -111,6 +128,10 @@ export default function ContratoView({ f, pnl }) {
   const mensualCostos = months.length
     ? ((pnl.total.directos || 0) + (pnl.total.manoObra || 0) + (pnl.total.estructura || 0)) / months.length : 0;
   const reserva = mensualCostos * (Number(params.reserva_meses) || 0);
+  const tc = Number(params.tipo_cambio) || 0;
+  // Historial del socio: todos los pagos cargados, sin importar el rango.
+  const pagos = entries.filter((e) => e.section === "pago_socio").sort((a, b) => a.period.localeCompare(b.period));
+  const mesesRango = months.filter((m) => pnl.perMonth[m].ingreso > 0 || pnl.perMonth[m].directos > 0).length || months.length;
 
   const saveContract = async ({ nombre, payload }) => {
     if (editing?.entry) await f.updateEntry(editing.entry.id, { contract: nombre, concept: nombre, payload });
@@ -182,7 +203,7 @@ export default function ContratoView({ f, pnl }) {
             <p className="text-caption text-gray-500">Período {monthLabel(months[0])} → {monthLabel(months[months.length - 1])}. Se calcula sobre el acumulado.</p>
           </div>
           <div className="grid gap-3 md:grid-cols-3">
-            <KpiCard label="Le corresponde" value={money(pnl.total.socio)} tone="warn" hint={`${Math.round(params.pct_socio * 100)}% de ${money(pnl.total.baseReparto)}`} />
+            <KpiCard label="Le corresponde" value={money(pnl.total.socio)} tone="warn" hint={`${Math.round(params.pct_socio * 100)}% de ${money(pnl.total.baseReparto)}${tc ? ` · ${pesos(pnl.total.socio * tc)}` : ""}`} />
             <KpiCard label="Ya pagado" value={money(pagado)} hint="renglones de Pagos al socio" />
             <KpiCard label="Saldo a pagarle" value={money(pnl.total.socio - pagado)} tone="brand" />
           </div>
@@ -194,6 +215,7 @@ export default function ContratoView({ f, pnl }) {
                 <th className="text-right font-medium">Trabajo</th>
                 <th className="text-right font-medium">Base</th>
                 <th className="text-right font-medium">Socio</th>
+                {tc > 0 && <th className="text-right font-medium">Socio en ARS por mes</th>}
                 <th className="text-right font-medium">Equipo (trabajo + su parte)</th>
               </tr>
             </thead>
@@ -205,6 +227,7 @@ export default function ContratoView({ f, pnl }) {
                   <td className="text-right tabular-nums">{money(s.trabajo)}</td>
                   <td className="text-right tabular-nums">{money(s.base)}</td>
                   <td className="text-right tabular-nums text-amber-300">{money(s.socio)}</td>
+                  {tc > 0 && <td className="text-right tabular-nums">{pesos((s.socio * tc) / mesesRango)}</td>}
                   <td className="text-right tabular-nums">{money(s.equipo)}</td>
                 </tr>
               ))}
@@ -213,6 +236,28 @@ export default function ContratoView({ f, pnl }) {
           <p className="text-label text-gray-500">
             Reserva sugerida antes de repartir: {money(reserva)} ({params.reserva_meses} meses de costos directos + estructura).
           </p>
+          {pagos.length > 0 && (
+            <div className="pt-3 border-t border-white/[0.06]">
+              <p className="text-section uppercase tracking-[0.08em] text-gray-400 font-semibold mb-1.5">Historial de pagos al socio</p>
+              <table className="w-full text-caption">
+                <tbody>
+                  {pagos.map((e) => (
+                    <tr key={e.id} className="border-t border-white/[0.05] text-gray-300">
+                      <td className="py-1">{monthLabel(e.period)}</td>
+                      <td className="text-gray-500">{e.concept || e.note || ""}</td>
+                      <td className="text-right tabular-nums">{e.payload?.ars ? pesos(e.payload.ars) : "—"}</td>
+                      <td className="text-right tabular-nums">{money(e.amount_usd)}</td>
+                    </tr>
+                  ))}
+                  <tr className="border-t border-white/[0.08] text-white">
+                    <td className="py-1" colSpan={2}>Este período, por mes ({mesesRango} meses)</td>
+                    <td className="text-right tabular-nums">{tc ? pesos((pnl.total.socio * tc) / mesesRango) : "—"}</td>
+                    <td className="text-right tabular-nums">{money(pnl.total.socio / mesesRango)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
         </section>
         <ParamsForm params={params} onSave={f.saveParams} />
       </div>

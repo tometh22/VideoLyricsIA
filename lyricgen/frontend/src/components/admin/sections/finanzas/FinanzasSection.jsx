@@ -8,7 +8,7 @@ import CriterioView from "./CriterioView";
 import MetricasView from "./MetricasView";
 import MovimientosView from "./MovimientosView";
 import ResultadoView from "./ResultadoView";
-import { buildPnl } from "./finanzasModel";
+import { buildPnl, effectiveEntries } from "./finanzasModel";
 import useFinanzas from "./useFinanzas";
 
 const TITLES = {
@@ -21,9 +21,14 @@ const TITLES = {
 
 export default function FinanzasSection({ subTab = "resultado" }) {
   const f = useFinanzas();
+  // Lo cargado a mano + lo automático (recolector, recurrentes, operadores).
+  const effective = useMemo(
+    () => effectiveEntries({ entries: f.entries, autoCosts: f.autoCosts, reviewers: f.ops.reviewers || [], params: f.params, months: f.months }),
+    [f.entries, f.autoCosts, f.ops, f.params, f.months],
+  );
   const pnl = useMemo(
-    () => buildPnl({ entries: f.entries, contracts: f.contracts, deliveries: f.ops.deliveries || [], params: f.params, months: f.months }),
-    [f.entries, f.contracts, f.ops, f.params, f.months],
+    () => buildPnl({ entries: effective, contracts: f.contracts, deliveries: f.ops.deliveries || [], params: f.params, months: f.months }),
+    [effective, f.contracts, f.ops, f.params, f.months],
   );
   const [title, subtitle] = TITLES[subTab] || TITLES.resultado;
   const monthInput = "bg-surface-3/60 ring-1 ring-white/[0.08] rounded px-2 py-1 text-caption text-white focus:outline-none focus:ring-brand/40";
@@ -52,7 +57,7 @@ export default function FinanzasSection({ subTab = "resultado" }) {
         <p className="text-caption text-gray-500">Cargando…</p>
       ) : (
         <>
-          {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} />}
+          {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} effective={effective} />}
           {subTab === "contrato" && <ContratoView f={f} pnl={pnl} />}
           {subTab === "metricas" && <MetricasView f={f} pnl={pnl} />}
           {subTab === "movimientos" && <MovimientosView f={f} />}

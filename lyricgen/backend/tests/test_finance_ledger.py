@@ -140,3 +140,25 @@ def test_alembic_upgrade_creates_finance_entries(tmp_path):
     finally:
         conn.close()
     assert {"id", "period", "section", "amount_usd", "basis", "evidence", "payload", "deleted_at"} <= columns
+
+
+def test_auto_costs_sums_daily_totals_and_reports_coverage(client, admin_token, db):
+    from datetime import date
+    from database import CostDaily
+
+    for day, amount in ((date(2025, 5, 1), 1.5), (date(2025, 5, 2), 2.0)):
+        db.add(CostDaily(day=day, source="railway", grain="day", dim_type="total",
+                         dim_value="total", amount_usd=amount, basis="measured"))
+        # Los desgloses no se suman dos veces.
+        db.add(CostDaily(day=day, source="railway", grain="day", dim_type="service",
+                         dim_value="api", amount_usd=amount, basis="measured"))
+    # OpenAI no se usa: hoy el recolector lee otra organización.
+    db.add(CostDaily(day=date(2025, 5, 1), source="openai", grain="day", dim_type="total",
+                     dim_value="total", amount_usd=99, basis="measured"))
+    db.commit()
+    res = client.get("/admin/finance/auto-costs?since=2025-05&until=2025-05", headers=auth(admin_token))
+    assert res.status_code == 200, res.text
+    costs = res.json()["costs"]
+    assert [c["source"] for c in costs] == ["railway"]
+    assert costs[0]["amount_usd"] == 3.5
+    assert costs[0]["days"] == 2 and costs[0]["expected_days"] == 31
