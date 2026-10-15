@@ -186,6 +186,15 @@ export default function LiquidacionView({ f, effective }) {
         </div>
       </div>
 
+      {!l.cobrada && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] leading-relaxed text-amber-900">
+          <b>Cuota sin cobrar.</b> Todavía no hay liquidación: lo que ves son solo los gastos del mes cargados hasta hoy
+          (servidores y herramientas). La IA y los operadores de este período se imputaron al cupo de las piezas que
+          produjeron{cuota > contract.inicio ? " de cuotas anteriores, cuando el material llegó tarde" : ""}. La ganancia y la parte
+          del socio se calculan cuando entra la cuota y se produce su cupo.
+        </div>
+      )}
+
       {/* Números principales */}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Tile
@@ -194,12 +203,17 @@ export default function LiquidacionView({ f, effective }) {
           sub={l.cobrada ? `${ars(l.cobrado * l.tc)} · BNA ${l.tc}` : "Cuota del contrato · todavía no entró"}
           status={l.cobrada ? <Status tone="ok">Cobrada</Status> : <Status tone="muted">Proyección</Status>}
         />
-        <Tile label="Costos" value={`US$ ${usd(l.costos)}`} sub={`${pct(l.costos, l.ingreso)} de lo cobrado`} />
-        <Tile label="Ganancia" value={`US$ ${usd(l.ganancia)}`} sub={`Margen ${pct(l.ganancia, l.ingreso)}`} accent="#0f766e" />
+        <Tile label={l.cobrada ? "Costos" : "Costos cargados hasta hoy"} value={`US$ ${usd(l.costos)}`} sub={l.cobrada ? `${pct(l.costos, l.ingreso)} de lo cobrado` : "Faltan los de producción de este cupo"} />
+        <Tile
+          label="Ganancia"
+          value={l.cobrada ? `US$ ${usd(l.ganancia)}` : "—"}
+          sub={l.cobrada ? `Margen ${pct(l.ganancia, l.ingreso)}` : "Se calcula al cobrar la cuota"}
+          accent="#0f766e"
+        />
         <Tile
           label={`Socio (${Math.round(l.pct * 100)}% de la ganancia)`}
-          value={`US$ ${usd(l.socio)}`}
-          sub={l.socioArs ? ars(l.socioArs) : "—"}
+          value={l.cobrada ? `US$ ${usd(l.socio)}` : "—"}
+          sub={l.cobrada ? (l.socioArs ? ars(l.socioArs) : "—") : "Se calcula al cobrar la cuota"}
           accent="#c2410c"
           status={l.cobrada ? (l.saldo <= 0.01 ? <Status tone="ok">Pagado</Status> : <Status tone="warn">A pagar</Status>) : null}
         />
@@ -207,6 +221,7 @@ export default function LiquidacionView({ f, effective }) {
 
       <div className="grid gap-4 xl:grid-cols-[1.1fr_1fr]">
         {/* A dónde va cada dólar */}
+        {l.cobrada ? (
         <section className="fin-card">
           <h4 className="fin-card__title">A dónde va cada dólar de la cuota</h4>
           <p className="fin-card__sub">US$ {usd(l.ingreso)} cobrados</p>
@@ -221,6 +236,11 @@ export default function LiquidacionView({ f, effective }) {
             />
           </div>
         </section>
+        ) : (
+          <section className="fin-card flex items-center justify-center text-center">
+            <p className="max-w-sm text-[14px] text-slate-500">El reparto de cada dólar aparece cuando la cuota está cobrada y su cupo producido.</p>
+          </section>
+        )}
 
         {/* Costos por categoría */}
         <section className="fin-card">

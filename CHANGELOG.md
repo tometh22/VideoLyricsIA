@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.134] - 2026-10-15
+
+### Fixed
+
+- Finanzas → Liquidación: una cuota sin cobrar ya no muestra una ganancia ni una parte del socio que no existen.
+  - Ganancia y socio aparecen como "—", con la aclaración de que se calculan al cobrar la cuota.
+  - Los costos se rotulan "cargados hasta hoy".
+  - No se muestra el reparto de cada dólar.
+  - Un aviso explica que la IA y los operadores de ese período se imputaron al cupo que produjeron.
+
 ## [1.1.133] - 2026-10-15
 
 ### Changed
