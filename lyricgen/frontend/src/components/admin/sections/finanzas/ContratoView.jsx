@@ -41,6 +41,7 @@ function ContractForm({ initial, onSave, onCancel }) {
       inicio: c.inicio, meses: Number(c.meses), cupo_vl_mes: Number(c.cupo_vl_mes), cupo_at_mes: Number(c.cupo_at_mes),
       precio_vl: Number(c.precio_vl), precio_at: Number(c.precio_at), fee_mensual: Number(c.fee_mensual),
       portales: String(c.portales).split(",").map((s) => s.trim()).filter(Boolean), cliente: c.cliente || null,
+      acuerdo_socio: c.acuerdo_socio || null,
     };
     onSave({ nombre: c.nombre, payload });
   };
@@ -60,6 +61,10 @@ function ContractForm({ initial, onSave, onCancel }) {
       {input("precio_at", "US$ por AT")}
       {input("fee_mensual", "Fee mensual")}
       {input("portales", "Portales", "w-36")}
+      <label className="flex flex-col gap-1 text-label text-gray-500 w-full">
+        Acuerdo con el socio
+        <textarea className={`${field} w-full min-h-[72px]`} value={c.acuerdo_socio || ""} onChange={set("acuerdo_socio")} />
+      </label>
       <button type="button" onClick={submit} className="text-caption px-3 py-1 rounded bg-brand/30 hover:bg-brand/50 text-white">Guardar contrato</button>
       {onCancel && <button type="button" onClick={onCancel} className="text-caption text-gray-500 hover:text-white">Cancelar</button>}
     </div>

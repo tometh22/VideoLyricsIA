@@ -38,6 +38,23 @@ function Row({ e, onSave, onDelete }) {
           {Object.entries(BASIS_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
       </td>
+      <td className="py-1">
+        <input
+          className={`${cell} w-20`}
+          placeholder={draft.period}
+          title="Cuota a la que se imputa (YYYY-MM). Vacío = el mes del renglón."
+          value={draft.payload?.cuota ?? ""}
+          onChange={(ev) => setDraft({ ...draft, payload: { ...(draft.payload || {}), cuota: ev.target.value } })}
+          onBlur={() => {
+            const value = (draft.payload?.cuota || "").trim();
+            if (value === (e.payload?.cuota || "")) return;
+            if (value && !/^\d{4}-\d{2}$/.test(value)) return;
+            const payload = { ...(draft.payload || {}) };
+            if (value) payload.cuota = value; else delete payload.cuota;
+            onSave(e.id, { payload });
+          }}
+        />
+      </td>
       <td className="py-1 text-center">
         <input
           type="checkbox"
@@ -116,11 +133,11 @@ export default function MovimientosView({ f }) {
             <tr className="text-label uppercase tracking-[0.08em] text-gray-500 text-left">
               <th className="py-1 font-medium">Mes</th><th className="font-medium">Sección</th><th className="font-medium">Categoría</th>
               <th className="font-medium">Proveedor</th><th className="font-medium">Concepto</th><th className="font-medium text-right">USD</th>
-              <th className="font-medium">Base</th><th className="font-medium" title="Se repite todos los meses">Mensual</th><th className="font-medium">Evidencia</th><th className="font-medium">Nota</th><th />
+              <th className="font-medium">Base</th><th className="font-medium" title="Cuota a la que se imputa">Cuota</th><th className="font-medium" title="Se repite todos los meses">Mensual</th><th className="font-medium">Evidencia</th><th className="font-medium">Nota</th><th />
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && <tr><td colSpan={11} className="py-3 text-caption text-gray-600">Sin renglones. Importá el CSV de la planilla o agregá uno.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={12} className="py-3 text-caption text-gray-600">Sin renglones. Importá el CSV de la planilla o agregá uno.</td></tr>}
             {rows.map((e) => <Row key={`${e.id}-${e.updated_at}`} e={e} onSave={f.updateEntry} onDelete={f.deleteEntry} />)}
           </tbody>
         </table>

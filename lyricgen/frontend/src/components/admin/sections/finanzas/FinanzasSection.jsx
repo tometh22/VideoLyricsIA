@@ -5,6 +5,7 @@ import { useMemo } from "react";
 import SectionHeader from "../../layout/SectionHeader";
 import ContratoView from "./ContratoView";
 import CriterioView from "./CriterioView";
+import LiquidacionView from "./LiquidacionView";
 import MetricasView from "./MetricasView";
 import MovimientosView from "./MovimientosView";
 import ResultadoView from "./ResultadoView";
@@ -12,6 +13,7 @@ import { buildPnl, effectiveEntries } from "./finanzasModel";
 import useFinanzas from "./useFinanzas";
 
 const TITLES = {
+  liquidacion: ["Liquidación por cuota", "La tabla que se le manda al socio cada mes, con el estado del cobro y del pago."],
   resultado: ["Resultado por mes", "Devengado: ingreso entregado y costo consumido en cada mes. Clic en una celda para cargarla."],
   contrato: ["Contrato y reparto", "Avance de cada contrato y la cuenta del socio."],
   metricas: ["Métricas", "Negocio y operación del mismo período."],
@@ -19,7 +21,7 @@ const TITLES = {
   criterio: ["Criterio", "Cómo se calcula y qué mira cada rol."],
 };
 
-export default function FinanzasSection({ subTab = "resultado" }) {
+export default function FinanzasSection({ subTab = "liquidacion" }) {
   const f = useFinanzas();
   // Lo cargado a mano + lo automático (recolector, recurrentes, operadores).
   const effective = useMemo(
@@ -30,7 +32,7 @@ export default function FinanzasSection({ subTab = "resultado" }) {
     () => buildPnl({ entries: effective, contracts: f.contracts, deliveries: f.ops.deliveries || [], params: f.params, months: f.months }),
     [effective, f.contracts, f.ops, f.params, f.months],
   );
-  const [title, subtitle] = TITLES[subTab] || TITLES.resultado;
+  const [title, subtitle] = TITLES[subTab] || TITLES.liquidacion;
   const monthInput = "bg-surface-3/60 ring-1 ring-white/[0.08] rounded px-2 py-1 text-caption text-white focus:outline-none focus:ring-brand/40";
 
   return (
@@ -57,6 +59,7 @@ export default function FinanzasSection({ subTab = "resultado" }) {
         <p className="text-caption text-gray-500">Cargando…</p>
       ) : (
         <>
+          {subTab === "liquidacion" && <LiquidacionView f={f} effective={effective} />}
           {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} effective={effective} />}
           {subTab === "contrato" && <ContratoView f={f} pnl={pnl} />}
           {subTab === "metricas" && <MetricasView f={f} pnl={pnl} />}

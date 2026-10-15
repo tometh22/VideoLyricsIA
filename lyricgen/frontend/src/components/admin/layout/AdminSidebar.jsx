@@ -90,6 +90,7 @@ const NAV = [
       </svg>
     ),
     subTabs: [
+      { id: "liquidacion", label: "Liquidación por cuota" },
       { id: "resultado", label: "Resultado por mes" },
       { id: "contrato", label: "Contrato y reparto" },
       { id: "metricas", label: "Métricas" },
