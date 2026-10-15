@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.133] - 2026-10-15
+
+### Changed
+
+- La barra lateral del admin vuelve a la identidad de Genly: fondo oscuro, logo, etiqueta "Admin" y acentos violeta. El contenido sigue en claro para leer números.
+- Finanzas → **Liquidación por cuota** pasa a ser un dashboard:
+  - Cuatro números grandes: cobrado (con ARS y BNA), costos, ganancia con margen y la parte del socio con su estado de pago.
+  - Una barra "a dónde va cada dólar" que reparte la cuota entre costos, socio y Genly, con etiquetas.
+  - Costos por categoría como barras desplegables, con el detalle por proveedor y su comprobante.
+  - Las 6 cuotas del contrato, cada una con su estado: cobrada, sin cobrar, futura o pagada.
+  - El acuerdo con el socio, plegable.
+
 ## [1.1.132] - 2026-10-15
 
 ### Changed
