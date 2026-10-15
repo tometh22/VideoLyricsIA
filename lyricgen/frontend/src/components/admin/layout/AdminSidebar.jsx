@@ -77,6 +77,27 @@ const NAV = [
     ],
   },
   {
+    // Resultado, contrato, reparto con el socio y métricas de negocio.
+    // Solo super-admin (como Insights): expone márgenes y mano de obra.
+    id: "finanzas",
+    label: "Finanzas",
+    description: "Resultado, contrato y reparto",
+    superAdminOnly: true,
+    icon: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+        <path d="M12 1v22" />
+        <path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6" />
+      </svg>
+    ),
+    subTabs: [
+      { id: "resultado", label: "Resultado por mes" },
+      { id: "contrato", label: "Contrato y reparto" },
+      { id: "metricas", label: "Métricas" },
+      { id: "movimientos", label: "Movimientos" },
+      { id: "criterio", label: "Criterio" },
+    ],
+  },
+  {
     // Administrar: cuentas, fondos, compliance, costos, facturación.
     id: "gestion",
     label: "Gestión",
@@ -108,7 +129,7 @@ export function defaultSubTab(sectionId) {
 }
 
 export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
-  const items = NAV.filter((item) => item.id !== "insights" || showInsights);
+  const items = NAV.filter((item) => (item.id !== "insights" && !item.superAdminOnly) || showInsights);
   return (
     <nav className="admin-subnav" aria-label="Secciones de administración">
       {items.map((item) => {

@@ -1,0 +1,64 @@
+// Sección "Finanzas" del admin (sólo super-admin): planilla de resultados,
+// contrato y reparto, métricas y criterio. Un solo rango de meses para todo.
+import { useMemo } from "react";
+
+import SectionHeader from "../../layout/SectionHeader";
+import ContratoView from "./ContratoView";
+import CriterioView from "./CriterioView";
+import MetricasView from "./MetricasView";
+import MovimientosView from "./MovimientosView";
+import ResultadoView from "./ResultadoView";
+import { buildPnl } from "./finanzasModel";
+import useFinanzas from "./useFinanzas";
+
+const TITLES = {
+  resultado: ["Resultado por mes", "Devengado: ingreso entregado y costo consumido en cada mes. Clic en una celda para cargarla."],
+  contrato: ["Contrato y reparto", "Avance de cada contrato y la cuenta del socio."],
+  metricas: ["Métricas", "Negocio y operación del mismo período."],
+  movimientos: ["Movimientos", "Cada renglón con su base y su evidencia. Importar o exportar CSV."],
+  criterio: ["Criterio", "Cómo se calcula y qué mira cada rol."],
+};
+
+export default function FinanzasSection({ subTab = "resultado" }) {
+  const f = useFinanzas();
+  const pnl = useMemo(
+    () => buildPnl({ entries: f.entries, contracts: f.contracts, deliveries: f.ops.deliveries || [], params: f.params, months: f.months }),
+    [f.entries, f.contracts, f.ops, f.params, f.months],
+  );
+  const [title, subtitle] = TITLES[subTab] || TITLES.resultado;
+  const monthInput = "bg-surface-3/60 ring-1 ring-white/[0.08] rounded px-2 py-1 text-caption text-white focus:outline-none focus:ring-brand/40";
+
+  return (
+    <div>
+      <SectionHeader
+        title={title}
+        subtitle={subtitle}
+        right={subTab !== "criterio" && (
+          <div className="flex items-center gap-2 text-caption text-gray-400">
+            <span>Desde</span>
+            <input type="month" aria-label="Desde" className={monthInput} value={f.since} onChange={(e) => e.target.value && f.setSince(e.target.value)} />
+            <span>hasta</span>
+            <input type="month" aria-label="Hasta" className={monthInput} value={f.until} onChange={(e) => e.target.value && f.setUntil(e.target.value)} />
+          </div>
+        )}
+      />
+      {f.error && (
+        <div className="mb-4 rounded-card bg-red-500/10 ring-1 ring-red-500/20 p-3 text-caption text-red-300 flex justify-between">
+          <span>{f.error}</span>
+          <button type="button" onClick={() => f.setError(null)} className="text-red-200 hover:text-white">✕</button>
+        </div>
+      )}
+      {f.loading ? (
+        <p className="text-caption text-gray-500">Cargando…</p>
+      ) : (
+        <>
+          {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} />}
+          {subTab === "contrato" && <ContratoView f={f} pnl={pnl} />}
+          {subTab === "metricas" && <MetricasView f={f} pnl={pnl} />}
+          {subTab === "movimientos" && <MovimientosView f={f} />}
+          {subTab === "criterio" && <CriterioView />}
+        </>
+      )}
+    </div>
+  );
+}

@@ -159,6 +159,7 @@ from batch_profiles import (
 )
 from billing import router as billing_router
 from admin import router as admin_router
+from finance_ledger import router as finance_router
 from corpus import router as corpus_router
 from batch_campaigns import router as batch_campaign_router
 from art_track_campaigns import router as art_track_campaign_router
@@ -674,6 +675,7 @@ async def enforce_submissions_switch(request: Request, call_next):
 # --- Include routers ---
 app.include_router(billing_router)
 app.include_router(admin_router)
+app.include_router(finance_router)
 app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
 from campaign_creative import router as campaign_creative_router

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.130] - 2026-10-15
+
+### Added
+
+- Nueva sección **Finanzas** en el admin, sólo para super-admin. **Resultado por mes** es una planilla por devengado: ingreso de lo entregado por el precio del contrato, costos directos, mano de obra pagada, margen bruto, estructura, resultado operativo, trabajo del equipo y reparto. Las celdas se cargan con un clic y cada número indica su base: factura, API, captura, estimado o imputado. **Contrato y reparto** muestra el cupo, lo recibido, lo entregado, lo cobrado y el anticipo de cada contrato, la cuenta del socio con parámetros editables y escenarios por tarifa por hora. **Métricas** muestra indicadores de negocio y de operación: piezas, material recibido, tiempo de entrega, pedidos de cambio y letras aprobadas por persona. **Movimientos** permite editar renglón por renglón e importar o exportar CSV. **Criterio** explica cómo se calcula y qué mira cada rol.
+- Los montos no viven en el repositorio: se cargan desde la UI o importando un CSV y se guardan en la nueva tabla `finance_entries` (migración aditiva). El audit registra cada cambio, sin montos.
+
 ## [1.1.129] - 2026-10-14
 
 ### Fixed
