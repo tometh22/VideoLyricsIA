@@ -2549,6 +2549,49 @@ class ReviewSignalRecord(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class FinanceEntry(Base):
+    """Un renglón de la planilla de finanzas del admin (sólo super-admin).
+
+    Lo que ninguna API devuelve sola vive acá: facturas verificadas a mano,
+    mano de obra pagada (Upwork) o imputada, gastos de estructura, cobros,
+    los términos de cada contrato y los parámetros del reparto. El ingreso
+    devengado NO se carga: sale de las entregas del portal × precio del
+    contrato (``finance_ledger.operations``).
+
+    ``period`` es el mes al que se DEVENGA el renglón (YYYY-MM), no el mes en
+    que se pagó: la factura de Railway del 20-ago al 20-sep es de dos meses.
+    ``basis`` dice de dónde sale el número (factura, api, captura, estimado,
+    imputado, acuerdo) para que nadie confunda una estimación con un hecho.
+    Los montos nunca se versionan en el repo (es público): se cargan desde la
+    UI o importando un CSV.
+    """
+    __tablename__ = "finance_entries"
+    __table_args__ = (
+        Index("ix_finance_entries_period", "period"),
+        Index("ix_finance_entries_section", "section"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False)
+    # ingreso | costo_directo | mano_obra | estructura | cobro | pago_socio
+    # | contrato | parametros
+    section = Column(String(24), nullable=False)
+    category = Column(String(40), nullable=True)
+    provider = Column(String(80), nullable=True)
+    concept = Column(String(200), nullable=True)
+    amount_usd = Column(Float, nullable=True)
+    basis = Column(String(16), nullable=True)
+    contract = Column(String(80), nullable=True)
+    evidence = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    created_by_user_id = Column(Integer, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------

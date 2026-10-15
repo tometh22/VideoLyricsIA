@@ -18,14 +18,15 @@ import ChangeRequestsSection from "./sections/operacion/ChangeRequestsSection";
 import RendimientoSection from "./sections/rendimiento/RendimientoSection";
 import InsightsSection from "./sections/insights/InsightsSection";
 import GestionSection from "./sections/gestion/GestionSection";
+import FinanzasSection from "./sections/finanzas/FinanzasSection";
 
 function AdminShell({ onBack, isSuperAdmin }) {
   const { adminError, setAdminError, stats } = useAdmin();
   const initialSection = (() => {
     if (typeof window === "undefined") return "ahora";
     const requested = new URLSearchParams(window.location.search).get("section");
-    if (requested === "insights" && !isSuperAdmin) return "ahora";
-    return ["ahora", "cambios", "rendimiento", "insights", "gestion"].includes(requested)
+    if ((requested === "insights" || requested === "finanzas") && !isSuperAdmin) return "ahora";
+    return ["ahora", "cambios", "rendimiento", "insights", "finanzas", "gestion"].includes(requested)
       ? requested
       : "ahora";
   })();
@@ -141,6 +142,7 @@ function AdminShell({ onBack, isSuperAdmin }) {
               quedó stale en localStorage el render también la niega. La
               seguridad real son los 403 del backend. */}
           {section === "insights" && isSuperAdmin && <InsightsSection subTab={subTab} />}
+          {section === "finanzas" && isSuperAdmin && <FinanzasSection subTab={subTab} />}
           {section === "gestion" && <GestionSection subTab={subTab} />}
         </div>
       </div>

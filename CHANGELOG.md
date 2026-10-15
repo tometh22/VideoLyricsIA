@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.130] - 2026-10-15
+
+### Fixed
+
+- El costo de Replicate se calcula con la tarifa del hardware de cada modelo: WhisperX corre en A100. Antes se usaba una única tarifa de T4 y WhisperX quedaba unas 6 veces por debajo.
+
+### Added
+
+- Nueva sección **Finanzas** en el admin, sólo para super-admin. **Resultado por mes** es una planilla por devengado: ingreso de lo entregado por el precio del contrato, costos directos, mano de obra pagada, margen bruto, estructura, resultado operativo, trabajo del equipo y reparto. Las celdas se cargan con un clic y cada número indica su base: factura, API, captura, estimado o imputado. **Contrato y reparto** muestra el cupo, lo recibido, lo entregado, lo cobrado y el anticipo de cada contrato, la cuenta del socio con parámetros editables y escenarios por tarifa por hora. **Métricas** muestra indicadores de negocio y de operación: piezas, material recibido, tiempo de entrega, pedidos de cambio y letras aprobadas por persona. **Movimientos** permite editar renglón por renglón e importar o exportar CSV. **Criterio** explica cómo se calcula y qué mira cada rol.
+- Los montos no viven en el repositorio: se cargan desde la UI o importando un CSV y se guardan en la nueva tabla `finance_entries` (migración aditiva). El audit registra cada cambio, sin montos.
+- La planilla se completa sola cada mes:
+  - Railway, Google Cloud, R2 y Replicate salen del recolector diario de costos, y se marca si el mes está incompleto.
+  - Los gastos marcados como mensuales se repiten.
+  - El pago a operadores se calcula como letras aprobadas × tarifa por canción, más la comisión.
+  - Lo cargado a mano siempre reemplaza al valor automático.
+  - Un recuadro de cierre del mes muestra qué falta.
+  - El reparto con el socio se puede ver en pesos y junto al historial de pagos.
+
 ## [1.1.129] - 2026-10-14
 
 ### Fixed
