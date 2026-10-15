@@ -5,6 +5,8 @@
 // badges: { [sectionId]: number } — contadores vivos (CRs pendientes, jobs
 // colgados) que el shell calcula desde el contexto.
 
+import GenlyLogo from "../../GenlyLogo";
+
 const NAV = [
   {
     // ¿Está sano AHORA? — triaje en vivo: zombies, salud del sistema,
@@ -134,11 +136,8 @@ export default function AdminSidebar({ section, subTab, onNavigate, badges = {},
   return (
     <aside className="admin-side">
       <div className="admin-side__brand">
-        <span className="admin-side__logo">G</span>
-        <div className="min-w-0">
-          <p className="admin-side__title">Genly Admin</p>
-          <p className="admin-side__subtitle">Operación y negocio</p>
-        </div>
+        <GenlyLogo variant="white" size="sm" priority />
+        <span className="admin-side__pill">Admin</span>
       </div>
       {onBack && (
         <button type="button" onClick={onBack} className="admin-side__back">

@@ -494,11 +494,13 @@ export function liquidacion({ entries, contracts, params, cuota }) {
   const operadores = pick((e) => e.section === "mano_obra");
   const horas = operadores.reduce((a, e) => a + num(e.payload?.horas), 0);
   const personas = operadores.reduce((a, e) => a + num(e.payload?.personas), 0);
+  const iaProv = [...new Set(ia.map((e) => (e.provider || "").split(" (")[0]))].filter(Boolean).join(", ");
+  const opSub = [personas ? `${personas} personas` : "", horas ? `${Math.round(horas)} h` : ""].filter(Boolean).join(" · ");
   const lines = [
-    { key: "ia", label: `IA (${[...new Set(ia.map((e) => (e.provider || "").split(" (")[0]))].filter(Boolean).join(", ") || "—"})`, rows: ia, usd: sum(ia) },
-    { key: "servidores", label: `Servidores y almacenamiento (${monthLabel(cuota)})`, rows: servidores, usd: sum(servidores) },
-    { key: "herramientas", label: "Herramientas", rows: herramientas, usd: sum(herramientas) },
-    { key: "operadores", label: `Operadores${personas ? ` (${personas})` : ""}${horas ? ` · ${Math.round(horas)} h` : ""}`, rows: operadores, usd: sum(operadores) },
+    { key: "ia", label: `IA (${iaProv || "—"})`, short: "IA", sub: iaProv, rows: ia, usd: sum(ia) },
+    { key: "servidores", label: `Servidores y almacenamiento (${monthLabel(cuota)})`, short: "Servidores", sub: `y almacenamiento · ${monthLabel(cuota)}`, rows: servidores, usd: sum(servidores) },
+    { key: "herramientas", label: "Herramientas", short: "Herramientas", sub: "", rows: herramientas, usd: sum(herramientas) },
+    { key: "operadores", label: `Operadores${personas ? ` (${personas})` : ""}${horas ? ` · ${Math.round(horas)} h` : ""}`, short: "Operadores", sub: opSub, rows: operadores, usd: sum(operadores) },
   ];
   const costos = round2(lines.reduce((a, l) => a + l.usd, 0));
   const cobros = pick((e) => e.section === "cobro");

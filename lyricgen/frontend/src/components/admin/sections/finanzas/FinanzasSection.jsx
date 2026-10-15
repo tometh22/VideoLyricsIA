@@ -13,7 +13,7 @@ import { buildPnl, effectiveEntries } from "./finanzasModel";
 import useFinanzas from "./useFinanzas";
 
 const TITLES = {
-  liquidacion: ["Liquidación por cuota", "La tabla que se le manda al socio cada mes, con el estado del cobro y del pago."],
+  liquidacion: ["Liquidación por cuota", "Cuánto entró, cuánto costó y cuánto le toca al socio en cada cuota del contrato."],
   resultado: ["Resultado por mes", "Devengado: ingreso entregado y costo consumido en cada mes. Clic en una celda para cargarla."],
   contrato: ["Contrato y reparto", "Avance de cada contrato y la cuenta del socio."],
   metricas: ["Métricas", "Negocio y operación del mismo período."],
