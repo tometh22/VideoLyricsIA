@@ -14,6 +14,7 @@ function Detail({ rows }) {
     <div className="mt-1 space-y-0.5">
       {rows.map((e, i) => (
         <div key={`${e.id ?? "s"}-${i}`} className="flex items-center gap-2 text-label text-gray-500">
+          <span className="w-12 shrink-0 text-gray-400">{monthLabel(e.period)}</span>
           <span className="truncate">{[e.provider, e.concept].filter(Boolean).join(" · ")}</span>
           <BasisBadge basis={e.basis} />
           <span className="ml-auto tabular-nums">{usd(e.amount_usd)}</span>
@@ -118,6 +119,7 @@ export default function LiquidacionView({ f, effective }) {
       <aside className="space-y-4">
         <section className="glass rounded-card p-4 space-y-2 text-caption">
           <p className="text-section uppercase tracking-[0.08em] text-gray-400 font-semibold">Pago al socio</p>
+          {!l.cobrada && <p className="text-label text-amber-300">Cuota sin cobro registrado: es una proyección con los costos cargados hasta hoy.</p>}
           <div className="flex justify-between"><span className="text-gray-400">Le corresponde</span><span className="tabular-nums text-white">US$ {usd(l.socio)}</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Pagado</span><span className="tabular-nums">US$ {usd(l.pagado)}</span></div>
           <div className="flex justify-between font-semibold"><span>{l.saldo > 0.01 ? "Pendiente" : "Saldado"}</span><span className={`tabular-nums ${l.saldo > 0.01 ? "text-amber-300" : "text-accent"}`}>US$ {usd(l.saldo)}</span></div>

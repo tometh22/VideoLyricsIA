@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.132] - 2026-10-15
+
+### Changed
+
+- **El admin pasa a ser un entorno aparte**, a pantalla completa y con barra lateral propia. Ya no lleva la barra lateral ni la barra superior de la app, y tiene un botón "Volver a Genly".
+  - El tema es claro, con más contraste y letra más grande para leer cifras y tablas.
+  - Todas las secciones existentes se adaptan solas, sin cambios de lógica.
+- **Finanzas usa un solo criterio para el reparto con el socio: la liquidación por cuota.**
+  - "Contrato y reparto" suma solo las cuotas cobradas. Las cuotas sin cobrar se muestran como proyección.
+  - Se quitaron los escenarios por tarifa por hora.
+  - "Resultado por mes" queda como vista contable por mes calendario.
+  - Las métricas de horas salen de los renglones de operadores.
+
+### Fixed
+
+- Las sparklines de las tarjetas ya no se pintan negras cuando la etiqueta tiene espacios o acentos.
+- El panel de ayuda cerrado ya no proyecta una franja de sombra en el borde derecho.
+
 ## [1.1.131] - 2026-10-15
 
 ### Added

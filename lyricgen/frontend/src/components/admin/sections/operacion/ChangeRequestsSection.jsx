@@ -36,11 +36,11 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
         <div className="flex items-stretch gap-2 text-caption">
           <div className="min-w-[6.5rem] rounded-xl bg-amber-500/[0.08] px-3 py-2 ring-1 ring-amber-400/15">
             <p className="text-xl font-bold text-amber-200">{changes.crPendingCount}</p>
-            <p className="text-label text-amber-100/60">pendientes</p>
+            <p className="text-label text-amber-300">pendientes</p>
           </div>
           <div className="min-w-[6.5rem] rounded-xl bg-emerald-500/[0.06] px-3 py-2 ring-1 ring-emerald-400/15">
             <p className="text-xl font-bold text-emerald-200">{changes.crResolvedCount}</p>
-            <p className="text-label text-emerald-100/60">resueltos</p>
+            <p className="text-label text-emerald-300">resueltos</p>
           </div>
         </div>
       </div>

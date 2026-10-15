@@ -52,7 +52,7 @@ describe("AdminPanel · navegación de cambios", () => {
         screen.getByRole("heading", { name: "Cambios UMG" }),
       ).toBeInTheDocument();
       expect(screen.getByTestId("change-requests-fullscreen")).toBeInTheDocument();
-      expect(screen.getByTestId("admin-shell")).toHaveClass("max-w-none");
+      expect(screen.getByTestId("admin-shell")).toHaveClass("admin-app");
       expect(screen.getByText("pendientes").parentElement).toHaveTextContent("11");
       expect(screen.getByText("resueltos").parentElement).toHaveTextContent("73");
     });
@@ -70,7 +70,7 @@ describe("AdminPanel · navegación de cambios", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Cambios UMG" })).toBeInTheDocument();
-      expect(screen.getByTestId("admin-shell")).toHaveClass("max-w-none");
+      expect(screen.getByTestId("admin-shell")).toHaveClass("admin-app");
     });
     expect(screen.queryByRole("heading", { name: "Pipeline en vivo" })).toBe(null);
   });
