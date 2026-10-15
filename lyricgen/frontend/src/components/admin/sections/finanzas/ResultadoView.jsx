@@ -234,13 +234,11 @@ function Checklist({ month, f, effective }) {
 }
 
 export default function ResultadoView({ f, pnl, effective }) {
-  const { months, params } = f;
+  const { months } = f;
   const entries = effective || f.entries;
   const save = (id, body) => f.updateEntry(id, body);
   const create = (body) => f.createEntry(body);
   const piezas = Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].ingresoEntregas]));
-  const restaLabel = params.resta_trabajo === "ninguno" ? "no se resta trabajo"
-    : params.resta_trabajo === "agus_y_tomi" ? "se resta Agus + operación de Tomi" : "se resta Agus";
 
   return (
     <div>
@@ -276,15 +274,11 @@ export default function ResultadoView({ f, pnl, effective }) {
           <GroupRows section="estructura" entries={entries} months={months} onSave={save} onCreate={create} />
           <TotalRow label="Resultado operativo (antes del trabajo del equipo)" pnl={pnl} field="operativo" months={months} ratioOf="ingreso" />
 
-          <SectionTitle label="Trabajo del equipo (no pagado)" months={months} hint={`US$ ${params.tarifa_hora}/h · ${restaLabel}`} />
-          <ValueRow label="Agus" sub={`${params.horas_dia_agus} h/día`} values={Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].trabajo_agus]))} months={months} total={pnl.total.trabajo_agus} badge={<BasisBadge basis="imputado" />} />
-          <ValueRow label="Tomi — operación" sub={`${Math.round(params.pct_operacion_tomi * 100)}% de ${params.horas_dia_tomi} h/día`} values={Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].trabajo_tomi_op]))} months={months} total={pnl.total.trabajo_tomi_op} badge={<BasisBadge basis="imputado" />} />
-          <ValueRow label="Tomi — desarrollo" sub="activo de Genly; no se resta" tone="text-gray-500" values={Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].trabajo_tomi_dev]))} months={months} total={pnl.total.trabajo_tomi_dev} badge={<BasisBadge basis="imputado" />} />
-          <TotalRow label="Base del reparto" pnl={pnl} field="baseReparto" months={months} />
-
-          <SectionTitle label="Reparto" months={months} hint="el total se calcula sobre el acumulado: un mes en pérdida compensa otro" />
-          <TotalRow label={`Socio (${Math.round(params.pct_socio * 100)}%)`} pnl={pnl} field="socio" months={months} tone="text-amber-300" />
-          <TotalRow label="Genly (resultado operativo − socio)" pnl={pnl} field="genly" months={months} tone="text-accent" />
+          <tr>
+            <td colSpan={months.length + 3} className="px-2 pt-3 pb-1 text-label text-gray-500">
+              Esta vista es por mes calendario. El reparto con el socio se calcula por cuota, en "Liquidación por cuota".
+            </td>
+          </tr>
 
           <SectionTitle label="Caja" months={months} hint="lo cobrado y pagado efectivamente" />
           <GroupRows section="cobro" entries={entries} months={months} onSave={save} onCreate={create} />

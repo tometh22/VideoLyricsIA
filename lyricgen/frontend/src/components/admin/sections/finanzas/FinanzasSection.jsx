@@ -40,7 +40,7 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
       <SectionHeader
         title={title}
         subtitle={subtitle}
-        right={subTab !== "criterio" && (
+        right={!["criterio", "liquidacion"].includes(subTab) && (
           <div className="flex items-center gap-2 text-caption text-gray-400">
             <span>Desde</span>
             <input type="month" aria-label="Desde" className={monthInput} value={f.since} onChange={(e) => e.target.value && f.setSince(e.target.value)} />
@@ -61,8 +61,8 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
         <>
           {subTab === "liquidacion" && <LiquidacionView f={f} effective={effective} />}
           {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} effective={effective} />}
-          {subTab === "contrato" && <ContratoView f={f} pnl={pnl} />}
-          {subTab === "metricas" && <MetricasView f={f} pnl={pnl} />}
+          {subTab === "contrato" && <ContratoView f={f} effective={effective} />}
+          {subTab === "metricas" && <MetricasView f={f} pnl={pnl} effective={effective} />}
           {subTab === "movimientos" && <MovimientosView f={f} />}
           {subTab === "criterio" && <CriterioView />}
         </>

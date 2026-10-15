@@ -129,60 +129,63 @@ export function defaultSubTab(sectionId) {
   return section?.subTabs?.[0]?.id ?? null;
 }
 
-export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
+export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false, onBack }) {
   const items = NAV.filter((item) => (item.id !== "insights" && !item.superAdminOnly) || showInsights);
   return (
-    <nav className="admin-subnav" aria-label="Secciones de administración">
-      {items.map((item) => {
-        const isActive = section === item.id;
-        return (
-          <div key={item.id}>
-            <button
-              type="button"
-              onClick={() => onNavigate(item.id, defaultSubTab(item.id))}
-              aria-current={isActive ? "page" : undefined}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-button text-left transition-colors duration-brand ${
-                isActive
-                  ? "bg-brand/15 ring-1 ring-brand/30 text-white"
-                  : "text-gray-400 hover:text-white hover:bg-white/[0.03]"
-              }`}
-            >
-              <span className={isActive ? "text-brand-light" : "text-gray-500"}>{item.icon}</span>
-              <span className="flex-1 min-w-0">
-                <span className="block text-ui font-medium leading-tight">{item.label}</span>
-                <span className="block text-section text-gray-600 mt-0.5 normal-case tracking-normal">
-                  {item.description}
+    <aside className="admin-side">
+      <div className="admin-side__brand">
+        <span className="admin-side__logo">G</span>
+        <div className="min-w-0">
+          <p className="admin-side__title">Genly Admin</p>
+          <p className="admin-side__subtitle">Operación y negocio</p>
+        </div>
+      </div>
+      {onBack && (
+        <button type="button" onClick={onBack} className="admin-side__back">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+          Volver a Genly
+        </button>
+      )}
+      <nav className="admin-side__nav" aria-label="Secciones de administración">
+        {items.map((item) => {
+          const isActive = section === item.id;
+          return (
+            <div key={item.id}>
+              <button
+                type="button"
+                onClick={() => onNavigate(item.id, defaultSubTab(item.id))}
+                aria-current={isActive ? "page" : undefined}
+                className={`admin-side__item ${isActive ? "is-active" : ""}`}
+              >
+                <span className="admin-side__icon">{item.icon}</span>
+                <span className="flex-1 min-w-0">
+                  <span className="admin-side__label">{item.label}</span>
+                  <span className="admin-side__desc">{item.description}</span>
                 </span>
-              </span>
-              {badges[item.id] > 0 && (
-                <span className="shrink-0 min-w-[1.25rem] text-center text-section font-bold rounded-full px-1.5 py-0.5 bg-amber-500/20 text-amber-300">
-                  {badges[item.id]}
-                </span>
+                {badges[item.id] > 0 && <span className="admin-side__badge">{badges[item.id]}</span>}
+              </button>
+              {/* Sub-tabs visibles solo en la sección activa */}
+              {isActive && item.subTabs && (
+                <div className="admin-side__subnav">
+                  {item.subTabs.map((st) => (
+                    <button
+                      key={st.id}
+                      type="button"
+                      onClick={() => onNavigate(item.id, st.id)}
+                      aria-pressed={subTab === st.id}
+                      className={`admin-side__subitem ${subTab === st.id ? "is-active" : ""}`}
+                    >
+                      {st.label}
+                    </button>
+                  ))}
+                </div>
               )}
-            </button>
-            {/* Sub-tabs visibles solo en la sección activa */}
-            {isActive && item.subTabs && (
-              <div className="mt-1 mb-2 ml-9 space-y-0.5">
-                {item.subTabs.map((st) => (
-                  <button
-                    key={st.id}
-                    type="button"
-                    onClick={() => onNavigate(item.id, st.id)}
-                    aria-pressed={subTab === st.id}
-                    className={`block w-full text-left px-3 py-1.5 rounded-md text-caption transition-colors duration-brand ${
-                      subTab === st.id
-                        ? "text-white bg-white/[0.05]"
-                        : "text-gray-500 hover:text-gray-300"
-                    }`}
-                  >
-                    {st.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </nav>
+            </div>
+          );
+        })}
+      </nav>
+    </aside>
   );
 }

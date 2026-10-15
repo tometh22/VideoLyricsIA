@@ -32,11 +32,12 @@ function Table({ title, hint, cols, rows }) {
   );
 }
 
-export default function MetricasView({ f, pnl }) {
+export default function MetricasView({ f, pnl, effective = [] }) {
   const { ops, months } = f;
   const t = pnl.total;
   const piezas = (t.piezas_vl || 0) + (t.piezas_at || 0);
-  const horas = t.horas_equipo || 0;
+  // Horas de operación cargadas en los renglones de operadores (payload.horas).
+  const horas = effective.filter((e) => e.section === "mano_obra" && months.includes(e.period)).reduce((a, e) => a + (Number(e.payload?.horas) || 0), 0);
   const entregas = (ops.deliveries || []).reduce((a, d) => a + d.entregas, 0);
   const crRecibidos = (ops.change_requests || []).reduce((a, c) => a + c.recibidos, 0);
 
@@ -61,7 +62,7 @@ export default function MetricasView({ f, pnl }) {
           <KpiCard label="Concentración de clientes" value="100%" hint="Universal es el único cliente que paga" tone="warn" />
           <KpiCard label="Costo directo por pieza" value={money2(piezas ? ((t.directos || 0) + (t.manoObra || 0)) / piezas : null)} hint="infra + IA + operadores pagados" />
           <KpiCard label="Costo total por pieza" value={money2(piezas ? ((t.directos || 0) + (t.manoObra || 0) + (t.estructura || 0)) / piezas : null)} hint="incluye estructura" />
-          <KpiCard label="Resultado por hora del equipo" value={money2(horas ? t.operativo / horas : null)} hint={`${Math.round(horas)} h de Agus + Tomi`} tone="brand" />
+          <KpiCard label="Resultado por hora de operación" value={money2(horas ? t.operativo / horas : null)} hint={`${Math.round(horas)} h de operadores`} tone="brand" />
           <KpiCard label="Cobrado vs devengado" value={money((t.cobrado || 0) - (t.ingreso || 0))} hint={(t.cobrado || 0) >= (t.ingreso || 0) ? "anticipo: cobrado antes de entregar" : "saldo a cobrar"} />
         </div>
       </div>
@@ -72,7 +73,7 @@ export default function MetricasView({ f, pnl }) {
           <KpiCard label="Piezas entregadas" value={String(entregas)} hint="primera entrega vigente de cada job" spark={months.map((m, i) => deliveredVl[i] + deliveredAt[i])} />
           <KpiCard label="Material recibido" value={String(receivedRows.reduce((a, b) => a + b, 0))} hint={`${discardedRows.reduce((a, b) => a + b, 0)} descartados (instrumental o repetido)`} />
           <KpiCard label="Pedidos de cambio" value={String(crRecibidos)} hint={`${pct(crRecibidos, entregas)} de las entregas · ${ops.change_requests_open ?? 0} abiertos hoy`} tone={crRecibidos ? "warn" : "default"} />
-          <KpiCard label="Horas del equipo" value={String(Math.round(horas))} hint="según horas por día de los parámetros" />
+          <KpiCard label="Horas de operación" value={String(Math.round(horas))} hint="cargadas en los renglones de operadores" />
         </div>
         <div className="grid gap-4 lg:grid-cols-2">
           <Table

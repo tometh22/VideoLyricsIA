@@ -504,6 +504,9 @@ export function liquidacion({ entries, contracts, params, cuota }) {
   const cobros = pick((e) => e.section === "cobro");
   const cobrado = sum(cobros);
   const tc = num(cobros.find((e) => e.payload?.tipo_cambio)?.payload?.tipo_cambio) || num(params.tipo_cambio);
+  // Una cuota sin cobro registrado es una proyección: se muestra, pero no
+  // suma al reparto hasta que entra la plata.
+  const cobrada = cobrado > 0;
   const ingreso = fee || cobrado;
   const ganancia = round2(ingreso - costos);
   const pct = num(params.pct_socio);
@@ -511,7 +514,7 @@ export function liquidacion({ entries, contracts, params, cuota }) {
   const pagos = pick((e) => e.section === "pago_socio");
   const pagado = sum(pagos);
   return {
-    contract, cuota, fee, ingreso, cobrado, tc, cobros, lines, costos, ganancia, pct,
+    contract, cuota, fee, ingreso, cobrado, cobrada, tc, cobros, lines, costos, ganancia, pct,
     socio, socioArs: tc ? Math.round(socio * tc) : null, pagos, pagado,
     saldo: round2(socio - pagado),
   };

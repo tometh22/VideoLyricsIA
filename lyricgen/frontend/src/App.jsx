@@ -654,6 +654,17 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "admin") navigate("/admin");
   };
 
+  // El admin es un entorno aparte: pantalla completa, con su propia barra
+  // lateral y tema claro. No lleva la sidebar ni la topbar de la app.
+  if (pathname === "/admin") {
+    return (
+      <div className="min-h-screen">
+        <ServiceStatusBanner />
+        <Outlet />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen overflow-x-hidden bg-surface flex">
       <Sidebar
