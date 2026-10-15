@@ -462,3 +462,71 @@ export function csvToEntries(text) {
     };
   });
 }
+
+/**
+ * Liquidación de una cuota mensual del contrato (lo que se le manda al socio).
+ *
+ * Criterio acordado: la cuota del mes es el ingreso; los costos de producción
+ * van a la cuota de las piezas que produjeron (payload.cuota), aunque se hayan
+ * gastado en otro mes; servidores y herramientas van al mes en que se usaron.
+ * Un renglón sin payload.cuota se asigna a la cuota de su propio mes.
+ */
+export function cuotaDe(entry) {
+  return entry?.payload?.cuota || entry?.period;
+}
+
+export function contractForCuota(contracts, cuota) {
+  return contracts.find((c) => {
+    const fin = addMonths(c.inicio, (num(c.meses) || 1) - 1);
+    return cuota >= c.inicio && cuota <= fin;
+  });
+}
+
+export function liquidacion({ entries, contracts, params, cuota }) {
+  const contract = contractForCuota(contracts, cuota);
+  const fee = num(contract?.fee_mensual);
+  const mine = entries.filter((e) => cuotaDe(e) === cuota);
+  const pick = (pred) => mine.filter(pred);
+  const sum = (rows) => round2(rows.reduce((a, e) => a + num(e.amount_usd), 0));
+  const ia = pick((e) => e.section === "costo_directo" && (e.category || "").toLowerCase() !== "infraestructura");
+  const servidores = pick((e) => e.section === "costo_directo" && (e.category || "").toLowerCase() === "infraestructura");
+  const herramientas = pick((e) => e.section === "estructura");
+  const operadores = pick((e) => e.section === "mano_obra");
+  const horas = operadores.reduce((a, e) => a + num(e.payload?.horas), 0);
+  const personas = operadores.reduce((a, e) => a + num(e.payload?.personas), 0);
+  const lines = [
+    { key: "ia", label: `IA (${[...new Set(ia.map((e) => (e.provider || "").split(" (")[0]))].filter(Boolean).join(", ") || "—"})`, rows: ia, usd: sum(ia) },
+    { key: "servidores", label: `Servidores y almacenamiento (${monthLabel(cuota)})`, rows: servidores, usd: sum(servidores) },
+    { key: "herramientas", label: "Herramientas", rows: herramientas, usd: sum(herramientas) },
+    { key: "operadores", label: `Operadores${personas ? ` (${personas})` : ""}${horas ? ` · ${Math.round(horas)} h` : ""}`, rows: operadores, usd: sum(operadores) },
+  ];
+  const costos = round2(lines.reduce((a, l) => a + l.usd, 0));
+  const cobros = pick((e) => e.section === "cobro");
+  const cobrado = sum(cobros);
+  const tc = num(cobros.find((e) => e.payload?.tipo_cambio)?.payload?.tipo_cambio) || num(params.tipo_cambio);
+  const ingreso = fee || cobrado;
+  const ganancia = round2(ingreso - costos);
+  const pct = num(params.pct_socio);
+  const socio = round2(Math.max(0, ganancia) * pct);
+  const pagos = pick((e) => e.section === "pago_socio");
+  const pagado = sum(pagos);
+  return {
+    contract, cuota, fee, ingreso, cobrado, tc, cobros, lines, costos, ganancia, pct,
+    socio, socioArs: tc ? Math.round(socio * tc) : null, pagos, pagado,
+    saldo: round2(socio - pagado),
+  };
+}
+
+/** Texto plano de la liquidación, listo para pegar en un mensaje. */
+export function liquidacionTexto(l) {
+  const f = (v) => v.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const out = [
+    `Liquidación ${l.contract?.nombre || ""} — ${monthLabel(l.cuota)}`,
+    `Cobrado: US$ ${f(l.ingreso)}${l.tc ? ` (BNA ${l.tc})` : ""}`,
+    ...l.lines.filter((x) => x.usd).map((x) => `${x.label}: US$ ${f(x.usd)}`),
+    `Total costos: US$ ${f(l.costos)}`,
+    `Ganancia: US$ ${f(l.ganancia)}`,
+    `${Math.round(l.pct * 100)}% de ganancia: US$ ${f(l.socio)}${l.socioArs ? ` = ARS ${l.socioArs.toLocaleString("es-AR")}` : ""}`,
+  ];
+  return out.join("\n");
+}

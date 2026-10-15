@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   allocateContracts, buildPnl, contractStatus, csvToEntries, effectiveEntries, entriesToCsv,
-  monthChecklist, monthsBetween, partnerScenarios, workDays, DEFAULT_PARAMS,
+  liquidacion, liquidacionTexto, monthChecklist, monthsBetween, partnerScenarios, workDays, DEFAULT_PARAMS,
 } from "./finanzasModel";
 
 // Números ficticios: los términos reales no viven en el repo.
@@ -141,3 +141,31 @@ describe("renglones automáticos", () => {
 });
 
 const providerIs = (e, name) => e.provider === name && e.section === "costo_directo";
+
+describe("liquidación por cuota", () => {
+  const contract = { nombre: "Contrato X", inicio: "2026-08", meses: 6, fee_mensual: 1000 };
+  const params = { ...DEFAULT_PARAMS, pct_socio: 0.5 };
+  const entries = [
+    // IA gastada en octubre pero imputada a la cuota de agosto.
+    { section: "costo_directo", category: "IA", provider: "Google Cloud (Vertex)", period: "2026-10", amount_usd: 50, payload: { cuota: "2026-08" } },
+    { section: "costo_directo", category: "Infraestructura", provider: "Railway", period: "2026-08", amount_usd: 100 },
+    // Servidores de septiembre: van a la cuota de septiembre, no a agosto.
+    { section: "costo_directo", category: "Infraestructura", provider: "Railway", period: "2026-09", amount_usd: 999 },
+    { section: "estructura", provider: "Vercel", period: "2026-08", amount_usd: 10 },
+    { section: "mano_obra", provider: "Operadores", period: "2026-10", amount_usd: 140, payload: { cuota: "2026-08", horas: 20, personas: 3 } },
+    { section: "cobro", period: "2026-10", amount_usd: 1000, payload: { cuota: "2026-08", tipo_cambio: 1500 } },
+    { section: "pago_socio", period: "2026-10", amount_usd: 300, payload: { cuota: "2026-08" } },
+  ];
+
+  it("arma la tabla del socio con la regla acordada", () => {
+    const l = liquidacion({ entries, contracts: [contract], params, cuota: "2026-08" });
+    expect(l.lines.map((x) => x.usd)).toEqual([50, 100, 10, 140]);
+    expect(l.lines[0].label).toBe("IA (Google Cloud)");
+    expect(l.lines[3].label).toBe("Operadores (3) · 20 h");
+    expect(l.ganancia).toBe(700);
+    expect(l.socio).toBe(350);
+    expect(l.socioArs).toBe(525000);
+    expect(l.saldo).toBe(50);
+    expect(liquidacionTexto(l)).toContain("50% de ganancia: US$ 350,00 = ARS 525.000");
+  });
+});

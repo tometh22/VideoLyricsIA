@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.131] - 2026-10-15
+
+### Added
+
+- Finanzas → **Liquidación por cuota**: la tabla que se le manda al socio cada mes. Muestra lo cobrado y su tipo de cambio, IA, servidores, herramientas y operadores (personas y horas), total de costos, ganancia y la parte del socio en dólares y en pesos.
+  - Muestra cuánto le corresponde al socio, cuánto se le pagó y cuánto queda pendiente, junto con el acuerdo vigente.
+  - Incluye un botón para copiar la liquidación como texto y mandarla.
+  - Los costos de producción se imputan a la cuota de las piezas que produjeron (nueva columna "Cuota" en Movimientos). Servidores y herramientas van al mes en que se usaron, y cada costo se cuenta una sola vez.
+
 ## [1.1.130] - 2026-10-15
 
 ### Fixed
