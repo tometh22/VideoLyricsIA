@@ -262,7 +262,8 @@ export default function LiquidacionView({ f, effective, months }) {
         <div className="flex flex-wrap items-center gap-2">
           <Status tone={st.tone}>{st.label}</Status>
           {(!l.cobrada || l.cobroParcial) && cuota <= currentPeriod() && !l.frozen && <RegistrarCobro l={l} contract={contract} onCreate={f.createEntry} />}
-          {l.cobrada && l.saldo > 0.01 && !l.frozen && <RegistrarPago l={l} contract={contract} onCreate={f.createEntry} />}
+          {/* Una liquidación cerrada (acordada) pero no pagada todavía igual se paga. */}
+          {l.cobrada && l.saldo > 0.01 && <RegistrarPago l={l} contract={contract} onCreate={f.createEntry} />}
           {l.cobrada && <button type="button" onClick={copy} className="fin-btn">{copied ? "Copiada ✓" : "Copiar para mandar"}</button>}
         </div>
       </div>
@@ -284,7 +285,7 @@ export default function LiquidacionView({ f, effective, months }) {
       )}
       {l.frozen && (
         <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-3 text-[14px] text-emerald-900">
-          <b>Liquidación cerrada.</b> Se muestra tal como se pagó. Los costos que lleguen después se liquidan en la próxima cuota abierta.
+          <b>Liquidación cerrada.</b> Se muestra tal como se acordó con el socio. Los costos que lleguen después se liquidan en la próxima cuota abierta.
           {Math.abs(l.drift || 0) > 0.01 && <> Ojo: renglones que estaban en este pago cambiaron después en US$ {usd(l.drift)}; cargá el ajuste en la cuota abierta.</>}
         </div>
       )}

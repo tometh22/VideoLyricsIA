@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.135] - 2026-10-16
+
+### Fixed
+
+- Finanzas: una cuota cerrada con los números acordados, pero todavía no pagada, sigue mostrando el botón "Registrar pago al socio" y el pago conserva la liquidación acordada. Antes el botón desaparecía al cerrarla.
+
 ## [1.1.134] - 2026-10-16
 
 ### Changed

@@ -300,3 +300,16 @@ describe("dos contratos superpuestos", () => {
     expect([la.costos, lb.costos]).toEqual([300, 100]);
   });
 });
+
+describe("cierre sin pago", () => {
+  it("una cuota cerrada con un renglón de US$ 0 queda congelada y sigue pendiente de pago", () => {
+    const contract = { nombre: "C", inicio: "2026-08", meses: 3, cupo_vl_mes: 10, cupo_at_mes: 0, precio_vl: 10, precio_at: 1, fee_mensual: 1000, portales: ["argentina"] };
+    const params = { ...DEFAULT_PARAMS, pct_socio: 0.5 };
+    const base = [{ id: 1, section: "cobro", period: "2026-08", amount_usd: 1000, payload: { cuota: "2026-08" } }];
+    const l = liquidacion({ entries: base, contracts: [contract], params, cuota: "2026-08", deliveries: [], months: ["2026-08"] });
+    const cierre = { id: 2, section: "pago_socio", period: "2026-10", amount_usd: 0, payload: { cuota: "2026-08", cierre: true, snapshot: liquidacionSnapshot(l) } };
+    const tarde = { id: 3, section: "mano_obra", provider: "Producción interna", period: "2026-10", amount_usd: 50 };
+    const ago = liquidacion({ entries: [...base, cierre, tarde], contracts: [contract], params, cuota: "2026-08", deliveries: [], months: ["2026-08", "2026-10"] });
+    expect([ago.frozen, ago.socio, ago.pagado, ago.saldo]).toEqual([true, 500, 0, 500]);
+  });
+});
