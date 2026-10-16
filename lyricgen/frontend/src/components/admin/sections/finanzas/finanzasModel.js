@@ -738,7 +738,7 @@ export function liquidacion({ entries, contracts = [], params, cuota, deliveries
   // Pagada: se muestra lo que se liquidó, y si los renglones cambiaron
   // después, cuánto (para cargar el ajuste en la cuota abierta).
   return {
-    ...live, frozen: true, lines: snap.lines, costos: snap.costos, ganancia: snap.ganancia, ingreso: snap.ingreso,
+    ...live, frozen: true, keys: snap.keys || live.keys, lines: snap.lines, costos: snap.costos, ganancia: snap.ganancia, ingreso: snap.ingreso,
     socio: snap.socio, socioArs: snap.socioArs ?? live.socioArs, tc: snap.tc ?? live.tc,
     saldo: round2(snap.socio - pagado), drift: round2(live.costos - snap.costos),
   };
