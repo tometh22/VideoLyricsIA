@@ -3,7 +3,7 @@
 // planilla se carga desde acá.
 import { useMemo, useRef, useState } from "react";
 
-import { BASIS_LABELS, SECTION_LABELS, csvToEntries, entriesToCsv, monthLabel } from "./finanzasModel";
+import { BASIS_LABELS, SECTION_LABELS, csvToEntries, entriesToCsv, monthLabel, parseNumberAr } from "./finanzasModel";
 import { BasisBadge } from "./ResultadoView";
 
 const cell = "bg-transparent hover:bg-white/[0.04] focus:bg-surface-3/60 focus:ring-1 focus:ring-brand/40 rounded px-1.5 py-0.5 text-caption text-gray-200 focus:outline-none w-full";
@@ -30,7 +30,13 @@ function Row({ e, onSave, onDelete }) {
       <td className="py-1">{text("provider", "w-32")}</td>
       <td className="py-1">{text("concept", "w-44")}</td>
       <td className="py-1">
-        <input className={`${cell} w-24 text-right tabular-nums`} value={draft.amount_usd ?? ""} onChange={(ev) => setDraft({ ...draft, amount_usd: ev.target.value })} onBlur={() => commit("amount_usd", (v) => (v === "" || v === null ? null : Number(String(v).replace(",", "."))))} />
+        <input className={`${cell} w-24 text-right tabular-nums`} value={draft.amount_usd ?? ""} onChange={(ev) => setDraft({ ...draft, amount_usd: ev.target.value })} onBlur={() => {
+          const raw = draft.amount_usd;
+          if (raw === "" || raw === null) return commit("amount_usd", () => null);
+          const n = typeof raw === "number" ? raw : parseNumberAr(raw);
+          if (n === null) { setDraft({ ...draft, amount_usd: e.amount_usd }); return undefined; } // inválido: se descarta
+          return commit("amount_usd", () => n);
+        }} />
       </td>
       <td className="py-1">
         <select className={cell} value={draft.basis || ""} onChange={(ev) => { setDraft({ ...draft, basis: ev.target.value || null }); onSave(e.id, { basis: ev.target.value || null }); }}>
@@ -48,29 +54,32 @@ function Row({ e, onSave, onDelete }) {
           onBlur={() => {
             const value = (draft.payload?.cuota || "").trim();
             if (value === (e.payload?.cuota || "")) return;
-            if (value && !/^\d{4}-\d{2}$/.test(value)) return;
-            const payload = { ...(draft.payload || {}) };
+            if (value && !/^\d{4}-(0[1-9]|1[0-2])$/.test(value)) {
+              // Inválido: se descarta y vuelve a lo guardado (no queda en el draft).
+              setDraft({ ...draft, payload: e.payload || null });
+              return;
+            }
+            const payload = { ...(e.payload || {}) };
             if (value) payload.cuota = value; else delete payload.cuota;
             onSave(e.id, { payload });
           }}
         />
       </td>
       <td className="py-1 text-center">
-        <input
-          type="checkbox"
-          title="Se repite todos los meses siguientes"
-          checked={!!draft.payload?.recurrente}
-          onChange={(ev) => {
-            const payload = { ...(draft.payload || {}), recurrente: ev.target.checked };
-            setDraft({ ...draft, payload });
-            onSave(e.id, { payload });
-          }}
-        />
+        {/* Cobros, pagos y renglones imputados a una cuota no se repiten. */}
+        {!["cobro", "pago_socio", "contrato"].includes(e.section) && !e.payload?.cuota && (
+          <input
+            type="checkbox"
+            title="Se repite todos los meses siguientes"
+            checked={!!e.payload?.recurrente}
+            onChange={(ev) => onSave(e.id, { payload: { ...(e.payload || {}), recurrente: ev.target.checked } })}
+          />
+        )}
       </td>
       <td className="py-1">{text("evidence", "w-56")}</td>
       <td className="py-1">{text("note", "w-48")}</td>
       <td className="py-1 text-right">
-        <button type="button" onClick={() => onDelete(e.id)} className="text-label text-gray-600 hover:text-red-300" title="Borrar renglón">✕</button>
+        <button type="button" onClick={() => { if (window.confirm("¿Borrar este renglón? Cambia la liquidación de su cuota.")) onDelete(e.id); }} className="text-label text-gray-600 hover:text-red-300" title="Borrar renglón">✕</button>
       </td>
     </tr>
   );
@@ -78,7 +87,7 @@ function Row({ e, onSave, onDelete }) {
 
 export default function MovimientosView({ f }) {
   const [filter, setFilter] = useState("todos");
-  const [replace, setReplace] = useState(true);
+  const [replace, setReplace] = useState(false);
   const [importMsg, setImportMsg] = useState(null);
   const fileRef = useRef(null);
   const rows = useMemo(
@@ -87,7 +96,8 @@ export default function MovimientosView({ f }) {
   );
 
   const exportCsv = () => {
-    const blob = new Blob([entriesToCsv(f.entries.filter((e) => e.section !== "parametros"))], { type: "text/csv" });
+    // Backup completo: incluye el contrato y los parámetros (con su payload).
+    const blob = new Blob([entriesToCsv(f.entries)], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -100,7 +110,7 @@ export default function MovimientosView({ f }) {
     try {
       const parsed = csvToEntries(await file.text());
       const res = await f.importEntries(parsed, replace);
-      setImportMsg(`Importados ${res.imported} renglones${res.replaced ? ` (reemplazó ${res.replaced})` : ""}.`);
+      setImportMsg(`Importados ${res.imported} renglones${res.replaced ? ` (reemplazó ${res.replaced})` : ""}${res.skipped ? `; ${res.skipped} ya existían y no se duplicaron` : ""}.`);
     } catch (err) {
       setImportMsg(`No se pudo importar: ${err.message}`);
     } finally {
@@ -115,7 +125,7 @@ export default function MovimientosView({ f }) {
           <option value="todos">Todas las secciones</option>
           {Object.entries(SECTION_LABELS).filter(([k]) => k !== "parametros").map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
-        <button type="button" onClick={() => f.createEntry({ period: f.months[f.months.length - 1], section: filter === "todos" ? "costo_directo" : filter, provider: "Nuevo renglón", basis: "estimado" })} className="text-caption px-3 py-1 rounded bg-brand/30 hover:bg-brand/50 text-white">+ Renglón</button>
+        <button type="button" onClick={() => f.createEntry({ period: f.months[f.months.length - 1], section: ["todos", "cobro", "pago_socio", "contrato", "parametros"].includes(filter) ? "costo_directo" : filter, provider: "Nuevo renglón", basis: "estimado" })} className="text-caption px-3 py-1 rounded bg-brand/30 hover:bg-brand/50 text-white">+ Renglón</button>
         <span className="ml-auto flex items-center gap-3">
           <label className="text-caption text-gray-400 flex items-center gap-1.5">
             <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />

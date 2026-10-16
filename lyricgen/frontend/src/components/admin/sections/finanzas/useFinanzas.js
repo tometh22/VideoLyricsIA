@@ -17,6 +17,7 @@ export default function useFinanzas() {
 
   const contracts = useMemo(() => contractsFrom(entries), [entries]);
   const params = useMemo(() => paramsFrom(entries), [entries]);
+  const firstInicio = contracts[0]?.inicio || null;
   // Sin rango elegido: desde el primer contrato (o tres meses atrás).
   const effectiveSince = since || contracts[0]?.inicio || addMonths(currentPeriod(), -2);
   const months = useMemo(() => monthsBetween(effectiveSince, until), [effectiveSince, until]);
@@ -38,20 +39,27 @@ export default function useFinanzas() {
 
   useEffect(() => {
     let active = true;
-    fetchJson(`${API}/admin/finance/operations?since=${effectiveSince}&until=${until}`)
+    // Las entregas se piden desde el inicio del contrato aunque el rango visible
+    // empiece después: la asignación de producción a cuotas las necesita todas.
+    const opsSince = firstInicio && firstInicio < effectiveSince ? firstInicio : effectiveSince;
+    // Hasta hoy como mínimo: la liquidación no puede depender del "Hasta" visible.
+    const opsUntil = until > currentPeriod() ? until : currentPeriod();
+    fetchJson(`${API}/admin/finance/operations?since=${opsSince}&until=${opsUntil}`)
       .then((data) => active && setOps(data))
       .catch((err) => active && setError(err.message));
     return () => { active = false; };
-  }, [effectiveSince, until]);
+  }, [effectiveSince, until, firstInicio]);
 
   useEffect(() => {
     let active = true;
-    fetchJson(`${API}/admin/finance/auto-costs?since=${effectiveSince}&until=${until}`)
+    const autoSince = firstInicio && firstInicio < effectiveSince ? firstInicio : effectiveSince;
+    const autoUntil = until > currentPeriod() ? until : currentPeriod();
+    fetchJson(`${API}/admin/finance/auto-costs?since=${autoSince}&until=${autoUntil}`)
       .then((data) => active && setAutoCosts(data.costs || []))
       // Sin recolector la planilla funciona igual, con carga manual.
       .catch(() => active && setAutoCosts([]));
     return () => { active = false; };
-  }, [effectiveSince, until]);
+  }, [effectiveSince, until, firstInicio]);
 
   const mutate = useCallback(async (fn) => {
     setError(null);

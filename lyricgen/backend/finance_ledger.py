@@ -16,6 +16,7 @@ por ``/admin/finance/entries/import``.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import statistics
 import unicodedata
@@ -97,6 +98,14 @@ class EntryIn(BaseModel):
             raise ValueError(f"basis inválida: {value}")
         return value
 
+    @field_validator("payload")
+    @classmethod
+    def _payload(cls, value: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if value and value.get("cuota") not in (None, ""):
+            if not PERIOD_RE.match(str(value["cuota"])):
+                raise ValueError("payload.cuota debe ser YYYY-MM")
+        return value
+
     @field_validator("amount_usd")
     @classmethod
     def _amount(cls, value: Optional[float]) -> Optional[float]:
@@ -126,6 +135,19 @@ class ImportIn(BaseModel):
     # Reemplaza los renglones de esos (period, section) en vez de sumarse:
     # reimportar la misma planilla no duplica.
     replace: bool = False
+
+
+# Un cobro o un pago al socio sin cuota caía en la cuota de su mes (el cobro
+# de agosto, hecho en octubre, liquidaba octubre). Se exige al crear.
+CUOTA_REQUIRED = {"cobro", "pago_socio"}
+
+
+def _require_cuota(entry: EntryIn) -> None:
+    if entry.section in CUOTA_REQUIRED and not (entry.payload or {}).get("cuota"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Un renglón de {entry.section} necesita la cuota a la que corresponde (payload.cuota = YYYY-MM)",
+        )
 
 
 def _to_dict(entry: FinanceEntry) -> dict:
@@ -174,6 +196,7 @@ def create_entry(
     admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
+    _require_cuota(body)
     entry = FinanceEntry(**body.model_dump(), created_by_user_id=admin.get("id"),
                          updated_by_user_id=admin.get("id"))
     db.add(entry)
@@ -201,6 +224,11 @@ def update_entry(
         validated = EntryIn(**{k: merged.get(k) for k in EntryIn.model_fields})
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if validated.section in CUOTA_REQUIRED and not (validated.payload or {}).get("cuota"):
+        # Renglones viejos (anteriores a la regla): la cuota es su propio mes.
+        validated.payload = {**(validated.payload or {}), "cuota": validated.period}
+        if "payload" not in changes:
+            changes["payload"] = validated.payload
     for key in changes:
         setattr(entry, key, getattr(validated, key))
     entry.updated_by_user_id = admin.get("id")
@@ -236,28 +264,69 @@ def import_entries(
         raise HTTPException(status_code=422, detail="Sin renglones para importar")
     if len(body.entries) > MAX_IMPORT:
         raise HTTPException(status_code=422, detail=f"Máximo {MAX_IMPORT} renglones por importación")
+    # Un backup exportado trae renglones viejos (anteriores a la regla de la
+    # cuota): se importan con la cuota de su propio mes, como hace el PATCH.
+    for item in body.entries:
+        if item.section in CUOTA_REQUIRED and not (item.payload or {}).get("cuota"):
+            item.payload = {**(item.payload or {}), "cuota": item.period}
     replaced = 0
+    skipped = 0
     now = utcnow()
     if body.replace:
-        keys = {(e.period, e.section) for e in body.entries}
-        for period, section in keys:
-            replaced += (
+        # Reemplaza sólo el mismo renglón lógico (mes, sección, proveedor y
+        # contrato). Nunca borra el contrato ni los parámetros: perderlos
+        # cambia todas las liquidaciones.
+        keys = {(e.period, e.section, e.provider, e.contract) for e in body.entries
+                if e.section not in {"contrato", "parametros"}}
+        for period, section, provider, contract in keys:
+            q = db.query(FinanceEntry).filter(
+                FinanceEntry.period == period,
+                FinanceEntry.section == section,
+                FinanceEntry.deleted_at.is_(None),
+            )
+            q = q.filter(FinanceEntry.provider.is_(None) if provider is None else FinanceEntry.provider == provider)
+            q = q.filter(FinanceEntry.contract.is_(None) if contract is None else FinanceEntry.contract == contract)
+            replaced += q.update({"deleted_at": now, "updated_by_user_id": admin.get("id")},
+                                 synchronize_session=False)
+    for item in body.entries:
+        if item.section in {"contrato", "parametros"}:
+            # Contrato y parámetros se actualizan en el lugar: reimportar no
+            # duplica el contrato (dos contratos cambian qué cuota se muestra).
+            existing = (
                 db.query(FinanceEntry)
                 .filter(
-                    FinanceEntry.period == period,
-                    FinanceEntry.section == section,
+                    FinanceEntry.section == item.section,
                     FinanceEntry.deleted_at.is_(None),
+                    FinanceEntry.contract.is_(None) if item.contract is None else FinanceEntry.contract == item.contract,
                 )
-                .update({"deleted_at": now, "updated_by_user_id": admin.get("id")},
-                        synchronize_session=False)
+                .first()
             )
-    for item in body.entries:
+            if existing is not None:
+                for key, value in item.model_dump().items():
+                    setattr(existing, key, value)
+                existing.updated_by_user_id = admin.get("id")
+                existing.updated_at = now
+                continue
+        if not body.replace:
+            # Sin reemplazo, un renglón idéntico a uno existente no se duplica
+            # (reimportar el mismo archivo no puede contar dos veces un costo).
+            same = db.query(FinanceEntry).filter(
+                FinanceEntry.deleted_at.is_(None),
+                FinanceEntry.period == item.period,
+                FinanceEntry.section == item.section,
+                FinanceEntry.provider.is_(None) if item.provider is None else FinanceEntry.provider == item.provider,
+                FinanceEntry.concept.is_(None) if item.concept is None else FinanceEntry.concept == item.concept,
+                FinanceEntry.amount_usd.is_(None) if item.amount_usd is None else FinanceEntry.amount_usd == item.amount_usd,
+            ).first()
+            if same is not None:
+                skipped += 1
+                continue
         db.add(FinanceEntry(**item.model_dump(), created_by_user_id=admin.get("id"),
                             updated_by_user_id=admin.get("id")))
     _audit(db, admin, "finance.entries.imported", None,
-           count=len(body.entries), replaced=replaced)
+           count=len(body.entries), replaced=replaced, skipped=skipped)
     db.commit()
-    return {"imported": len(body.entries), "replaced": replaced}
+    return {"imported": len(body.entries) - skipped, "replaced": replaced, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +499,15 @@ AUTO_SOURCES = {
 }
 
 
+def _auto_sources() -> dict:
+    """OpenAI entra recién cuando el recolector lee la organización de Genly
+    (FINANCE_OPENAI_AUTO=1, se prende al cargar su admin key)."""
+    sources = dict(AUTO_SOURCES)
+    if os.environ.get("FINANCE_OPENAI_AUTO", "").strip() == "1":
+        sources["openai"] = ("IA", "OpenAI")
+    return sources
+
+
 @router.get("/auto-costs")
 def auto_costs(
     since: str = Query(..., description="YYYY-MM"),
@@ -448,6 +526,7 @@ def auto_costs(
     start = datetime.strptime(since, "%Y-%m").date()
     y, m = map(int, until.split("-"))
     end = datetime(y + (m == 12), (m % 12) + 1, 1).date()
+    sources = _auto_sources()
     rows = (
         db.query(CostDaily.day, CostDaily.source, CostDaily.amount_usd,
                  CostDaily.is_estimate, CostDaily.fetched_at)
@@ -456,7 +535,7 @@ def auto_costs(
             CostDaily.dim_type == "total",
             CostDaily.day >= start,
             CostDaily.day < end,
-            CostDaily.source.in_(list(AUTO_SOURCES)),
+            CostDaily.source.in_(list(sources)),
         )
         .all()
     )
@@ -477,7 +556,7 @@ def auto_costs(
         nxt = datetime(my + (mm == 12), (mm % 12) + 1, 1).date()
         # Días esperados: hasta ayer en el mes en curso (el de hoy no cerró).
         expected = (min(nxt, today) - first).days
-        category, provider = AUTO_SOURCES[source]
+        category, provider = sources[source]
         out.append({
             "month": month, "source": source, "category": category, "provider": provider,
             "amount_usd": round(v["amount_usd"], 2), "days": len(v["days"]),

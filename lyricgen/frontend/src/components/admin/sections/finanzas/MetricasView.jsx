@@ -38,8 +38,10 @@ export default function MetricasView({ f, pnl, effective = [] }) {
   const piezas = (t.piezas_vl || 0) + (t.piezas_at || 0);
   // Horas de operación cargadas en los renglones de operadores (payload.horas).
   const horas = effective.filter((e) => e.section === "mano_obra" && months.includes(e.period)).reduce((a, e) => a + (Number(e.payload?.horas) || 0), 0);
-  const entregas = (ops.deliveries || []).reduce((a, d) => a + d.entregas, 0);
-  const crRecibidos = (ops.change_requests || []).reduce((a, c) => a + c.recibidos, 0);
+  // ops trae datos desde el inicio del contrato; las métricas son del rango visible.
+  const inRange = (r) => months.includes(r.month);
+  const entregas = (ops.deliveries || []).filter(inRange).reduce((a, d) => a + d.entregas, 0);
+  const crRecibidos = (ops.change_requests || []).filter(inRange).reduce((a, c) => a + c.recibidos, 0);
 
   const byMonth = (rows, pick) => months.map((m) => rows.filter((r) => r.month === m).reduce((a, r) => a + pick(r), 0));
   const deliveredVl = byMonth(ops.deliveries || [], (r) => (r.type === "lyric_video" ? r.canciones : 0));

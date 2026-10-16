@@ -1,14 +1,32 @@
 # Changelog
 
-## [1.1.134] - 2026-10-15
+## [1.1.134] - 2026-10-16
+
+### Changed
+
+- **Finanzas se completa solo y cada liquidación es confiable.**
+  - La producción (IA y operadores) se asigna sola a la cuota de las piezas que produjo, por orden de entregas (FIFO), sin marcarla a mano.
+  - Servidores y herramientas van a su mes. Con contratos superpuestos, cada entrega cuenta para un solo contrato y los costos se reparten según el peso de cada cuota.
+  - Operadores externos automáticos: letras aprobadas × tarifa + comisión, por persona.
+  - Producción interna automática: días hábiles × horas × tarifa, desde una fecha. Sin esa fecha no se calcula.
+  - OpenAI entra en los costos automáticos con `FINANCE_OPENAI_AUTO=1`.
+  - Botones **Registrar cobro** (pesos y tipo de cambio, admite cobro parcial) y **Registrar pago al socio**.
+  - Al pagar al socio, la liquidación queda **congelada** con los números pagados. Lo que llega después va a la próxima cuota abierta, y si se edita un renglón ya pagado, se avisa la diferencia.
 
 ### Fixed
 
-- Finanzas → Liquidación: una cuota sin cobrar ya no muestra una ganancia ni una parte del socio que no existen.
-  - Ganancia y socio aparecen como "—", con la aclaración de que se calculan al cobrar la cuota.
-  - Los costos se rotulan "cargados hasta hoy".
-  - No se muestra el reparto de cada dólar.
-  - Un aviso explica que la IA y los operadores de ese período se imputaron al cupo que produjeron.
+- Lo hallado en dos auditorías:
+  - **Cobros y pagos al socio exigen cuota.** No pueden caer en la cuota de su mes de carga. Los renglones viejos que no la tienen toman la de su propio mes.
+  - **Recurrentes:** ya no arrastran la cuota ni datos de cobro, y un cambio de precio reemplaza al anterior.
+  - **Lo cargado a mano pisa a lo automático** según la fuente: "R2" equivale a "Cloudflare R2", y Google Workspace ya no tapa a Google Cloud.
+  - **Ingreso:** en una cuota cobrada es lo que entró, no la cuota completa.
+  - **Cuotas sin cobrar:** no muestran ganancia ni socio, y lo copiado sale marcado como PROYECCIÓN.
+  - **Rango Desde/Hasta:** la liquidación ya no depende de él.
+  - **Importar y exportar:** el CSV exporta el payload, el contrato y los parámetros. La importación no duplica renglones idénticos y nunca borra el contrato ni los parámetros. El reemplazo se hace por mes, sección, proveedor y contrato.
+  - **Números en formato es-AR:** "1.535" se lee como 1535 y se pueden tipear decimales.
+  - **Borrar:** vaciar una celda borra el renglón con confirmación (un monto vacío dejaba el costo en 0). Borrar desde Movimientos también pide confirmación.
+  - **Fecha del pago:** se toma la local.
+  - **Métricas:** respetan el rango visible.
 
 ## [1.1.133] - 2026-10-15
 

@@ -162,3 +162,52 @@ def test_auto_costs_sums_daily_totals_and_reports_coverage(client, admin_token, 
     assert [c["source"] for c in costs] == ["railway"]
     assert costs[0]["amount_usd"] == 3.5
     assert costs[0]["days"] == 2 and costs[0]["expected_days"] == 31
+
+
+def test_auto_costs_includes_openai_only_when_enabled(client, admin_token, db, monkeypatch):
+    from datetime import date
+    from database import CostDaily
+
+    db.add(CostDaily(day=date(2025, 6, 1), source="openai", grain="day", dim_type="total",
+                     dim_value="total", amount_usd=5, basis="measured"))
+    db.commit()
+    url = "/admin/finance/auto-costs?since=2025-06&until=2025-06"
+    assert [c["source"] for c in client.get(url, headers=auth(admin_token)).json()["costs"]] == []
+    monkeypatch.setenv("FINANCE_OPENAI_AUTO", "1")
+    assert [c["source"] for c in client.get(url, headers=auth(admin_token)).json()["costs"]] == ["openai"]
+
+
+def test_cobro_y_pago_exigen_cuota_y_la_validan(client, admin_token):
+    cobro = _entry(section="cobro", provider="Cliente", amount_usd=1000)
+    assert client.post("/admin/finance/entries", json=cobro, headers=auth(admin_token)).status_code == 422
+    cobro["payload"] = {"cuota": "2026-13"}
+    assert client.post("/admin/finance/entries", json=cobro, headers=auth(admin_token)).status_code == 422
+    cobro["payload"] = {"cuota": "2026-08", "ars": 1500000}
+    assert client.post("/admin/finance/entries", json=cobro, headers=auth(admin_token)).status_code == 200
+
+
+def test_import_replace_no_borra_contrato_ni_otros_proveedores(client, admin_token):
+    contrato = _entry(period="2032-01", section="contrato", provider="Cliente", amount_usd=None,
+                      payload={"inicio": "2032-01", "meses": 6})
+    otro = _entry(period="2032-01", provider="Otro proveedor", amount_usd=5)
+    client.post("/admin/finance/entries/import", json={"entries": [contrato, otro]}, headers=auth(admin_token))
+    nuevo = _entry(period="2032-01", provider="Railway", amount_usd=9)
+    res = client.post("/admin/finance/entries/import", json={"entries": [contrato, nuevo], "replace": True},
+                      headers=auth(admin_token))
+    assert res.status_code == 200, res.text
+    mine = [e for e in client.get("/admin/finance/entries", headers=auth(admin_token)).json()["entries"]
+            if e["period"] == "2032-01"]
+    assert sorted(e["provider"] for e in mine if e["section"] == "costo_directo") == ["Otro proveedor", "Railway"]
+    assert len([e for e in mine if e["section"] == "contrato"]) == 1
+
+
+def test_import_sin_reemplazo_no_duplica_y_completa_cuota_vieja(client, admin_token):
+    viejo = _entry(period="2033-02", section="pago_socio", provider="Socio", amount_usd=700)
+    costo = _entry(period="2033-02", provider="Railway", amount_usd=12)
+    for _ in range(2):
+        res = client.post("/admin/finance/entries/import", json={"entries": [viejo, costo]}, headers=auth(admin_token))
+        assert res.status_code == 200, res.text
+    mine = [e for e in client.get("/admin/finance/entries", headers=auth(admin_token)).json()["entries"]
+            if e["period"] == "2033-02"]
+    assert len(mine) == 2
+    assert next(e for e in mine if e["section"] == "pago_socio")["payload"]["cuota"] == "2033-02"

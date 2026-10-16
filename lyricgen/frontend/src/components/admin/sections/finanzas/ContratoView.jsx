@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 
 import KpiCard from "../../primitives/KpiCard";
-import { contractStatus, contractForCuota, liquidacion, monthLabel } from "./finanzasModel";
+import { addMonths, contractStatus, liquidacion, monthLabel, parseNumberAr } from "./finanzasModel";
 
 const money = (v) => `US$ ${(Number(v) || 0).toLocaleString("es-AR", { maximumFractionDigits: 0 })}`;
 const pesos = (v) => `$ ${(Number(v) || 0).toLocaleString("es-AR", { maximumFractionDigits: 0 })}`;
@@ -74,7 +74,9 @@ function ContractForm({ initial, onSave, onCancel }) {
 function ParamsForm({ params, onSave }) {
   const [p, setP] = useState(params);
   useEffect(() => setP(params), [params]);
-  const set = (k) => (e) => setP({ ...p, [k]: Number(String(e.target.value).replace(",", ".")) });
+  // Se guarda el texto tal cual se tipea ("0,08" no puede convertirse a 8 a
+  // mitad de camino); se convierte a número recién al guardar.
+  const set = (k) => (e) => setP({ ...p, [k]: e.target.value });
   const row = (label, key, hint) => (
     <label className="flex items-center justify-between gap-3 text-caption text-gray-300">
       <span>{label}{hint && <span className="block text-label text-gray-600">{hint}</span>}</span>
@@ -87,9 +89,58 @@ function ParamsForm({ params, onSave }) {
       {row("Parte del socio", "pct_socio", "0,5 = 50% de la ganancia")}
       {row("Tipo de cambio por defecto", "tipo_cambio", "ARS por US$, si la cuota no tiene el suyo")}
       {row("Reserva (meses de costos)", "reserva_meses")}
+      <div className="pt-3 border-t border-white/[0.06] space-y-2">
+        <p className="text-caption text-gray-300 font-semibold">Operadores externos (automático)
+          <span className="block text-label text-gray-600 font-normal">Letras aprobadas en el sistema × tarifa por canción, más comisión. Un mes con pagos cargados a mano no se recalcula.</span>
+        </p>
+        {(p.operadores || []).map((o, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <input className={`${field} w-28`} placeholder="usuario" value={o.usuario || ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, usuario: e.target.value } : x)) })} />
+            <input className={`${field} w-20`} placeholder="nombre" value={o.nombre || ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, nombre: e.target.value } : x)) })} />
+            <input className={`${field} w-16 text-right`} placeholder="US$" value={o.tarifa_cancion ?? ""} onChange={(e) => setP({ ...p, operadores: p.operadores.map((x, j) => (j === i ? { ...x, tarifa_cancion: e.target.value } : x)) })} />
+            <button type="button" className="text-label text-gray-600 hover:text-red-300" onClick={() => setP({ ...p, operadores: p.operadores.filter((_, j) => j !== i) })}>✕</button>
+          </div>
+        ))}
+        <button type="button" className="text-label text-brand-light" onClick={() => setP({ ...p, operadores: [...(p.operadores || []), { usuario: "", nombre: "", tarifa_cancion: 0 }] })}>+ operador</button>
+        {row("Comisión de la plataforma", "comision_operadores", "0,0834 = 8,34%")}
+        <label className="flex items-center justify-between gap-3 text-caption text-gray-300">
+          <span>Calcular desde (mes)<span className="block text-label text-gray-600">YYYY-MM; antes queda lo cargado a mano</span></span>
+          <input className={`${field} w-24 text-right`} value={p.operadores_desde || ""} onChange={(e) => setP({ ...p, operadores_desde: e.target.value })} />
+        </label>
+      </div>
+      <div className="pt-3 border-t border-white/[0.06] space-y-2">
+        <p className="text-caption text-gray-300 font-semibold">Producción interna (automático)
+          <span className="block text-label text-gray-600 font-normal">Días hábiles × horas por día × tarifa. Un mes con "Producción interna" cargada a mano no se recalcula.</span>
+        </p>
+        {["horas_dia", "tarifa_hora", "personas"].map((k) => (
+          <label key={k} className="flex items-center justify-between gap-3 text-caption text-gray-300">
+            <span>{{ horas_dia: "Horas por día hábil", tarifa_hora: "Tarifa por hora (US$)", personas: "Personas" }[k]}</span>
+            <input className={`${field} w-24 text-right`} value={p.produccion_interna?.[k] ?? ""} onChange={(e) => setP({ ...p, produccion_interna: { ...(p.produccion_interna || {}), [k]: e.target.value } })} />
+          </label>
+        ))}
+        <label className="flex items-center justify-between gap-3 text-caption text-gray-300">
+          <span>Contar desde (fecha)<span className="block text-label text-gray-600">YYYY-MM-DD; lo anterior ya está cargado</span></span>
+          <input className={`${field} w-28 text-right`} value={p.produccion_interna?.desde || ""} onChange={(e) => setP({ ...p, produccion_interna: { ...(p.produccion_interna || {}), desde: e.target.value } })} />
+        </label>
+      </div>
       <button
         type="button"
-        onClick={() => { const { entryId: _ignored, ...payload } = p; onSave(payload); }}
+        onClick={() => {
+          const { entryId: _ignored, ...raw } = p;
+          const toNum = (v) => (typeof v === "string" ? (parseNumberAr(v) ?? 0) : v);
+          const payload = {
+            ...raw,
+            pct_socio: toNum(raw.pct_socio), tipo_cambio: toNum(raw.tipo_cambio), reserva_meses: toNum(raw.reserva_meses),
+            comision_operadores: toNum(raw.comision_operadores),
+            operadores: (raw.operadores || []).map((o) => ({ ...o, tarifa_cancion: toNum(o.tarifa_cancion) })),
+            produccion_interna: raw.produccion_interna ? {
+              ...raw.produccion_interna,
+              horas_dia: toNum(raw.produccion_interna.horas_dia), tarifa_hora: toNum(raw.produccion_interna.tarifa_hora),
+              personas: toNum(raw.produccion_interna.personas),
+            } : raw.produccion_interna,
+          };
+          onSave(payload);
+        }}
         className="w-full mt-1 text-caption px-3 py-1.5 rounded bg-brand text-white hover:opacity-90"
       >
         Guardar parámetros
@@ -98,13 +149,19 @@ function ParamsForm({ params, onSave }) {
   );
 }
 
-export default function ContratoView({ f, effective }) {
+export default function ContratoView({ f, effective, months: allMonths }) {
   const [editing, setEditing] = useState(null);
   const { contracts, params, entries, ops, months } = f;
   // El reparto sale de las liquidaciones por cuota: es el mismo número que
   // se le manda al socio, no un recálculo por mes calendario.
-  const cuotas = months.filter((m) => contractForCuota(contracts, m));
-  const liqs = cuotas.map((m) => liquidacion({ entries: effective || entries, contracts, params, cuota: m }));
+  // Cada cuota con SU contrato (con contratos superpuestos, el mismo mes es
+  // una cuota de cada uno).
+  const pairs = contracts.flatMap((c) => (allMonths || months)
+    .filter((m) => m >= c.inicio && m <= addMonths(c.inicio, (Number(c.meses) || 1) - 1))
+    .map((m) => [c, m]));
+  const liqs = pairs.map(([c, m]) => liquidacion({
+    entries: effective || entries, contracts, params, cuota: m, deliveries: ops.deliveries || [], months: allMonths || months, contract: c,
+  }));
   // Solo cuotas cobradas: las demás son proyección y no se le deben todavía.
   const cobradas = liqs.filter((l) => l.cobrada);
   const socio = cobradas.reduce((a, l) => a + l.socio, 0);
@@ -182,7 +239,7 @@ export default function ContratoView({ f, effective }) {
         <section className="glass rounded-card p-5 space-y-4">
           <div>
             <h3 className="text-base font-semibold text-white">Reparto con el socio</h3>
-            <p className="text-caption text-gray-500">Suma de las liquidaciones por cuota de {monthLabel(months[0])} a {monthLabel(months[months.length - 1])}.</p>
+            <p className="text-caption text-gray-500">Suma de las liquidaciones de todas las cuotas cobradas del contrato.</p>
           </div>
           <div className="grid gap-3 md:grid-cols-3">
             <KpiCard label="Le corresponde" value={money(socio)} tone="warn" hint={`${socioArs ? pesos(socioArs) + " · " : ""}${cobradas.length} cuota${cobradas.length === 1 ? "" : "s"} cobrada${cobradas.length === 1 ? "" : "s"}`} />
@@ -202,12 +259,12 @@ export default function ContratoView({ f, effective }) {
             </thead>
             <tbody>
               {liqs.map((l) => (
-                <tr key={l.cuota} className={`border-t border-white/[0.05] ${l.cobrada ? "text-gray-300" : "text-gray-600"}`}>
-                  <td className="py-1.5">{monthLabel(l.cuota)}{!l.cobrada && <span className="ml-1.5 text-label">· sin cobrar (proyección)</span>}</td>
+                <tr key={`${l.contract?.nombre}-${l.cuota}`} className={`border-t border-white/[0.05] ${l.cobrada ? "text-gray-300" : "text-gray-600"}`}>
+                  <td className="py-1.5">{contracts.length > 1 ? `${l.contract?.nombre} · ` : ""}{monthLabel(l.cuota)}{!l.cobrada && <span className="ml-1.5 text-label">· sin cobrar (proyección)</span>}</td>
                   <td className="text-right tabular-nums">{l.cobrado ? money(l.cobrado) : "—"}</td>
                   <td className="text-right tabular-nums">{money(l.costos)}</td>
-                  <td className="text-right tabular-nums">{money(l.ganancia)}</td>
-                  <td className={`text-right tabular-nums ${l.cobrada ? "text-amber-300" : ""}`}>{money(l.socio)}{l.cobrada && l.socioArs ? ` · ${pesos(l.socioArs)}` : ""}</td>
+                  <td className="text-right tabular-nums">{l.cobrada ? money(l.ganancia) : "—"}</td>
+                  <td className={`text-right tabular-nums ${l.cobrada ? "text-amber-300" : ""}`}>{l.cobrada ? `${money(l.socio)}${l.socioArs ? ` · ${pesos(l.socioArs)}` : ""}` : "—"}</td>
                   <td className="text-right tabular-nums">{money(l.pagado)}</td>
                 </tr>
               ))}
