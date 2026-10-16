@@ -7,7 +7,7 @@
 // salen del sistema (entregas, trabajo imputado) no.
 import { useMemo, useState } from "react";
 
-import { BASIS_LABELS, groupRows, monthChecklist, monthLabel } from "./finanzasModel";
+import { BASIS_LABELS, groupRows, monthChecklist, monthLabel, parseNumberAr } from "./finanzasModel";
 
 const usd = (v) => {
   const n = Number(v) || 0;
@@ -35,7 +35,7 @@ export function BasisBadge({ basis }) {
   );
 }
 
-function EditableCell({ value, entries, onSave, onCreate }) {
+function EditableCell({ value, entries, onSave, onCreate, onDelete, readOnly = false }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const real = (entries || []).filter((e) => !e.synthetic);
@@ -46,11 +46,18 @@ function EditableCell({ value, entries, onSave, onCreate }) {
   if (editing) {
     const commit = async () => {
       setEditing(false);
-      const n = draft.trim() === "" ? null : Number(draft.replace(",", "."));
-      if (n !== null && !Number.isFinite(n)) return;
-      // Editar un valor automático lo convierte en uno cargado a mano.
-      if (real.length === 1) await onSave(real[0], n);
-      else if (n !== null) await onCreate(n);
+      const n = draft.trim() === "" ? null : parseNumberAr(draft);
+      if (draft.trim() !== "" && n === null) return; // texto inválido: no se toca nada
+      // Editar un valor automático lo convierte en uno cargado a mano. Vaciar
+      // una celda borra el renglón (un monto vacío tapaba al automático y el
+      // costo pasaba a 0 sin aviso).
+      if (real.length === 1) {
+        if (n === null) {
+          const rec = real[0].payload?.recurrente ? " Es un gasto mensual: deja de repetirse." : "";
+          if (window.confirm(`¿Borrar este renglón?${rec}`)) await onDelete(real[0]);
+        } else await onSave(real[0], n);
+      }
+      else if (n !== null && onCreate) await onCreate(n);
     };
     return (
       <td className="px-2 py-1 text-right">
@@ -76,7 +83,7 @@ function EditableCell({ value, entries, onSave, onCreate }) {
         : synthetic && !real.length ? `${evidence}\nAutomático. Clic para reemplazarlo por un valor cargado a mano.`
           : evidence || "Clic para cargar"}
       onClick={() => {
-        if (many) return;
+        if (many || readOnly) return;
         setDraft(value ? String(Math.round(value * 100) / 100) : "");
         setEditing(true);
       }}
@@ -179,7 +186,12 @@ function AddRow({ section, months, onCreate }) {
   );
 }
 
-function GroupRows({ section, entries, months, onSave, onCreate }) {
+// Cobros y pagos al socio no se cargan desde la planilla: necesitan la cuota
+// y se registran con los botones de la Liquidación.
+const READ_ONLY_SECTIONS = new Set(["cobro", "pago_socio"]);
+
+function GroupRows({ section, entries, months, onSave, onCreate, onDelete }) {
+  const readOnly = READ_ONLY_SECTIONS.has(section);
   const rows = useMemo(() => groupRows(entries, section, months), [entries, section, months]);
   let lastCategory = null;
   return (
@@ -199,6 +211,8 @@ function GroupRows({ section, entries, months, onSave, onCreate }) {
                 key={m}
                 value={r.byMonth[m]}
                 entries={r.entries[m]}
+                readOnly={readOnly}
+                onDelete={(entry) => onDelete(entry.id)}
                 onSave={(entry, amount) => onSave(entry.id, { amount_usd: amount })}
                 onCreate={(amount) => onCreate({ section, period: m, category: r.category === "Sin categoría" ? null : r.category, provider: r.provider, amount_usd: amount, basis: r.bases[0] || "estimado" })}
               />
@@ -207,7 +221,7 @@ function GroupRows({ section, entries, months, onSave, onCreate }) {
           </tr>
         );
       })}
-      <AddRow section={section} months={months} onCreate={onCreate} />
+      {!readOnly && <AddRow section={section} months={months} onCreate={onCreate} />}
     </>
   );
 }
@@ -238,6 +252,7 @@ export default function ResultadoView({ f, pnl, effective }) {
   const entries = effective || f.entries;
   const save = (id, body) => f.updateEntry(id, body);
   const create = (body) => f.createEntry(body);
+  const remove = (id) => f.deleteEntry(id);
   const piezas = Object.fromEntries(months.map((m) => [m, pnl.perMonth[m].ingresoEntregas]));
 
   return (
@@ -261,17 +276,17 @@ export default function ResultadoView({ f, pnl, effective }) {
             values={piezas} months={months} total={pnl.total.ingresoEntregas}
             badge={<BasisBadge basis="sistema" />}
           />
-          <GroupRows section="ingreso" entries={entries} months={months} onSave={save} onCreate={create} />
+          <GroupRows section="ingreso" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
           <TotalRow label="Ingreso total" pnl={pnl} field="ingreso" months={months} />
 
           <SectionTitle label="Costos directos" months={months} hint="lo que cuesta producir: infraestructura, IA y operadores" />
-          <GroupRows section="costo_directo" entries={entries} months={months} onSave={save} onCreate={create} />
+          <GroupRows section="costo_directo" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
           <SectionTitle label="Mano de obra pagada" months={months} />
-          <GroupRows section="mano_obra" entries={entries} months={months} onSave={save} onCreate={create} />
+          <GroupRows section="mano_obra" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
           <TotalRow label="Margen bruto" pnl={pnl} field="margenBruto" months={months} tone="text-accent" ratioOf="ingreso" />
 
           <SectionTitle label="Gastos de estructura" months={months} hint="lo que se paga aunque no haya clientes" />
-          <GroupRows section="estructura" entries={entries} months={months} onSave={save} onCreate={create} />
+          <GroupRows section="estructura" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
           <TotalRow label="Resultado operativo (antes del trabajo del equipo)" pnl={pnl} field="operativo" months={months} ratioOf="ingreso" />
 
           <tr>
@@ -281,8 +296,8 @@ export default function ResultadoView({ f, pnl, effective }) {
           </tr>
 
           <SectionTitle label="Caja" months={months} hint="lo cobrado y pagado efectivamente" />
-          <GroupRows section="cobro" entries={entries} months={months} onSave={save} onCreate={create} />
-          <GroupRows section="pago_socio" entries={entries} months={months} onSave={save} onCreate={create} />
+          <GroupRows section="cobro" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
+          <GroupRows section="pago_socio" entries={entries} months={months} onSave={save} onCreate={create} onDelete={remove} />
         </tbody>
       </table>
       <p className="mt-3 text-label text-gray-600">

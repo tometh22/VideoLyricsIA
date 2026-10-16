@@ -8,7 +8,13 @@
 // Los costos por categoría son magnitud → un solo tono (azul).
 import { useMemo, useState } from "react";
 
-import { addMonths, currentPeriod, liquidacion, liquidacionTexto, monthLabel, monthsBetween } from "./finanzasModel";
+import { addMonths, currentPeriod, liquidacion, liquidacionSnapshot, liquidacionTexto, monthLabel, monthsBetween, parseNumberAr } from "./finanzasModel";
+
+// Fecha local (no UTC): un pago a las 22 h del último día no puede caer en el mes siguiente.
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 import { BasisBadge } from "./ResultadoView";
 
 const SERIES = { costos: "#2a78d6", socio: "#eb6834", genly: "#1baf7a" };
@@ -130,23 +136,96 @@ function CostBars({ lines, total, cobrado }) {
   );
 }
 
+function RegistrarCobro({ l, contract, onCreate }) {
+  const [open, setOpen] = useState(false);
+  const [arsTxt, setArsTxt] = useState("");
+  const [tcTxt, setTcTxt] = useState("");
+  const [fecha, setFecha] = useState(today());
+  const [saving, setSaving] = useState(false);
+  const pendiente = Math.max(0, l.fee - (l.cobrado || 0));
+  const arsValue = parseNumberAr(arsTxt) || 0;
+  // El tipo de cambio es el de la factura (BNA del día). Si no se escribe, se
+  // sugiere el que cierra contra lo pendiente; para un cobro parcial hay que escribirlo.
+  const tc = parseNumberAr(tcTxt) || (arsValue > 0 && pendiente ? Math.round((arsValue / pendiente) * 100) / 100 : null);
+  const usdValue = tc ? Math.round((arsValue / tc) * 100) / 100 : 0;
+  const label = l.cobrada ? "Registrar el resto del cobro" : "Registrar cobro";
+  if (!open) return <button type="button" className="fin-btn" onClick={() => setOpen(true)}>{label}</button>;
+  const save = async () => {
+    if (!tc || !usdValue) return;
+    setSaving(true);
+    try {
+      await onCreate({
+        period: fecha.slice(0, 7), section: "cobro", category: "Cobros", provider: contract.cliente || "Cliente",
+        concept: `Cuota ${monthLabel(l.cuota)} (cobrada ${fecha})`, amount_usd: usdValue, basis: "captura",
+        contract: contract.nombre, evidence: `Transferencia ${fecha}: ARS ${arsValue.toLocaleString("es-AR")} a ${tc}`,
+        payload: { cuota: l.cuota, ars: arsValue, tipo_cambio: tc, fecha },
+      });
+      setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+  const input = "rounded-md border border-slate-300 px-2 py-1 text-[14px]";
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2">
+      <span className="text-[13px] text-slate-700">ARS cobrados</span>
+      <input className={`${input} w-32 text-right`} value={arsTxt} onChange={(e) => setArsTxt(e.target.value)} placeholder="9.517.000" aria-label="ARS cobrados" />
+      <span className="text-[13px] text-slate-700">Tipo de cambio</span>
+      <input className={`${input} w-24 text-right`} value={tcTxt} onChange={(e) => setTcTxt(e.target.value)} placeholder={tc ? String(tc) : "1.535"} aria-label="Tipo de cambio" />
+      <input type="date" className={input} value={fecha} onChange={(e) => setFecha(e.target.value)} aria-label="Fecha de cobro" />
+      <span className="text-[13px] text-slate-500">{usdValue ? `= US$ ${usd(usdValue)}${usdValue < pendiente - 0.01 ? " (parcial)" : ""}` : ""}</span>
+      <button type="button" className="fin-btn" disabled={!usdValue || saving} onClick={save}>{saving ? "Guardando…" : "Guardar"}</button>
+      <button type="button" className="text-[13px] text-slate-500" onClick={() => setOpen(false)}>Cancelar</button>
+    </div>
+  );
+}
+
+function RegistrarPago({ l, contract, onCreate }) {
+  const [saving, setSaving] = useState(false);
+  const save = async () => {
+    if (!window.confirm(`¿Registrar el pago al socio de US$ ${usd(l.saldo)}? La liquidación de ${monthLabel(l.cuota)} queda congelada con estos números.`)) return;
+    setSaving(true);
+    try {
+      const fecha = today();
+      await onCreate({
+        period: fecha.slice(0, 7), section: "pago_socio", category: "Socio", provider: "Socio",
+        concept: `Pago cuota ${monthLabel(l.cuota)} (${fecha})`, amount_usd: l.saldo, basis: "captura",
+        contract: contract.nombre,
+        evidence: l.socioArs ? `ARS ${Math.round(l.saldo * l.tc).toLocaleString("es-AR")} al tipo de cambio de la cuota (${l.tc})` : "",
+        payload: { cuota: l.cuota, fecha, ars: l.tc ? Math.round(l.saldo * l.tc) : null, snapshot: liquidacionSnapshot(l) },
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <button type="button" className="fin-btn" disabled={saving} onClick={save}>
+      {saving ? "Guardando…" : `Registrar pago al socio (US$ ${usd(l.saldo)})`}
+    </button>
+  );
+}
+
 function cuotaStatus(l, cuota) {
   if (cuota > currentPeriod()) return { tone: "muted", label: "Futura" };
   if (!l.cobrada) return { tone: "warn", label: "Sin cobrar" };
+  if (l.socio <= 0.01 && l.pagado <= 0.01) return { tone: "muted", label: "Sin ganancia para repartir" };
   if (l.saldo <= 0.01) return { tone: "ok", label: "Pagada al socio" };
   return { tone: "warn", label: "Cobrada · falta pagar" };
 }
 
-export default function LiquidacionView({ f, effective }) {
+export default function LiquidacionView({ f, effective, months }) {
   const { contracts, params } = f;
-  const contract = contracts[0];
+  const [contractName, setContractName] = useState(null);
+  const contract = contracts.find((c) => c.nombre === contractName) || contracts[contracts.length - 1];
   const cuotas = useMemo(() => {
     if (!contract) return [];
     return monthsBetween(contract.inicio, addMonths(contract.inicio, (Number(contract.meses) || 1) - 1));
   }, [contract]);
   const liqs = useMemo(
-    () => Object.fromEntries(cuotas.map((m) => [m, liquidacion({ entries: effective, contracts, params, cuota: m })])),
-    [cuotas, effective, contracts, params],
+    () => Object.fromEntries(cuotas.map((m) => [m, liquidacion({
+      entries: effective, contracts, params, cuota: m, deliveries: f.ops.deliveries || [], months, contract,
+    })])),
+    [cuotas, effective, contracts, params, f.ops, months, contract],
   );
   const defaultCuota = [...cuotas].reverse().find((m) => liqs[m]?.cobrada) || cuotas[0];
   const [selected, setSelected] = useState(null);
@@ -180,11 +259,48 @@ export default function LiquidacionView({ f, effective }) {
           <p className="text-[13px] font-semibold uppercase tracking-[0.12em] text-violet-600">Cuota {index} de {cuotas.length} · {contract.nombre}</p>
           <h3 className="mt-1 text-[28px] font-bold text-slate-900 capitalize">{monthLong(cuota)}</h3>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Status tone={st.tone}>{st.label}</Status>
-          <button type="button" onClick={copy} className="fin-btn">{copied ? "Copiada ✓" : "Copiar para mandar"}</button>
+          {(!l.cobrada || l.cobroParcial) && cuota <= currentPeriod() && !l.frozen && <RegistrarCobro l={l} contract={contract} onCreate={f.createEntry} />}
+          {l.cobrada && l.saldo > 0.01 && !l.frozen && <RegistrarPago l={l} contract={contract} onCreate={f.createEntry} />}
+          {l.cobrada && <button type="button" onClick={copy} className="fin-btn">{copied ? "Copiada ✓" : "Copiar para mandar"}</button>}
         </div>
       </div>
+
+      {contracts.length > 1 && (
+        <div className="flex flex-wrap gap-2">
+          {contracts.map((c) => (
+            <button key={c.nombre} type="button" onClick={() => { setContractName(c.nombre); setSelected(null); }}
+              className={`fin-cuota !flex-row !items-center gap-2 !py-2 ${c.nombre === contract.nombre ? "is-active" : ""}`}>
+              <span className="text-[14px] font-semibold text-slate-900">{c.nombre}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {l.cobroParcial && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-3 text-[14px] text-amber-900">
+          <b>Cobro parcial.</b> Entraron US$ {usd(l.cobrado)} de los US$ {usd(l.fee)} de la cuota: la liquidación usa lo que entró.
+        </div>
+      )}
+      {l.frozen && (
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-3 text-[14px] text-emerald-900">
+          <b>Liquidación cerrada.</b> Se muestra tal como se pagó. Los costos que lleguen después se liquidan en la próxima cuota abierta.
+          {Math.abs(l.drift || 0) > 0.01 && <> Ojo: renglones que estaban en este pago cambiaron después en US$ {usd(l.drift)}; cargá el ajuste en la cuota abierta.</>}
+        </div>
+      )}
+      {l.cobrada && l.saldo < -0.01 && (
+        <div className="rounded-2xl border border-sky-200 bg-sky-50 px-5 py-3 text-[14px] text-sky-900">
+          <b>Pagado de más:</b> los pagos registrados superan en US$ {usd(-l.saldo)} lo que le corresponde. Revisá los pagos de esta cuota.
+        </div>
+      )}
+      {!l.cobrada && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] leading-relaxed text-amber-900">
+          <b>Cuota sin cobrar.</b> Todavía no hay liquidación: lo que ves son solo los gastos del mes cargados hasta hoy
+          (servidores y herramientas). La IA y los operadores de este período se imputaron al cupo de las piezas que
+          produjeron{cuota > contract.inicio ? " de cuotas anteriores, cuando el material llegó tarde" : ""}. La ganancia y la parte
+          del socio se calculan cuando entra la cuota y se produce su cupo.
+        </div>
+      )}
 
       {/* Números principales */}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -194,12 +310,17 @@ export default function LiquidacionView({ f, effective }) {
           sub={l.cobrada ? `${ars(l.cobrado * l.tc)} · BNA ${l.tc}` : "Cuota del contrato · todavía no entró"}
           status={l.cobrada ? <Status tone="ok">Cobrada</Status> : <Status tone="muted">Proyección</Status>}
         />
-        <Tile label="Costos" value={`US$ ${usd(l.costos)}`} sub={`${pct(l.costos, l.ingreso)} de lo cobrado`} />
-        <Tile label="Ganancia" value={`US$ ${usd(l.ganancia)}`} sub={`Margen ${pct(l.ganancia, l.ingreso)}`} accent="#0f766e" />
+        <Tile label={l.cobrada ? "Costos" : "Costos cargados hasta hoy"} value={`US$ ${usd(l.costos)}`} sub={l.cobrada ? `${pct(l.costos, l.ingreso)} de lo cobrado` : "Faltan los de producción de este cupo"} />
+        <Tile
+          label="Ganancia"
+          value={l.cobrada ? `US$ ${usd(l.ganancia)}` : "—"}
+          sub={l.cobrada ? `Margen ${pct(l.ganancia, l.ingreso)}` : "Se calcula al cobrar la cuota"}
+          accent="#0f766e"
+        />
         <Tile
           label={`Socio (${Math.round(l.pct * 100)}% de la ganancia)`}
-          value={`US$ ${usd(l.socio)}`}
-          sub={l.socioArs ? ars(l.socioArs) : "—"}
+          value={l.cobrada ? `US$ ${usd(l.socio)}` : "—"}
+          sub={l.cobrada ? (l.socioArs ? ars(l.socioArs) : "—") : "Se calcula al cobrar la cuota"}
           accent="#c2410c"
           status={l.cobrada ? (l.saldo <= 0.01 ? <Status tone="ok">Pagado</Status> : <Status tone="warn">A pagar</Status>) : null}
         />
@@ -207,6 +328,7 @@ export default function LiquidacionView({ f, effective }) {
 
       <div className="grid gap-4 xl:grid-cols-[1.1fr_1fr]">
         {/* A dónde va cada dólar */}
+        {l.cobrada ? (
         <section className="fin-card">
           <h4 className="fin-card__title">A dónde va cada dólar de la cuota</h4>
           <p className="fin-card__sub">US$ {usd(l.ingreso)} cobrados</p>
@@ -221,6 +343,11 @@ export default function LiquidacionView({ f, effective }) {
             />
           </div>
         </section>
+        ) : (
+          <section className="fin-card flex items-center justify-center text-center">
+            <p className="max-w-sm text-[14px] text-slate-500">El reparto de cada dólar aparece cuando la cuota está cobrada y su cupo producido.</p>
+          </section>
+        )}
 
         {/* Costos por categoría */}
         <section className="fin-card">

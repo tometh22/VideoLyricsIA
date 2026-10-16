@@ -82,15 +82,21 @@ export function currentPeriod(today = new Date()) {
 }
 
 /** Días trabajables del mes; el mes en curso cuenta hasta hoy inclusive. */
-export function workDays(period, { soloHabiles = true, today = new Date() } = {}) {
+export function workDays(period, { soloHabiles = true, today = new Date(), desde = null } = {}) {
   const [y, m] = period.split("-").map(Number);
   const last = new Date(y, m, 0).getDate();
   const isCurrent = currentPeriod(today) === period;
   const isFuture = period > currentPeriod(today);
   if (isFuture) return 0;
   const end = isCurrent ? today.getDate() : last;
+  // `desde` (YYYY-MM-DD): no contar días anteriores (lo previo ya está cargado a mano).
+  let start = 1;
+  if (desde) {
+    if (desde.slice(0, 7) > period) return 0;
+    if (desde.slice(0, 7) === period) start = Number(desde.slice(8, 10)) || 1;
+  }
   let days = 0;
-  for (let d = 1; d <= end; d += 1) {
+  for (let d = start; d <= end; d += 1) {
     const wd = new Date(y, m - 1, d).getDay();
     if (!soloHabiles || (wd !== 0 && wd !== 6)) days += 1;
   }
@@ -98,6 +104,16 @@ export function workDays(period, { soloHabiles = true, today = new Date() } = {}
 }
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+/** Número escrito a mano en es-AR: "1.535" → 1535, "9.517.000" → 9517000, "7,78" → 7.78. */
+export function parseNumberAr(text) {
+  let t = String(text ?? "").trim().replace(/\s/g, "").replace(/^US\$|^\$|^ARS/i, "");
+  if (t === "") return null;
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(t)) t = t.replace(/\./g, "").replace(",", ".");
+  else if (/^-?\d+,\d+$/.test(t)) t = t.replace(",", ".");
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
 const round2 = (v) => Math.round(v * 100) / 100;
 
 export function contractsFrom(entries) {
@@ -183,6 +199,25 @@ export function teamLabor(months, params, today = new Date()) {
 
 const providerKey = (p) => String(p || "").toLowerCase().split(/[—(\-]/)[0].trim();
 
+// Fuente de un costo, para decidir si lo manual pisa a lo automático. Usa
+// payload.source si está, y si no reconoce el proveedor por palabra clave
+// (no por prefijo: "R2" y "Cloudflare R2" son lo mismo).
+const SOURCE_PATTERNS = [
+  ["railway", /railway/i],
+  ["r2", /\br2\b|cloudflare r2/i],
+  ["gcp", /google cloud|\bgcp\b|vertex|gemini|\bveo\b/i],
+  ["replicate", /replicate/i],
+  ["openai", /openai|whisper/i],
+];
+export function sourceOf(e) {
+  if (e?.payload?.source) return e.payload.source;
+  const text = `${e?.provider || ""}`;
+  return SOURCE_PATTERNS.find(([, re]) => re.test(text))?.[0] || null;
+}
+
+// Secciones que no se repiten nunca: son hechos de un momento.
+const NO_RECURRENTE = new Set(["cobro", "pago_socio", "contrato", "parametros"]);
+
 /**
  * Renglones efectivos de la planilla: los cargados a mano + los que salen
  * solos. Lo cargado a mano SIEMPRE pisa a lo automático del mismo proveedor y
@@ -200,44 +235,90 @@ export function effectiveEntries({ entries, autoCosts = [], reviewers = [], para
     (e) => e.section === section && e.period === month && providerKey(e.provider).startsWith(key),
   );
   const out = [...entries];
+  const manualSource = (month, source) => manual.some(
+    (e) => e.period === month && e.section === "costo_directo" && sourceOf(e) === source,
+  );
   for (const c of autoCosts) {
-    if (!months.includes(c.month) || has("costo_directo", c.month, providerKey(c.provider))) continue;
+    if (!months.includes(c.month) || manualSource(c.month, c.source)) continue;
     out.push({
       id: null, synthetic: "api", period: c.month, section: "costo_directo", category: c.category,
-      provider: c.provider, amount_usd: c.amount_usd, basis: "api",
+      provider: c.provider, amount_usd: c.amount_usd, basis: "api", payload: { source: c.source },
       coverage: { days: c.days, expected: c.expected_days },
       evidence: `recolector diario: ${c.days} de ${c.expected_days} días`,
     });
   }
   const last = currentPeriod(today);
-  for (const e of manual) {
-    if (!e.payload?.recurrente) continue;
+  const sameProvider = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+  // Un recurrente se repite cada mes hasta que hay un renglón del MISMO
+  // proveedor ese mes, o hasta que otro recurrente más nuevo del mismo
+  // proveedor lo reemplaza (cambio de precio). La copia no arrastra la cuota
+  // ni datos de cobro: es un gasto nuevo de su mes.
+  const recurrentes = manual.filter((e) => e.payload?.recurrente && !NO_RECURRENTE.has(e.section) && !e.payload?.cuota);
+  for (const e of recurrentes) {
     const hasta = e.payload.hasta && e.payload.hasta < last ? e.payload.hasta : last;
     for (const m of months) {
-      if (m <= e.period || m > hasta || has(e.section, m, providerKey(e.provider))) continue;
-      out.push({ ...e, id: null, synthetic: "recurrente", period: m, evidence: `se repite desde ${monthLabel(e.period)}` });
+      if (m <= e.period || m > hasta) continue;
+      if (manual.some((x) => x.period === m && x.section === e.section && sameProvider(x.provider, e.provider))) continue;
+      const newer = recurrentes.some((x) => x !== e && sameProvider(x.provider, e.provider) && x.section === e.section
+        && x.period > e.period && x.period <= m);
+      if (newer) continue;
+      const { cuota: _c, ars: _a, tipo_cambio: _t, ...rest } = e.payload || {};
+      out.push({ ...e, id: null, synthetic: "recurrente", period: m, payload: rest, evidence: `se repite desde ${monthLabel(e.period)}` });
     }
   }
+  // Un mes con operadores externos cargados a mano no se recalcula: lo manual
+  // pisa a lo automático. Se reconoce por el nombre ("Upwork", "operadores
+  // externos") sin depender de cómo se cortó el proveedor.
+  const isExternal = (e) => e.section === "mano_obra" && /upwork|operadores externos/i.test(`${e.provider || ""} ${e.concept || ""}`);
+  // Un renglón manual genérico ("Operadores externos (Upwork)") cubre a todos
+  // los operadores del mes; uno con nombre ("Operadores externos — Ana") solo
+  // reemplaza a esa persona.
+  const manualExternal = (m, nombre) => manual.some((e) => {
+    if (e.period !== m || !isExternal(e)) return false;
+    const named = /—/.test(e.provider || "");
+    return !named || (nombre && (e.provider || "").toLowerCase().includes(String(nombre).toLowerCase()));
+  });
   const ops = (params.operadores || []).filter((o) => o.usuario && Number(o.tarifa_cancion) > 0);
+  const opsDesde = params.operadores_desde || "";
   for (const m of months) {
-    if (!ops.length || has("mano_obra", m, "upwork")) continue;
+    if (!ops.length || (opsDesde && m < opsDesde) || manualExternal(m, null)) continue;
     let subtotal = 0;
     for (const o of ops) {
+      if (manualExternal(m, o.nombre || o.usuario)) continue;
       const n = reviewers.filter((r) => r.month === m && r.reviewer === o.usuario).reduce((a, r) => a + num(r.canciones), 0);
       if (!n) continue;
       const amount = round2(n * num(o.tarifa_cancion));
       subtotal += amount;
       out.push({
         id: null, synthetic: "operadores", period: m, section: "mano_obra", category: "Operadores",
-        provider: `Upwork — ${o.nombre || o.usuario}`, amount_usd: amount, basis: "sistema",
+        provider: `Operadores externos — ${o.nombre || o.usuario}`, amount_usd: amount, basis: "sistema",
         evidence: `${n} letras aprobadas × US$ ${o.tarifa_cancion}`,
+        // ~8,5 min por canción: la mediana medida de revisión.
+        payload: { personas: 1, horas: Math.round((n * 8.5) / 60) },
       });
     }
     if (subtotal && num(params.comision_operadores)) {
       out.push({
         id: null, synthetic: "operadores", period: m, section: "mano_obra", category: "Operadores",
-        provider: "Upwork — comisiones", amount_usd: round2(subtotal * num(params.comision_operadores)), basis: "sistema",
+        provider: "Operadores externos — comisiones", amount_usd: round2(subtotal * num(params.comision_operadores)), basis: "sistema",
         evidence: `${Math.round(num(params.comision_operadores) * 1000) / 10}% sobre ${subtotal.toFixed(2)}`,
+      });
+    }
+  }
+  const pi = params.produccion_interna || {};
+  // Sin fecha de inicio no se calcula: lo anterior ya está cargado a mano y
+  // contarlo de nuevo duplicaría horas.
+  if (num(pi.horas_dia) > 0 && num(pi.tarifa_hora) > 0 && /^\d{4}-\d{2}-\d{2}$/.test(pi.desde || "")) {
+    for (const m of months) {
+      if (manual.some((e) => e.period === m && e.section === "mano_obra" && /producci[oó]n interna/i.test(e.provider || ""))) continue;
+      const days = workDays(m, { soloHabiles: true, today, desde: pi.desde || null });
+      if (!days) continue;
+      const horas = round2(days * num(pi.horas_dia));
+      out.push({
+        id: null, synthetic: "produccion", period: m, section: "mano_obra", category: "Operadores",
+        provider: "Producción interna", amount_usd: round2(horas * num(pi.tarifa_hora)), basis: "imputado",
+        evidence: `${days} días hábiles × ${pi.horas_dia} h × US$ ${pi.tarifa_hora}/h`,
+        payload: { personas: num(pi.personas) || 1, horas },
       });
     }
   }
@@ -413,12 +494,13 @@ export function partnerScenarios(pnl, params, rates = [0, 5, 8, 10]) {
 }
 
 export function entriesToCsv(entries) {
-  const cols = ["period", "section", "category", "provider", "concept", "amount_usd", "basis", "contract", "evidence", "note"];
+  const cols = ["period", "section", "category", "provider", "concept", "amount_usd", "basis", "contract", "evidence", "note", "payload"];
   const esc = (v) => {
     const s = v === null || v === undefined ? "" : String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  return [cols.join(","), ...entries.map((e) => cols.map((c) => esc(e[c])).join(","))].join("\n");
+  const cell = (e, c) => (c === "payload" ? (e.payload ? JSON.stringify(e.payload) : "") : e[c]);
+  return [cols.join(","), ...entries.map((e) => cols.map((c) => esc(cell(e, c))).join(","))].join("\n");
 }
 
 /** CSV → renglones para /entries/import. Acepta `payload` como JSON. */
@@ -482,18 +564,146 @@ export function contractForCuota(contracts, cuota) {
   });
 }
 
-export function liquidacion({ entries, contracts, params, cuota }) {
-  const contract = contractForCuota(contracts, cuota);
+/**
+ * A qué cuota va la producción de cada mes, sin marcar nada a mano.
+ *
+ * Las piezas entregadas llenan las cuotas en orden (FIFO): primero el cupo de
+ * la cuota 1, después el de la 2, etc. La producción de un mes se reparte
+ * entre las cuotas de las piezas que se entregaron ese mes (ponderadas por
+ * precio: un art track pesa menos que un video). Un mes sin entregas produce
+ * para la cuota más vieja que todavía no se completó.
+ *
+ * Devuelve { [mes]: { [cuota]: fracción } }.
+ */
+export function productionShares(contract, deliveries, months, contracts = [contract]) {
+  if (!contract) return {};
+  const meses = num(contract.meses) || 1;
+  const cuotas = monthsBetween(contract.inicio, addMonths(contract.inicio, meses - 1));
+  const left = cuotas.map(() => ({ lyric_video: num(contract.cupo_vl_mes), art_track: num(contract.cupo_at_mes) }));
+  const price = { lyric_video: num(contract.precio_vl) || 1, art_track: num(contract.precio_at) || 1 };
+  // Las piezas de ESTE contrato: cada entrega cuenta para un solo contrato.
+  const byMonth = allocateContracts(contracts, deliveries)[contract.nombre]?.byMonth || {};
+  const allMonths = [...new Set([...Object.keys(byMonth), ...months])].sort();
+  const out = {};
+  for (const m of allMonths) {
+    const weights = {};
+    for (const t of ["lyric_video", "art_track"]) {
+      let n = byMonth[m]?.[t] || 0;
+      for (let i = 0; i < cuotas.length && n > 0; i += 1) {
+        if (cuotas[i] > m) break;
+        const take = Math.min(n, left[i][t]);
+        if (take <= 0) continue;
+        left[i][t] -= take;
+        n -= take;
+        weights[cuotas[i]] = (weights[cuotas[i]] || 0) + take * price[t];
+      }
+    }
+    const total = Object.values(weights).reduce((a, v) => a + v, 0);
+    if (total > 0) {
+      out[m] = Object.fromEntries(Object.entries(weights).map(([c, w]) => [c, w / total]));
+    } else {
+      const open = cuotas.find((c, i) => c <= m && (left[i].lyric_video > 0 || left[i].art_track > 0));
+      if (open) out[m] = { [open]: 1 };
+    }
+  }
+  return out;
+}
+
+/** Peso de un contrato en los costos de un mes: su cuota sobre la suma de las cuotas activas. */
+export function contractWeight(contract, contracts, month) {
+  const active = contracts.filter((c) => month >= c.inicio && month <= addMonths(c.inicio, (num(c.meses) || 1) - 1));
+  if (!active.length || !active.some((c) => c.nombre === contract?.nombre)) return active.length ? 0 : 1;
+  const total = active.reduce((a, c) => a + num(c.fee_mensual), 0);
+  return total > 0 ? num(contract.fee_mensual) / total : 1 / active.length;
+}
+
+/** Clave estable de un renglón, para saber si ya estaba en una liquidación pagada. */
+export function entryKey(e) {
+  return e.id != null ? `id:${e.id}` : `${e.synthetic || "x"}:${e.period}:${e.provider || ""}`;
+}
+
+// Producción = operadores, o IA (por categoría o por proveedor). Servidores,
+// almacenamiento y herramientas son fijos del mes aunque estén mal rotulados.
+const FIXED_SOURCES = new Set(["railway", "r2"]);
+export const isProduction = (e) => {
+  if (e.section === "mano_obra") return true;
+  if (e.section !== "costo_directo") return false;
+  const src = sourceOf(e);
+  if (FIXED_SOURCES.has(src)) return false;
+  return /^ia$/i.test(e.category || "") || ["gcp", "openai", "replicate"].includes(src);
+};
+
+/**
+ * Renglones imputados a una cuota: los fijos por su mes; los de producción por
+ * su payload.cuota si lo tienen (cargado a mano), y si no, repartidos según
+ * las entregas (productionShares).
+ */
+export function entriesForCuota(entries, cuota, shares, frozen = {}, contract = null, contracts = []) {
+  const cuotasDelContrato = contract ? monthsBetween(contract.inicio, addMonths(contract.inicio, (num(contract.meses) || 1) - 1)) : [];
+  // Una cuota pagada está congelada: lo que no estaba en su liquidación pasa a
+  // la próxima cuota abierta (desde su propio mes), así nunca se pierde y la
+  // liquidación pagada no cambia.
+  const reroute = (target, e) => {
+    if (!frozen[target] || frozen[target].keys.has(entryKey(e))) return target;
+    const from = e.period > target ? e.period : target;
+    return cuotasDelContrato.find((c) => c >= from && !frozen[c]) || from;
+  };
+  const out = [];
+  const push = (e, share) => {
+    if (share <= 0) return;
+    if (share >= 0.9999) { out.push(e); return; }
+    out.push({
+      ...e, amount_usd: num(e.amount_usd) * share, shared: share,
+      payload: e.payload ? { ...e.payload, horas: e.payload.horas ? e.payload.horas * share : e.payload.horas } : e.payload,
+    });
+  };
+  for (const e of entries) {
+    if (e.section === "contrato" || e.section === "parametros") continue;
+    if (e.section === "cobro" || e.section === "pago_socio") {
+      if (contract && e.contract && e.contract !== contract.nombre) continue;
+      if (cuotaDe(e) === cuota) out.push(e);
+      continue;
+    }
+    // Con contratos superpuestos, cada costo se reparte por el peso de la cuota.
+    const w = contracts.length > 1 ? contractWeight(contract, contracts, e.period) : 1;
+    if (w <= 0) continue;
+    if (e.payload?.cuota || !isProduction(e) || !shares) {
+      if (reroute(cuotaDe(e), e) === cuota) push(e, w);
+      continue;
+    }
+    const byTarget = {};
+    for (const [c, frac] of Object.entries(shares[e.period] || { [e.period]: 1 })) {
+      const t = reroute(c, e);
+      byTarget[t] = (byTarget[t] || 0) + frac;
+    }
+    push(e, (byTarget[cuota] || 0) * w);
+  }
+  return out;
+}
+
+export function liquidacion({ entries, contracts = [], params, cuota, deliveries = null, months = [], contract: forced = null }) {
+  const contract = forced || contractForCuota(contracts, cuota);
   const fee = num(contract?.fee_mensual);
-  const mine = entries.filter((e) => cuotaDe(e) === cuota);
+  // Todos los meses con renglones, no solo los del rango visible: un costo de
+  // producción en un mes sin entregas igual tiene que caer en alguna cuota.
+  const allMonths = [...new Set([...months, ...entries.map((e) => e.period).filter(Boolean)])];
+  const shares = deliveries ? productionShares(contract, deliveries, allMonths, contracts.length ? contracts : [contract]) : null;
+  // Cuotas pagadas: su liquidación queda congelada en el snapshot del pago.
+  const frozen = {};
+  for (const e of entries) {
+    if (e.section !== "pago_socio" || !e.payload?.cuota || !e.payload?.snapshot) continue;
+    if (contract && e.contract && e.contract !== contract.nombre) continue;
+    frozen[e.payload.cuota] = { snapshot: e.payload.snapshot, keys: new Set(e.payload.snapshot.keys || []) };
+  }
+  const mine = entriesForCuota(entries, cuota, shares, frozen, contract, contracts);
   const pick = (pred) => mine.filter(pred);
   const sum = (rows) => round2(rows.reduce((a, e) => a + num(e.amount_usd), 0));
-  const ia = pick((e) => e.section === "costo_directo" && (e.category || "").toLowerCase() !== "infraestructura");
-  const servidores = pick((e) => e.section === "costo_directo" && (e.category || "").toLowerCase() === "infraestructura");
+  const ia = pick((e) => e.section === "costo_directo" && isProduction(e));
+  const servidores = pick((e) => e.section === "costo_directo" && !isProduction(e));
   const herramientas = pick((e) => e.section === "estructura");
   const operadores = pick((e) => e.section === "mano_obra");
   const horas = operadores.reduce((a, e) => a + num(e.payload?.horas), 0);
-  const personas = operadores.reduce((a, e) => a + num(e.payload?.personas), 0);
+  const personas = operadores.filter((e) => !/comisi/i.test(e.provider || "") && !e.shared).reduce((a, e) => a + num(e.payload?.personas), 0);
   const iaProv = [...new Set(ia.map((e) => (e.provider || "").split(" (")[0]))].filter(Boolean).join(", ");
   const opSub = [personas ? `${personas} personas` : "", horas ? `${Math.round(horas)} h` : ""].filter(Boolean).join(" · ");
   const lines = [
@@ -507,18 +717,30 @@ export function liquidacion({ entries, contracts, params, cuota }) {
   const cobrado = sum(cobros);
   const tc = num(cobros.find((e) => e.payload?.tipo_cambio)?.payload?.tipo_cambio) || num(params.tipo_cambio);
   // Una cuota sin cobro registrado es una proyección: se muestra, pero no
-  // suma al reparto hasta que entra la plata.
+  // suma al reparto hasta que entra la plata. Cobrada, el ingreso es lo que
+  // ENTRÓ (una retención o un cobro parcial bajan la ganancia), no la cuota.
   const cobrada = cobrado > 0;
-  const ingreso = fee || cobrado;
+  const ingreso = cobrada ? cobrado : fee;
   const ganancia = round2(ingreso - costos);
   const pct = num(params.pct_socio);
   const socio = round2(Math.max(0, ganancia) * pct);
   const pagos = pick((e) => e.section === "pago_socio");
   const pagado = sum(pagos);
-  return {
-    contract, cuota, fee, ingreso, cobrado, cobrada, tc, cobros, lines, costos, ganancia, pct,
+  const keys = mine.filter((e) => e.section !== "cobro" && e.section !== "pago_socio").map(entryKey);
+  const live = {
+    contract, cuota, fee, ingreso, cobrado, cobrada, cobroParcial: cobrada && fee > 0 && cobrado < fee - 0.01,
+    tc, cobros, lines, costos, ganancia, pct,
     socio, socioArs: tc ? Math.round(socio * tc) : null, pagos, pagado,
-    saldo: round2(socio - pagado),
+    saldo: round2(socio - pagado), keys, frozen: false,
+  };
+  const snap = frozen[cuota]?.snapshot;
+  if (!snap) return live;
+  // Pagada: se muestra lo que se liquidó, y si los renglones cambiaron
+  // después, cuánto (para cargar el ajuste en la cuota abierta).
+  return {
+    ...live, frozen: true, lines: snap.lines, costos: snap.costos, ganancia: snap.ganancia, ingreso: snap.ingreso,
+    socio: snap.socio, socioArs: snap.socioArs ?? live.socioArs, tc: snap.tc ?? live.tc,
+    saldo: round2(snap.socio - pagado), drift: round2(live.costos - snap.costos),
   };
 }
 
@@ -526,6 +748,7 @@ export function liquidacion({ entries, contracts, params, cuota }) {
 export function liquidacionTexto(l) {
   const f = (v) => v.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const out = [
+    ...(l.cobrada ? [] : ["PROYECCIÓN — la cuota todavía no se cobró"]),
     `Liquidación ${l.contract?.nombre || ""} — ${monthLabel(l.cuota)}`,
     `Cobrado: US$ ${f(l.ingreso)}${l.tc ? ` (BNA ${l.tc})` : ""}`,
     ...l.lines.filter((x) => x.usd).map((x) => `${x.label}: US$ ${f(x.usd)}`),
@@ -534,4 +757,16 @@ export function liquidacionTexto(l) {
     `${Math.round(l.pct * 100)}% de ganancia: US$ ${f(l.socio)}${l.socioArs ? ` = ARS ${l.socioArs.toLocaleString("es-AR")}` : ""}`,
   ];
   return out.join("\n");
+}
+
+/** Lo que se guarda al registrar el pago: la liquidación tal como se pagó. */
+export function liquidacionSnapshot(l) {
+  return {
+    ingreso: l.ingreso, costos: l.costos, ganancia: l.ganancia, socio: l.socio, socioArs: l.socioArs, tc: l.tc,
+    keys: l.keys,
+    lines: l.lines.map((x) => ({
+      key: x.key, label: x.label, short: x.short, sub: x.sub, usd: x.usd,
+      rows: x.rows.map((r) => ({ period: r.period, provider: r.provider, concept: r.concept, basis: r.basis, amount_usd: Math.round(num(r.amount_usd) * 100) / 100 })),
+    })),
+  };
 }

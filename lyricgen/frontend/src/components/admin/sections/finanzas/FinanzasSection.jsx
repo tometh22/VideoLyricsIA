@@ -9,7 +9,7 @@ import LiquidacionView from "./LiquidacionView";
 import MetricasView from "./MetricasView";
 import MovimientosView from "./MovimientosView";
 import ResultadoView from "./ResultadoView";
-import { buildPnl, effectiveEntries } from "./finanzasModel";
+import { addMonths, buildPnl, currentPeriod, effectiveEntries, monthsBetween } from "./finanzasModel";
 import useFinanzas from "./useFinanzas";
 
 const TITLES = {
@@ -27,6 +27,22 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
   const effective = useMemo(
     () => effectiveEntries({ entries: f.entries, autoCosts: f.autoCosts, reviewers: f.ops.reviewers || [], params: f.params, months: f.months }),
     [f.entries, f.autoCosts, f.ops, f.params, f.months],
+  );
+  // Las liquidaciones se calculan SIEMPRE sobre todo el contrato (desde su
+  // inicio hasta hoy), sin importar el rango visible: si no, una cuota cambia
+  // según el "Desde/Hasta" elegido.
+  const contractMonths = useMemo(() => {
+    const set = new Set(f.months);
+    for (const c of f.contracts) {
+      const fin = addMonths(c.inicio, (Number(c.meses) || 1) - 1);
+      const hasta = currentPeriod() < fin ? currentPeriod() : fin;
+      if (c.inicio <= hasta) monthsBetween(c.inicio, hasta).forEach((m) => set.add(m));
+    }
+    return [...set].sort();
+  }, [f.months, f.contracts]);
+  const effectiveAll = useMemo(
+    () => effectiveEntries({ entries: f.entries, autoCosts: f.autoCosts, reviewers: f.ops.reviewers || [], params: f.params, months: contractMonths }),
+    [f.entries, f.autoCosts, f.ops, f.params, contractMonths],
   );
   const pnl = useMemo(
     () => buildPnl({ entries: effective, contracts: f.contracts, deliveries: f.ops.deliveries || [], params: f.params, months: f.months }),
@@ -59,9 +75,9 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
         <p className="text-caption text-gray-500">Cargando…</p>
       ) : (
         <>
-          {subTab === "liquidacion" && <LiquidacionView f={f} effective={effective} />}
+          {subTab === "liquidacion" && <LiquidacionView f={f} effective={effectiveAll} months={contractMonths} />}
           {subTab === "resultado" && <ResultadoView f={f} pnl={pnl} effective={effective} />}
-          {subTab === "contrato" && <ContratoView f={f} effective={effective} />}
+          {subTab === "contrato" && <ContratoView f={f} effective={effectiveAll} months={contractMonths} />}
           {subTab === "metricas" && <MetricasView f={f} pnl={pnl} effective={effective} />}
           {subTab === "movimientos" && <MovimientosView f={f} />}
           {subTab === "criterio" && <CriterioView />}
