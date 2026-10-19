@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.136] - 2026-10-19
+
+### Fixed
+
+- Los Art Tracks creados individualmente se publican en el portal UMG como referencias al render vigente, con ProRes bajo demanda y la etiqueta "Art Track". No se copian archivos al publicar.
+
 ## [1.1.135] - 2026-10-16
 
 ### Fixed

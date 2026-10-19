@@ -21132,8 +21132,9 @@ def admin_create_delivery_from_job(
     # transactions after 60 s, so never hold the job lock/DB connections
     # while copying. Revalidate both identities under locks afterwards.
     from delivery_snapshots import copy_snapshot, latest_pointer_enabled
+    is_art_track = bool((job.render_params or {}).get("art_track"))
     prepared_snapshot = existing.published_file_keys if existing else None
-    if (replaced_job_id or not prepared_snapshot or existing.file_types != delivery_file_types
+    if (is_art_track or replaced_job_id or not prepared_snapshot or existing.file_types != delivery_file_types
             or delivery_freshness.needs_publish(job, existing)):
         expected_job = (delivery_freshness.render_fingerprint(job),
                         job.segments_revision, job.status, job.approved_at)
@@ -21144,8 +21145,9 @@ def admin_create_delivery_from_job(
         if ddb is not db:
             ddb.rollback()
         try:
-            # Pointer mode: nothing to copy; the portal serves the newest render.
-            prepared_snapshot = None if latest_pointer_enabled() else copy_snapshot(snapshot_tenant, job_id, snapshot_file_types)
+            # Art Tracks always use the current render, including ProRes prepared
+            # on demand. The deployment-wide setting still controls other videos.
+            prepared_snapshot = None if (is_art_track or latest_pointer_enabled()) else copy_snapshot(snapshot_tenant, job_id, snapshot_file_types)
         except Exception as exc:
             raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
         job = (db.query(Job).filter(Job.job_id == job_id)
@@ -21175,7 +21177,9 @@ def admin_create_delivery_from_job(
     # cliente. Visto en vivo al reparar la entrega 289 (2026-09-15), y ahora
     # que publicar una corrección es un botón, pasaría en cada corrección.
     explicit_label = (body.label if body else None)
-    if existing is not None:
+    if is_art_track:
+        label = "Art Track"
+    elif existing is not None:
         label = explicit_label or existing.label
     else:
         label = explicit_label or _compute_default_delivery_label(
