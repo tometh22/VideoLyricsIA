@@ -79,7 +79,7 @@ export async function installCampaignApi(page, { id = "workflow", name = "CampaÃ
     if (path === `${base}/creative/apply`) {
       const body = state.lastPreview;
       state.plan = { revision: state.plan.revision + 1, groups: body.groups, mode: body.mode, contract: body.contract ? { agreement: body.agreement, rounding_note: body.rounding_note, revision: state.plan.revision + 1, item_ids: body.item_ids, mode: body.mode } : undefined };
-      body.item_ids.forEach((itemId, index) => { const value = find(itemId); value.settings = body.groups[index % body.groups.length].settings; value.assignment = { revision: state.plan.revision, group_name: body.groups[index % body.groups.length].name }; });
+      body.item_ids.forEach((itemId, index) => { const value = find(itemId); const { scene_source, ...settings } = body.groups[index % body.groups.length].settings; value.settings = { ...value.settings, ...settings, ...(scene_source ? { match_lyrics: scene_source === "lyrics", bg_verbatim: scene_source === "prompt_literal", ...(["lyrics", "auto"].includes(scene_source) ? { background_hint: "" } : {}) } : {}) }; value.assignment = { revision: state.plan.revision, group_name: body.groups[index % body.groups.length].name }; });
       return json({ revision: state.plan.revision });
     }
     if (path === "/backgrounds") return json([]);

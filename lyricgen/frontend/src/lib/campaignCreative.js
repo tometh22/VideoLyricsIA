@@ -36,3 +36,12 @@ export function campaignGenerateForm(item, job) {
   }
   return form;
 }
+
+export function photoEffectGroups(effects) {
+  return effects.map(effect => ({
+    id: `foto-${effect}`, name: `Foto fija + ${effect === "embers" ? "Chispas" : "Bokeh"}`,
+    weight: 100 / effects.length, requirement: "photo_effect", model: "",
+    settings: { background_id: null, background_mode: "as_is", scene_source: "lyrics",
+      movement_style: "foto-parallax", effect, animate_image: false, enable_scenes: false },
+  }));
+}

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
+import { useI18n } from "../../i18n";
+import { EFFECT_LABELS } from "../../lib/optionLabels";
+import { photoEffectGroups } from "../../lib/campaignCreative";
 import { campaignPost, campaignRequest } from "../../lib/campaignApi";
-import StyleControls, { StylePreview } from "./StyleControls";
+import StyleControls, { StylePreview, SOURCE_LABELS } from "./StyleControls";
 import { Banner, Button, Field, inputClass } from "./ui";
 
 export const VEO_LITE = "veo-3.1-lite-generate-001";
@@ -11,13 +14,16 @@ export function initialGroups(plan) {
     : [{ id: "estilo-1", name: "Estilo 1", weight: 100, requirement: "creative", model: "", settings: {} }];
 }
 
+const photoSource = settings => settings.scene_source || (settings.background_hint ? settings.bg_verbatim ? "prompt_literal" : "prompt_improved" : settings.match_lyrics === false ? "auto" : "lyrics");
+
 const trim = (value) => (Number.isInteger(value) ? value : Number(value.toFixed(2)));
 
 /**
  * Split a set of songs across one or more styles. Nothing is saved until the
  * operator reviews the frozen preview; nothing is ever generated here.
  */
-export default function StyleAssignment({ campaignId, creative, itemIds, onSaved, onBusyChange }) {
+export default function StyleAssignment({ campaignId, creative, itemIds, onSaved, onBusyChange, onPrepareGeneration }) {
+  const { t } = useI18n();
   const base = `/batch/campaigns/${encodeURIComponent(campaignId)}`;
   const plan = creative.plan || { revision: 0 };
   const [groups, setGroups] = useState(() => initialGroups(plan));
@@ -36,6 +42,8 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const running = useRef(false);
+  const previewRef = useRef(null);
+  useEffect(() => { if (preview) previewRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }); }, [preview]);
   useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
   useEffect(() => {
     const controller = new AbortController();
@@ -51,7 +59,7 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
   const change = (fn) => { setPreview(null); fn(); };
   const updateGroup = (index, patch) => change(() => setGroups((old) => old.map((group, n) => (n === index ? { ...group, ...patch } : group))));
   const chooseRequirement = (index, value) => {
-    const patch = value === "photo_effect" ? { movement_style: "foto-parallax", effect: "bokeh", animate_image: false, enable_scenes: false, background_mode: "as_is" }
+    const patch = value === "photo_effect" ? photoEffectGroups(["bokeh"])[0].settings
       : value === "veo" ? { movement_style: "estandar", background_id: null, animate_image: false, effect: "" } : {};
     updateGroup(index, { requirement: value, model: value === "veo" ? VEO_LITE : "", settings: { ...groups[index].settings, ...patch } });
   };
@@ -60,8 +68,39 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
   const target = mode === "percent" ? 100 : count;
   const balanced = groups.length > 0 && Math.abs(weightSum - target) < 1e-6;
   const lastOperation = creative.operations?.[0];
+  const readyCount = (creative.items || []).filter(item => itemIds.includes(item.id) && item.status === "lyrics_approved" && !item.discarded).length;
+  const issues = [
+    !count && "Seleccioná las canciones a las que querés aplicar el diseño",
+    !balanced && (mode === "percent" ? "Los porcentajes deben sumar 100%" : "Las cantidades deben sumar las canciones seleccionadas"),
+    reason.trim().length > 0 && reason.trim().length < 3 && "Escribí al menos 3 caracteres en la nota o dejala vacía",
+    ...groups.filter(group => ["prompt_literal", "prompt_improved"].includes(group.settings.scene_source) && !group.settings.background_hint?.trim()).map(group => `Escribí la descripción del fondo en «${group.name}»`),
+  ].filter(Boolean);
+  const previewAssignment = () => run(async () => {
+    setPreview(await campaignPost(`${base}/creative/preview`, {
+      revision: plan.revision, item_ids: itemIds, mode, groups, seed, replace_exceptions: replace, pin, contract, agreement, rounding_note: rounding,
+      reason: reason.trim() || "Configuración de estilos y reparto desde la campaña",
+    }));
+  });
+  const choosePhotoPreset = effects => change(() => { setGroups(photoEffectGroups(effects)); setMode("percent"); });
+  const save = prepareGeneration => run(async () => {
+    await campaignPost(`${base}/creative/apply`, { preview_id: preview.preview_id });
+    setPreview(null); setMessage("Asignación guardada. No se generaron videos.");
+    await onSaved?.();
+    if (prepareGeneration) await onPrepareGeneration?.();
+  });
 
   return <fieldset disabled={busy} className="space-y-5">
+    <div className="space-y-3 rounded-card bg-brand/10 p-4 ring-1 ring-brand/25">
+      <h3 className="font-semibold">Foto fija inspirada en la letra</h3>
+      <p className="text-sm text-ink-secondary">Elegí un reparto rápido. Conserva la tipografía guardada y reemplaza los estilos del borrador. Después revisás qué recibe cada canción.</p>
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" onClick={() => choosePhotoPreset(["bokeh"])}>Todas con Bokeh</Button>
+        <Button size="sm" onClick={() => choosePhotoPreset(["embers"])}>Todas con Chispas</Button>
+        <Button size="sm" variant="primary" onClick={() => choosePhotoPreset(["bokeh", "embers"])}>50% Bokeh / 50% Chispas</Button>
+      </div>
+      <p className="text-xs text-ink-secondary">Una imagen por canción, sin animación IA. El efecto se superpone a la foto.</p>
+      <Button variant="primary" disabled={issues.length > 0} aria-describedby={issues.length ? "campaign-style-issues" : undefined} onClick={previewAssignment}>Revisar reparto de {count} canciones</Button>
+    </div>
     <div className="flex flex-wrap items-end gap-4">
       <Field label="Repartir por" className="w-44">
         <select aria-label="Modo de reparto" className={inputClass} value={mode} onChange={(event) => change(() => setMode(event.target.value))}>
@@ -88,7 +127,19 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
         </Field>
       </div>
       {group.requirement === "veo" && <p className="rounded-lg bg-black/20 px-3 py-2 text-xs text-ink-secondary"><strong className="text-white">Modelo de fondo: Veo Lite.</strong> Todos los fondos nuevos usan Veo Lite; nunca se cambia solo a un modelo más caro.</p>}
-      <StyleControls fields={creative.fields} values={group.settings} assets={assets} label={group.name}
+      {group.requirement === "photo_effect" && <div className="space-y-3 rounded-xl bg-black/20 p-4">
+        <p className="text-sm font-medium">Foto fija · efecto sobre la imagen</p>
+        <div className="grid gap-3 md:grid-cols-2">
+          <Field label="Efecto"><select aria-label={`Efecto de foto del grupo ${index + 1}`} className={inputClass} value={group.settings.effect || "bokeh"} onChange={event => updateGroup(index, { settings: { ...group.settings, effect: event.target.value } })}>
+            {[...new Set(["bokeh", "embers", ...(creative.fields?.effect?.options || [])])].filter(effect => effect && !["none", "foto_viva"].includes(effect)).map(effect => <option key={effect} value={effect}>{EFFECT_LABELS(t)[effect] || (effect === "embers" ? "Chispas" : effect === "bokeh" ? "Bokeh" : effect)}</option>)}
+          </select></Field>
+          <Field label="Inspiración del fondo"><select aria-label={`Inspiración de foto del grupo ${index + 1}`} className={inputClass} value={photoSource(group.settings)} onChange={event => updateGroup(index, { settings: { ...group.settings, scene_source: event.target.value } })}>
+            {Object.entries(SOURCE_LABELS).filter(([key]) => ["lyrics", "auto", "prompt_literal", "prompt_improved"].includes(key)).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select></Field>
+        </div>
+        {["prompt_literal", "prompt_improved"].includes(photoSource(group.settings)) && <Field label="Descripción de la foto"><textarea aria-label={`Descripción de foto del grupo ${index + 1}`} className={inputClass} maxLength={4000} value={group.settings.background_hint || ""} onChange={event => updateGroup(index, { settings: { ...group.settings, background_hint: event.target.value } })} /></Field>}
+      </div>}
+      <StyleControls fields={Object.fromEntries(Object.entries(creative.fields || {}).filter(([key]) => group.requirement !== "photo_effect" || !["effect", "scene_source", "background_hint", "movement_style", "animate_image", "enable_scenes", "background_mode"].includes(key)))} values={group.settings} assets={assets} label={group.name}
         update={(key, value) => { const settings = { ...group.settings }; if (value === undefined) delete settings[key]; else settings[key] = value; updateGroup(index, { settings }); }} />
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="ghost" onClick={() => setPreviewStyle((old) => (old === group.id ? null : group.id))}>{previewStyle === group.id ? "Ocultar muestra" : "Ver muestra del estilo"}</Button>
@@ -119,26 +170,26 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
         <Field label="Acuerdo y referencia del documento"><textarea aria-label="Acuerdo contractual" rows={3} className={inputClass} value={agreement} onChange={(event) => change(() => setAgreement(event.target.value))} /></Field>
         <Field label="Aceptación del redondeo, si corresponde"><textarea aria-label="Aceptación del redondeo" rows={3} className={inputClass} placeholder="Quién acordó 20/19 y a qué grupo va el video extra" value={rounding} onChange={(event) => change(() => setRounding(event.target.value))} /></Field>
       </div>}
-      <Field label="Motivo del cambio"><input aria-label="Motivo del cambio" className={inputClass} value={reason} onChange={(event) => change(() => setReason(event.target.value))} /></Field>
+      <Field label="Nota del cambio (opcional)"><input aria-label="Motivo del cambio" aria-describedby="campaign-style-note-help" maxLength={1000} placeholder="Por ejemplo: reparto acordado con Chile" className={inputClass} value={reason} onChange={(event) => change(() => setReason(event.target.value))} /></Field>
     </div>
 
+    <p id="campaign-style-note-help" className="text-xs text-ink-secondary">Si dejás la nota vacía, guardamos un motivo automático en el historial.</p>
+    {issues.length > 0 && <ul id="campaign-style-issues" className="list-inside list-disc space-y-1 text-sm text-amber-200">{issues.map(issue => <li key={issue}>{issue}</li>)}</ul>}
     {error && <Banner tone="danger">{error}</Banner>}
     {message && <Banner tone="success">{message}</Banner>}
 
     <div className="flex flex-wrap items-center gap-2">
-      <Button variant="primary" disabled={!count || reason.trim().length < 3 || !balanced}
+      <Button variant="primary" disabled={issues.length > 0} aria-describedby={issues.length ? "campaign-style-issues" : undefined}
         title={balanced ? undefined : mode === "percent" ? "Los porcentajes deben sumar 100" : "Las cantidades deben sumar las canciones seleccionadas"}
-        onClick={() => run(async () => setPreview(await campaignPost(`${base}/creative/preview`, {
-          revision: plan.revision, item_ids: itemIds, mode, groups, seed, replace_exceptions: replace, pin, contract, agreement, rounding_note: rounding, reason,
-        })))}>Ver reparto antes de guardar</Button>
-      {lastOperation?.revision === plan.revision && <Button variant="ghost" disabled={reason.trim().length < 3} onClick={() => run(async () => {
-        await campaignPost(`${base}/creative/undo`, { revision: plan.revision, operation_id: lastOperation.id, reason });
+        onClick={previewAssignment}>Ver reparto antes de guardar</Button>
+      {lastOperation?.revision === plan.revision && <Button variant="ghost" disabled={reason.trim().length > 0 && reason.trim().length < 3} onClick={() => run(async () => {
+        await campaignPost(`${base}/creative/undo`, { revision: plan.revision, operation_id: lastOperation.id, reason: reason.trim() || "Deshacer asignación desde la campaña" });
         setPreview(null); setMessage("Última asignación deshecha."); await onSaved?.();
       })}>Deshacer última asignación</Button>}
       <span className="text-xs text-ink-secondary">{count} {count === 1 ? "canción" : "canciones"} en este reparto</span>
     </div>
 
-    {preview && <div className="space-y-3 rounded-card bg-brand/10 p-5 ring-1 ring-brand/30">
+    {preview && <div ref={previewRef} className="scroll-mt-4 space-y-3 rounded-card bg-brand/10 p-5 ring-1 ring-brand/30">
       <h3 className="font-semibold">Vista previa · {preview.changes.length} canciones · {preview.skipped.length} excepciones conservadas</h3>
       <div className="flex flex-wrap gap-2">{groups.map((group, index) => <span key={group.id} className="rounded-lg bg-black/25 px-2.5 py-1 text-sm">{group.name}: {preview.counts[index]} ({(100 * preview.counts[index] / Math.max(1, preview.changes.length)).toFixed(2)}%)</span>)}</div>
       {preview.rounded && <p className="text-sm text-amber-200">Hubo redondeo: estas cantidades son el reparto efectivo.</p>}
@@ -146,10 +197,11 @@ export default function StyleAssignment({ campaignId, creative, itemIds, onSaved
         <summary className="cursor-pointer">{item.artist} — {item.title} → <strong>{item.group}</strong></summary>
         <dl className="ml-4 mt-1 text-xs text-ink-secondary">{Object.entries(item.after).filter(([key, value]) => item.before[key] !== value).map(([key, value]) => <div key={key}>{creative.fields?.[key]?.label || key}: {String(item.before[key] ?? "Heredado")} → {String(value)}</div>)}</dl>
       </details>)}</div>
-      <Button variant="primary" onClick={() => run(async () => {
-        await campaignPost(`${base}/creative/apply`, { preview_id: preview.preview_id });
-        setPreview(null); setMessage("Asignación guardada. No se generaron videos."); await onSaved?.();
-      })}>Guardar esta asignación</Button>
+      <div className="flex flex-wrap gap-2">
+        <Button onClick={() => save(false)}>Guardar esta asignación</Button>
+        {onPrepareGeneration && <Button variant="primary" disabled={!readyCount} onClick={() => save(true)}>Guardar y preparar {readyCount} videos</Button>}
+      </div>
+      <p className="text-xs text-ink-secondary">Antes de generar, vas a confirmar las canciones y el diseño guardado.</p>
     </div>}
   </fieldset>;
 }
