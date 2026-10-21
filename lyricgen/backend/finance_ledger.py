@@ -564,3 +564,20 @@ def auto_costs(
             "fetched_at": v["fetched_at"].isoformat() if v["fetched_at"] else None,
         })
     return {"since": since, "until": until, "costs": out}
+
+
+@router.get("/background-mix")
+def background_mix(
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Veo vs foto + efecto de los video lyrics vigentes en los portales, por
+    campaña. El contrato pide 50/50; el operador elige qué campañas suman."""
+    from background_mix import build_mix
+    from database import scoped_peer_db
+
+    with scoped_peer_db() as peer:
+        result = build_mix(ddb, db, peer)
+    result["generated_at"] = utcnow().isoformat()
+    return result

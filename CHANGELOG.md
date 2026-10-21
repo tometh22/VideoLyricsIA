@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.138] - 2026-10-21
+## [1.1.139] - 2026-10-21
 
 ### Changed
 
@@ -11,6 +11,12 @@
 
 - Remove the unexplained required change-note blocker by recording an automatic audit reason when the optional note is empty.
 - Prevent duplicate submission when entering generation from the design summary; preserve queue-capacity handling and review of pinned exceptions.
+
+## [1.1.138] - 2026-10-21
+
+### Added
+
+- Finanzas → **Mix de fondos**: cuántos video lyrics publicados en los portales de UMG llevan fondo de video Veo y cuántos foto + efecto (el contrato pide 50/50). Se tildan las campañas que entran en la cuenta y calcula el porcentaje, cuántas fotos faltan para empatar, cuántas de cada tipo faltan para una meta de videos, y marca los Veo que no son Lite. El tipo de fondo sale de lo que generó el pipeline, no del estilo elegido en el wizard. Sólo lectura.
 
 ## [1.1.137] - 2026-10-21
 
