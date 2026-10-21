@@ -88,33 +88,45 @@ def test_background_mix_groups_live_deliveries_by_campaign(client, admin_token, 
                         added_by_user_id=admin_user_id, added_at=added, portal_id=portal,
                         removed_at=T0 if removed else None))
 
-    veo = job("01", {"movement_style": "estatico"}, [("video_bg", "veo-3.1-lite-generate-001")])
-    foto = job("02", {"movement_style": "foto-parallax", "effect": "bokeh"},
-               [("image_bg", "gemini-2.5-flash-image")])
-    retirado = job("03", {}, [("video_bg", "veo-3.1-lite-generate-001")])
-    art = job("04", {"art_track": True})
-    suelto = job("05", {}, [("video_bg", "veo-3.1-fast-generate-001")], campaign=None)
-    # Publicado dos veces: un solo video.
-    deliver(veo)
-    deliver(veo, added=T0 + timedelta(days=3))
-    deliver(foto)
-    deliver(retirado, removed=True)
-    deliver(art, label="Opción 3")
-    deliver(suelto, label="Renderizado", portal="chile")
-    deliver(f"m{tag}99", label="Art Track")
-    db.commit()
+    try:
+        veo = job("01", {"movement_style": "estatico"}, [("video_bg", "veo-3.1-lite-generate-001")])
+        foto = job("02", {"movement_style": "foto-parallax", "effect": "bokeh"},
+                   [("image_bg", "gemini-2.5-flash-image")])
+        retirado = job("03", {}, [("video_bg", "veo-3.1-lite-generate-001")])
+        art = job("04", {"art_track": True})
+        suelto = job("05", {}, [("video_bg", "veo-3.1-fast-generate-001")], campaign=None)
+        # Publicado dos veces: un solo video.
+        deliver(veo)
+        deliver(veo, added=T0 + timedelta(days=3))
+        deliver(foto)
+        deliver(retirado, removed=True)
+        deliver(art, label="Opción 3")
+        deliver(suelto, label="Renderizado", portal="chile")
+        deliver(f"m{tag}99", label="Art Track")
+        db.commit()
 
-    res = client.get("/admin/finance/background-mix", headers=auth(admin_token))
-    assert res.status_code == 200, res.text
-    body = res.json()
-    group = next(g for g in body["groups"] if g["key"] == f"campaign:{camp}")
-    assert (group["videos"], group["veo"], group["foto"]) == (2, 1, 1)
-    assert group["veo_models"] == {"lite": 1}
-    assert group["efectos"] == {"bokeh": 1}
-    assert group["name"] == f"Campaña {tag}" and group["portal"] == "argentina"
+        res = client.get("/admin/finance/background-mix", headers=auth(admin_token))
+        assert res.status_code == 200, res.text
+        body = res.json()
+        group = next(g for g in body["groups"] if g["key"] == f"campaign:{camp}")
+        assert (group["videos"], group["veo"], group["foto"]) == (2, 1, 1)
+        assert group["veo_models"] == {"lite": 1}
+        assert group["efectos"] == {"bokeh": 1}
+        assert group["name"] == f"Campaña {tag}" and group["portal"] == "argentina"
 
-    mine = {i["job_id"]: i for i in body["items"] if i["job_id"].startswith(f"m{tag}")}
-    assert set(mine) == {veo, foto, suelto}
-    assert mine[suelto]["group"] == "sin_campana:chile"
-    assert mine[suelto]["veo_model"] == "fast"
-    assert body["excluded_art_tracks"] >= 1
+        mine = {i["job_id"]: i for i in body["items"] if i["job_id"].startswith(f"m{tag}")}
+        assert set(mine) == {veo, foto, suelto}
+        assert mine[suelto]["group"] == "sin_campana:chile"
+        assert mine[suelto]["veo_model"] == "fast"
+        assert body["excluded_art_tracks"] >= 1
+    finally:
+        # Lo que se commiteó acá es visible para el resto de la suite (en CI
+        # es Postgres compartido): otros tests borran todas las campañas y
+        # cuentan entregas, así que no puede quedar nada.
+        db.rollback()
+        ids = [f"m{tag}{n}" for n in ("01", "02", "03", "04", "05", "99")]
+        db.query(Delivery).filter(Delivery.job_id.in_(ids)).delete(synchronize_session=False)
+        db.query(AIProvenance).filter(AIProvenance.job_id.in_(ids)).delete(synchronize_session=False)
+        db.query(Job).filter(Job.job_id.in_(ids)).delete(synchronize_session=False)
+        db.query(BatchCampaign).filter(BatchCampaign.id == camp).delete(synchronize_session=False)
+        db.commit()
