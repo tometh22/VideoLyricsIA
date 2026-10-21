@@ -17,7 +17,7 @@ export default function BulkActionBar({ songs, kind, canManage, portalSends = tr
       {hiddenCount > 0 && <span className="block text-xs text-amber-200">{hiddenCount} fuera del filtro actual</span>}</span>
     <Button size="sm" variant="ghost" onClick={onClear}>Limpiar <Kbd className="hidden sm:inline-flex">Esc</Kbd></Button>
     <div className="ml-auto flex flex-wrap items-center gap-2">
-      {style.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("style", style)}>Asignar estilo</Button>}
+      {style.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("style", style)}>Elegir fondo</Button>}
       {retry.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("retry", retry)}>Reintentar {retry.length}</Button>}
       {restore.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("restore", restore)}>Recuperar {restore.length}</Button>}
       {discard.length > 0 && <Button size="sm" variant="danger" onClick={() => onAction("discard", discard)}>Descartar {discard.length}</Button>}

@@ -475,7 +475,7 @@ export default function CampaignDetailPage({ id }) {
       }
       void refresh();
     }} />}
-    {dialog?.type === "generate" && <GenerateDialog items={dialog.items} onClose={() => setDialog(null)} onDone={(result) => {
+    {dialog?.type === "generate" && <GenerateDialog items={dialog.items} startImmediately={dialog.startImmediately} onChangeStyle={canManage ? () => { setStyleTargets(dialog.items.map(item => item.id)); setDialog(null); } : undefined} onClose={() => setDialog(null)} onDone={(result) => {
       setDialog(null);
       const summary = generationSummary(result);
       setSelected((old) => new Set([...old].filter((songId) => !result.sentIds.has(songId))));
@@ -511,19 +511,19 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: result.failed.length ? "warning" : "success", text: `${result.done} ${result.done === 1 ? "canción" : "canciones"} ${dialog.mode === "restore" ? "recuperada" : "descartada"}${result.done === 1 ? "" : "s"}.` });
       void refresh();
     }} />}
-    {styleTargets && <Modal label="Asignar estilo" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
+    {styleTargets && <Modal label="Elegir fondo" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
       <div className="mb-5 flex items-start justify-between gap-3">
-        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Estilo y reparto</p>
-          <h2 className="mt-1 text-xl font-semibold">Asignar estilo a {styleTargets.length} {styleTargets.length === 1 ? "canción" : "canciones"}</h2>
-          <p className="mt-1 text-sm text-ink-secondary">Sólo cambia cómo se generarán estos videos. No genera nada.</p></div>
+        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Fondo del video</p>
+          <h2 className="mt-1 text-xl font-semibold">Elegir fondo para {styleTargets.length} {styleTargets.length === 1 ? "video" : "videos"}</h2>
+          <p className="mt-1 text-sm text-ink-secondary">Elegí cómo querés verlos. Después revisás el resumen y generás.</p></div>
         <Button variant="ghost" size="sm" disabled={styleBusy} onClick={() => setStyleTargets(null)} aria-label="Cerrar">✕</Button>
       </div>
       {creative.data ? creative.data.can_manage
-        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onBusyChange={setStyleBusy} onSaved={async () => { await refresh(); }} onPrepareGeneration={async () => {
+        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onBusyChange={setStyleBusy} onSaved={async () => { await refresh(); }} onPrepareGeneration={async ({ startImmediately = false } = {}) => {
           const fresh = await campaignRequest(`${base}/creative`);
           const items = fresh.items.filter(item => styleTargets.includes(item.id) && item.status === "lyrics_approved" && !item.discarded);
           if (!items.length) throw new Error("El diseño quedó guardado, pero estas canciones ya no están listas para generar. Revisá su estado actualizado.");
-          setStyleBusy(false); setStyleTargets(null); setDialog({ type: "generate", items });
+          setStyleBusy(false); setStyleTargets(null); setDialog({ type: "generate", items, startImmediately });
         }} />
         : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar estilos.</p>
         : <Skeleton className="h-48" />}

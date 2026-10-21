@@ -4,7 +4,7 @@ import { installCampaignApi, song, expectNoHorizontalOverflow } from "./campaign
 
 for (const width of [1440, 390]) {
   test(`ready songs can save and generate a photo 50/50 split at ${width}px`, async ({ page }) => {
-    await page.setViewportSize({ width, height: 1000 });
+    await page.setViewportSize({ width, height: width < 768 ? 844 : 1000 });
     await installEditorHarness(page, { jobId: "song-1", role: "admin" });
     const api = await installCampaignApi(page, { songs: [
       ...Array.from({ length: 10 }, (_, i) => song(i + 1, "ready", { settings: { font: "poppins-bold" } })),
@@ -12,27 +12,26 @@ for (const width of [1440, 390]) {
     ] });
     await page.goto("/campaigns/workflow?view=ready");
     await page.getByRole("checkbox", { name: width < 768 ? "Seleccionar todas (10)" : "Seleccionar 10 canciones" }).check();
-    await page.getByRole("region", { name: "Acciones sobre la selección" }).getByRole("button", { name: "Asignar estilo" }).click();
-    const assignment = page.getByRole("dialog", { name: "Asignar estilo" });
-    await assignment.getByRole("button", { name: "50% Bokeh / 50% Chispas" }).click();
-    await expect(assignment.getByLabel("Efecto de foto del grupo 1")).toHaveValue("bokeh");
-    await expect(assignment.getByLabel("Efecto de foto del grupo 2")).toHaveValue("embers");
-    await expect(assignment.getByLabel("Inspiración de foto del grupo 1")).toHaveValue("lyrics");
-    await page.screenshot({ path: `test-results/photo-preset-${width}.png` });
-    await assignment.getByRole("button", { name: "Revisar reparto de 10 canciones" }).click();
-    await expect(assignment.getByText("Foto fija + Bokeh: 5 (50.00%)")).toBeVisible();
-    await expect(assignment.getByText("Foto fija + Chispas: 5 (50.00%)")).toBeVisible();
+    await page.getByRole("region", { name: "Acciones sobre la selección" }).getByRole("button", { name: "Generar 10 videos" }).click();
+    await page.getByRole("dialog", { name: "Confirmar generación" }).getByRole("button", { name: "Cambiar fondo" }).click();
+    const assignment = page.getByRole("dialog", { name: "Elegir fondo" });
+    await assignment.getByRole("button", { name: /Foto fija/ }).click();
+    await assignment.getByRole("button", { name: "Mitad y mitad" }).click();
+    await expect(assignment.getByLabel("Efecto de foto del grupo 1")).not.toBeVisible();
+    await expect(assignment.getByLabel("Motivo del cambio")).not.toBeVisible();
+    await expect(assignment.getByRole("button", { name: "Mitad y mitad" })).toHaveAttribute("aria-pressed", "true");
+    await expectNoHorizontalOverflow(page, expect);
+    await expect(assignment.getByRole("button", { name: "Bokeh", exact: true })).toHaveAttribute("aria-pressed", "false");
+    await expect(assignment.getByRole("button", { name: "Mitad y mitad" })).toHaveAttribute("aria-pressed", "true");
+    await page.screenshot({ path: `test-results/photo-preset-${width}.png`, animations: "disabled" });
+    await assignment.getByRole("button", { name: "Continuar" }).click();
+    await expect(assignment.getByText("5 · Bokeh")).toBeVisible();
+    await expect(assignment.getByText("5 · Chispas")).toBeVisible();
     expect(api.lastPreview.reason).toBe("Configuración de estilos y reparto desde la campaña");
     expect(api.generations).toHaveLength(0);
-    await assignment.getByRole("button", { name: "Guardar y preparar 10 videos" }).click();
-    const generation = page.getByRole("dialog", { name: "Confirmar generación" });
-    await expect(generation).toBeVisible();
-    await expect(generation.getByText(/Foto fija \+ Bokeh/)).toHaveCount(6);
-    await expect(generation.getByText(/Foto fija \+ Chispas/)).toHaveCount(6);
-    expect(api.generations).toHaveLength(0);
-    await page.screenshot({ path: `test-results/photo-confirm-${width}.png` });
+    await page.screenshot({ path: `test-results/photo-confirm-${width}.png`, animations: "disabled" });
     await expectNoHorizontalOverflow(page, expect);
-    await generation.getByRole("button", { name: "Confirmar generación" }).click();
+    await assignment.getByRole("button", { name: "Generar 10 videos" }).click();
     await expect(page.getByText(/10 trabajos enviados/)).toBeVisible();
     expect(api.generations).toHaveLength(10);
     expect(api.generations.filter(body => body.includes('name="effect"\r\n\r\nbokeh'))).toHaveLength(5);
