@@ -96,6 +96,7 @@ const NAV = [
       { id: "resultado", label: "Resultado por mes" },
       { id: "contrato", label: "Contrato y reparto" },
       { id: "metricas", label: "Métricas" },
+      { id: "mix", label: "Mix de fondos" },
       { id: "movimientos", label: "Movimientos" },
       { id: "criterio", label: "Criterio" },
     ],
