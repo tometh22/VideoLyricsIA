@@ -7,6 +7,7 @@ import ContratoView from "./ContratoView";
 import CriterioView from "./CriterioView";
 import LiquidacionView from "./LiquidacionView";
 import MetricasView from "./MetricasView";
+import MixFondosView from "./MixFondosView";
 import MovimientosView from "./MovimientosView";
 import ResultadoView from "./ResultadoView";
 import { addMonths, buildPnl, currentPeriod, effectiveEntries, monthsBetween } from "./finanzasModel";
@@ -17,6 +18,7 @@ const TITLES = {
   resultado: ["Resultado por mes", "Devengado: ingreso entregado y costo consumido en cada mes. Clic en una celda para cargarla."],
   contrato: ["Contrato y reparto", "Avance de cada contrato y la cuenta del socio."],
   metricas: ["Métricas", "Negocio y operación del mismo período."],
+  mix: ["Mix de fondos", "Video Veo vs foto + efecto de lo publicado en los portales. Tildá las campañas que entran en la cuenta del contrato."],
   movimientos: ["Movimientos", "Cada renglón con su base y su evidencia. Importar o exportar CSV."],
   criterio: ["Criterio", "Cómo se calcula y qué mira cada rol."],
 };
@@ -56,7 +58,7 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
       <SectionHeader
         title={title}
         subtitle={subtitle}
-        right={!["criterio", "liquidacion"].includes(subTab) && (
+        right={!["criterio", "liquidacion", "mix"].includes(subTab) && (
           <div className="flex items-center gap-2 text-caption text-gray-400">
             <span>Desde</span>
             <input type="month" aria-label="Desde" className={monthInput} value={f.since} onChange={(e) => e.target.value && f.setSince(e.target.value)} />
@@ -71,7 +73,10 @@ export default function FinanzasSection({ subTab = "liquidacion" }) {
           <button type="button" onClick={() => f.setError(null)} className="text-red-200 hover:text-white">✕</button>
         </div>
       )}
-      {f.loading ? (
+      {subTab === "mix" ? (
+        // No depende de la planilla: sus datos salen de los portales.
+        <MixFondosView />
+      ) : f.loading ? (
         <p className="text-caption text-gray-500">Cargando…</p>
       ) : (
         <>
