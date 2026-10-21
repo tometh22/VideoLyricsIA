@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.139] - 2026-10-21
+
+### Changed
+
+- Simplify campaign video generation to photo or video, then Bokeh, Chispas or a half-and-half photo split. Keep typography, custom distributions, contracts and technical controls inside collapsed advanced options.
+- Show the actual assignment before generating, then save the design and start the approved songs from one final action. Keep Veo Lite for video backgrounds and preserve approved lyrics and timings.
+
+### Fixed
+
+- Remove the unexplained required change-note blocker by recording an automatic audit reason when the optional note is empty.
+- Prevent duplicate submission when entering generation from the design summary; preserve queue-capacity handling and review of pinned exceptions.
+
 ## [1.1.138] - 2026-10-21
 
 ### Added

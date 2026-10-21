@@ -141,7 +141,7 @@ export default function CampaignSettings({ campaign, section, onSection, canMana
             : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cargar audios.</p>}
         </Section>
         : <Section title="Audios y portadas"><ArtTrackPanel campaign={campaign} onChanged={onChanged} /></Section>)}
-      {active === "style" && <Section title="Estilo y reparto" description="Define cómo se ve cada video. Con un solo estilo al 100 % todas las canciones activas usan el mismo; con varios, se reparten. Para cambiar sólo algunas, seleccionalas en la lista y usá «Asignar estilo».">
+      {active === "style" && <Section title="Estilo y reparto" description="Elegí foto fija o video y un efecto. Los ajustes de detalle están en Opciones avanzadas. Para cambiar sólo algunas canciones, seleccionalas en la lista y usá «Elegir fondo».">
         {!creative ? <Skeleton className="h-40" /> : !creative.can_manage
           ? <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar estilos.</p>
           : <StyleAssignment campaignId={campaign.id} creative={creative} itemIds={activeItems} onSaved={onChanged} />}
