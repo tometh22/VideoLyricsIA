@@ -12,6 +12,12 @@
 - Remove the unexplained required change-note blocker by recording an automatic audit reason when the optional note is empty.
 - Prevent duplicate submission when entering generation from the design summary; preserve queue-capacity handling and review of pinned exceptions.
 
+## [1.1.137] - 2026-10-21
+
+### Security
+
+- Pillow 12.3.0 → 13.0.0: corrige ocho vulnerabilidades al abrir archivos TIFF, GIF, PDF, PPM y EPS maliciosos (CVE-2026-112395, -112397, -112400, -112404, -112895, -112896, -112897 y -112899). Las fuentes, la onda de los art tracks y los efectos dan idénticos; los redimensionados cambian por redondeo, sin diferencia visible (PSNR de 55 a 66 dB en portadas y thumbnails).
+
 ## [1.1.136] - 2026-10-19
 
 ### Fixed
