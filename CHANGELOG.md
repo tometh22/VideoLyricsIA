@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.140] - 2026-10-22
+
+### Changed
+
+- Campañas: la lista deja de ser una grilla plana ordenada por fecha de creación. Arriba, **Para hacer**: sólo las campañas con letras, videos o cambios del cliente esperando, primero los pedidos del cliente más antiguos. Abajo, **todas las campañas agrupadas por lote** (el primer tramo del nombre: "UMG Chile", "UMG Agosto 2026"), en filas compactas que muestran el nombre sin el prefijo del lote, así lo que distingue a cada campaña ya no queda cortado. Los lotes con trabajo vivo arrancan abiertos y con lo activo primero; los terminados, cerrados. Un prefijo usado una sola vez va a "Otras campañas" y las canceladas quedan juntas y cerradas al final, sin botones de "Revisar". Buscar abre todos los lotes.
+
 ## [1.1.139] - 2026-10-21
 
 ### Changed
