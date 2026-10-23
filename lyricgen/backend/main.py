@@ -13772,7 +13772,7 @@ async def reject_job(
 
 
 @app.get("/jobs/{job_id}/source-audio-url")
-async def get_source_audio_url(
+def get_source_audio_url(
     job_id: str,
     request: Request,
     prefer_original: bool = Query(False),
@@ -13786,6 +13786,10 @@ async def get_source_audio_url(
     align segments to it. Returning a signed URL (instead of proxying
     bytes through uvicorn) keeps the API container free during long
     editor sessions.
+
+    This handler performs synchronous SQLAlchemy, R2 and Redis I/O. Run it
+    in FastAPI's worker pool so a slow storage probe cannot freeze the event
+    loop, including CORS preflights and the editor's save/heartbeat requests.
 
     Resolution order:
       1. content-addressed editor AAC preview (when ready).
