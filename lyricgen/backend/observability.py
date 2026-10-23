@@ -42,8 +42,9 @@ def _bool_env(name: str, default: bool = False) -> bool:
     }
 
 
-def runtime_timing_config() -> dict[str, float | int | bool]:
+def runtime_timing_config() -> dict[str, float | int | bool | str]:
     """Canonical timing knobs that must agree across transcription services."""
+    from display_segmentation import runtime_config_fingerprint as display_fingerprint
     return {
         "lyric_hold_s": _float_env("LYRIC_HOLD_S", 0.5),
         "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
@@ -52,6 +53,7 @@ def runtime_timing_config() -> dict[str, float | int | bool]:
         "lyric_min_gap_ms": _int_env("LYRIC_MIN_GAP_MS"),
         "lyric_min_gap_ab_enabled": _bool_env("LYRIC_MIN_GAP_AB_ENABLED"),
         "lyric_min_gap_ab_arm_b_ms": _int_env("LYRIC_MIN_GAP_AB_ARM_B_MS", 300),
+        "display_segmentation": display_fingerprint(),
     }
 
 
@@ -1117,6 +1119,14 @@ def quality_gates_snapshot(snap: dict | None = None) -> dict:
         payload["calibrated"] = bool(calibration.get("calibrated"))
         payload["calibration_id"] = calibration.get("calibration_id")
         payload["pipeline_config_fingerprint"] = identity.get("pipeline_config_fingerprint")
+        from display_segmentation import mode as display_mode, POLICY_VERSION as DISPLAY_POLICY
+        from display_segmentation_policy import runtime_authorization as display_authorization
+        display_grant = display_authorization()
+        payload["display_segmentation"] = {
+            "mode": display_mode(), "policy_version": DISPLAY_POLICY,
+            "authorization_status": display_grant["status"],
+            "authorized": bool(display_grant["authorized"]),
+        }
         if not calibration.get("calibrated"):
             reasons.append("quality_calibration_unavailable")
     except Exception:

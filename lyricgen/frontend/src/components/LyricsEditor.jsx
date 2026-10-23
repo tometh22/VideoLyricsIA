@@ -1,3 +1,4 @@
+import DisplaySegmentationNotice from "./DisplaySegmentationNotice";
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { classifyTask, isEditableTarget, readTaskAttr } from "../editorTaskClock";
 import { createPortal } from "react-dom";
@@ -6164,6 +6165,12 @@ export default function LyricsEditor({
           </div>
         )}
       </div>
+      <DisplaySegmentationNotice
+        report={durableEditor.document?.display_segmentation || transcriptionQuality?.display_segmentation}
+        stale={isDirty || (durableEditor.document?.display_segmentation
+          ? !durableEditor.document.display_segmentation_current
+          : Number(transcriptionQuality?.evaluated_revision) !== Number(segmentsRevision))}
+        onSeek={(seconds) => seekTo(seconds, false)} t={t} />
       {editorV2Enabled && durableEditor.document?.auto_repair_undo_available && (
         <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-2 text-xs text-gray-200">
           <span>Esta canción recibió una mejora automática. Podés volver a la versión anterior.</span>

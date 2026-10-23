@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.143] - 2026-10-23
+
+### Added
+
+- División final de frases para transcripciones nuevas, con propuesta en shadow por defecto, aplicación condicionada a evidencia validada y autorización propia, preservación de texto y bordes, IDs únicos y pendientes de escucha. Worker y rutas HTTP comparten el mismo contrato.
+- Evidencia privada recuperable y aviso de cortes aplicados/propuestos en el editor, conservados frente a reevaluaciones y marcados como anteriores después de editar. Incluye previsualización local sin escrituras en canciones.
+
+### Fixed
+
+- El formateador ortográfico ya no acepta dividir tarjetas ni inventar tiempos proporcionales. Las divisiones usan únicamente relojes actuales, completos y contenidos, y se rechazan si cambian el audio, la revisión o el documento durante el cálculo.
+- La calidad y los hashes finales se vinculan a la precisión temporal que persiste el editor. No se vuelve a retimar durante la medición posterior a una división.
+
+
 ## [1.1.140] - 2026-10-22
 
 ### Changed

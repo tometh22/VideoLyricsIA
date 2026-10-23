@@ -446,7 +446,7 @@ def _coverage_de(r) -> float | None:
 
 def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                            audio_path: str = "", *, strip_internal: bool = True,
-                           live_hint: bool = False):
+                           live_hint: bool = False, allow_timing_mutation: bool = True):
     """Loguea la cobertura final y la compara con la de la cascada y la
     previa al formateador. Saca `_asr_words` del result (transporte interno:
     no se persiste ni llega al cliente). Nunca levanta.
@@ -481,7 +481,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # This happens after word consistency, never trims, and skips
             # operator-locked boundaries.
             from timing_review_suggestions import automatic_tail_enabled
-            if _stem and automatic_tail_enabled():
+            if allow_timing_mutation and _stem and automatic_tail_enabled():
                 try:
                     from pathlib import Path
                     from timing_review_suggestions import (
@@ -755,7 +755,8 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   timing_consistency_fn, *, live_hint: bool = False,
                                   source_audio_sha256: str = "",
                                   source_audio_revision: int = 0,
-                                  source_segments_revision: int = 0):
+                                  source_segments_revision: int = 0,
+                                  fresh_transcription: bool = False):
     """Measure, retry only unsafe windows, and persist one final verdict."""
     from transcription_quality import POLICY_VERSION, calibration_identity, evaluate
     from line_evidence import annotate_provider_evidence
@@ -1088,6 +1089,70 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 auto_trace["status"] = "timing_candidate_generation_failed"
             auto_trace["abstained_count"] += 1
 
+    # One final owner of display boundaries, after all retries/formatting and
+    # before the final quality verdict and immutable machine snapshot.
+    from display_segmentation import run as segment_display
+    from display_segmentation_policy import runtime_authorization as display_authorization
+    display_previous_result = copy.deepcopy(r)
+    display_before = copy.deepcopy(r.get("segments") or [])
+    display_report = None
+    try:
+        from line_evidence import evidence_issues as display_parent_issues
+        display_source = {
+            "job_id": job_id, "audio_sha256": source_audio_sha256,
+            "audio_revision": int(source_audio_revision or 0),
+            "segments_revision": int(source_segments_revision or 0),
+            "protected_quality_indices": sorted({
+                issue["segment_index"] for issue in display_parent_issues(display_before)
+            }),
+        }
+        display_fresh = bool(
+            fresh_transcription and source_segments_revision == 0
+            and len(source_audio_sha256) == 64 and source_audio_revision > 0
+            and not r.get("approved_text_reuse")
+        )
+        display_rows, display_report, display_proposal = segment_display(
+            display_before, source=display_source, fresh=display_fresh,
+            authorization=display_authorization(),
+        )
+        if display_report and display_report.get("applied_count"):
+            from display_segmentation import digest as display_digest
+            expected_display_hash = display_digest(display_rows)
+            r["segments"] = display_rows
+            # Old counts/indices belong to the old cards. Remeasure without
+            # allowing the stable-pitch measurement helper to retime them.
+            r["postpass_stats"] = dict(r.get("postpass_stats") or {})
+            for key in ("coverage_final", "quality_windows", "voiced_gaps_v2"):
+                r["postpass_stats"].pop(key, None)
+            r = _medir_cobertura_final(
+                r, job_id, antes_fmt, audio_path, strip_internal=False,
+                live_hint=live_hint, allow_timing_mutation=False,
+            )
+            if display_digest(r.get("segments")) != expected_display_hash:
+                raise ValueError("post_segmentation_timing_changed")
+            post = r.get("postpass_stats") or {}
+            windows = post.get("quality_windows") or []
+            from machine_evidence import snapshot_hash
+            display_report["source_snapshot_sha256"] = snapshot_hash(display_before)
+            display_report["source_segments_hash"] = _segments_hash(display_before)
+            r["_pre_display_segmentation_segments"] = display_before
+        if display_proposal is not None:
+            r["_display_segmentation_proposal"] = display_proposal
+    except Exception as exc:
+        # Optional segmentation can abstain, never leave a partially changed
+        # document or certify old per-card metrics against the new structure.
+        r = display_previous_result
+        post = r.get("postpass_stats") or {}
+        windows = post.get("quality_windows") or []
+        display_report = {
+            "policy_version": "display-phrases-v1", "status": "unavailable",
+            "failure_code": _safe_exception_code(exc), "applied_count": 0,
+            "before": len(display_before), "after": len(display_before),
+        }
+        r.pop("_pre_display_segmentation_segments", None)
+        logger.warning("[DISPLAY-SEGMENTATION] abstained job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
     from quality_jobs import _sanitize_analytical_evidence
@@ -1181,6 +1246,11 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
         )
     final["auto_repair"] = auto_trace
+    if display_report is not None:
+        if display_report.get("applied_count"):
+            from machine_evidence import snapshot_hash
+            display_report["result_snapshot_sha256"] = snapshot_hash(r.get("segments") or [])
+        final["display_segmentation"] = display_report
     r["transcription_quality"] = final
     if auto_trace["applied_count"] > 0:
         # Keep the exact machine output before automatic changes in the
@@ -1210,6 +1280,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
     r.pop("_pre_auto_repair_segments", None)
+    r.pop("_pre_display_segmentation_segments", None)
+    r.pop("_display_segmentation_proposal", None)
+    r.pop("_transcription_source", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
     r.pop("_reconcile_capture", None)
@@ -1390,6 +1463,7 @@ def run_transcription_job(
     source_audio_sha256 = sha256_file(audio_path)
     source_audio_revision = 0
     source_segments_revision = 0
+    fresh_transcription = False
     # Establish the immutable source identity before the expensive pipeline.
     # Direct browser PUTs necessarily start at a mutable upload key because
     # the server does not see their bytes; the first worker materialization
@@ -1437,6 +1511,8 @@ def run_transcription_job(
             )
         source_audio_revision = int(_identity_row.audio_revision or 0)
         source_segments_revision = int(_identity_row.segments_revision or 0)
+        from display_segmentation_policy import fresh_job
+        fresh_transcription = fresh_job(_identity_db, _identity_row)
         _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
@@ -1505,6 +1581,12 @@ def run_transcription_job(
                 live=live, reference_required=reference_required,
                 workload_class=workload_class,
                 parallel_audio_reference=parallel_audio_reference,
+                transcription_source={
+                    "job_id": job_id, "audio_sha256": source_audio_sha256,
+                    "audio_revision": source_audio_revision,
+                    "segments_revision": source_segments_revision,
+                    "fresh": fresh_transcription,
+                },
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -1615,6 +1697,7 @@ def run_transcription_job(
                 source_audio_sha256=source_audio_sha256,
                 source_audio_revision=source_audio_revision,
                 source_segments_revision=source_segments_revision,
+                fresh_transcription=fresh_transcription,
             )
             if isinstance(r.get("catalog_reference"), dict):
                 quality = dict(r.get("transcription_quality") or {})
@@ -1776,6 +1859,13 @@ def run_transcription_job(
                     "job_id": job_id, "status": "discarded",
                     "reason": "source_segments_revision_changed",
                 }
+            display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
+            if display_trace.get("applied_count"):
+                from display_segmentation_policy import fresh_job
+                if current_revision != source_segments_revision or not fresh_job(_persist_db, row):
+                    _persist_db.rollback()
+                    return {"job_id": job_id, "status": "discarded",
+                            "reason": "display_segmentation_source_changed"}
             if current_revision > 0 and segments != row.segments_json:
                 # An operator edited while the ASR was running. Preserve the
                 # human version and do not attach a verdict for discarded data.
@@ -1818,6 +1908,14 @@ def run_transcription_job(
                         quality["learning_shadow"] = {
                             "available": False, "reason": "prediction_failed",
                             "mutated_segments": False,
+                        }
+                    from transcription_quality import segments_hash as _persisted_segments_hash
+                    quality["segments_hash"] = _persisted_segments_hash(document.current_segments or [])
+                    if isinstance(quality.get("display_segmentation"), dict) and quality["display_segmentation"].get("applied_count"):
+                        from machine_evidence import snapshot_hash as _persisted_snapshot_hash
+                        quality["display_segmentation"] = {
+                            **quality["display_segmentation"],
+                            "result_snapshot_sha256": _persisted_snapshot_hash(document.original_segments or []),
                         }
                     from transcription_quality import quality_fingerprint
                     quality["quality_fingerprint"] = quality_fingerprint(

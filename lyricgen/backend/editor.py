@@ -655,8 +655,16 @@ def auto_repair_undo_segments(job: Job, document: EditorDocument) -> list[dict] 
     decisions = evidence.get("decisions") or {}
     frozen_quality = decisions.get("quality") if isinstance(decisions, dict) else None
     trace = frozen_quality.get("auto_repair") if isinstance(frozen_quality, dict) else None
-    if not isinstance(trace, dict):
-        return None
+    source_role = "pre_auto_repair"
+    # The existing generic 'undo automatic improvement' restores all machine
+    # edits if lexical repair preceded division; otherwise just the display
+    # partition. Separate immutable sources remain available for both stages.
+    if not isinstance(trace, dict) or not trace.get("applied_count"):
+        display = frozen_quality.get("display_segmentation") if isinstance(frozen_quality, dict) else None
+        if not isinstance(display, dict) or not display.get("applied_count"):
+            return None
+        trace = {**display, "source_segments_revision": (display.get("source") or {}).get("segments_revision")}
+        source_role = "pre_display_segmentation"
     if type(trace.get("applied_count")) is not int or trace["applied_count"] <= 0:
         return None
     from machine_evidence import MachineSnapshotMissing, snapshot_hash, validate_machine_evidence
@@ -675,7 +683,7 @@ def auto_repair_undo_segments(job: Job, document: EditorDocument) -> list[dict] 
         return None
     source = [
         item for item in evidence.get("hypotheses_by_family") or []
-        if isinstance(item, dict) and item.get("role") == "pre_auto_repair"
+        if isinstance(item, dict) and item.get("role") == source_role
     ]
     if len(source) != 1 or not isinstance(source[0].get("events"), list):
         return None
@@ -716,6 +724,12 @@ def serialize_document(
             **_version_summary(db, latest_approved),
             "segments": latest_approved.segments,
         }
+    machine_evidence = document.machine_evidence if isinstance(document.machine_evidence, dict) else {}
+    frozen_decisions = machine_evidence.get("decisions")
+    frozen_quality = frozen_decisions.get("quality") if isinstance(frozen_decisions, dict) else {}
+    display_report = frozen_quality.get("display_segmentation") if isinstance(frozen_quality, dict) else None
+    display_current = bool(document.current_segments == document.original_segments
+                           and job is not None and job.segments_json == document.original_segments)
     # Authorship and isolation are read back from the stored rows, so a caller
     # verifying a saved copy never has to take the client's word for them.
     pilot = {
@@ -734,6 +748,8 @@ def serialize_document(
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
+        **({"display_segmentation": display_report,
+            "display_segmentation_current": display_current} if isinstance(display_report, dict) else {}),
         "auto_repair_undo_available": bool(
             job is not None and auto_repair_undo_segments(job, document) is not None
         ),

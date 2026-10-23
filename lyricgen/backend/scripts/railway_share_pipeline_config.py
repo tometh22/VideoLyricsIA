@@ -47,7 +47,11 @@ def config_keys() -> tuple[str, ...]:
         "TRANSCRIPTION_QUALITY_RELEASE_REPORT_PATH", "TRANSCRIPTION_QUALITY_RELEASE_REPORT_SHA256",
         "TRANSCRIPTION_QUALITY_BENCHMARK_MANIFEST_PATH",
     )
-    return tuple(dict.fromkeys((*_PIPELINE_CONFIG_KEYS, *calibration, *TIMING_KEYS)))
+    display_grant = (
+        "DISPLAY_SEGMENTATION_AUTHORIZATION_PATH", "DISPLAY_SEGMENTATION_AUTHORIZATION_SHA256",
+        "DISPLAY_SEGMENTATION_PUBLIC_KEYS",
+    )
+    return tuple(dict.fromkeys((*_PIPELINE_CONFIG_KEYS, *calibration, *TIMING_KEYS, *display_grant)))
 
 
 def plan(raw: dict[str, dict[str, str]], keys) -> tuple[dict[str, str], dict[str, list[str]], list[str]]:
