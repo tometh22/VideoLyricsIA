@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Conserva el arreglo de audio del editor y las alertas de frases largas/repetidas por aparición, sin sustituir los cambios recientes de campañas y finanzas de staging.
 - El formateador ortográfico ya no acepta dividir tarjetas ni inventar tiempos proporcionales. Las divisiones usan únicamente relojes actuales, completos y contenidos, y se rechazan si cambian el audio, la revisión o el documento durante el cálculo.
 - La calidad y los hashes finales se vinculan a la precisión temporal que persiste el editor. No se vuelve a retimar durante la medición posterior a una división.
 
