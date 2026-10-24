@@ -45,7 +45,8 @@ La reutilización de una letra aprobada tampoco se vuelve a dividir.
   Las tarjetas exteriores quedan iguales. No se copian señales analíticas o
   confianza agregada del padre como si fueran nueva evidencia de reconocimiento.
 - No se modifica ninguna fila bloqueada o con evidencia obsoleta. No se parte
-  una capa vocal que se superponga a una tarjeta vecina. No se ordena para
+  una capa vocal que se superponga a otra, incluida cualquier voz anterior que
+  siga activa aunque ya termine la tarjeta precedente. No se ordena para
   esconder inversiones. Una violación rechaza la aplicación completa.
 
 `plan` es puro. `apply` vuelve a comprobar fuente completa (incluidos bloqueos

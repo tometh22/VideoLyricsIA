@@ -254,6 +254,7 @@ def apply(segments: list[dict], proposal: dict, *, source: dict) -> list[dict]:
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate_segment_ids")
     previous_start = -1.0
+    previous_max_end = -1.0
     for i, parent in enumerate(segments):
         start, end = _number(parent.get("start")), _number(parent.get("end"))
         if start < 0 or end <= start or start < previous_start:
@@ -261,9 +262,11 @@ def apply(segments: list[dict], proposal: dict, *, source: dict) -> list[dict]:
         previous_start = start
         if i in changes:
             # Simultaneous choruses need human interpretation; don't create
-            # consecutive cards that compete with an adjacent vocal layer.
-            if (i and segments[i - 1]["end"] > start) or (i + 1 < len(segments) and end > segments[i + 1]["start"]):
+            # consecutive cards that compete with any still-active earlier
+            # layer. The immediate predecessor can finish inside a held voice.
+            if previous_max_end > start or (i + 1 < len(segments) and end > segments[i + 1]["start"]):
                 raise ValueError("overlapping_vocal_layers")
+        previous_max_end = max(previous_max_end, end)
     return output
 
 

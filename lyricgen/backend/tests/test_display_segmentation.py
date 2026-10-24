@@ -136,6 +136,45 @@ def test_no_sorting_hides_inversion_and_no_new_consecutive_layers():
         ds.apply(rows, proposal(rows), source=SOURCE)
 
 
+@pytest.mark.parametrize("earlier_end", [3.01, 20.0])
+def test_nested_earlier_vocal_layer_blocks_division(earlier_end):
+    rows = [{"_id": "held", "start": 0.0, "end": earlier_end, "text": "Ah"},
+            {"_id": "echo", "start": 1.0, "end": 2.0, "text": "Eco"},
+            line(start=3.0)]
+    before = deepcopy(rows)
+    p = proposal(rows)
+    assert [change["index"] for change in p["changes"]] == [2]
+    with pytest.raises(ValueError, match="overlapping_vocal_layers"):
+        ds.apply(rows, p, source=SOURCE)
+    assert rows == before
+
+
+@pytest.mark.parametrize("earlier_end", [2.5, 3.0])
+def test_finished_earlier_vocal_layer_does_not_block_later_division(earlier_end):
+    rows = [{"_id": "held", "start": 0.0, "end": earlier_end, "text": "Ah"},
+            {"_id": "echo", "start": 1.0, "end": 2.0, "text": "Eco"},
+            line(start=3.0)]
+    output = ds.apply(rows, proposal(rows), source=SOURCE)
+    assert output[:2] == rows[:2]
+    assert len(output) > len(rows)
+    assert output[2]["start"] == rows[2]["start"]
+    assert output[-1]["end"] == rows[2]["end"]
+
+
+def test_nested_overlap_in_enforce_preserves_all_cards_for_review(monkeypatch):
+    monkeypatch.setenv("DISPLAY_SEGMENTATION_MODE", "enforce")
+    rows = [{"_id": "held", "start": 0.0, "end": 20.0, "text": "Ah"},
+            {"_id": "echo", "start": 1.0, "end": 2.0, "text": "Eco"},
+            line(start=3.0)]
+    before = deepcopy(rows)
+    output, report, _ = ds.run(rows, source=SOURCE, fresh=True,
+                              authorization={"authorized": True})
+    assert rows == output == before
+    assert report["status"] == "contract_rejected"
+    assert report["failure_code"] == "overlapping_vocal_layers"
+    assert report["applied_count"] == 0
+
+
 def test_modes_fail_closed_and_enforce_is_only_fresh_and_authorized(monkeypatch):
     rows = [line()]
     monkeypatch.setenv("DISPLAY_SEGMENTATION_MODE", "off")

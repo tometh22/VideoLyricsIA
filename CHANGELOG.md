@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.144] - 2026-10-24
+
+### Fixed
+
+- La división de frases detecta cualquier capa vocal anterior que siga activa, aunque termine la tarjeta inmediatamente anterior. Ante superposiciones anidadas conserva todas las tarjetas para revisión; una voz ya terminada no bloquea cortes posteriores. Incluye regresiones del caso y de la preservación atómica.
+
 ## [1.1.143] - 2026-10-23
 
 ### Added
