@@ -6437,9 +6437,37 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
     """
     from transcription_worker import _quality_gate_and_retry
 
+    # Inline rollback paths use the same explicit source identity as RQ.
+    # Never keep a transaction open while analyzing audio.
+    from quality_cache import sha256_file as _inline_audio_hash
+    from display_segmentation_policy import fresh_job as _display_fresh_job
+    from database import SessionLocal as _SourceSession
+    captured_source = result.pop("_transcription_source", None)
+    inline_audio_sha = await asyncio.to_thread(_inline_audio_hash, audio_path)
+    if captured_source and captured_source.get("audio_sha256") != inline_audio_sha:
+        raise HTTPException(status_code=409, detail="transcription_source_audio_changed")
+    with _SourceSession() as source_db:
+        source_row = source_db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+        if source_row is None:
+            raise RuntimeError("transcription_source_missing")
+        if source_row.input_audio_sha256 and source_row.input_audio_sha256 != inline_audio_sha:
+            raise HTTPException(status_code=409, detail="transcription_source_audio_changed")
+        source_row.input_audio_sha256 = inline_audio_sha
+        source_row.audio_revision = max(1, int(source_row.audio_revision or 0))
+        inline_audio_revision = int((captured_source or {}).get("audio_revision", source_row.audio_revision))
+        if int(source_row.audio_revision) != inline_audio_revision:
+            raise HTTPException(status_code=409, detail="transcription_source_audio_changed")
+        inline_segments_revision = int((captured_source or {}).get("segments_revision", source_row.segments_revision or 0))
+        inline_fresh = bool(captured_source and captured_source.get("fresh")
+                            and _display_fresh_job(source_db, source_row))
+        source_db.commit()
     finalized = await _quality_gate_and_retry(
         result, audio_path, job_id, language, None,
         _maybe_timing_consistency, live_hint=live_hint,
+        source_audio_sha256=inline_audio_sha,
+        source_audio_revision=inline_audio_revision,
+        source_segments_revision=inline_segments_revision,
+        fresh_transcription=inline_fresh,
     )
     quality_to_enqueue = None
     persisted_revision = 0
@@ -6459,6 +6487,13 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
             if row is not None:
                 segments = finalized.get("segments") or []
                 revision = int(row.segments_revision or 0)
+                if (row.input_audio_sha256 != inline_audio_sha
+                        or int(row.audio_revision or 0) != inline_audio_revision):
+                    raise RuntimeError("transcription_source_audio_changed")
+                display_trace = (finalized.get("transcription_quality") or {}).get("display_segmentation") or {}
+                if display_trace.get("applied_count") and (
+                        revision != inline_segments_revision or not _display_fresh_job(_quality_db, row)):
+                    raise RuntimeError("display_segmentation_source_changed")
                 if revision > 0 and segments != row.segments_json:
                     logger.warning(
                         "[QUALITY-GATE] inline result discarded after editor race job=%s revision=%s",
@@ -6480,8 +6515,8 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         quality = dict(quality)
                         quality["machine_evidence_required"] = True
                         quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
-                        from quality_cache import sha256_file
-                        quality["audio_sha256"] = sha256_file(audio_path)
+                        quality["audio_sha256"] = inline_audio_sha
+                        quality["audio_revision"] = inline_audio_revision
                         quality["evaluated_revision"] = revision
                         quality["timing_source"] = row.timing_source or "unknown"
                         try:
@@ -6493,6 +6528,14 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                             quality["learning_shadow"] = {
                                 "available": False, "reason": "prediction_failed",
                                 "mutated_segments": False,
+                            }
+                        from transcription_quality import segments_hash as _persisted_segments_hash
+                        quality["segments_hash"] = _persisted_segments_hash(document.current_segments or [])
+                        if isinstance(quality.get("display_segmentation"), dict) and quality["display_segmentation"].get("applied_count"):
+                            from machine_evidence import snapshot_hash as _persisted_snapshot_hash
+                            quality["display_segmentation"] = {
+                                **quality["display_segmentation"],
+                                "result_snapshot_sha256": _persisted_snapshot_hash(document.original_segments or []),
                             }
                         from transcription_quality import quality_fingerprint
                         quality["quality_fingerprint"] = quality_fingerprint(
@@ -6537,10 +6580,20 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     require_machine_snapshot(row, document)
                     row.status = "transcribed_pending"
                     row.current_step = "editing"
+                    finalized["segments"] = list(document.current_segments or [])
+                    finalized["transcription_quality"] = quality
                 _quality_db.commit()
         finally:
             _quality_db.close()
     except Exception as exc:
+        if str(exc) in {"transcription_source_audio_changed", "display_segmentation_source_changed"}:
+            # A concurrent editor/audio change is not a failed transcription.
+            # The rolled-back candidate must not mark the operator's job as
+            # failed or return unpersisted lyrics as the current document.
+            raise HTTPException(status_code=409, detail={
+                "code": "transcription_result_stale", "reason": str(exc),
+                "message": "La canción cambió durante el cálculo. Conservamos la versión guardada.",
+            }) from None
         logger.warning("[QUALITY-GATE] inline persistence failed: %s job=%s", exc, job_id)
         try:
             from jobs import update_job
@@ -6581,6 +6634,9 @@ def _maybe_phrase_segment(result, job_id: str):
     if not isinstance(result, dict):
         return result
     try:
+        from display_segmentation import mode as _display_mode
+        if _display_mode() != "off":
+            return result  # Finalizer owns display division in shadow/enforce.
         import phrase_segmenter as _ps
         if not _ps.is_enabled():
             return result
@@ -7529,6 +7585,7 @@ async def _run_transcription_for_job(
     reference_required: bool = False,
     workload_class: str = "interactive",
     parallel_audio_reference: bool = False,
+    transcription_source: dict | None = None,
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -7554,6 +7611,9 @@ async def _run_transcription_for_job(
     # through a dozen fallback signatures.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    if transcription_source is None:
+        from display_segmentation_policy import capture_source
+        transcription_source = await asyncio.to_thread(capture_source, job_id, audio_path)
 
     if not filename:
         filename = os.path.basename(audio_path)
@@ -7776,7 +7836,8 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             _capture.record("presentation_output", polished)
             out = {"job_id": job_id, "segments": polished,
-                   "reference_lyrics": reference_lyrics}
+                   "reference_lyrics": reference_lyrics,
+                   "_transcription_source": dict(transcription_source)}
             _captured_stages = _capture.snapshot()
             if _captured_stages is not None:
                 out["_reconcile_capture"] = _captured_stages
@@ -13711,7 +13772,7 @@ async def reject_job(
 
 
 @app.get("/jobs/{job_id}/source-audio-url")
-async def get_source_audio_url(
+def get_source_audio_url(
     job_id: str,
     request: Request,
     prefer_original: bool = Query(False),
@@ -13725,6 +13786,10 @@ async def get_source_audio_url(
     align segments to it. Returning a signed URL (instead of proxying
     bytes through uvicorn) keeps the API container free during long
     editor sessions.
+
+    This handler performs synchronous SQLAlchemy, R2 and Redis I/O. Run it
+    in FastAPI's worker pool so a slow storage probe cannot freeze the event
+    loop, including CORS preflights and the editor's save/heartbeat requests.
 
     Resolution order:
       1. content-addressed editor AAC preview (when ready).

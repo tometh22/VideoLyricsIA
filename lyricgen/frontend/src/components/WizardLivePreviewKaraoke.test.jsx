@@ -77,6 +77,28 @@ describe("WizardLivePreview — Phase C karaoke driven by ref", () => {
     expect(container.textContent.toLowerCase()).not.toContain("esta es tu letra");
   });
 
+  it("clears the previous song when App resets the shared playback ref", async () => {
+    const refOut = { current: null };
+    const { container } = render(<_Harness refOut={refOut} />);
+    await act(async () => {
+      refOut.current.current = {
+        activeLine: "a la escuela divina del poder universal azar",
+        activeStart: 3.02, activeEnd: 5.22, currentTime: 4,
+      };
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    await waitFor(() => expect(container.textContent).toContain("escuela"));
+    // The preview stays mounted when switching from Sueños to Sueldos.
+    await act(async () => {
+      refOut.current.current = { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 };
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    await waitFor(() => {
+      expect(container.textContent).not.toContain("escuela");
+      expect(container.textContent.toLowerCase()).toContain("esta es tu letra");
+    });
+  });
+
   it("changes active line when ref updates to a different segment", async () => {
     // En vez de probar el clear (que depende de timing del rAF en jsdom),
     // probamos el switch entre dos segments distintos — uso real del

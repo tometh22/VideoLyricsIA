@@ -26,7 +26,10 @@ def test_runtime_timing_config_normalizes_equivalent_values(monkeypatch):
     monkeypatch.delenv("LYRIC_MIN_GAP_AB_ENABLED", raising=False)
     monkeypatch.delenv("LYRIC_MIN_GAP_AB_ARM_B_MS", raising=False)
 
-    assert runtime_timing_config() == {
+    config = runtime_timing_config()
+    display_fingerprint = config.pop("display_segmentation")
+    assert len(display_fingerprint) == 64
+    assert config == {
         "lyric_hold_s": 0.5,
         "lyric_lead_in_s": 0.0,
         "lyric_lead_in_ms": 0,
@@ -153,3 +156,13 @@ def test_effective_view_never_changes_the_parity_gate():
     assert parity["match"] is True
     assert parity["effective_match"] is False
     assert parity["effective_unreported"] == ["BatchWorker:batchworker"]
+
+
+def test_display_mode_and_pinned_authorization_are_in_blocking_fleet_parity(monkeypatch):
+    monkeypatch.setenv("DISPLAY_SEGMENTATION_MODE", "shadow")
+    shadow = runtime_timing_config()
+    monkeypatch.setenv("DISPLAY_SEGMENTATION_MODE", "enforce")
+    enforce = runtime_timing_config()
+    assert not timing_config_parity([_row("ShortWorker", shadow)], api_config=enforce)["match"]
+    monkeypatch.setenv("DISPLAY_SEGMENTATION_AUTHORIZATION_SHA256", "a" * 64)
+    assert runtime_timing_config() != enforce

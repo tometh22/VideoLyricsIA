@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import re
 import unicodedata
@@ -59,6 +60,8 @@ from heard_words import (
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
 MAX_ITEMS = 60
+PHRASE_REVIEW_MAX_WORDS = 8
+PHRASE_REVIEW_MAX_CHARS = 42
 # Más palabras que esto no se comparan contra los oídos (se avisa como canción
 # difícil): protege al servidor de letras gigantes o pegadas a propósito.
 MAX_REVIEW_TOKENS = 2500
@@ -119,7 +122,7 @@ KIND_GROUP = {
     "chorus_propagate": "chorus", "question_marks": "style",
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
-    "timing": "timing",
+    "timing": "timing", "phrase_structure": "layout",
 }
 
 
@@ -743,6 +746,66 @@ def _rule_orphans(segments: list[dict]) -> list[dict]:
     return out
 
 
+def _rule_phrase_structure(segments: list[dict]) -> list[dict]:
+    """Review long cards and repeated phrases before musical segmentation.
+
+    Repetition can be musically intentional. This is a listening suggestion,
+    never a text correction or a source of guessed split timestamps. In
+    particular, matching words here does not validate old word-level timing.
+    """
+    out = []
+    for index, segment in enumerate(segments):
+        text = unicodedata.normalize("NFC", str(segment.get("text") or "")).strip()
+        words = _words(text)
+        long_card = (len(words) > PHRASE_REVIEW_MAX_WORDS
+                     or len(text) > PHRASE_REVIEW_MAX_CHARS)
+        duration = _f(segment.get("end")) - _f(segment.get("start"))
+        if duration < 4 and not long_card:
+            continue
+        tokens = [word.casefold() for word in words]
+        phrase = None
+        for width in (range(min(6, len(tokens) // 2), 2, -1) if duration >= 4 else ()):
+            seen = {}
+            for start in range(len(tokens) - width + 1):
+                key = tuple(tokens[start:start + width])
+                # Short, uniform adlibs such as "oh oh oh" aren't evidence
+                # of phrases being packed into the same display card.
+                if len(set(key)) < 2 or not any(len(word) >= 4 for word in key):
+                    continue
+                first = seen.setdefault(key, start)
+                if start >= first + width:
+                    phrase = " ".join(words[first:first + width])
+                    break
+            if phrase:
+                break
+        if phrase or long_card:
+            segment_id = segment.get("segment_id")
+            if segment_id is None:
+                segment_id = segment.get("_id")
+            if segment_id is None:
+                segment_id = f"index:{index}"
+            # A musical decision belongs to this occurrence and timing.
+            # Accepting one chorus must not hide an unchecked repetition.
+            identity = json.dumps([
+                str(segment_id), _f(segment.get("start")), _f(segment.get("end")),
+                unicodedata.normalize("NFC", str(segment.get("text") or "")),
+            ], ensure_ascii=False)
+            out.append({
+                "kind": "phrase_structure", "line": index,
+                "key": "phrase_structure:" + hashlib.sha256(identity.encode()).hexdigest(),
+                "required": False, "listen": True,
+                "title": "Revisar división de frases",
+                "why": (f"«{phrase}» se repite dentro de la misma tarjeta. "
+                        "Escuchá si conviene mostrar las frases por separado."
+                        if phrase else
+                        f"Esta tarjeta tiene {len(words)} palabras y {len(text)} caracteres. "
+                        "Escuchá dónde dividirla en frases musicales más cortas."),
+                "sources": set(), "fix": {"type": "inspect_structure"},
+                "action": "Escuchar", "dismiss": "Está bien así",
+            })
+    return out
+
+
 def _rule_memory(segments: list[dict], pairs: dict[str, str],
                  witness: list[dict]) -> list[dict]:
     out = []
@@ -988,6 +1051,8 @@ def _item_key(kind: str, fix: dict, line_text: str = "") -> str:
         return f"{kind}:" + "/".join(_key_text(x["text"]) for x in fix["lines"])
     if fix["type"] == "timing":
         return f"{kind}:{_key_text(line_text)}:{'end' if 'end' in fix else 'start'}"
+    if fix["type"] == "inspect_structure":
+        return f"{kind}:{_key_text(line_text)}"
     return (f"{kind}:+{_key_text(fix.get('text'))}|{fix.get('anchor_before', '')}"
             f"|{fix.get('anchor_after', '')}")
 
@@ -1154,6 +1219,7 @@ def build_review(
     items.extend(_rule_accents(segments))
     items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_clean), vocabulary))
     items.extend(_rule_orphans(segments))
+    items.extend(_rule_phrase_structure(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
     # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
@@ -1239,6 +1305,8 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             group_sig = ("new_line", sig[1:])
         elif fix["type"] in {"replace", "insert"}:
             group_sig = (item["kind"], sig[1])
+        elif fix["type"] == "inspect_structure":
+            group_sig = (item["kind"], fix["type"], item.get("key") or sig[0])
         else:
             # Signos, uniones, cortes y timing: sólo se agrupan líneas con el
             # mismo texto (un coro), nunca líneas distintas.

@@ -277,10 +277,13 @@ export default function WizardLivePreview({
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
           setLivePlaybackTick({ ...tick, lineSeq: lineSeqRef.current });
         }
-      } else if (livePlaybackTick !== null) {
+      } else if (lastTickRef.current.activeLine) {
         // El operador pausó/paró el audio — limpiar para volver al loop sample.
+        // This rAF effect outlives React renders. Its captured state can still
+        // be null after a song has played, so use the live ref to clear it.
         lastTickRef.current = { activeLine: "", currentTime: -1 };
         liveHistoryRef.current = [];
+        lineSeqRef.current = 0;
         setLivePlaybackTick(null);
       }
       raf = requestAnimationFrame(loop);
