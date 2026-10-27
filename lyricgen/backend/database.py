@@ -899,6 +899,24 @@ class BatchCampaign(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class BatchCampaignReviewer(Base):
+    """Explicit access to one campaign's lyric review workspace."""
+
+    __tablename__ = "batch_campaign_reviewers"
+    __table_args__ = (
+        Index("ix_batch_campaign_reviewers_user", "user_id", "revoked_at"),
+    )
+
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    granted_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class BatchCampaignItem(Base):
     """One source audio registered before a Job is promoted for transcription."""
 

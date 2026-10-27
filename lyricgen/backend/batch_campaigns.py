@@ -27,6 +27,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from auth import get_current_user, has_art_track_access
+from campaign_review_access import granted_campaign_ids, has_reviewer_grant
 from database import (
     AuditLog,
     BatchCampaign,
@@ -178,11 +179,12 @@ def _require_scope(user: dict) -> None:
 
 
 def _campaign_or_404(db: Session, campaign_id: str, user: dict) -> BatchCampaign:
-    query = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id)
-    if user.get("role") != "admin":
-        query = query.filter(BatchCampaign.tenant_id == user["tenant_id"])
-    campaign = query.first()
-    if campaign is None:
+    campaign = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).first()
+    if campaign is None or (
+        user.get("role") != "admin"
+        and campaign.tenant_id != user["tenant_id"]
+        and not has_reviewer_grant(db, campaign_id, user["id"])
+    ):
         raise HTTPException(status_code=404, detail="Campaign not found.")
     return campaign
 
@@ -521,7 +523,10 @@ def list_campaigns(
     _require_scope(current_user)
     query = db.query(BatchCampaign)
     if current_user.get("role") != "admin":
-        query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
+        query = query.filter(or_(
+            BatchCampaign.tenant_id == current_user["tenant_id"],
+            BatchCampaign.id.in_(granted_campaign_ids(db, current_user["id"])),
+        ))
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     from campaign_pipeline import pipeline_counts_bulk
     pipelines = pipeline_counts_bulk(db, rows)
@@ -707,6 +712,8 @@ def restore_campaign_item(
 def _set_item_discard(db, campaign_id, item_id, user, reason):
     _require_scope(user)
     campaign = _campaign_or_404(db, campaign_id, user)
+    if user.get("role") != "admin" and campaign.tenant_id != user["tenant_id"]:
+        raise HTTPException(status_code=403, detail="Reviewers cannot discard campaign items.")
     job = db.query(Job).filter(
         Job.campaign_id == campaign.id, Job.campaign_item_id == item_id,
         Job.tenant_id == campaign.tenant_id,
@@ -2324,7 +2331,7 @@ def claim_next_stage_review(
         BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
     ).outerjoin(EditorDocument, EditorDocument.job_id == Job.job_id).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status == "pending_review",
         or_(
             EditorDocument.job_id.is_(None),
