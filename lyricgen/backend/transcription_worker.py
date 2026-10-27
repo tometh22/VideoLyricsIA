@@ -151,6 +151,8 @@ def _catalog_reference_summary(
     reason: str = "",
     attestation: dict | None = None,
     timing_source: str = "",
+    normalization: str = "",
+    effective_text_sha256: str = "",
 ) -> dict:
     """Persist provenance and decisions without duplicating raw lyric text."""
     summary = {
@@ -167,10 +169,39 @@ def _catalog_reference_summary(
         "source_audio_sha256": str(reference.get("source_audio_sha256") or "")[:64],
         "text_sha256": str(reference.get("text_sha256") or "")[:64],
         "timing_source": str(timing_source or "")[:80],
+        "normalization": str(normalization or "")[:80],
+        "effective_text_sha256": str(effective_text_sha256 or "")[:64],
     }
     if isinstance(attestation, dict):
         summary["attestation"] = attestation
     return summary
+
+
+def _sung_catalog_text(reference: dict) -> tuple[str, str]:
+    """Remove an exact editorial title heading; never change sung lines.
+
+    Some client sheets place ``Letra de <track>`` above the actual lyric. The
+    manifest retains the original text and hash. This derived text is used
+    only for audio attestation and timing, with its own hash in the outcome.
+    """
+    import unicodedata
+
+    text = str(reference.get("text") or "").strip()
+    lines = text.splitlines()
+    if not lines:
+        return text, ""
+
+    def heading_key(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        plain = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+        return " ".join(re.findall(r"[^\W_]+", plain, re.UNICODE))
+
+    expected = heading_key(f"Letra de {reference.get('track') or ''}")
+    if reference.get("track") and heading_key(lines[0]) == expected:
+        sung = "\n".join(lines[1:]).strip()
+        if sung:
+            return sung, "editorial_title_heading_removed"
+    return text, ""
 
 
 def _lrclib_candidate_enabled() -> bool:
@@ -302,6 +333,9 @@ async def _maybe_apply_catalog_reference(
         )
         return result
 
+    text, normalization = _sung_catalog_text(reference)
+    effective_text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     from pipeline import _audio_duration
     from reference_attestation import assess_reference_attestation, reference_gate_action
     try:
@@ -323,6 +357,8 @@ async def _maybe_apply_catalog_reference(
             used=False,
             reason=f"attestation_{action}",
             attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return result
 
@@ -336,6 +372,8 @@ async def _maybe_apply_catalog_reference(
         original["catalog_reference"] = _catalog_reference_summary(
             reference, status="alignment_declined", used=False,
             reason=f"alignment_{_safe_exception_code(exc)}", attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return original
     alignment = dict(aligned.get("anchor_alignment") or {}) if isinstance(aligned, dict) else {}
@@ -346,6 +384,8 @@ async def _maybe_apply_catalog_reference(
             used=False,
             reason=str(alignment.get("reason") or "alignment_declined"),
             attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return original
     # Keep the independent acoustic reference separate from catalogue text.
@@ -356,6 +396,8 @@ async def _maybe_apply_catalog_reference(
         used=True,
         attestation=report,
         timing_source=str(alignment.get("timing_source") or ""),
+        normalization=normalization,
+        effective_text_sha256=effective_text_sha256,
     )
     return aligned
 
