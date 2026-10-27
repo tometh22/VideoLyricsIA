@@ -38,6 +38,16 @@ def test_untouched_audio_bound_heading_is_repair_candidate():
     assert report["allow_global_forced_alignment"] is True
 
 
+def test_final_asr_can_revalidate_a_previous_rejection_without_heading():
+    item, job, document = fixture()
+    reference = item.render_overrides["source_reference"]
+    reference["text"] = SUNG
+    reference["text_sha256"] = hashlib.sha256(SUNG.encode()).hexdigest()
+    decision, report = _eligible(item, job, document)
+    assert decision == "candidate"
+    assert report["allow_global_forced_alignment"] is True
+
+
 def test_human_revision_or_editor_divergence_blocks_repair():
     item, job, document = fixture()
     document.revision = 1

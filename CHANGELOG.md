@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.148] - 2026-10-27
+
+### Fixed
+
+- La reparación de letras de campaña también reevalúa borradores sin encabezado editorial cuando la transcripción acústica final corrigió el rechazo inicial. Mantiene las mismas verificaciones de audio, letra y revisión del editor antes de sincronizar.
+
 ## [1.1.147] - 2026-10-27
 
 ### Fixed

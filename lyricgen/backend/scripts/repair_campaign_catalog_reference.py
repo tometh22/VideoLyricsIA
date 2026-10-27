@@ -1,9 +1,11 @@
-"""Repair untouched campaign drafts after removing an editorial sheet heading.
+"""Repair untouched campaign drafts after final audio-first reassessment.
 
 Dry-run by default. Apply only to drafts whose exact source audio and original
-sheet text still match the manifest, and whose cleaned lyric independently
-passes the existing audio-first gate. Alignment may still decline. Every
-successful change creates an editor revision, provenance, and quality event.
+sheet text still match the manifest, and whose lyric independently passes the
+existing audio-first gate against final ASR segments. This also catches an
+earlier rejection that final ASR post-passes resolved without a title heading.
+Alignment may still decline. Every successful change creates an editor
+revision, provenance, and quality event.
 """
 
 from __future__ import annotations
@@ -54,9 +56,7 @@ def _eligible(item: BatchCampaignItem, job: Job, document: EditorDocument | None
             or reference.get("source_asset_id") != item.sha256
             or (job.input_audio_sha256 and job.input_audio_sha256 != item.sha256)):
         return "source_binding_invalid", None
-    sung, normalization = _sung_catalog_text(reference)
-    if normalization != "editorial_title_heading_removed":
-        return "no_editorial_heading", None
+    sung, _ = _sung_catalog_text(reference)
     live = "live" in str(item.title or "").lower() or "en vivo" in str(item.title or "").lower()
     report = assess_reference_attestation(
         sung, job.segments_json or [], reference_source="catalog_unverified",
@@ -114,6 +114,12 @@ async def _align(item_id: str, campaign_id: str) -> tuple[str, str]:
     outcome = dict(aligned.get("catalog_reference") or {})
     if not outcome.get("used"):
         return ordinal, str(outcome.get("status") or "alignment_declined")
+    repair_reason = (
+        "editorial_heading_removed"
+        if outcome.get("normalization") == "editorial_title_heading_removed"
+        else "final_asr_reassessment"
+    )
+    outcome["repair_reason"] = repair_reason
     segments = normalize_segments(aligned.get("segments") or [])
     if not segments:
         return ordinal, "empty_alignment"
@@ -153,6 +159,7 @@ async def _align(item_id: str, campaign_id: str) -> tuple[str, str]:
             "text_sha256": outcome.get("text_sha256"),
             "effective_text_sha256": outcome.get("effective_text_sha256"),
             "source_audio_sha256": audio_sha256,
+            "repair_reason": repair_reason,
         })
         from main import _create_editor_quality_outbox, _invalidate_quality_after_editor_save
         superseded_quality = _invalidate_quality_after_editor_save(
@@ -171,6 +178,7 @@ async def _align(item_id: str, campaign_id: str) -> tuple[str, str]:
             "source_audio_sha256": audio_sha256,
             "effective_text_sha256": outcome.get("effective_text_sha256"),
             "timing_source": outcome.get("timing_source"),
+            "repair_reason": repair_reason,
         }))
         event_id = _create_editor_quality_outbox(
             db, job, revision=1, segments=segments,
