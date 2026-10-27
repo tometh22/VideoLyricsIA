@@ -242,8 +242,10 @@ def register_art_manifest(
     if current_user.get("role") == "uploader" and current_user.get("campaign_id") != campaign.id:
         raise HTTPException(status_code=404, detail="Campaign not found.")
     _require_manager(campaign, current_user)
-    existing = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign.id).count()
-    if existing + len(body.audios) > ART_TRACK_LIMIT:
+    existing_digests = {sha for (sha,) in db.query(BatchCampaignItem.sha256).filter(BatchCampaignItem.campaign_id == campaign.id).all()}
+    existing = len(existing_digests)
+    new_digests = {audio.sha256.lower() for audio in body.audios} - existing_digests
+    if existing + len(new_digests) > ART_TRACK_LIMIT:
         raise HTTPException(status_code=413, detail=f"Art-track campaigns accept at most {ART_TRACK_LIMIT} audios.")
     # Surface duplicate technical codes as a deterministic association
     # conflict instead of letting the database uniqueness constraint turn a

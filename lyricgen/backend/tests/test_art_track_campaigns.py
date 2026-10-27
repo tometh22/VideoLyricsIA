@@ -80,6 +80,7 @@ def test_art_manifest_deduplicates_shared_cover_and_blocks_ambiguous(client, adm
 
 def test_art_manifest_retry_repairs_covers_after_year_in_title(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setattr("art_track_campaigns.ART_TRACK_LIMIT", 2)
     campaign_id = _create(client, admin_token)
     auth = {"Authorization": f"Bearer {admin_token}"}
     audios = [
