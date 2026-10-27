@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.147] - 2026-10-27
+
+### Fixed
+
+- Las letras oficiales de campañas omiten el encabezado editorial `Letra de <título>` al comparar y sincronizar con el audio. Se conserva el texto original y su huella; la letra cantada tiene una huella propia en la auditoría.
+- Herramienta de reparación para borradores de campaña sin cambios humanos: vuelve a comprobar la letra contra el audio exacto y sincroniza solo las canciones que superan el control acústico. Conserva revisión del editor y auditoría; deja intactas las discrepancias.
+
 ## [1.1.146] - 2026-10-27
 
 ### Fixed
