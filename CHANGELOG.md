@@ -5,6 +5,7 @@
 ### Fixed
 
 - La reparación de letras de campaña también reevalúa borradores sin encabezado editorial cuando la transcripción acústica final corrigió el rechazo inicial. Mantiene las mismas verificaciones de audio, letra y revisión del editor antes de sincronizar.
+- El arranque de la API en pruebas ya no deja hilos de mantenimiento vivos entre instancias de TestClient, evitando interferencias en verificaciones de auditoría y conexiones PostgreSQL.
 
 ## [1.1.147] - 2026-10-27
 

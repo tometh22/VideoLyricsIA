@@ -757,6 +757,12 @@ def on_startup():
             _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
+    # Each TestClient lifespan calls startup again. Daemon loops outlive that
+    # lifespan and can race later tests (and keep PostgreSQL pool connections
+    # checked out). Tests exercise the sweep functions directly instead.
+    if ENVIRONMENT == "test":
+        return
+
     # Background reaper. Daemon → dies with the container. Single
     # instance is enough; if the API ever scales horizontally, the
     # reap_all_stuck call is idempotent (filters by status="processing"
