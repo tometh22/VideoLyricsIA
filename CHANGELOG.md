@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.145] - 2026-10-27
+
+### Added
+
+- Campañas separadas por producto y canal: Art Tracks Artistas, HitsDeSiempre Lyrics y Art Tracks, y CancioneroRock Lyrics y Art Tracks. La selección acompaña la creación y puede corregirse desde la configuración.
+- Cargador de Art Tracks por terminal con subidas paralelas y reanudables para lotes grandes.
+
+### Fixed
+
+- El importador de Art Tracks reconoce archivos `Título_Artista_ISRC` y asocia la portada del mismo nombre. Un año dentro del título ya no se confunde con el código técnico; repetir el manifiesto repara portadas pendientes sin duplicar canciones.
+- El cambio de producto de una campaña no invalida una previsualización creativa en curso.
+
 ## [1.1.144] - 2026-10-24
 
 ### Fixed

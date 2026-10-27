@@ -160,7 +160,7 @@ export function portalLabel(id) {
 export const FILES_DESTINATION = "files";
 export const ART_TRACK_PRESETS = [
   { key: "waveform", label: "Portada + onda", description: "La portada con barras que laten con el audio." },
-  { key: "colombia_static", label: "Portada fija + título", description: "Portada quieta con título y artista, sin animación." },
+  { key: "colombia_static", label: "Portada a la izquierda + título", description: "Portada a la izquierda, título y artista a la derecha, sin animación." },
 ];
 
 export function artTrackPresetLabel(key) {

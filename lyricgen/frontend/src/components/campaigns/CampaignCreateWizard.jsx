@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { campaignPost, campaignRequest } from "../../lib/campaignApi";
 import { ART_TRACK_PRESETS, FILES_DESTINATION, PORTALS } from "../../lib/campaignPipeline";
+import { PRODUCT_TABS } from "../../lib/campaignProducts";
 import ArtTrackPanel from "./ArtTrackPanel";
 import CampaignAudioUploader from "./CampaignAudioUploader";
 import StyleControls, { StylePreview } from "./StyleControls";
@@ -93,13 +94,15 @@ function StyleStep({ campaign, onDone, onSkip }) {
 }
 
 /** Create → style → audios, without leaving the campaign section. */
-export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, onFinished }) {
+export default function CampaignCreateWizard({ artTrackAllowed = true, initialProductId = "", onClose, onFinished }) {
+  const initialProduct = PRODUCT_TABS.find((product) => product.id === initialProductId);
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
-  const [kind, setKind] = useState("lyric_video");
+  const [kind, setKind] = useState(initialProduct?.kind || "lyric_video");
+  const [productChannel, setProductChannel] = useState(initialProduct?.channel || "");
   const [destination, setDestination] = useState("");
   const [expected, setExpected] = useState("");
-  const [preset, setPreset] = useState("waveform");
+  const [preset, setPreset] = useState(initialProductId === "hits_art" ? "colombia_static" : "waveform");
   const [umgFrameSize, setUmgFrameSize] = useState("HD");
   const [umgFps, setUmgFps] = useState("24");
   const [umgProresProfile, setUmgProresProfile] = useState("3");
@@ -119,8 +122,8 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, 
         kind,
         destination_portal: destination || null,
         default_render_params: art
-          ? { delivery_profile: "both", art_track: true, art_track_preset: preset, umg_frame_size: umgFrameSize, umg_fps: umgFps, umg_prores_profile: umgProresProfile }
-          : { background_mode: "ai", delivery_profile: "youtube" },
+          ? { product_channel: productChannel, delivery_profile: "both", art_track: true, art_track_preset: preset, umg_frame_size: umgFrameSize, umg_fps: umgFps, umg_prores_profile: umgProresProfile }
+          : { product_channel: productChannel, background_mode: "ai", delivery_profile: "youtube" },
       });
       setCampaign(created);
       setStep(art ? 2 : 1);
@@ -139,10 +142,18 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, 
         <div>
           <p className="mb-2 text-xs font-medium text-ink-secondary">Tipo</p>
           <div role="radiogroup" aria-label="Tipo de campaña" className="grid gap-2 sm:grid-cols-2">
-            <KindCard value="lyric_video" current={kind} title="Lyric videos" description="Letra sincronizada sobre fondo IA, foto o video. Hasta 1000 canciones." onSelect={setKind} />
-            {artTrackAllowed && <KindCard value="art_track" current={kind} title="Art tracks" description="Portada + audio, sin letra. Hasta 500 canciones." onSelect={setKind} />}
+            <KindCard value="lyric_video" current={kind} title="Lyric videos" description="Letra sincronizada sobre fondo IA, foto o video. Hasta 1000 canciones." onSelect={() => { setKind("lyric_video"); if (productChannel === "artists") setProductChannel(""); }} />
+            {artTrackAllowed && <KindCard value="art_track" current={kind} title="Art tracks" description="Portada + audio, sin letra. Hasta 500 canciones." onSelect={() => { setKind("art_track"); if (!productChannel) setProductChannel("artists"); }} />}
           </div>
         </div>
+        <Field label="Producto / canal">
+          <select aria-label="Producto / canal" className={inputClass} value={productChannel} onChange={(event) => { setProductChannel(event.target.value); if (kind === "art_track" && event.target.value === "hitsdesiempre") setPreset("colombia_static"); }}>
+            {kind !== "art_track" && <option value="">Sin clasificar</option>}
+            {kind === "art_track" && <option value="artists">Art Tracks Artistas</option>}
+            <option value="hitsdesiempre">HitsDeSiempre</option>
+            <option value="cancionerorock">CancioneroRock</option>
+          </select>
+        </Field>
         {art && <div>
           <p className="mb-2 text-xs font-medium text-ink-secondary">Master ProRes para el portal</p>
           <div className="grid gap-3 sm:grid-cols-3">
