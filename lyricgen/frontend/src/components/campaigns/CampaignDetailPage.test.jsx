@@ -227,9 +227,11 @@ describe("campaign workspace", () => {
     mount(api, "/campaigns/c1?view=qc&q=garcia");
     await screen.findByText("Canción 3");
     fireEvent.click(screen.getByRole("button", { name: "Revisar video · Canción 1" }));
-    await screen.findByRole("dialog", { name: "Reproducir Canción 1" });
+    const firstVideo = (await screen.findByRole("dialog", { name: "Reproducir Canción 1" })).querySelector("video");
+    expect(firstVideo.autoplay).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Aprobar y siguiente" }));
-    await screen.findByRole("dialog", { name: "Reproducir Canción 3" });
+    const nextVideo = (await screen.findByRole("dialog", { name: "Reproducir Canción 3" })).querySelector("video");
+    expect(nextVideo.autoplay).toBe(false);
     const approvals = api.state.calls.filter((call) => call.path.startsWith("/approve/"));
     expect(approvals.map((call) => call.path)).toEqual(["/approve/j1"]);
     expect(approvals[0].body).toEqual({ notes: "Revisión final desde el reproductor de campaña" });

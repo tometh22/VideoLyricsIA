@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.146] - 2026-10-27
+
+### Fixed
+
+- Los videos de revisión de campañas esperan que la persona pulse Play. Al aprobar y avanzar al siguiente, el nuevo video tampoco reproduce audio automáticamente.
+
 ## [1.1.145] - 2026-10-27
 
 ### Added
