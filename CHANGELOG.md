@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.149] - 2026-10-27
+
+### Added
+
+- Acceso de revisión por campaña para usuarios de otro espacio de trabajo: la campaña aparece en su lista y permite abrir audio, forma de onda y editor de letras sin conceder acceso al resto de los jobs del propietario. El permiso queda en una tabla revocable y se registra al asignarlo.
+
 ## [1.1.148] - 2026-10-27
 
 ### Fixed

@@ -102,6 +102,7 @@ from database import (
     get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
+from campaign_review_access import can_review_campaign_job
 from editor import (
     apply_quality_proposal,
     auto_repair_undo_segments,
@@ -2967,6 +2968,14 @@ def _job_scope(current_user: dict) -> dict:
         # contrato que get_job.
         return {"tenant_id": None}
     return {"tenant_id": current_user["tenant_id"]}
+
+
+def _review_job_or_404(db: Session, job_id: str, current_user: dict) -> Job:
+    """Resolve one explicitly shared campaign job without widening /jobs."""
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    if job is None or not can_review_campaign_job(db, job, current_user):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
 
 
 def _audit_cross_tenant_access(db: Session, current_user: dict, job: dict, kind: str,
@@ -11730,6 +11739,9 @@ def status(
     from pipeline import _MAX_EDITS
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
+        job_model = _review_job_or_404(db, job_id, current_user)
+        job = get_job(db, job_id, tenant_id=job_model.tenant_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     edit_count = job.get("edit_count") or 0
     # Admins are exempt from the per-job edit cap. The frontend reads
@@ -12093,6 +12105,9 @@ def batch_job_status(
     the runner can build its scoreboard.
     """
     row = get_job(db, job_id, **_job_scope(current_user))
+    if row is None:
+        job = _review_job_or_404(db, job_id, current_user)
+        row = get_job(db, job_id, tenant_id=job.tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     return row
@@ -13821,20 +13836,14 @@ def get_source_audio_url(
     Now agus.cafisi (and any operator with stale jobs) can keep
     correcting lyrics using the rendered video's audio track.
 
-    Owner / same-tenant only — same auth model as /download/<job>/<file>.
+    Same-tenant, platform admin, or explicit campaign reviewer.
     """
-    from database import Job as JobModel
     # Cross-tenant para admins de plataforma: mismo contrato que _job_scope
     # (pedido CEO 2026-06-11) — el rol admin abre el video de cualquier
     # cliente para resolver incidentes. Sin bypass, el editor de un tenant
     # ajeno abría MUDO (audio no disponible) aunque el admin ya podía ver el
     # job. Acceso auditado (compliance UMG).
-    _audio_q = db.query(JobModel).filter(JobModel.job_id == job_id)
-    if current_user.get("role") != "admin":
-        _audio_q = _audio_q.filter(JobModel.tenant_id == current_user["tenant_id"])
-    job = _audio_q.first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _review_job_or_404(db, job_id, current_user)
     _audit_cross_tenant_access(db, current_user, job, "source_audio")
 
     preview_status = "unavailable"
@@ -14184,15 +14193,9 @@ async def get_background_url(
     editor's live preview can show lyrics over the REAL background. 404
     when there's no cached background yet (e.g. a job that never rendered),
     in which case the preview falls back to a style-tinted gradient.
-    Owner / same-tenant only, same model as /source-audio-url."""
-    from database import Job as JobModel
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
-    if not job:
+    Same-tenant users and explicit campaign reviewers."""
+    job = _review_job_or_404(db, job_id, current_user)
+    if current_user.get("role") == "admin" and job.tenant_id != current_user["tenant_id"]:
         raise HTTPException(status_code=404, detail="Job not found")
     if not job.bg_r2_key_cached:
         raise HTTPException(status_code=404, detail="No cached background for this job.")
@@ -14224,19 +14227,11 @@ def get_waveform(
     pre-computes the envelope when the job flips to done/pending_review,
     so the first operator-facing call to this endpoint is almost always
     a cache hit (~200ms instead of 5-30s cold-cache cost).
-    Owner / same-tenant only, same auth model as /source-audio-url.
+    Same access as /source-audio-url.
     """
-    from database import Job as JobModel
     from waveform_compute import compute_and_cache_waveform
 
-    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
-    if current_user.get("role") != "admin":
-        job_query = job_query.filter(
-            JobModel.tenant_id == current_user["tenant_id"],
-        )
-    job = job_query.first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _review_job_or_404(db, job_id, current_user)
     _audit_cross_tenant_access(db, current_user, job, "waveform")
     if not job.input_r2_key:
         raise HTTPException(
@@ -14621,7 +14616,11 @@ def _editor_scoped_job(db: Session, job_id: str, current_user: dict):
     """
     if current_user.get("role") == "admin":
         return db.query(Job).filter(Job.job_id == job_id).first()
-    return get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    if job is not None:
+        return job
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    return job if job is not None and can_review_campaign_job(db, job, current_user) else None
 
 
 def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
@@ -16779,8 +16778,13 @@ async def reanchor_segments(
 
     job = get_job_model(db, job_id)
     is_platform_admin = current_user.get("role") == "admin"
+    is_campaign_reviewer = bool(
+        job and job.tenant_id != current_user["tenant_id"]
+        and can_review_campaign_job(db, job, current_user)
+    )
     if (not job
             or (not is_platform_admin
+                and not is_campaign_reviewer
                 and (job.user_id != current_user["id"]
                      or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -16948,8 +16952,13 @@ async def reanchor_task_status(
 
     job = get_job_model(db, job_id)
     is_platform_admin = current_user.get("role") == "admin"
+    is_campaign_reviewer = bool(
+        job and job.tenant_id != current_user["tenant_id"]
+        and can_review_campaign_job(db, job, current_user)
+    )
     if (not job
             or (not is_platform_admin
+                and not is_campaign_reviewer
                 and (job.user_id != current_user["id"]
                      or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
