@@ -122,8 +122,8 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, initialPr
         kind,
         destination_portal: destination || null,
         default_render_params: art
-          ? { product_channel: productChannel, delivery_profile: "both", art_track: true, art_track_preset: preset, umg_frame_size: umgFrameSize, umg_fps: umgFps, umg_prores_profile: umgProresProfile }
-          : { product_channel: productChannel, background_mode: "ai", delivery_profile: "youtube" },
+          ? { ...(productChannel ? { product_channel: productChannel } : {}), delivery_profile: "both", art_track: true, art_track_preset: preset, umg_frame_size: umgFrameSize, umg_fps: umgFps, umg_prores_profile: umgProresProfile }
+          : { ...(productChannel ? { product_channel: productChannel } : {}), background_mode: "ai", delivery_profile: "youtube" },
       });
       setCampaign(created);
       setStep(art ? 2 : 1);

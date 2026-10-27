@@ -141,8 +141,8 @@ describe("campaign list", () => {
     fireEvent.change(within(wizard).getByLabelText("Portal de destino"), { target: { value: "files" } });
     expect(within(wizard).getByRole("button", { name: "Crear y seguir" })).toBeEnabled();
     expect(within(wizard).getByRole("radio", { name: /Portada \+ onda/ })).toHaveAttribute("aria-checked", "true");
-    fireEvent.click(within(wizard).getByRole("radio", { name: /Portada fija/ }));
-    expect(within(wizard).getByRole("radio", { name: /Portada fija/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(wizard).getByRole("radio", { name: /Portada a la izquierda/ }));
+    expect(within(wizard).getByRole("radio", { name: /Portada a la izquierda/ })).toHaveAttribute("aria-checked", "true");
   });
 });
 
