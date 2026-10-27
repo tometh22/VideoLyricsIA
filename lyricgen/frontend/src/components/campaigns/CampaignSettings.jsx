@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { campaignApiBase, campaignRequest } from "../../lib/campaignApi";
 import { PORTALS, artTrackPresetLabel } from "../../lib/campaignPipeline";
+import { PRODUCT_TABS, productForCampaign } from "../../lib/campaignProducts";
 import { CampaignReviewerSummary } from "../CampaignReviewerStatus";
 import ArtTrackPanel from "./ArtTrackPanel";
 import CampaignAudioUploader from "./CampaignAudioUploader";
@@ -32,6 +33,7 @@ function Section({ title, description, children, action }) {
 
 function General({ campaign, canManage, isAdmin, onChanged }) {
   const [name, setName] = useState(campaign.name);
+  const [productChannel, setProductChannel] = useState(campaign.default_render_params?.product_channel || (campaign.kind === "art_track" ? "artists" : ""));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -53,6 +55,16 @@ function General({ campaign, canManage, isAdmin, onChanged }) {
         <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); void patch({ name: name.trim() }, "Nombre guardado."); }}>
           <Field label="Nombre"><input className={inputClass} value={name} maxLength={160} disabled={!canManage || busy} onChange={(event) => setName(event.target.value)} /></Field>
           {canManage && <Button type="submit" size="sm" disabled={busy || !name.trim() || name.trim() === campaign.name}>Guardar nombre</Button>}
+          <Field label="Producto / canal">
+            <select aria-label="Producto / canal" className={inputClass} value={productChannel} disabled={!canManage || busy}
+              onChange={(event) => setProductChannel(event.target.value)}>
+              {campaign.kind !== "art_track" && <option value="">Sin clasificar</option>}
+              {PRODUCT_TABS.filter((product) => product.kind === (campaign.kind || "lyric_video")).map((product) =>
+                <option key={product.id} value={product.channel}>{product.label}</option>)}
+            </select>
+          </Field>
+          {canManage && <Button type="button" size="sm" disabled={busy || productChannel === (campaign.default_render_params?.product_channel || (campaign.kind === "art_track" ? "artists" : ""))}
+            onClick={() => void patch({ default_render_params: { ...(campaign.default_render_params || {}), product_channel: productChannel } }, "Producto guardado.")}>Guardar producto</Button>}
         </form>
         <div className="space-y-3">
           <p className="text-xs font-medium text-ink-secondary">Estado</p>
@@ -64,6 +76,7 @@ function General({ campaign, canManage, isAdmin, onChanged }) {
           {cancelled && <p className="text-sm text-red-200">Campaña cancelada. No se puede reactivar.</p>}
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
             <dt className="text-ink-secondary">Tipo</dt><dd>{campaign.kind === "art_track" ? "Art tracks" : "Lyric videos"}</dd>
+            <dt className="text-ink-secondary">Producto</dt><dd>{PRODUCT_TABS.find((product) => product.id === productForCampaign(campaign))?.label || "Sin clasificar"}</dd>
             <dt className="text-ink-secondary">Portal</dt><dd>{campaign.destination_portal === "files" ? "Archivos (sin portal)" : PORTALS[campaign.destination_portal]?.label || (campaign.destination_portal ? campaign.destination_portal : "Se elige al enviar")}</dd>
             {campaign.kind === "art_track" && <><dt className="text-ink-secondary">Estilo</dt><dd>{artTrackPresetLabel(campaign.default_render_params?.art_track_preset)}</dd></>}
             <dt className="text-ink-secondary">Creada</dt><dd>{campaign.created_at ? new Date(campaign.created_at).toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric" }) : "—"}</dd>
@@ -100,7 +113,7 @@ function General({ campaign, canManage, isAdmin, onChanged }) {
   </div>;
 }
 
-function TerminalUploader({ campaignId }) {
+function TerminalUploader({ campaignId, art = false }) {
   const [pair, setPair] = useState(null);
   const [error, setError] = useState("");
   return <details className="rounded-xl bg-black/20 p-4 ring-1 ring-white/[0.06]">
@@ -110,7 +123,7 @@ function TerminalUploader({ campaignId }) {
     {error && <div className="mt-3"><Banner tone="danger">{error}</Banner></div>}
     {pair && <div className="mt-3 rounded-xl bg-black/30 p-4">
       <div className="font-mono text-2xl font-bold tracking-[.2em] text-brand-light">{pair.pairing_code}</div>
-      <code className="mt-3 block whitespace-pre-wrap break-all text-xs text-ink-secondary">python3 scripts/campaign_uploader.py --api "{campaignApiBase() || window.location.origin}" --campaign {campaignId} --code {pair.pairing_code} --folder "/ruta/a/audios"</code>
+      <code className="mt-3 block whitespace-pre-wrap break-all text-xs text-ink-secondary">python3 scripts/campaign_uploader.py --api "{campaignApiBase() || window.location.origin}" --campaign {campaignId} --code {pair.pairing_code} --folder "/ruta/a/audios"{art ? ' --covers "/ruta/a/portadas"' : ''}</code>
     </div>}
   </details>;
 }
@@ -140,7 +153,7 @@ export default function CampaignSettings({ campaign, section, onSection, canMana
           {canManage ? <div className="space-y-4"><CampaignAudioUploader campaignId={campaign.id} onUploaded={onUploaded} remaining={remaining} /><TerminalUploader campaignId={campaign.id} /></div>
             : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cargar audios.</p>}
         </Section>
-        : <Section title="Audios y portadas"><ArtTrackPanel campaign={campaign} onChanged={onChanged} /></Section>)}
+        : <Section title="Audios y portadas"><ArtTrackPanel campaign={campaign} onChanged={onChanged} />{canManage && <div className="mt-5"><TerminalUploader campaignId={campaign.id} art /></div>}</Section>)}
       {active === "style" && <Section title="Estilo y reparto" description="Elegí foto fija o video y un efecto. Los ajustes de detalle están en Opciones avanzadas. Para cambiar sólo algunas canciones, seleccionalas en la lista y usá «Elegir fondo».">
         {!creative ? <Skeleton className="h-40" /> : !creative.can_manage
           ? <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar estilos.</p>

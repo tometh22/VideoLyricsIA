@@ -78,6 +78,42 @@ def test_art_manifest_deduplicates_shared_cover_and_blocks_ambiguous(client, adm
         db.close()
 
 
+def test_art_manifest_retry_repairs_covers_after_year_in_title(client, admin_token, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setattr("art_track_campaigns.ART_TRACK_LIMIT", 2)
+    campaign_id = _create(client, admin_token)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    audios = [
+        {"filename": f"{title} (Live In Buenos Aires 2001)_Bersuit Vergarabat_{code}.mp3",
+         "title": title, "artist": "Bersuit Vergarabat", "technical_code": code,
+         "size_bytes": 1000, "sha256": _digest(title)}
+        for title, code in (("Yo Tomo", "ARF140200015"), ("Mi Caramelo", "ARF140200011"))
+    ]
+    covers = [
+        {"filename": audio["filename"].replace(".mp3", ".png"),
+         "sha256": _digest(f"cover-{index}"), "size_bytes": 100}
+        for index, audio in enumerate(audios)
+    ]
+    first = client.post(f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
+                        json={"audios": audios, "covers": []})
+    assert first.status_code == 200, first.text
+    assert first.json()["matched_count"] == 0
+    retry = client.post(f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
+                        json={"audios": audios, "covers": covers})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["matched_count"] == 2
+    db = SessionLocal()
+    try:
+        rows = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign_id).all()
+        assert len(rows) == 2
+        for row in rows:
+            cover = db.query(BatchCampaignAsset).filter_by(id=row.cover_asset_id).one()
+            assert row.cover_match_state == "matched"
+            assert row.technical_code in cover.filename
+    finally:
+        db.close()
+
+
 def test_art_manifest_rejects_duplicate_technical_codes_without_server_error(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign_id = _create(client, admin_token)

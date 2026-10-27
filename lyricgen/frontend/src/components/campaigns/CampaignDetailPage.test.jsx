@@ -363,7 +363,7 @@ describe("campaign workspace", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Carga de audios" }));
     expect(await screen.findByText(/Entrega por archivos/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enviar aprobados" })).not.toBeInTheDocument();
-    expect(screen.getByText(/portada fija \+ título/)).toBeInTheDocument();
+    expect(screen.getByText(/portada a la izquierda \+ título/)).toBeInTheDocument();
   });
 
   it("moves through songs with the keyboard and acts with Enter", async () => {

@@ -442,6 +442,7 @@ def main() -> int:
             f"{base}/batch/art-track-campaigns/{args.campaign}/assets", auth=auth,
         )
         failures = []
+        pending_art = []
         for asset in assets.get("items", []):
             source = source_for_art_asset(asset, entries, covers)
             if asset.get("upload_state") == "uploaded":
@@ -454,12 +455,20 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 continue
-            try:
-                filename, state = upload_art_asset(base, auth, source, asset["id"])
-                print(f"OK {filename}: {state}")
-            except Exception as exc:
-                failures.append(asset.get("filename") or source["filename"])
-                print(f"ERROR {asset.get('filename')}: {exc}", file=sys.stderr)
+            pending_art.append((asset, source))
+        with ThreadPoolExecutor(max_workers=max(1, min(args.concurrency, 4))) as pool:
+            futures = {
+                pool.submit(upload_art_asset, base, auth, source, asset["id"]): (asset, source)
+                for asset, source in pending_art
+            }
+            for future in as_completed(futures):
+                asset, source = futures[future]
+                try:
+                    filename, state = future.result()
+                    print(f"OK {filename}: {state}")
+                except Exception as exc:
+                    failures.append(asset.get("filename") or source["filename"])
+                    print(f"ERROR {asset.get('filename')}: {exc}", file=sys.stderr)
         if failures:
             print("Re-run with the same folders and a new pairing code to resume missing assets.", file=sys.stderr)
             return 1

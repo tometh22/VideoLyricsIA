@@ -77,7 +77,10 @@ def _parent(path: str) -> str:
 
 
 def _code(value: str | None) -> str | None:
-    match = _CODE_RE.search(str(value or ""))
+    # Titles may contain years (for example "Live In Buenos Aires 2001").
+    # The technical code is the final code-like token in supplied filenames.
+    matches = list(_CODE_RE.finditer(str(value or "")))
+    match = matches[-1] if matches else None
     return re.sub(r"[-_ ]", "", match.group(1)).upper() if match else None
 
 
@@ -239,8 +242,10 @@ def register_art_manifest(
     if current_user.get("role") == "uploader" and current_user.get("campaign_id") != campaign.id:
         raise HTTPException(status_code=404, detail="Campaign not found.")
     _require_manager(campaign, current_user)
-    existing = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign.id).count()
-    if existing + len(body.audios) > ART_TRACK_LIMIT:
+    existing_digests = {sha for (sha,) in db.query(BatchCampaignItem.sha256).filter(BatchCampaignItem.campaign_id == campaign.id).all()}
+    existing = len(existing_digests)
+    new_digests = {audio.sha256.lower() for audio in body.audios} - existing_digests
+    if existing + len(new_digests) > ART_TRACK_LIMIT:
         raise HTTPException(status_code=413, detail=f"Art-track campaigns accept at most {ART_TRACK_LIMIT} audios.")
     # Surface duplicate technical codes as a deterministic association
     # conflict instead of letting the database uniqueness constraint turn a
@@ -323,6 +328,18 @@ def register_art_manifest(
             BatchCampaignItem.sha256 == digest,
         ).first()
         if row is not None:
+            # A repeated manifest is also a safe way to repair a missing cover
+            # after the files have already been uploaded. Never alter a confirmed
+            # association or an item that has begun rendering.
+            if row.cover_match_state != "matched" and not row.association_confirmed and not db.query(Job.job_id).filter(Job.campaign_item_id == row.id).first():
+                matched, method, error = _match_audio(audio, body.covers)
+                cover_asset = cover_rows.get(("cover", matched.sha256.lower())) if matched else None
+                if cover_asset:
+                    row.cover_asset_id = cover_asset.id
+                    row.cover_match_state = "matched"
+                    row.cover_match_method = method
+                    row.cover_match_error = None
+                    row.updated_at = _now()
             results.append({"client_id": audio.client_id, "item_id": row.id, "duplicate": True, "cover_match_state": row.cover_match_state})
             continue
         asset = db.query(BatchCampaignAsset).filter(

@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource from "../../hooks/useCampaignResource";
 import { campaignRequest } from "../../lib/campaignApi";
 import { campaignCounts, campaignNextStep, doneCount, relativeDate, stagesFor, toneOf, totalOf } from "../../lib/campaignPipeline";
+import { PRODUCT_TABS, productForCampaign } from "../../lib/campaignProducts";
 import { CANCELLED_GROUP, campaignPending, campaignShortName, groupCampaigns, sortByUrgency } from "../../lib/campaignGroups";
 import { matchesCampaignSearch } from "../../lib/campaignSearch";
 import CampaignSearch from "../CampaignSearch";
@@ -117,10 +118,17 @@ export default function CampaignListPage() {
   const [params, setParams] = useSearchParams();
   const query = params.get("q") || "";
   const status = params.get("status") || "";
+  const product = params.get("product") || "";
   const [creating, setCreating] = useState(params.get("new") === "1");
   const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }));
   const items = list.data?.items || [];
-  const filtered = useMemo(() => items.filter((campaign) => matchesCampaignSearch(query, campaign.name, campaign.id) && (!status || campaign.status === status)), [items, query, status]);
+  const filtered = useMemo(() => items.filter((campaign) => matchesCampaignSearch(query, campaign.name, campaign.id)
+    && (!status || campaign.status === status) && (!product || productForCampaign(campaign) === product)), [items, query, status, product]);
+  const productCounts = useMemo(() => items.reduce((counts, campaign) => {
+    const key = productForCampaign(campaign);
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {}), [items]);
   const todo = useMemo(() => sortByUrgency(filtered), [filtered]);
   const groups = useMemo(() => groupCampaigns(filtered, { separateCancelled: status !== "cancelled" }), [filtered, status]);
   const [expanded, setExpanded] = useState({});
@@ -151,6 +159,16 @@ export default function CampaignListPage() {
           {list.data ? <p className="mt-1 text-2xl font-semibold tabular-nums text-white">{value}</p> : <Skeleton className="mt-2 h-7 w-12" />}
         </div>)}
     </div>
+
+    <nav aria-label="Productos" className="flex gap-2 overflow-x-auto pb-1">
+      {[["", "Todas", items.length], ...PRODUCT_TABS.map((tab) => [tab.id, tab.label, productCounts[tab.id] || 0]),
+        ...(productCounts.unclassified ? [["unclassified", "Sin clasificar", productCounts.unclassified]] : [])]
+        .map(([key, label, count]) => <button key={key || "all"} type="button" aria-current={product === key ? "page" : undefined}
+          onClick={() => setParam("product", key, false)}
+          className={`shrink-0 rounded-xl px-3.5 py-2 text-sm font-medium ring-1 transition ${product === key ? "bg-brand/20 text-white ring-brand/50" : "bg-surface-2/40 text-ink-secondary ring-white/10 hover:text-white"}`}>
+          {label}<span className="ml-2 text-xs opacity-70">{count}</span>
+        </button>)}
+    </nav>
 
     <div className="flex flex-col gap-3 md:flex-row md:items-center">
       <CampaignSearch className="md:w-80" label="Buscar campañas" placeholder="Nombre de campaña" value={query} onChange={(value) => setParam("q", value)} />
@@ -189,7 +207,7 @@ export default function CampaignListPage() {
     {list.data && items.length > 0 && !filtered.length && <EmptyState title="No hay campañas con estos filtros"
       action={<Button size="sm" onClick={() => setParams({})}>Limpiar filtros</Button>} />}
 
-    {creating && <CampaignCreateWizard onClose={() => { setCreating(false); if (params.get("new")) setParam("new", ""); }}
+    {creating && <CampaignCreateWizard initialProductId={product} onClose={() => { setCreating(false); if (params.get("new")) setParam("new", ""); }}
       onFinished={(campaign) => { setCreating(false); void list.reload(); navigate(`/campaigns/${encodeURIComponent(campaign.id)}`); }} />}
   </div>;
 }

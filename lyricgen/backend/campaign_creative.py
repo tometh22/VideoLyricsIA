@@ -246,7 +246,9 @@ def _items(db, campaign):
 def _snapshot(db, campaign):
     jobs = db.query(Job).filter(Job.campaign_id == campaign.id).all()
     docs = db.query(EditorDocument).filter(EditorDocument.job_id.in_([j.job_id for j in jobs])).all()
-    return digest({"defaults": campaign.default_render_params,
+    # Product routing is campaign metadata; changing its tab must not stale a creative preview.
+    defaults = {k: v for k, v in (campaign.default_render_params or {}).items() if k != "product_channel"}
+    return digest({"defaults": defaults,
                    "items": [(i.id, i.render_overrides, i.discard_record) for i in _items(db, campaign)],
                    "jobs": sorted((j.job_id, j.status, j.render_params) for j in jobs),
                    "docs": sorted((d.job_id, d.revision, str(d.lock_expires_at)) for d in docs)})
