@@ -645,6 +645,7 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     v = versions[0]
     assert v["job_id"] == approved_job.job_id
     assert v["label"] == "Renderizado"
+    assert v["product_category"] is None
     # delivery_id is what the portal uses for DELETE
     assert isinstance(v.get("delivery_id"), int)
     # 5 files expected (umg_master, umg_short, video, short, thumbnail)

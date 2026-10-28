@@ -1040,12 +1040,16 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         # fingerprint, así que la detección de deriva quedaba
                         # muerta justo en las filas que lista la campaña — y la
                         # primera corrección de cada una pasaba en silencio.
-                        delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"), published_render_fingerprint=delivery_freshness.render_fingerprint(job), content_updated_at=_now())
+                        from delivery_products import product_category
+                        category = product_category(campaign.kind, (campaign.default_render_params or {}).get("product_channel"))
+                        delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"), published_render_fingerprint=delivery_freshness.render_fingerprint(job), content_updated_at=_now(), product_category=category)
                         if hasattr(Delivery, "portal_id"):
                             delivery_kwargs["portal_id"] = op.destination_portal
                         active = Delivery(**delivery_kwargs)
                         ddb.add(active); ddb.flush()
                     else:
+                        from delivery_products import product_category
+                        active.product_category = product_category(campaign.kind, (campaign.default_render_params or {}).get("product_channel"))
                         active.job_id = job.job_id
                         active.label = delivery_label
                         active.file_types = delivery_file_types
