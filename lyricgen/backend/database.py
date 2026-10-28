@@ -1389,6 +1389,9 @@ class Delivery(Base):
         String(20), nullable=False, default="argentina",
         server_default="argentina", index=True,
     )
+    # Product shown in the UMG portal. Snapshot at publication time so the
+    # portal does not depend on a Job or campaign from another environment.
+    product_category = Column(String(32), nullable=True, index=True)
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
