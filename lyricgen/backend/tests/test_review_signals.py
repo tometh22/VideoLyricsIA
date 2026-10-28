@@ -85,7 +85,7 @@ def test_alembic_upgrade_creates_review_signal_records(tmp_path):
     } <= columns
     assert "ix_review_signal_records_job_id" in indexes
     assert "ix_review_signal_records_kind_created" in indexes
-    assert version == "e3c5a7b9d1f2"
+    assert version == "a6c8e0f2b4d6"
 
 
 def test_single_alembic_head():
@@ -95,7 +95,7 @@ def test_single_alembic_head():
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cfg = Config(os.path.join(backend_dir, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["e3c5a7b9d1f2"]
+    assert ScriptDirectory.from_config(cfg).get_heads() == ["a6c8e0f2b4d6"]
 
 
 # ---------------------------------------------------------------------------
