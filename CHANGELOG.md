@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.110] - 2026-10-28
+
+### Added
+
+- Las entregas del portal UMG conservan la categoría de producto al publicarse y la exponen en el listado, para las pestañas de Argentina por canal y formato.
+
 ## [1.1.109] - 2026-10-03
 
 ### Fixed

@@ -267,6 +267,10 @@ def test_bulk_copy_releases_transactions_and_rechecks_revision(client, admin_tok
     from database import Delivery
     monkeypatch.setenv('BATCH_CAMPAIGN_ENABLED', '1')
     campaign = _campaign_for(client, admin_token, 'Bounded publication')
+    with SessionLocal() as setup:
+        source = setup.query(BatchCampaign).filter_by(id=campaign.id).one()
+        source.default_render_params = {"product_channel": "hitsdesiempre"}
+        setup.commit()
     jid = _seed_campaign_job(campaign, umg_spec=None, s3_keys={
         'video': 't/j/lyric_video.mp4', 'short': 't/j/short.mp4', 'thumbnail': 't/j/thumbnail.jpg'})
     op = _run_bulk_delivery(client, admin_token, campaign.id, 'transaction-test-' + str(edit_during_copy))
@@ -296,6 +300,8 @@ def test_bulk_copy_releases_transactions_and_rechecks_revision(client, admin_tok
         if edit_during_copy:
             assert row.error_code == 'stale_approval'
             assert check.query(Delivery).filter_by(job_id=jid).first() is None
+        else:
+            assert check.query(Delivery).filter_by(job_id=jid).one().product_category == 'hits_lyrics'
 
 
 def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
