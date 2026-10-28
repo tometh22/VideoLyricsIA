@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.150] - 2026-10-28
+
+### Added
+
+- El portal Argentina separa Art Tracks Artistas, HitsDeSiempre Lyrics/Art Tracks y CancioneroRock Lyrics/Art Tracks. Conserva Todos y Otros videos para las entregas históricas sin clasificación.
+- La categoría de producto queda guardada al publicar cada entrega y viaja en el listado del portal; no depende del nombre de la canción ni de una consulta al Job de staging.
+
 ## [1.1.149] - 2026-10-27
 
 ### Added

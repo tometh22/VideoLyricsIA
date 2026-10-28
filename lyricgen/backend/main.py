@@ -21265,6 +21265,13 @@ def admin_create_delivery_from_job(
         label = explicit_label or _compute_default_delivery_label(
             ddb, job.artist, job.song_title, portal_id
         )
+    from delivery_products import product_category
+    from database import BatchCampaign
+    campaign = db.query(BatchCampaign).filter(BatchCampaign.id == job.campaign_id).first() if job.campaign_id else None
+    category = product_category(
+        campaign.kind if campaign else ("art_track" if is_art_track else "lyric_video"),
+        (campaign.default_render_params or {}).get("product_channel") if campaign else None,
+    )
     # Identidad del corte que está en R2 ahora. Comparada contra la que se
     # publicó, es lo que separa "corregí esto y lo mando" de "toqué el botón
     # dos veces": las keys de R2 son determinísticas, así que sin esto la
@@ -21289,6 +21296,7 @@ def admin_create_delivery_from_job(
         existing.song_title_snapshot = job.song_title or ""
         existing.tenant_snapshot = job.tenant_id
         existing.portal_id = portal_id
+        existing.product_category = category
         existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
         existing.published_render_fingerprint = fingerprint
         # Un reenvío del mismo corte no reabre nada: la aprobación de UMG
@@ -21317,6 +21325,7 @@ def admin_create_delivery_from_job(
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
             portal_id=portal_id,
+            product_category=category,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
             added_by_user_id=added_by,
             added_at=now,
@@ -22201,6 +22210,7 @@ def portal_get_items(
             "delivery_id": d.id,
             "job_id": d.job_id,
             "label": d.label,
+            "product_category": d.product_category,
             "frame_size": d.frame_size_snapshot,
             "added_at": d.added_at.isoformat() if d.added_at else None,
             "files": files,
