@@ -58,7 +58,7 @@ const COPY = {
     pathsTitle: "Lo hacés vos o lo hacemos nosotros",
     paths: [
       { name: "Genly Platform", tag: "Para artistas y sellos", title: "Lo hacés vos", body: "Subís las canciones, corregís la letra y elegís la estética. Genly arma los videos.", points: ["Video, vertical y miniatura de cada canción", "Hasta cinco canciones por vez", "Para sellos: un workspace con todo tu equipo"], cta: "Empezar gratis", labelsLink: "¿Sos un sello? Te armamos el workspace del equipo" },
-      { name: "Genly Studio", tag: "Para sellos", title: "Lo hacemos nosotros", body: "Nos mandás las canciones y te devolvemos los videos listos para subir, con la letra revisada palabra por palabra.", points: ["Muestra gratis de 30 segundos", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir mi muestra gratis" },
+      { name: "Genly Studio", tag: "Para sellos", title: "Lo hacemos nosotros", body: "Nos mandás las canciones y te devolvemos los videos listos para subir, con la letra revisada palabra por palabra.", points: ["Muestra gratis de 30 segundos", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir mi muestra gratis", footNote: "Sin compromiso de seguir." },
     ],
     pathsNote: "Se pueden combinar: usás Platform para el día a día y nos pasás los lotes grandes a Studio.",
     proof: ["Trabajamos con grandes sellos. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
@@ -164,7 +164,7 @@ const COPY = {
     pathsTitle: "You make it, or we make it for you",
     paths: [
       { name: "Genly Platform", tag: "For artists and labels", title: "You make it", body: "Upload the songs, fix the lyrics and pick the look. Genly puts the videos together.", points: ["Video, vertical edit and thumbnail for every song", "Up to five songs at a time", "For labels: one workspace for your whole team"], cta: "Start free", labelsLink: "Run a label? We’ll set up your team workspace" },
-      { name: "Genly Studio", tag: "For labels", title: "We make it for you", body: "Send us the songs and we send back the videos ready to upload, with the lyrics checked word by word.", points: ["Free 30-second sample", "One person handles the whole batch", "Pricing based on volume"], cta: "Get my free sample" },
+      { name: "Genly Studio", tag: "For labels", title: "We make it for you", body: "Send us the songs and we send back the videos ready to upload, with the lyrics checked word by word.", points: ["Free 30-second sample", "One person handles the whole batch", "Pricing based on volume"], cta: "Get my free sample", footNote: "No commitment to continue." },
     ],
     pathsNote: "You can combine them: use Platform day to day and send the big batches to Studio.",
     proof: ["We work with major labels. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
@@ -270,7 +270,7 @@ const COPY = {
     pathsTitle: "Você faz ou a gente faz",
     paths: [
       { name: "Genly Platform", tag: "Para artistas e gravadoras", title: "Você faz", body: "Você envia as músicas, corrige a letra e escolhe a estética. A Genly monta os vídeos.", points: ["Vídeo, vertical e thumbnail de cada música", "Até cinco músicas por vez", "Para gravadoras: um workspace com toda a sua equipe"], cta: "Começar grátis", labelsLink: "Tem uma gravadora? A gente monta o workspace da equipe" },
-      { name: "Genly Studio", tag: "Para gravadoras", title: "A gente faz", body: "Você nos manda as músicas e devolvemos os vídeos prontos para subir, com a letra revisada palavra por palavra.", points: ["Amostra grátis de 30 segundos", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir minha amostra grátis" },
+      { name: "Genly Studio", tag: "Para gravadoras", title: "A gente faz", body: "Você nos manda as músicas e devolvemos os vídeos prontos para subir, com a letra revisada palavra por palavra.", points: ["Amostra grátis de 30 segundos", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir minha amostra grátis", footNote: "Sem compromisso de continuar." },
     ],
     pathsNote: "Dá para combinar: você usa a Platform no dia a dia e manda os lotes grandes para o Studio.",
     proof: ["Trabalhamos com grandes gravadoras. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
@@ -589,7 +589,11 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 {index === 0
                   ? <button type="button" onClick={start} className="hm-button hm-button--light hm-button--wide">{isLoggedIn ? c.dashboard : path.cta}<ArrowIcon /></button>
                   : <a href="#sellos" onClick={() => setWorkMode("managed")} className="hm-button hm-button--ghost hm-button--wide">{path.cta}<ArrowIcon /></a>}
-                {path.labelsLink && <a href="#sellos" onClick={() => setWorkMode("team")} className="hm-path__link">{path.labelsLink} <span aria-hidden="true">→</span></a>}
+                <p className="hm-path__foot">
+                  {path.labelsLink
+                    ? <a href="#sellos" onClick={() => setWorkMode("team")} className="hm-path__link">{path.labelsLink} <span aria-hidden="true">→</span></a>
+                    : path.footNote}
+                </p>
               </article>
             ))}
           </div>
