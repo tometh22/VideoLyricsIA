@@ -29,16 +29,13 @@ describe("Landing", () => {
     expect(screen.queryByText(/sin riesgo de ContentID/i)).not.toBeInTheDocument();
   });
 
-  it("muestra trabajo publicado que abre la publicación original", () => {
+  it("muestra trabajo real sin nombrar ni enlazar dónde está publicado", () => {
     renderLanding();
 
     const reel = document.querySelector("#videos");
-    const links = within(reel).getAllByRole("link").filter((link) => link.href.includes("youtube.com/watch"));
-    expect(links.length).toBeGreaterThanOrEqual(12);
-    links.forEach((link) => {
-      expect(link).toHaveAttribute("target", "_blank");
-      expect(link).toHaveAttribute("rel", "noopener noreferrer");
-    });
+    expect(within(reel).getAllByText("Charly García").length).toBeGreaterThan(0);
+    expect(document.body.textContent).not.toMatch(/HitsDeSiempre|VEVO/i);
+    expect(document.querySelectorAll('a[href*="youtube"]')).toHaveLength(0);
   });
 
   it("cambia el estilo de letra mostrado", async () => {

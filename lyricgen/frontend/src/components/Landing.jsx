@@ -6,32 +6,29 @@ import "./Landing.css";
 
 const API = import.meta.env.VITE_API_URL || "";
 const SALES_EMAIL = "tomas@genly.pro";
-const CHANNEL_URL = "https://www.youtube.com/@HitsDeSiempreVEVO/videos";
 
-// Lyric videos hechos con Genly y publicados en HitsDeSiempreVEVO. Las
-// imágenes son fotogramas reales (con la letra en pantalla) de cada video;
-// cada tarjeta abre la publicación original.
-const FEATURED = { id: "3ekfvw_8BEA", artist: "Enanitos Verdes", title: "Salpicandonos", duration: "5:12" };
+// Lyric videos hechos con Genly. Las imágenes son fotogramas reales (con la
+// letra en pantalla). No se enlaza ni se nombra dónde están publicados.
+const FEATURED = { id: "enanitos-verdes-salpicandonos", artist: "Enanitos Verdes", title: "Salpicandonos", duration: "5:12" };
 const WORK = [
   [
-    { id: "DRpsp2tVFJ8", artist: "Illya Kuryaki and the Valderramas", title: "Jugo" },
-    { id: "3ekfvw_8BEA", artist: "Enanitos Verdes", title: "Salpicandonos" },
-    { id: "6viFf207jPo", artist: "Los Abuelos de la Nada", title: "Mil Horas" },
-    { id: "GNvJ4y68Bfg", artist: "Luciano Pereyra", title: "Princesa" },
-    { id: "Vepu85BjK54", artist: "Coti", title: "Te Quise Tanto" },
-    { id: "Zdt5_EVsiso", artist: "Rodrigo", title: "La Chica Del Ascensor" },
+    { id: "illya-kuryaki-jugo", artist: "Illya Kuryaki and the Valderramas", title: "Jugo" },
+    { id: "enanitos-verdes-salpicandonos", artist: "Enanitos Verdes", title: "Salpicandonos" },
+    { id: "abuelos-de-la-nada-mil-horas", artist: "Los Abuelos de la Nada", title: "Mil Horas" },
+    { id: "luciano-pereyra-princesa", artist: "Luciano Pereyra", title: "Princesa" },
+    { id: "coti-te-quise-tanto", artist: "Coti", title: "Te Quise Tanto" },
+    { id: "rodrigo-la-chica-del-ascensor", artist: "Rodrigo", title: "La Chica Del Ascensor" },
   ],
   [
-    { id: "Yl1u-11xFMU", artist: "Mercedes Sosa", title: "Déjame Que Me Vaya" },
-    { id: "ZnXt8gobqRw", artist: "Viejas Locas", title: "¿Qué Vas A Hacer Tan Sola Hoy?" },
-    { id: "zbUm8keRrkU", artist: "Serú Girán", title: "Llorando En El Espejo" },
-    { id: "8eqjCfQN-CM", artist: "Axel", title: "Ella" },
-    { id: "YA9Arv3i2WM", artist: "Charly García", title: "Tango" },
-    { id: "vNmyPVOd3MQ", artist: "Diego Torres", title: "El Mundo Sigue Igual" },
+    { id: "mercedes-sosa-dejame-que-me-vaya", artist: "Mercedes Sosa", title: "Déjame Que Me Vaya" },
+    { id: "viejas-locas-que-vas-a-hacer", artist: "Viejas Locas", title: "¿Qué Vas A Hacer Tan Sola Hoy?" },
+    { id: "seru-giran-llorando-en-el-espejo", artist: "Serú Girán", title: "Llorando En El Espejo" },
+    { id: "axel-ella", artist: "Axel", title: "Ella" },
+    { id: "charly-garcia-tango", artist: "Charly García", title: "Tango" },
+    { id: "diego-torres-el-mundo-sigue-igual", artist: "Diego Torres", title: "El Mundo Sigue Igual" },
   ],
 ];
 const LOOK_KEYS = ["cosmico", "cine", "pincel", "pop", "pelicula"];
-const youtubeUrl = (id) => `https://www.youtube.com/watch?v=${id}`;
 
 const COPY = {
   es: {
@@ -56,14 +53,12 @@ const COPY = {
     primaryCta: "Crear mi lyric video",
     secondaryCta: "Ver videos hechos con Genly",
     heroNote: "MP3 o WAV, hasta cinco canciones por vez",
-    proof: ["Trabajamos con grandes sellos. Algunos de nuestros videos ya están publicados en ", "."],
-    featureTag: "Publicado en YouTube",
-    featureMeta: "Lyric video · Hecho con Genly",
-    watchOn: "Ver en YouTube",
-    workEyebrow: "Videos publicados",
-    workTitle: "Algunos de los que ya están en YouTube.",
-    workBody: "Son del canal HitsDeSiempreVEVO, con rock nacional, folklore, pop y cuarteto. Tocá cualquiera y se abre en YouTube.",
-    workChannel: "Ver el canal completo",
+    proof: ["Trabajamos con grandes sellos. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
+    featureTag: "Hecho con Genly",
+    featureMeta: "Lyric video",
+    workEyebrow: "Nuestro trabajo",
+    workTitle: "Algunos lyric videos que hicimos.",
+    workBody: "Para catálogos de rock nacional, folklore, pop y cuarteto. Cada canción con su estética y la letra revisada línea por línea.",
     pause: "Pausar",
     resume: "Reanudar",
     looksEyebrow: "Estilos de letra",
@@ -127,7 +122,7 @@ const COPY = {
     finalCta: "Crear mi lyric video",
     footerLine: "Lyric videos para artistas y sellos.",
     footerStatus: "Estado del servicio",
-    footerNote: "Las imágenes de la sección de videos son de publicaciones reales y abren el original en YouTube.",
+    footerNote: "Las imágenes de la sección de videos son fotogramas de lyric videos hechos con Genly.",
   },
   en: {
     metaTitle: "Genly — Make the lyric video for your song",
@@ -151,14 +146,12 @@ const COPY = {
     primaryCta: "Create my lyric video",
     secondaryCta: "See videos made with Genly",
     heroNote: "MP3 or WAV, up to five songs at a time",
-    proof: ["We work with major labels. Some of our videos are already live on ", "."],
-    featureTag: "Live on YouTube",
-    featureMeta: "Lyric video · Made with Genly",
-    watchOn: "Watch on YouTube",
-    workEyebrow: "Published videos",
-    workTitle: "A few that are already on YouTube.",
-    workBody: "They’re from the HitsDeSiempreVEVO channel, across Argentine rock, folk, pop and cuarteto. Tap any of them to open it on YouTube.",
-    workChannel: "See the full channel",
+    proof: ["We work with major labels. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
+    featureTag: "Made with Genly",
+    featureMeta: "Lyric video",
+    workEyebrow: "Our work",
+    workTitle: "A few lyric videos we’ve made.",
+    workBody: "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
     pause: "Pause",
     resume: "Resume",
     looksEyebrow: "Lyric styles",
@@ -222,7 +215,7 @@ const COPY = {
     finalCta: "Create my lyric video",
     footerLine: "Lyric videos for artists and labels.",
     footerStatus: "Service status",
-    footerNote: "Images in the videos section come from real publications and open the original on YouTube.",
+    footerNote: "Images in the videos section are stills from lyric videos made with Genly.",
   },
   pt: {
     metaTitle: "Genly — Faça o lyric video da sua música",
@@ -246,14 +239,12 @@ const COPY = {
     primaryCta: "Criar meu lyric video",
     secondaryCta: "Ver vídeos feitos com Genly",
     heroNote: "MP3 ou WAV, até cinco músicas por vez",
-    proof: ["Trabalhamos com grandes gravadoras. Alguns dos nossos vídeos já estão publicados no ", "."],
-    featureTag: "Publicado no YouTube",
-    featureMeta: "Lyric video · Feito com Genly",
-    watchOn: "Ver no YouTube",
-    workEyebrow: "Vídeos publicados",
-    workTitle: "Alguns que já estão no YouTube.",
-    workBody: "São do canal HitsDeSiempreVEVO, com rock argentino, folclore, pop e cuarteto. Toque em qualquer um para abrir no YouTube.",
-    workChannel: "Ver o canal completo",
+    proof: ["Trabalhamos com grandes gravadoras. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
+    featureTag: "Feito com Genly",
+    featureMeta: "Lyric video",
+    workEyebrow: "Nosso trabalho",
+    workTitle: "Alguns lyric videos que fizemos.",
+    workBody: "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com sua estética e a letra revisada linha por linha.",
     pause: "Pausar",
     resume: "Retomar",
     looksEyebrow: "Estilos de letra",
@@ -317,7 +308,7 @@ const COPY = {
     finalCta: "Criar meu lyric video",
     footerLine: "Lyric videos para artistas e gravadoras.",
     footerStatus: "Status do serviço",
-    footerNote: "As imagens da seção de vídeos são de publicações reais e abrem o original no YouTube.",
+    footerNote: "As imagens da seção de vídeos são frames de lyric videos feitos com Genly.",
   },
 };
 
@@ -390,10 +381,10 @@ function SyncedTitle({ text, reducedMotion }) {
 function WorkCard({ item, hidden = false }) {
   return (
     <li aria-hidden={hidden || undefined}>
-      <a className="hm-reel__item" href={youtubeUrl(item.id)} target="_blank" rel="noopener noreferrer" tabIndex={hidden ? -1 : undefined}>
+      <figure className="hm-reel__item">
         <img src={`/landing/work/${item.id}-800.jpg`} alt="" width="800" height="450" loading="lazy" decoding="async" />
-        <span className="hm-reel__meta"><b>{item.artist}</b><span>{item.title}</span></span>
-      </a>
+        <figcaption className="hm-reel__meta"><b>{item.artist}</b><span>{item.title}</span></figcaption>
+      </figure>
     </li>
   );
 }
@@ -529,14 +520,13 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 <span className="hm-proof__stack" aria-hidden="true">
                   {WORK[0].slice(0, 3).map((item) => <img key={item.id} src={`/landing/work/${item.id}-800.jpg`} alt="" width="46" height="46" />)}
                 </span>
-                <span>{c.proof[0]}<b>HitsDeSiempreVEVO</b>{c.proof[1]}</span>
+                <span>{c.proof[0]}<b>{c.proof[1]}</b>{c.proof[2]}</span>
               </p>
             </div>
             <figure className="hm-feature">
-              <a className="hm-feature__media" href={youtubeUrl(FEATURED.id)} target="_blank" rel="noopener noreferrer" aria-label={`${c.watchOn}: ${FEATURED.artist} — ${FEATURED.title}`}>
-                <img src={`/landing/work/${FEATURED.id}.jpg`} alt="" width="1280" height="720" fetchpriority="high" />
-                <span className="hm-play" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg></span>
-              </a>
+              <div className="hm-feature__media">
+                <img src={`/landing/work/${FEATURED.id}.jpg`} alt={`${FEATURED.artist} — ${FEATURED.title}`} width="1280" height="720" fetchpriority="high" />
+              </div>
               <figcaption>
                 <span className="hm-feature__tag"><span className="hm-live" aria-hidden="true" />{c.featureTag}</span>
                 <span className="hm-feature__title"><strong>{FEATURED.artist}</strong> {FEATURED.title}</span>
@@ -555,8 +545,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             <div>
               <p className="hm-body">{c.workBody}</p>
               <div className="hm-reel__links">
-                <a className="hm-text-link" href={CHANNEL_URL} target="_blank" rel="noopener noreferrer">{c.workChannel} <span aria-hidden="true">↗</span></a>
-                {!reducedMotion && <button type="button" className="hm-chip-button" aria-pressed={reelPaused} onClick={() => setReelPaused((paused) => !paused)}>{reelPaused ? c.resume : c.pause}</button>}
+                                {!reducedMotion && <button type="button" className="hm-chip-button" aria-pressed={reelPaused} onClick={() => setReelPaused((paused) => !paused)}>{reelPaused ? c.resume : c.pause}</button>}
               </div>
             </div>
           </div>
