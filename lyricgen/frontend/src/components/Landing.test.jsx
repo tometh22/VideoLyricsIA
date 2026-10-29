@@ -44,16 +44,19 @@ describe("Landing", () => {
     renderLanding({ onLogin });
 
     const paths = document.querySelector("#para-quien");
-    expect(within(paths).getByText("Artistas y sellos")).toBeInTheDocument();
-    expect(within(paths).getByRole("heading", { name: /te lo hacemos nosotros/i })).toBeInTheDocument();
-    await user.click(within(paths).getByRole("button", { name: /crear mi lyric video/i }));
+    expect(within(paths).getByText("Genly Platform")).toBeInTheDocument();
+    expect(within(paths).getByText("Genly Studio")).toBeInTheDocument();
+    expect(within(paths).getByText("Para artistas y sellos")).toBeInTheDocument();
+    expect(within(paths).getByRole("heading", { level: 3, name: /lo hacemos nosotros/i })).toBeInTheDocument();
+    await user.click(within(paths).getByRole("button", { name: /empezar gratis/i }));
     expect(onLogin).toHaveBeenCalledTimes(1);
 
     const mode = screen.getByRole("combobox", { name: /cómo querés trabajar/i });
     expect(mode).toHaveValue("managed");
-    await user.click(within(paths).getByRole("link", { name: /querés usarlo con tu equipo/i }));
+    await user.click(within(paths).getByRole("link", { name: /workspace del equipo/i }));
     expect(mode).toHaveValue("team");
-    await user.click(within(paths).getByRole("link", { name: /pedir una muestra gratis/i }));
+    expect(screen.getByRole("button", { name: /quiero el workspace para mi equipo/i })).toBeInTheDocument();
+    await user.click(within(paths).getByRole("link", { name: /pedir mi muestra gratis/i }));
     expect(mode).toHaveValue("managed");
   });
 
@@ -83,7 +86,7 @@ describe("Landing", () => {
     const onLogin = vi.fn();
     renderLanding({ onLogin });
 
-    await user.click(screen.getAllByRole("button", { name: /crear mi lyric video/i })[0]);
+    await user.click(screen.getAllByRole("button", { name: /empezar gratis/i })[0]);
     expect(onLogin).toHaveBeenCalledTimes(1);
   });
 });

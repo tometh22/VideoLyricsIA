@@ -126,7 +126,10 @@
 .hm-paths { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 44px; }
 .hm-path { display: flex; flex-direction: column; padding: clamp(26px, 3vw, 38px); border: 1px solid var(--hm-line-strong); border-radius: 24px; background: rgba(255, 255, 255, .025); }
 .hm-path--labels { border-color: rgba(168, 152, 255, .4); background: linear-gradient(160deg, rgba(117, 87, 255, .18), rgba(117, 87, 255, .03) 60%); }
-.hm-path__tag { color: var(--hm-violet-soft); font-size: 13px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase; }
+.hm-path__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.hm-path__name { padding: 5px 11px; border: 1px solid var(--hm-line-strong); border-radius: 999px; color: var(--hm-text); font-size: 13px; font-weight: 650; }
+.hm-path--labels .hm-path__name { border-color: rgba(168, 152, 255, .5); background: rgba(117, 87, 255, .2); }
+.hm-path__tag { color: var(--hm-violet-soft); font-size: 12.5px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase; }
 .hm-path h3 { margin-top: 14px; font-family: var(--hm-display); font-size: clamp(1.6rem, 2.6vw, 2.2rem); font-weight: 800; line-height: 1.1; letter-spacing: -.03em; }
 .hm-path__body { margin-top: 14px; color: var(--hm-muted); }
 .hm-path .hm-checks { margin: 24px 0 30px; }
