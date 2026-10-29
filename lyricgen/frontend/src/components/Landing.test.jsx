@@ -38,6 +38,19 @@ describe("Landing", () => {
     expect(document.querySelectorAll('a[href*="youtube"]')).toHaveLength(0);
   });
 
+  it("presenta los dos caminos: artistas independientes y sellos", async () => {
+    const user = userEvent.setup();
+    const onLogin = vi.fn();
+    renderLanding({ onLogin });
+
+    const paths = document.querySelector("#para-quien");
+    expect(within(paths).getByText(/artistas independientes/i)).toBeInTheDocument();
+    expect(within(paths).getByText(/sellos y equipos/i)).toBeInTheDocument();
+    expect(within(paths).getByRole("link", { name: /pedir una muestra gratis/i })).toHaveAttribute("href", "#sellos");
+    await user.click(within(paths).getByRole("button", { name: /crear mi lyric video/i }));
+    expect(onLogin).toHaveBeenCalledTimes(1);
+  });
+
   it("cambia el estilo de letra mostrado", async () => {
     const user = userEvent.setup();
     renderLanding();

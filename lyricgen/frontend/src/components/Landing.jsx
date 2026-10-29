@@ -40,6 +40,7 @@ const COPY = {
     navWork: "Videos",
     navLooks: "Estilos",
     navWorkflow: "Cómo funciona",
+    navArtists: "Para artistas",
     navLabels: "Para sellos",
     navFaq: "Preguntas",
     login: "Ingresar",
@@ -47,12 +48,18 @@ const COPY = {
     navCta: "Crear lyric video",
     menuOpen: "Abrir navegación",
     menuClose: "Cerrar navegación",
-    heroEyebrow: "Lyric videos para artistas, productores y sellos",
+    heroEyebrow: "Para artistas independientes y sellos",
     heroTitle: "Hacé el lyric video de tu canción.",
-    heroBody: "Subís el audio y Genly transcribe la letra, la sincroniza y te propone una estética. Corregís lo que haga falta y recién ahí generás. Te llevás el video, un vertical para redes y la miniatura.",
+    heroBody: "Subís el audio y Genly transcribe la letra, la sincroniza y te propone una estética. Corregís lo que haga falta y recién ahí generás. Te llevás el video, un vertical para redes y la miniatura. Y si tenés un sello, te los hacemos nosotros.",
     primaryCta: "Crear mi lyric video",
-    secondaryCta: "Ver videos hechos con Genly",
+    secondaryCta: "Tengo un sello",
     heroNote: "MP3 o WAV, hasta cinco canciones por vez",
+    pathsEyebrow: "Para quién",
+    pathsTitle: "Dos formas de trabajar con Genly",
+    paths: [
+      { tag: "Artistas independientes", title: "Lo hacés vos, desde la app", body: "Creás tu cuenta, subís la canción y armás tu lyric video vos mismo. No hace falta saber de edición.", points: ["Video, vertical y miniatura de cada canción", "Corregís la letra antes de generar", "Hasta cinco canciones por vez"], cta: "Crear mi lyric video" },
+      { tag: "Sellos y equipos", title: "Te lo hacemos nosotros", body: "Nuestro equipo produce los videos de tus artistas, revisa la letra palabra por palabra y te los entrega listos para subir.", points: ["Muestra gratis de 30 segundos, una por sello", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir una muestra gratis" },
+    ],
     proof: ["Trabajamos con grandes sellos. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
     featureTag: "Hecho con Genly",
     featureMeta: "Lyric video",
@@ -110,6 +117,7 @@ const COPY = {
     faqEyebrow: "Preguntas",
     faqTitle: "Lo que más nos preguntan",
     faqs: [
+      { q: "¿Sirve si soy artista independiente?", a: "Sí. Creás tu cuenta, subís la canción y lo hacés vos desde la app. Si preferís que lo hagamos nosotros, escribinos." },
       { q: "¿Son plantillas de lyric video?", a: "No. El fondo sale de lo que elegís: concepto, movimiento, paleta y efectos. Si preferís, también podés subir un fondo propio." },
       { q: "¿Puedo corregir la letra y los tiempos?", a: "Sí. Antes de generar editás el texto, movés los tiempos en la línea de tiempo, dividís o unís líneas y lo ves sincronizado en el preview." },
       { q: "¿Qué puedo cambiar del estilo?", a: "El modo, el género, el concepto visual, el movimiento, la paleta y tus propios colores, los efectos, y la tipografía, el tamaño, el contraste y la animación de la letra." },
@@ -119,6 +127,7 @@ const COPY = {
     ],
     finalTitle: "Probalo con tu próxima canción.",
     finalBody: "Subís el audio, elegís el estilo y revisás todo antes de generar.",
+    finalLabels: "¿Tenés un sello? Pedí una muestra gratis",
     finalCta: "Crear mi lyric video",
     footerLine: "Lyric videos para artistas y sellos.",
     footerStatus: "Estado del servicio",
@@ -133,6 +142,7 @@ const COPY = {
     navWork: "Videos",
     navLooks: "Styles",
     navWorkflow: "How it works",
+    navArtists: "For artists",
     navLabels: "For labels",
     navFaq: "Questions",
     login: "Sign in",
@@ -140,12 +150,18 @@ const COPY = {
     navCta: "Create lyric video",
     menuOpen: "Open navigation",
     menuClose: "Close navigation",
-    heroEyebrow: "Lyric videos for artists, producers and labels",
+    heroEyebrow: "For independent artists and labels",
     heroTitle: "Make the lyric video for your song.",
-    heroBody: "Upload the audio and Genly transcribes the lyrics, syncs them and suggests a look. You fix whatever needs fixing and only then generate. You get the video, a vertical edit for social and the thumbnail.",
+    heroBody: "Upload the audio and Genly transcribes the lyrics, syncs them and suggests a look. You fix whatever needs fixing and only then generate. You get the video, a vertical edit for social and the thumbnail. And if you run a label, we can make them for you.",
     primaryCta: "Create my lyric video",
-    secondaryCta: "See videos made with Genly",
+    secondaryCta: "I run a label",
     heroNote: "MP3 or WAV, up to five songs at a time",
+    pathsEyebrow: "Who it’s for",
+    pathsTitle: "Two ways to work with Genly",
+    paths: [
+      { tag: "Independent artists", title: "You make it yourself, in the app", body: "Create your account, upload the song and put your lyric video together yourself. No editing skills needed.", points: ["Video, vertical edit and thumbnail for every song", "Fix the lyrics before generating", "Up to five songs at a time"], cta: "Create my lyric video" },
+      { tag: "Labels and teams", title: "We make it for you", body: "Our team makes your artists’ videos, checks the lyrics word by word and delivers them ready to upload.", points: ["Free 30-second sample, one per label", "One person handles the whole batch", "Pricing based on volume"], cta: "Get a free sample" },
+    ],
     proof: ["We work with major labels. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
     featureTag: "Made with Genly",
     featureMeta: "Lyric video",
@@ -203,6 +219,7 @@ const COPY = {
     faqEyebrow: "Questions",
     faqTitle: "What people usually ask us",
     faqs: [
+      { q: "Does it work for independent artists?", a: "Yes. Create your account, upload the song and make it yourself in the app. If you’d rather we make it, write to us." },
       { q: "Are these lyric video templates?", a: "No. The background comes from what you pick: concept, motion, palette and effects. You can also upload your own background." },
       { q: "Can I fix the lyrics and timing?", a: "Yes. Before generating you edit the text, move timing on the timeline, split or merge lines and watch it synced in the preview." },
       { q: "What can I change about the style?", a: "The mode, genre, visual concept, motion, palette and your own colors, effects, and the lyrics’ typeface, size, contrast and animation." },
@@ -212,6 +229,7 @@ const COPY = {
     ],
     finalTitle: "Try it with your next song.",
     finalBody: "Upload the audio, pick a style and review everything before generating.",
+    finalLabels: "Run a label? Get a free sample",
     finalCta: "Create my lyric video",
     footerLine: "Lyric videos for artists and labels.",
     footerStatus: "Service status",
@@ -226,6 +244,7 @@ const COPY = {
     navWork: "Vídeos",
     navLooks: "Estilos",
     navWorkflow: "Como funciona",
+    navArtists: "Para artistas",
     navLabels: "Para gravadoras",
     navFaq: "Perguntas",
     login: "Entrar",
@@ -233,12 +252,18 @@ const COPY = {
     navCta: "Criar lyric video",
     menuOpen: "Abrir navegação",
     menuClose: "Fechar navegação",
-    heroEyebrow: "Lyric videos para artistas, produtores e gravadoras",
+    heroEyebrow: "Para artistas independentes e gravadoras",
     heroTitle: "Faça o lyric video da sua música.",
-    heroBody: "Você envia o áudio e o Genly transcreve a letra, sincroniza e sugere uma estética. Você corrige o que precisar e só então gera. Leva o vídeo, um vertical para redes e a thumbnail.",
+    heroBody: "Você envia o áudio e o Genly transcreve a letra, sincroniza e sugere uma estética. Você corrige o que precisar e só então gera. Leva o vídeo, um vertical para redes e a thumbnail. E se você tem uma gravadora, a gente faz para você.",
     primaryCta: "Criar meu lyric video",
-    secondaryCta: "Ver vídeos feitos com Genly",
+    secondaryCta: "Tenho uma gravadora",
     heroNote: "MP3 ou WAV, até cinco músicas por vez",
+    pathsEyebrow: "Para quem",
+    pathsTitle: "Duas formas de trabalhar com a Genly",
+    paths: [
+      { tag: "Artistas independentes", title: "Você mesmo faz, pelo app", body: "Você cria sua conta, envia a música e monta seu lyric video sozinho. Não precisa saber editar.", points: ["Vídeo, vertical e thumbnail de cada música", "Você corrige a letra antes de gerar", "Até cinco músicas por vez"], cta: "Criar meu lyric video" },
+      { tag: "Gravadoras e equipes", title: "A gente faz para você", body: "Nossa equipe produz os vídeos dos seus artistas, revisa a letra palavra por palavra e entrega tudo pronto para subir.", points: ["Amostra grátis de 30 segundos, uma por gravadora", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir uma amostra grátis" },
+    ],
     proof: ["Trabalhamos com grandes gravadoras. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
     featureTag: "Feito com Genly",
     featureMeta: "Lyric video",
@@ -296,6 +321,7 @@ const COPY = {
     faqEyebrow: "Perguntas",
     faqTitle: "O que mais nos perguntam",
     faqs: [
+      { q: "Serve para artista independente?", a: "Sim. Você cria sua conta, envia a música e faz pelo app. Se preferir que a gente faça, fale com a gente." },
       { q: "São templates de lyric video?", a: "Não. O fundo sai do que você escolhe: conceito, movimento, paleta e efeitos. Você também pode enviar um fundo próprio." },
       { q: "Posso corrigir a letra e os tempos?", a: "Sim. Antes de gerar você edita o texto, ajusta os tempos na timeline, divide ou junta linhas e vê tudo sincronizado no preview." },
       { q: "O que posso mudar no estilo?", a: "O modo, o gênero, o conceito visual, o movimento, a paleta e suas próprias cores, os efeitos, e a fonte, o tamanho, o contraste e a animação da letra." },
@@ -305,6 +331,7 @@ const COPY = {
     ],
     finalTitle: "Teste com a sua próxima música.",
     finalBody: "Envie o áudio, escolha o estilo e revise tudo antes de gerar.",
+    finalLabels: "Tem uma gravadora? Peça uma amostra grátis",
     finalCta: "Criar meu lyric video",
     footerLine: "Lyric videos para artistas e gravadoras.",
     footerStatus: "Status do serviço",
@@ -466,7 +493,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
     }
   };
 
-  const navLinks = [["#videos", c.navWork], ["#estilos", c.navLooks], ["#como-funciona", c.navWorkflow], ["#sellos", c.navLabels], ["#preguntas", c.navFaq]];
+  const navLinks = [["#para-quien", c.navArtists], ["#sellos", c.navLabels], ["#videos", c.navWork], ["#estilos", c.navLooks], ["#como-funciona", c.navWorkflow], ["#preguntas", c.navFaq]];
   const languageButtons = ["es", "en", "pt"].map((code) => (
     <button key={code} type="button" onClick={() => setLang(code)} aria-pressed={lang === code}>{code}</button>
   ));
@@ -513,7 +540,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               <p className="hm-lead">{c.heroBody}</p>
               <div className="hm-hero__actions">
                 <button type="button" onClick={start} className="hm-button hm-button--light">{startLabel}<ArrowIcon /></button>
-                <a href="#videos" className="hm-button hm-button--ghost">{c.secondaryCta}</a>
+                <a href="#sellos" className="hm-button hm-button--ghost">{c.secondaryCta}</a>
               </div>
               <p className="hm-hero__note"><CheckIcon />{c.heroNote}</p>
               <p className="hm-proof">
@@ -536,10 +563,28 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
           </div>
         </section>
 
+        <section id="para-quien" className="hm-section hm-shell hm-paths-section" aria-labelledby="hm-paths-title">
+          <p className="hm-kicker"><span>01</span>{c.pathsEyebrow}</p>
+          <h2 id="hm-paths-title">{c.pathsTitle}</h2>
+          <div className="hm-paths">
+            {c.paths.map((path, index) => (
+              <article key={path.tag} className={`hm-path${index === 1 ? " hm-path--labels" : ""}`}>
+                <p className="hm-path__tag">{path.tag}</p>
+                <h3>{path.title}</h3>
+                <p className="hm-path__body">{path.body}</p>
+                <ul className="hm-checks">{path.points.map((point) => <li key={point}><CheckIcon />{point}</li>)}</ul>
+                {index === 0
+                  ? <button type="button" onClick={start} className="hm-button hm-button--light hm-button--wide">{isLoggedIn ? c.dashboard : path.cta}<ArrowIcon /></button>
+                  : <a href="#sellos" className="hm-button hm-button--ghost hm-button--wide">{path.cta}<ArrowIcon /></a>}
+              </article>
+            ))}
+          </div>
+        </section>
+
         <section id="videos" className="hm-reel-section" aria-labelledby="hm-work-title">
           <div className="hm-shell hm-split-head">
             <div>
-              <p className="hm-kicker"><span>01</span>{c.workEyebrow}</p>
+              <p className="hm-kicker"><span>02</span>{c.workEyebrow}</p>
               <h2 id="hm-work-title">{c.workTitle}</h2>
             </div>
             <div>
@@ -564,7 +609,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section id="estilos" className="hm-section hm-shell" aria-labelledby="hm-looks-title">
           <div className="hm-split-head">
             <div>
-              <p className="hm-kicker"><span>02</span>{c.looksEyebrow}</p>
+              <p className="hm-kicker"><span>03</span>{c.looksEyebrow}</p>
               <h2 id="hm-looks-title">{c.looksTitle}</h2>
             </div>
             <p className="hm-body">{c.looksBody}</p>
@@ -591,7 +636,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section className="hm-section hm-shell" aria-labelledby="hm-direction-title">
           <div className="hm-direction">
             <div>
-              <p className="hm-kicker"><span>03</span>{c.directionEyebrow}</p>
+              <p className="hm-kicker"><span>04</span>{c.directionEyebrow}</p>
               <h2 id="hm-direction-title">{c.directionTitle}</h2>
               <p className="hm-body">{c.directionBody}</p>
               <p className="hm-small">{c.scenesNote}</p>
@@ -610,14 +655,14 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
         <section id="como-funciona" className="hm-paper" aria-labelledby="hm-workflow-title">
           <div className="hm-shell">
-            <p className="hm-kicker"><span>04</span>{c.workflowEyebrow}</p>
+            <p className="hm-kicker"><span>05</span>{c.workflowEyebrow}</p>
             <h2 id="hm-workflow-title">{c.workflowTitle}</h2>
             <ol className="hm-steps">
               {c.workflow.map((step, index) => <li key={step.title}><span>0{index + 1}</span><h3>{step.title}</h3><p>{step.body}</p></li>)}
             </ol>
             <div className="hm-outputs">
               <div>
-                <p className="hm-kicker"><span>05</span>{c.outputsEyebrow}</p>
+                <p className="hm-kicker"><span>06</span>{c.outputsEyebrow}</p>
                 <h2>{c.outputsTitle}</h2>
                 <p className="hm-small">{c.proNote}</p>
               </div>
@@ -636,7 +681,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section id="sellos" className="hm-labels" aria-labelledby="hm-labels-title">
           <div className="hm-shell hm-labels__grid">
             <div>
-              <p className="hm-kicker"><span>06</span>{c.labelsEyebrow}</p>
+              <p className="hm-kicker"><span>07</span>{c.labelsEyebrow}</p>
               <h2 id="hm-labels-title">{c.labelsTitle}</h2>
               <p className="hm-body">{c.labelsBody}</p>
               <ul className="hm-checks">{c.labelsPoints.map((point) => <li key={point}><CheckIcon />{point}</li>)}</ul>
@@ -662,7 +707,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
         <section id="preguntas" className="hm-section hm-shell hm-faq" aria-labelledby="hm-faq-title">
           <div>
-            <p className="hm-kicker"><span>07</span>{c.faqEyebrow}</p>
+            <p className="hm-kicker"><span>08</span>{c.faqEyebrow}</p>
             <h2 id="hm-faq-title">{c.faqTitle}</h2>
           </div>
           <div className="hm-faq__list">
@@ -675,6 +720,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             <h2>{c.finalTitle}</h2>
             <p className="hm-body">{c.finalBody}</p>
             <button type="button" onClick={start} className="hm-button hm-button--light">{isLoggedIn ? c.dashboard : c.finalCta}<ArrowIcon /></button>
+            <a href="#sellos" className="hm-text-link">{c.finalLabels} <span aria-hidden="true">→</span></a>
           </div>
         </section>
       </main>
