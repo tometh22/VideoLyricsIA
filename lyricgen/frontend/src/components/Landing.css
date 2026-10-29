@@ -131,6 +131,9 @@
 .hm-path__body { margin-top: 14px; color: var(--hm-muted); }
 .hm-path .hm-checks { margin: 24px 0 30px; }
 .hm-path .hm-button { margin-top: auto; }
+.hm-path__link { align-self: flex-start; margin-top: 16px; padding-bottom: 2px; border-bottom: 1px solid var(--hm-line-strong); color: var(--hm-muted); font-size: 14.5px; }
+.hm-path__link:hover { border-color: var(--hm-violet-soft); color: var(--hm-text); }
+.hm-paths__note { margin-top: 22px; color: var(--hm-muted); font-size: 16px; }
 
 /* Published work reel */
 .hm-reel-section { padding: clamp(72px, 9vw, 120px) 0 clamp(64px, 8vw, 104px); border-top: 1px solid var(--hm-line); background: linear-gradient(180deg, var(--hm-ink-2), var(--hm-ink)); }

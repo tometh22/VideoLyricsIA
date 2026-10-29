@@ -38,17 +38,23 @@ describe("Landing", () => {
     expect(document.querySelectorAll('a[href*="youtube"]')).toHaveLength(0);
   });
 
-  it("presenta los dos caminos: artistas independientes y sellos", async () => {
+  it("ofrece autogestión a artistas y sellos, y producción gestionada a sellos", async () => {
     const user = userEvent.setup();
     const onLogin = vi.fn();
     renderLanding({ onLogin });
 
     const paths = document.querySelector("#para-quien");
-    expect(within(paths).getByText(/artistas independientes/i)).toBeInTheDocument();
-    expect(within(paths).getByText(/sellos y equipos/i)).toBeInTheDocument();
-    expect(within(paths).getByRole("link", { name: /pedir una muestra gratis/i })).toHaveAttribute("href", "#sellos");
+    expect(within(paths).getByText("Artistas y sellos")).toBeInTheDocument();
+    expect(within(paths).getByRole("heading", { name: /te lo hacemos nosotros/i })).toBeInTheDocument();
     await user.click(within(paths).getByRole("button", { name: /crear mi lyric video/i }));
     expect(onLogin).toHaveBeenCalledTimes(1);
+
+    const mode = screen.getByRole("combobox", { name: /cómo querés trabajar/i });
+    expect(mode).toHaveValue("managed");
+    await user.click(within(paths).getByRole("link", { name: /querés usarlo con tu equipo/i }));
+    expect(mode).toHaveValue("team");
+    await user.click(within(paths).getByRole("link", { name: /pedir una muestra gratis/i }));
+    expect(mode).toHaveValue("managed");
   });
 
   it("cambia el estilo de letra mostrado", async () => {

@@ -50,16 +50,17 @@ const COPY = {
     menuClose: "Cerrar navegación",
     heroEyebrow: "Para artistas independientes y sellos",
     heroTitle: "Hacé el lyric video de tu canción.",
-    heroBody: "Subís el audio y Genly transcribe la letra, la sincroniza y te propone una estética. Corregís lo que haga falta y recién ahí generás. Te llevás el video, un vertical para redes y la miniatura. Y si tenés un sello, te los hacemos nosotros.",
+    heroBody: "Subís el audio y Genly transcribe la letra, la sincroniza y te propone una estética. Corregís lo que haga falta y recién ahí generás. Te llevás el video, un vertical para redes y la miniatura. Si tenés un sello, podés usarlo con tu equipo o pedirnos que lo hagamos nosotros.",
     primaryCta: "Crear mi lyric video",
     secondaryCta: "Tengo un sello",
     heroNote: "MP3 o WAV, hasta cinco canciones por vez",
     pathsEyebrow: "Para quién",
     pathsTitle: "Dos formas de trabajar con Genly",
     paths: [
-      { tag: "Artistas independientes", title: "Lo hacés vos, desde la app", body: "Creás tu cuenta, subís la canción y armás tu lyric video vos mismo. No hace falta saber de edición.", points: ["Video, vertical y miniatura de cada canción", "Corregís la letra antes de generar", "Hasta cinco canciones por vez"], cta: "Crear mi lyric video" },
-      { tag: "Sellos y equipos", title: "Te lo hacemos nosotros", body: "Nuestro equipo produce los videos de tus artistas, revisa la letra palabra por palabra y te los entrega listos para subir.", points: ["Muestra gratis de 30 segundos, una por sello", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir una muestra gratis" },
+      { tag: "Artistas y sellos", title: "Lo hacés vos, desde la app", body: "Creás tu cuenta, subís las canciones y armás los lyric videos vos mismo. No hace falta saber de edición.", points: ["Video, vertical y miniatura de cada canción", "Hasta cinco canciones por vez", "Para sellos: un workspace compartido con tu equipo"], cta: "Crear mi lyric video", labelsLink: "¿Sos un sello y querés usarlo con tu equipo? Escribinos" },
+      { tag: "Sellos", title: "Te lo hacemos nosotros", body: "Nuestro equipo produce los videos de tus artistas, revisa la letra palabra por palabra y te los entrega listos para subir.", points: ["Muestra gratis de 30 segundos, una por sello", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir una muestra gratis" },
     ],
+    pathsNote: "También se pueden combinar: usás la app para el día a día y nos pasás los lotes grandes.",
     proof: ["Trabajamos con grandes sellos. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
     featureTag: "Hecho con Genly",
     featureMeta: "Lyric video",
@@ -101,16 +102,18 @@ const COPY = {
     ],
     proNote: "Las cuentas habilitadas también pueden descargar ProRes para entregas broadcast.",
     labelsEyebrow: "Para sellos",
-    labelsTitle: "¿Tenés muchas canciones? Te las hacemos nosotros.",
-    labelsBody: "Si manejás varios artistas o un catálogo, nuestro equipo produce los videos, revisa la letra palabra por palabra y te los entrega listos para subir.",
-    labelsPoints: ["Empezás con una muestra gratis de 30 segundos, una por sello", "Hablás con una sola persona para todo el lote", "Si el error es nuestro, lo corregimos sin costo"],
+    labelsTitle: "¿Tenés un sello? Lo hacés vos o lo hacemos nosotros.",
+    labelsBody: "Podés usar Genly con tu equipo en un workspace compartido, o pasarnos las canciones y te entregamos los videos listos para subir. También se pueden combinar.",
+    labelsPoints: ["Muestra gratis de 30 segundos, una por sello", "En la app: planes mensuales, la línea ℗ de tu sello en cada video y API para integrarlo", "Con nosotros: revisamos la letra palabra por palabra y el precio va según volumen"],
     formName: "Tu nombre",
     formCompany: "Sello o empresa",
     formEmail: "Email",
     formVolume: "Canciones por mes",
     volumeOptions: ["1 a 5", "6 a 25", "Más de 25"],
     formMessage: "Contanos qué tienen en camino (opcional)",
-    formSubmit: "Pedir una muestra gratis",
+    formMode: "¿Cómo querés trabajar?",
+    modeOptions: { team: "Con mi equipo, en la app", managed: "Que lo hagan ustedes", both: "Las dos cosas o todavía no sé" },
+    formSubmit: "Hablemos",
     formSending: "Enviando…",
     formSent: "Listo, nos llegó. Te escribimos por mail.",
     formError: "No pudimos enviarlo desde acá. Te abrimos el correo con el mensaje armado.",
@@ -152,16 +155,17 @@ const COPY = {
     menuClose: "Close navigation",
     heroEyebrow: "For independent artists and labels",
     heroTitle: "Make the lyric video for your song.",
-    heroBody: "Upload the audio and Genly transcribes the lyrics, syncs them and suggests a look. You fix whatever needs fixing and only then generate. You get the video, a vertical edit for social and the thumbnail. And if you run a label, we can make them for you.",
+    heroBody: "Upload the audio and Genly transcribes the lyrics, syncs them and suggests a look. You fix whatever needs fixing and only then generate. You get the video, a vertical edit for social and the thumbnail. If you run a label, your team can use it or we can make the videos for you.",
     primaryCta: "Create my lyric video",
     secondaryCta: "I run a label",
     heroNote: "MP3 or WAV, up to five songs at a time",
     pathsEyebrow: "Who it’s for",
     pathsTitle: "Two ways to work with Genly",
     paths: [
-      { tag: "Independent artists", title: "You make it yourself, in the app", body: "Create your account, upload the song and put your lyric video together yourself. No editing skills needed.", points: ["Video, vertical edit and thumbnail for every song", "Fix the lyrics before generating", "Up to five songs at a time"], cta: "Create my lyric video" },
-      { tag: "Labels and teams", title: "We make it for you", body: "Our team makes your artists’ videos, checks the lyrics word by word and delivers them ready to upload.", points: ["Free 30-second sample, one per label", "One person handles the whole batch", "Pricing based on volume"], cta: "Get a free sample" },
+      { tag: "Artists and labels", title: "You make it yourself, in the app", body: "Create your account, upload the songs and put the lyric videos together yourself. No editing skills needed.", points: ["Video, vertical edit and thumbnail for every song", "Up to five songs at a time", "For labels: a workspace shared with your team"], cta: "Create my lyric video", labelsLink: "Run a label and want to use it with your team? Write to us" },
+      { tag: "Labels", title: "We make it for you", body: "Our team makes your artists’ videos, checks the lyrics word by word and delivers them ready to upload.", points: ["Free 30-second sample, one per label", "One person handles the whole batch", "Pricing based on volume"], cta: "Get a free sample" },
     ],
+    pathsNote: "You can also combine them: use the app day to day and send us the big batches.",
     proof: ["We work with major labels. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
     featureTag: "Made with Genly",
     featureMeta: "Lyric video",
@@ -203,16 +207,18 @@ const COPY = {
     ],
     proNote: "Enabled accounts can also download ProRes for broadcast delivery.",
     labelsEyebrow: "For labels",
-    labelsTitle: "Got a lot of songs? We’ll make them for you.",
-    labelsBody: "If you work with several artists or a catalog, our team makes the videos, checks the lyrics word by word and delivers them ready to upload.",
-    labelsPoints: ["Start with a free 30-second sample, one per label", "One person handles the whole batch", "If the mistake is ours, we fix it at no cost"],
+    labelsTitle: "Run a label? Do it yourself or let us do it.",
+    labelsBody: "Your team can use Genly in a shared workspace, or you can send us the songs and we deliver the videos ready to upload. You can also combine both.",
+    labelsPoints: ["Free 30-second sample, one per label", "In the app: monthly plans, your label’s ℗ line on every video and an API to plug it in", "With us: we check the lyrics word by word and pricing depends on volume"],
     formName: "Your name",
     formCompany: "Label or company",
     formEmail: "Email",
     formVolume: "Songs per month",
     volumeOptions: ["1 to 5", "6 to 25", "More than 25"],
     formMessage: "Tell us what you have coming up (optional)",
-    formSubmit: "Get a free sample",
+    formMode: "How would you like to work?",
+    modeOptions: { team: "With my team, in the app", managed: "Have you make them", both: "Both, or not sure yet" },
+    formSubmit: "Let’s talk",
     formSending: "Sending…",
     formSent: "Got it. We’ll email you.",
     formError: "We couldn’t send it from here. We opened your email with the message ready.",
@@ -254,16 +260,17 @@ const COPY = {
     menuClose: "Fechar navegação",
     heroEyebrow: "Para artistas independentes e gravadoras",
     heroTitle: "Faça o lyric video da sua música.",
-    heroBody: "Você envia o áudio e o Genly transcreve a letra, sincroniza e sugere uma estética. Você corrige o que precisar e só então gera. Leva o vídeo, um vertical para redes e a thumbnail. E se você tem uma gravadora, a gente faz para você.",
+    heroBody: "Você envia o áudio e o Genly transcreve a letra, sincroniza e sugere uma estética. Você corrige o que precisar e só então gera. Leva o vídeo, um vertical para redes e a thumbnail. Se você tem uma gravadora, sua equipe pode usar ou a gente faz para você.",
     primaryCta: "Criar meu lyric video",
     secondaryCta: "Tenho uma gravadora",
     heroNote: "MP3 ou WAV, até cinco músicas por vez",
     pathsEyebrow: "Para quem",
     pathsTitle: "Duas formas de trabalhar com a Genly",
     paths: [
-      { tag: "Artistas independentes", title: "Você mesmo faz, pelo app", body: "Você cria sua conta, envia a música e monta seu lyric video sozinho. Não precisa saber editar.", points: ["Vídeo, vertical e thumbnail de cada música", "Você corrige a letra antes de gerar", "Até cinco músicas por vez"], cta: "Criar meu lyric video" },
-      { tag: "Gravadoras e equipes", title: "A gente faz para você", body: "Nossa equipe produz os vídeos dos seus artistas, revisa a letra palavra por palavra e entrega tudo pronto para subir.", points: ["Amostra grátis de 30 segundos, uma por gravadora", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir uma amostra grátis" },
+      { tag: "Artistas e gravadoras", title: "Você mesmo faz, pelo app", body: "Você cria sua conta, envia as músicas e monta os lyric videos sozinho. Não precisa saber editar.", points: ["Vídeo, vertical e thumbnail de cada música", "Até cinco músicas por vez", "Para gravadoras: um workspace compartilhado com sua equipe"], cta: "Criar meu lyric video", labelsLink: "Tem uma gravadora e quer usar com sua equipe? Fale com a gente" },
+      { tag: "Gravadoras", title: "A gente faz para você", body: "Nossa equipe produz os vídeos dos seus artistas, revisa a letra palavra por palavra e entrega tudo pronto para subir.", points: ["Amostra grátis de 30 segundos, uma por gravadora", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir uma amostra grátis" },
     ],
+    pathsNote: "Também dá para combinar: você usa o app no dia a dia e manda para a gente os lotes grandes.",
     proof: ["Trabalhamos com grandes gravadoras. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
     featureTag: "Feito com Genly",
     featureMeta: "Lyric video",
@@ -305,16 +312,18 @@ const COPY = {
     ],
     proNote: "Contas habilitadas também podem baixar ProRes para entregas broadcast.",
     labelsEyebrow: "Para gravadoras",
-    labelsTitle: "Tem muitas músicas? A gente faz para você.",
-    labelsBody: "Se você cuida de vários artistas ou de um catálogo, nossa equipe produz os vídeos, revisa a letra palavra por palavra e entrega tudo pronto para subir.",
-    labelsPoints: ["Você começa com uma amostra grátis de 30 segundos, uma por gravadora", "Uma só pessoa cuida do lote inteiro", "Se o erro for nosso, corrigimos sem custo"],
+    labelsTitle: "Tem uma gravadora? Você faz ou a gente faz.",
+    labelsBody: "Sua equipe pode usar a Genly em um workspace compartilhado, ou você nos manda as músicas e entregamos os vídeos prontos para subir. Também dá para combinar.",
+    labelsPoints: ["Amostra grátis de 30 segundos, uma por gravadora", "No app: planos mensais, a linha ℗ da sua gravadora em cada vídeo e API para integrar", "Com a gente: revisamos a letra palavra por palavra e o preço depende do volume"],
     formName: "Seu nome",
     formCompany: "Gravadora ou empresa",
     formEmail: "Email",
     formVolume: "Músicas por mês",
     volumeOptions: ["1 a 5", "6 a 25", "Mais de 25"],
     formMessage: "Conte o que vocês têm pela frente (opcional)",
-    formSubmit: "Pedir uma amostra grátis",
+    formMode: "Como você quer trabalhar?",
+    modeOptions: { team: "Com minha equipe, no app", managed: "Que vocês façam", both: "Os dois ou ainda não sei" },
+    formSubmit: "Vamos conversar",
     formSending: "Enviando…",
     formSent: "Pronto, recebemos. Vamos te escrever por email.",
     formError: "Não conseguimos enviar daqui. Abrimos seu email com a mensagem pronta.",
@@ -425,6 +434,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
   const [activeLook, setActiveLook] = useState(LOOK_KEYS[0]);
   const [reelPaused, setReelPaused] = useState(false);
   const [formState, setFormState] = useState("idle");
+  const [workMode, setWorkMode] = useState("managed");
   const mobileNavRef = useRef(null);
   const mobileMenuRef = useRef(null);
   const mobileTriggerRef = useRef(null);
@@ -473,7 +483,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       company: form.company.value.trim(),
       email: form.email.value.trim(),
       volume: form.volume.value,
-      message: form.message.value.trim(),
+      message: [`${c.formMode} ${c.modeOptions[workMode]}`, form.message.value.trim()].filter(Boolean).join("\n\n"),
     };
     setFormState("loading");
     try {
@@ -487,7 +497,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
       form.reset();
     } catch {
       setFormState("error");
-      const subject = `Genly — Muestra gratis${payload.company ? ` (${payload.company})` : ""}`;
+      const subject = `Genly — Consulta para sellos${payload.company ? ` (${payload.company})` : ""}`;
       const body = [`Nombre: ${payload.name}`, `Empresa: ${payload.company}`, `Email: ${payload.email}`, `Canciones por mes: ${payload.volume}`, "", payload.message].join("\n");
       window.location.href = `mailto:${SALES_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     }
@@ -575,10 +585,12 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 <ul className="hm-checks">{path.points.map((point) => <li key={point}><CheckIcon />{point}</li>)}</ul>
                 {index === 0
                   ? <button type="button" onClick={start} className="hm-button hm-button--light hm-button--wide">{isLoggedIn ? c.dashboard : path.cta}<ArrowIcon /></button>
-                  : <a href="#sellos" className="hm-button hm-button--ghost hm-button--wide">{path.cta}<ArrowIcon /></a>}
+                  : <a href="#sellos" onClick={() => setWorkMode("managed")} className="hm-button hm-button--ghost hm-button--wide">{path.cta}<ArrowIcon /></a>}
+                {path.labelsLink && <a href="#sellos" onClick={() => setWorkMode("team")} className="hm-path__link">{path.labelsLink} <span aria-hidden="true">→</span></a>}
               </article>
             ))}
           </div>
+          <p className="hm-paths__note">{c.pathsNote}</p>
         </section>
 
         <section id="videos" className="hm-reel-section" aria-labelledby="hm-work-title">
@@ -695,6 +707,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 <label><span>{c.formEmail}</span><input name="email" type="email" required autoComplete="email" /></label>
                 <label><span>{c.formVolume}</span><select name="volume" defaultValue={c.volumeOptions[0]}>{c.volumeOptions.map((option) => <option key={option}>{option}</option>)}</select></label>
               </div>
+              <label><span>{c.formMode}</span><select name="mode" value={workMode} onChange={(event) => setWorkMode(event.target.value)}>{Object.entries(c.modeOptions).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
               <label><span>{c.formMessage}</span><textarea name="message" rows="3" /></label>
               <button type="submit" className="hm-button hm-button--light hm-button--wide" disabled={formState === "loading" || formState === "sent"}>{formState === "loading" ? c.formSending : c.formSubmit}<ArrowIcon /></button>
               <div className="hm-form__status" aria-live="polite">
