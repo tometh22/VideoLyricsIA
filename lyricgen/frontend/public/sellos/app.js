@@ -214,7 +214,6 @@ function setupReel() {
     [...track.children].forEach(item => {
       const clone = item.cloneNode(true);
       clone.setAttribute('aria-hidden','true');
-      clone.querySelector('a').tabIndex = -1;
       track.appendChild(clone);
     });
   });
