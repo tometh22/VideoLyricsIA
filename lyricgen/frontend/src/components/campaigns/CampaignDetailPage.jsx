@@ -14,6 +14,7 @@ import { RecordDeliveryDialog, SendToPortalDialog } from "./DeliveryDialogs";
 import DiscardDialog from "./DiscardDialog";
 import GenerateDialog, { generationSummary } from "./GenerateDialog";
 import PipelineBar from "./PipelineBar";
+import PriorityReview, { RICARDO_PRIORITY, RICARDO_PRIORITY_CAMPAIGN } from "./PriorityReview";
 import ClientChangesInbox from "./ClientChangesInbox";
 import SongDrawer from "./SongDrawer";
 import SongTable from "./SongTable";
@@ -129,7 +130,8 @@ export default function CampaignDetailPage({ id }) {
   const outdatedCount = Number(pipe.data?.flags?.portal_outdated) || 0; // kept for API parity; the UI derives the split from the songs
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
-  const view = resolveView(params, kind);
+  const requestedView = resolveView(params, kind);
+  const view = requestedView === "priority" && id !== RICARDO_PRIORITY_CAMPAIGN ? "all" : requestedView;
   // `?view=contract` predates the settings tab; it still lands on the report.
   const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
   const order = params.get("order") === "learning" ? "learning" : "effort";
@@ -227,6 +229,10 @@ export default function CampaignDetailPage({ id }) {
     if (!song?.job_id) return;
     navigate(`/review/${encodeURIComponent(song.job_id)}?return_to=${encodeURIComponent(returnPath(song))}`);
   }, [navigate, returnPath]);
+  const openPriorityReview = useCallback((jobId) => {
+    const returnTo = `/campaigns/${encodeURIComponent(id)}?view=priority`;
+    navigate(`/review/${encodeURIComponent(jobId)}?return_to=${encodeURIComponent(returnTo)}`);
+  }, [id, navigate]);
   const openEditLyrics = useCallback((song) => {
     const videoStage = ["qc", "approved", "delivered"].includes(song.stage) && song.current_job_id;
     navigate(videoStage
@@ -393,7 +399,8 @@ export default function CampaignDetailPage({ id }) {
       </div>
     </header>
 
-    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} badges={{ delivered: resend.ready }} />
+    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} badges={{ delivered: resend.ready }}
+      additionalTabs={id === RICARDO_PRIORITY_CAMPAIGN ? [{ key: "priority", label: "Prioritarias", title: "Revisar antes de aprobar o generar", count: RICARDO_PRIORITY.length, tone: null }] : []} />
 
     {approvedSong && <Banner tone="success" action={<div className="flex gap-2">
       {nextAfterApproval && <Button size="sm" variant="primary" onClick={() => openReview(nextAfterApproval)}>Revisar siguiente: {nextAfterApproval.title}</Button>}
@@ -422,7 +429,9 @@ export default function CampaignDetailPage({ id }) {
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
-    {view === "changes"
+    {view === "priority"
+      ? <PriorityReview songs={songs} onOpen={openPriorityReview} />
+      : view === "changes"
       ? <ClientChangesInbox campaignId={id} isAdmin={Boolean(pipe.data?.is_admin)} canResolve={Boolean(pipe.data?.features?.change_request_actions && canManage)} onChanged={refresh} onOpenSong={(songId) => updateParams({ song: songId }, { push: true })} />
       : view === "config" && campaign
       ? <CampaignSettings campaign={campaign} section={section} onSection={(value) => updateParams({ section: value })} canManage={canManage} isAdmin={canManage}
@@ -445,7 +454,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && view !== "changes" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}

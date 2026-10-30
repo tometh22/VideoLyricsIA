@@ -1,16 +1,17 @@
 import { EXTRA_STAGES, stagesFor, totalOf, toneOf } from "../../lib/campaignPipeline";
 
 /**
- * The campaign's navigation *is* its pipeline. Every tab counts songs with
- * the same backend rule, so the numbers add up to the campaign total.
+ * Stage tabs partition the campaign with backend counts. Additional tabs
+ * can expose a review subset without changing those pipeline totals.
  */
-export default function PipelineBar({ counts, kind, value, onChange, loading = false, badges = {} }) {
+export default function PipelineBar({ counts, kind, value, onChange, loading = false, badges = {}, additionalTabs = [] }) {
   const stages = stagesFor(kind);
   const active = totalOf(counts);
   const tabs = [
     { key: "all", label: "Todas", count: active, tone: null },
     ...stages.map((stage) => ({ key: stage.key, label: stage.label, title: stage.title, count: counts?.[stage.key] ?? 0, tone: toneOf(stage.key), human: stage.human })),
     ...EXTRA_STAGES.map((stage) => ({ key: stage.key, label: stage.label, title: stage.title, count: counts?.[stage.key] ?? 0, tone: toneOf(stage.key), extra: true })),
+    ...additionalTabs,
   ].filter((tab) => !tab.extra || tab.count > 0 || tab.key === value);
 
   const move = (event, index) => {
