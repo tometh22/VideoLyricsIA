@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.151] - 2026-10-30
+
+### Added
+
+- La campaña CancioneroRock de septiembre muestra una pestaña de 17 canciones prioritarias de la auditoría de Ricardo, con líneas concretas, motivo de revisión, estado actual y acceso directo al editor. Distingue las correcciones guardadas de los casos que requieren escucha manual antes de generar.
+
 ## [1.1.150] - 2026-10-28
 
 ### Added
