@@ -364,6 +364,17 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
 
 
 describe("Loader bloqueante de re-sincronización", () => {
+  it("a known task timeout releases the dialog and preserves pasted lyrics", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "task-timeout", taskId: "slow-task" }));
+    const onReanchorReconcile = vi.fn(async () => ({ ok: true, revision: 9, segments: SEGMENTS }));
+    render(<LyricsEditor {...baseProps({ onReanchor, onReanchorReconcile })} />);
+    start("paste");
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("No se pudo confirmar"));
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull();
+    expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+  });
+
   function start(mode) {
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
