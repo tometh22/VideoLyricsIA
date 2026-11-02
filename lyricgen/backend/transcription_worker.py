@@ -801,7 +801,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             transformation = str(hypothesis.get("transformation") or "")
             if transformation == "cache_hit_raw":
                 asr_calls["whisperx_cache_hits"] += 1
-            elif transformation == "replicate_raw":
+            elif transformation == "replicate_raw" or transformation.startswith("replicate_raw:offset="):
                 asr_calls["whisperx_real_calls"] += 1
         asr_calls["asr_actually_ran"] = asr_calls["whisperx_real_calls"] > 0
         final_metrics["asr_calls"] = asr_calls

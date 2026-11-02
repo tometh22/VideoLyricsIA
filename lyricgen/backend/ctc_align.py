@@ -334,12 +334,21 @@ _EN_STOP = frozenset(
 
 
 def guess_text_lang(lines: list[str]) -> str:
-    """'es' / 'en' / 'unknown' by exclusive function-word voting.
+    """Conservative language guard for a Spanish-only acoustic model.
 
     Shared words (notably ``no`` and ``me``) are not language evidence.
     Counting them for both sides made Spanish live choruses with repeated
     ``no`` look ambiguous and disabled CTC before any acoustic work.
     """
+    # Spanish/English voting alone treats French as Spanish because both
+    # use de/la/que/en. A dominant Spanish chorus must not authorize Spanish
+    # forced alignment over a French verse (Congreso incident).
+    from transcription_language import detect_text_languages
+    languages = set(detect_text_languages(lines))
+    for line in lines:
+        languages.update(detect_text_languages([line]))
+    if languages - {"es"}:
+        return "mixed" if len(languages) > 1 else next(iter(languages))
     es = en = 0
     for line in lines:
         for w in line.lower().split():

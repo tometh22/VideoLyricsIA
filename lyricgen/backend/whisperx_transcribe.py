@@ -703,6 +703,9 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
         f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
         f":m{model_id}:r{release}:c{config}"
     )
+    if not language:
+        from whisperx_windows import POLICY
+        key += f":{POLICY}"
     return (key, audio_hash, hint_hash)
 
 
@@ -1045,12 +1048,11 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     """Transcribe `audio_path` with whisperX. Returns segments with word
     stamps, or None (disabled / failure / empty). Never raises.
 
-    `lyrics_hint`: optional reference text (lrclib / Genius / Gemini plain
-    lyrics). When provided, the first ~800 chars are passed as Whisper's
-    `initial_prompt` — biases the model's vocabulary towards the actual
-    lyrics so it stops mishearing (e.g. "Legalícenla" instead of
-    "Le realizan la"). Costs nothing extra — Whisper-large-v3 already
-    accepts the prompt parameter; we just weren't using it.
+    Auto mode recognizes silence-separated vocal windows independently;
+    their language is never inherited from the intro or adjacent window.
+    `lyrics_hint` is used only with an explicit language, capped at 120
+    characters. Auto windows stay prompt-free so a monolingual reference
+    cannot suppress a foreign-language verse.
 
     INCIDENT 2026-05-25: PROD without this hint produced ["Le realizan
     la"] × 4 in the intro of "Legalícenla" because the audio is
@@ -1077,7 +1079,10 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     vad_onset, vad_offset = _vad_params()
     cache_key, audio_hash, hint_hash = _compute_cache_key(
         audio_path, language, lyrics_hint, vad_onset, vad_offset)
-    if cache_key:
+    # A composite cache row cannot preserve the rejected candidates and LID
+    # evidence for every window. Until the cache supports those hypotheses,
+    # only the explicit-language single-call path can read/write it.
+    if cache_key and language:
         cached_payload = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
         if (
             isinstance(cached_payload, dict)
@@ -1171,12 +1176,23 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
         return {"audio_file": f, **payload}
 
     try:
-        output = call_with_budget(
-            _MODEL, _input_factory,
-            total_budget_s=_budget_for("whisperx", default_s=480.0),
-            backoff=[0, 8, 24],
-            call_label="WHISPERX",
-        )
+        if not language:
+            from whisperx_windows import transcribe_windows
+            try:
+                output = transcribe_windows(
+                    audio_path, _MODEL, payload,
+                    _budget_for("whisperx", default_s=480.0),
+                )
+            except Exception as exc:
+                logger.warning("[WHISPERX] windowed recognition failed (%s); falling back", type(exc).__name__)
+                return None
+        else:
+            output = call_with_budget(
+                _MODEL, _input_factory,
+                total_budget_s=_budget_for("whisperx", default_s=480.0),
+                backoff=[0, 8, 24],
+                call_label="WHISPERX",
+            )
     finally:
         for _h in _open_handles:
             try:
@@ -1188,12 +1204,14 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
 
     raw_segs = _raw_provider_segments(output)
     from recognition_provenance import record_completed
-    record_completed(
-        family=recognition_family(),
-        events=raw_segs,
-        view=provenance_view,
-        transformation="replicate_raw",
-    )
+    windowed = isinstance(output, dict) and output.get("_windowed") is True
+    if not windowed:
+        record_completed(
+            family=recognition_family(),
+            events=raw_segs,
+            view=provenance_view,
+            transformation="replicate_raw",
+        )
     segs = _map_segments(output)
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
@@ -1219,7 +1237,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     logger.info("[WHISPERX] transcribed %s segments (%s raw, after ghost-filter + split)", len(segs), raw_n)
 
     # Persist result for future identical calls. Errors silenced inside.
-    if cache_key:
+    if cache_key and not windowed:
         _cache_write(
             cache_key, audio_hash, hint_hash, language, segs,
             raw_segments=raw_segs,
