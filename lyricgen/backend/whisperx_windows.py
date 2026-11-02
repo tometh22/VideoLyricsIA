@@ -75,7 +75,8 @@ def absolute_segments(rows, start: float, end: float) -> list[dict]:
         out = deepcopy(row)
         try:
             a, b = float(out["start"]), float(out["end"])
-            if not (math.isfinite(a) and math.isfinite(b) and 0 <= a < b <= end - start + 0.25):
+            if not (math.isfinite(a) and math.isfinite(b)
+                    and 0 <= a < min(b, end - start) and b <= end - start + 0.25):
                 continue
             out.update(start=round(start + a, 3), end=round(min(end, start + b), 3))
         except (ValueError, TypeError, KeyError):
@@ -84,7 +85,8 @@ def absolute_segments(rows, start: float, end: float) -> list[dict]:
         for word in out.get("words") or []:
             try:
                 a, b = float(word["start"]), float(word["end"])
-                if math.isfinite(a) and math.isfinite(b) and 0 <= a <= b <= end - start + 0.25:
+                if (math.isfinite(a) and math.isfinite(b)
+                        and 0 <= a <= min(b, end - start) and b <= end - start + 0.25):
                     words.append({**word, "start": round(start + a, 3), "end": round(min(end, start + b), 3)})
             except (ValueError, TypeError, KeyError):
                 continue
@@ -201,6 +203,19 @@ def recover_reference_conflict(audio_path: str, segments: list[dict], reference:
         )]
         if not selected:
             return segments
+        # Replacement is atomic at segment granularity. A valid phrase may
+        # straddle a selected boundary; expand to its other vocal windows so
+        # replacing the intersecting row cannot silently discard its tail.
+        while True:
+            touched = [s for s in segments if any(
+                float(s["start"]) < b and float(s["end"]) > a for a, b in selected
+            )]
+            expanded = [(a, b) for a, b in planned if any(
+                float(s["start"]) < b and float(s["end"]) > a for s in touched
+            )]
+            if expanded == selected:
+                break
+            selected = expanded
         candidate = [s for s in segments if not any(
             float(s["start"]) < b and float(s["end"]) > a for a, b in selected
         )]

@@ -34,6 +34,7 @@ def test_window_bounds_reject_nonfinite_and_preserve_short_voice():
 def test_offsets_apply_once_to_words_and_reject_broken_bounds():
     raw = [dict(start=1, end=4, text="bonjour", words=[dict(word="bonjour", start=1, end=3.8)]),
            dict(start=0, end=float('nan'), text="invalid"),
+           dict(start=20.1, end=20.2, text="starts outside window"),
            dict(start=0, end=50, text="outside window")]
     original = deepcopy(raw[0])
     result = windows.absolute_segments(raw, 160, 180)
@@ -203,3 +204,17 @@ def test_conflict_recovery_failure_keeps_original_for_quality_review(provider, m
         raise TimeoutError('provider unavailable')
     monkeypatch.setattr(windows, '_independent_retry', fail)
     assert windows.recover_reference_conflict('audio.wav', segments, reference) is segments
+
+
+def test_recovery_includes_tail_of_valid_phrase_crossing_window_boundary(provider, monkeypatch):
+    monkeypatch.setattr(windows, 'audio_windows', lambda _: [(60, 80), (80, 100)])
+    reference = 'The morning light is shining\nWe are walking through the city\nYou will find your way home'
+    segments = [dict(start=61+i*4, end=65+i*4, text='El corazón vive cerca del mar') for i in range(3)]
+    segments.append(dict(start=77, end=85, text='You will find your way home'))
+    calls = []
+    def retry(path, remaining):
+        calls.append(path)
+        return [dict(start=1, end=5, text='The morning light is shining')], 'english'
+    monkeypatch.setattr(windows, '_independent_retry', retry)
+    windows.recover_reference_conflict('audio.wav', segments, reference)
+    assert len(calls) == 2
