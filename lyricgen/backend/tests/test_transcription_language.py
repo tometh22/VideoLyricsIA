@@ -86,6 +86,24 @@ def test_bilingual_reference_stays_multi_label():
     assert resolve_transcription_language("", reference_text=reference) is None
 
 
+@pytest.mark.parametrize("output", [
+    "The night is falling and you will leave me alone tonight",
+    "Yo tengo una razón para cambiar la noche y nunca volver atrás",
+])
+def test_bilingual_reference_cannot_be_overridden_by_primary_decode(output):
+    reference = (
+        "Yo tengo una razón para cambiar la noche y nunca volver atrás.\n"
+        "Je vous donne mon amour, je ne veux pas avoir peur."
+    )
+    assert detect_text_languages(reference) == {"es", "fr"}
+    assert resolve_transcription_language(
+        "", reference_text=reference, result={"segments": [{"text": output}]},
+    ) is None
+    assert resolve_transcription_language(
+        "es", reference_text=reference, result={"segments": [{"text": output}]},
+    ) == "es"
+
+
 def test_lid_diagnostic_separates_mixed_and_insufficient_abstentions():
     mixed = (
         "Yo tengo una razón para cambiar la noche y nunca volver atrás.\n"
