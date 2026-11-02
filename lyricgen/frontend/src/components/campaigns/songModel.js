@@ -1,3 +1,4 @@
+import { assignedBackground } from "../../lib/campaignCreative";
 import { matchesCampaignSong } from "../../lib/campaignSearch";
 import { reviewActionLabel } from "../../lib/reviewerNavigation";
 
@@ -25,7 +26,8 @@ export function isLockedByOther(song) {
 }
 
 export function canGenerate(song) {
-  return song.stage === "ready" && song.creative?.status === "lyrics_approved" && !song.creative?.discarded;
+  return song.stage === "ready" && song.creative?.status === "lyrics_approved" && !song.creative?.discarded
+    && (!song.creative.requires_background_assignment || assignedBackground(song.creative) !== "unknown");
 }
 
 export function canSend(song) {

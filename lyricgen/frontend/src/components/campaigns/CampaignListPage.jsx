@@ -7,6 +7,7 @@ import { PRODUCT_TABS, productForCampaign } from "../../lib/campaignProducts";
 import { CANCELLED_GROUP, campaignPending, campaignShortName, groupCampaigns, sortByUrgency } from "../../lib/campaignGroups";
 import { matchesCampaignSearch } from "../../lib/campaignSearch";
 import CampaignSearch from "../CampaignSearch";
+import DeliveryPlan from "../DeliveryPlan";
 import CampaignCreateWizard from "./CampaignCreateWizard";
 import { Banner, Button, Chip, EmptyState, Skeleton } from "./ui";
 
@@ -119,6 +120,7 @@ export default function CampaignListPage() {
   const query = params.get("q") || "";
   const status = params.get("status") || "";
   const product = params.get("product") || "";
+  const [planBusy, setPlanBusy] = useState(false);
   const [creating, setCreating] = useState(params.get("new") === "1");
   const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }));
   const items = list.data?.items || [];
@@ -149,9 +151,11 @@ export default function CampaignListPage() {
         <h1 className="mt-2 text-3xl font-bold tracking-tight text-white">Campañas</h1>
         <p className="mt-1.5 text-sm text-ink-secondary">De la carpeta de audios al portal del cliente, canción por canción.</p>
       </div>
-      <Button variant="primary" size="lg" onClick={() => setCreating(true)}>+ Nueva campaña</Button>
+      <Button variant="primary" size="lg" disabled={planBusy} onClick={() => setCreating(true)}>+ Nueva campaña</Button>
     </header>
 
+    {list.data?.can_view_accounts && <nav aria-label="Campañas y cuentas" className="flex gap-2">{[["campaigns", "Campañas"], ["accounts", "Cuentas · Plan de entrega"]].map(([value, label]) => <Button key={value} disabled={planBusy} variant={(params.get("view") || "campaigns") === value ? "primary" : "ghost"} onClick={() => setParam("view", value, false)}>{label}</Button>)}</nav>}
+    {list.data?.can_view_accounts && params.get("view") === "accounts" ? <DeliveryPlan onBusyChange={setPlanBusy} /> : <>
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       {[["Campañas activas", totals.active], ["Letras por revisar", totals.lyrics], ["Videos por revisar", totals.qc], ["Terminadas", totals.delivered]].map(([label, value]) =>
         <div key={label} className="rounded-card bg-surface-2/40 p-4 ring-1 ring-white/[0.06]">
@@ -207,6 +211,7 @@ export default function CampaignListPage() {
     {list.data && items.length > 0 && !filtered.length && <EmptyState title="No hay campañas con estos filtros"
       action={<Button size="sm" onClick={() => setParams({})}>Limpiar filtros</Button>} />}
 
+    </>}
     {creating && <CampaignCreateWizard initialProductId={product} onClose={() => { setCreating(false); if (params.get("new")) setParam("new", ""); }}
       onFinished={(campaign) => { setCreating(false); void list.reload(); navigate(`/campaigns/${encodeURIComponent(campaign.id)}`); }} />}
   </div>;

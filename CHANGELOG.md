@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.152] - 2026-11-02
+
+### Added
+
+- Delivery plans by campaign and client portal account, with delivered,
+  generated, in-progress and pending Veo/photo-effect totals, monthly filters
+  and a reviewed 50/50 allocation that preserves pinned choices. Background
+  assignment and generation are separate actions; stale plans require a new
+  preview. Art Tracks remain outside the lyric-video mix.
+
 ## [1.1.151] - 2026-10-30
 
 ### Added

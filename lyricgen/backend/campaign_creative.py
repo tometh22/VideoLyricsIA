@@ -305,6 +305,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
         for group in plan.get("groups", [])
     ]}
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
+            "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
             "veo_model": VEO_LITE,
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
@@ -491,6 +492,10 @@ def generation_receipt(db, job, submitted_revision, settings, actor):
     campaign = db.query(BatchCampaign).filter_by(id=job.campaign_id).one()
     item = db.query(BatchCampaignItem).filter_by(id=job.campaign_item_id).first()
     assignment = effective_veo_assignment((item.render_overrides or {}).get(ASSIGNMENT) if item else None)
+    if campaign.kind == "lyric_video" and (campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")):
+        from delivery_plan import assignment_type
+        if assignment_type(settings, assignment) == "unknown":
+            fail("Asigná Veo o Foto + efecto en el Plan de entrega antes de generar.", 409)
     if not assignment:
         return
     if str(assignment["revision"]) != str(submitted_revision):
