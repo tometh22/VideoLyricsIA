@@ -20,6 +20,21 @@ VOCAB = {c: i + 5 for i, c in enumerate("abcdefghijklmnopqrstuvwxyzáéíóúñ�
 STAR = 999
 
 
+def test_spanish_aligner_declines_bilingual_song_before_loading_model(monkeypatch, tmp_path):
+    lines = ['Viaje hacia el corazón', 'Viaje hacia el centro del sol'] * 8 + [
+        "Et alors qu'est-ce que je fais assis dans cette nuit",
+        "Mon amour je viens chercher les ailes que je t'ai données",
+    ]
+    assert ctc_align.guess_text_lang(lines) != 'es'
+    monkeypatch.setenv('CTC_ALIGN_ENABLED', '1')
+    audio = tmp_path / 'song.wav'; audio.write_bytes(b'fake audio')
+    def forbidden():
+        raise AssertionError('Spanish model must not process the French verse')
+    monkeypatch.setattr(ctc_align, '_load_model', forbidden)
+    assert ctc_align.retime_segments(str(audio), [dict(text=t, start=i, end=i+1)
+        for i, t in enumerate(lines)], 'bilingual') is None
+
+
 def test_norm_word_keeps_spanish_chars():
     assert ctc_align.norm_word("Canción") == "canción"
     assert ctc_align.norm_word("¡Hola!") == "hola"

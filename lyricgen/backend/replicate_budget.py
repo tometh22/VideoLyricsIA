@@ -266,7 +266,18 @@ def _run_predict_with_progress(
         status = getattr(prediction, "status", "") or ""
         if status in ("succeeded",):
             _emit(1.0)
-            return prediction.output
+            output = prediction.output
+            # WhisperX exposes LID confidence only in logs, not its JSON.
+            # Preserve this numeric evidence without retaining provider logs
+            # (which may contain audio URLs or recognized lyric text).
+            if call_label.upper() == "WHISPERX" and isinstance(output, dict):
+                match = re.search(
+                    r"Detected language:\s*([a-z]{2,3})\s*\((0(?:\.\d+)?|1(?:\.0+)?)\)",
+                    getattr(prediction, "logs", "") or "",
+                )
+                if match:
+                    output = {**output, "_language_detection_probability": float(match[2])}
+            return output
         if status in ("failed", "canceled"):
             err = getattr(prediction, "error", None) or f"prediction {status}"
             raise RuntimeError(str(err))
