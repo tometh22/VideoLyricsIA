@@ -681,12 +681,12 @@ app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
 from campaign_creative import router as campaign_creative_router
 app.include_router(campaign_creative_router)
+from delivery_plan import router as delivery_plan_router
+app.include_router(delivery_plan_router)
 from campaign_pipeline import router as campaign_pipeline_router
 app.include_router(campaign_pipeline_router)
 from campaign_change_requests import router as campaign_change_requests_router
 app.include_router(campaign_change_requests_router)
-from delivery_plan import router as delivery_plan_router
-app.include_router(delivery_plan_router)
 app.include_router(art_track_campaign_router)
 # Página de status pública (/service-status/*, sin auth) + redacción de
 # incidentes para admin (/admin/status/*). Ver status_page.py.
@@ -20824,8 +20824,10 @@ async def youtube_metadata_preview(
     return metadata
 
 
-# ======================================================================# UMG deliveries portal (umg.genly.pro)
-# ======================================================================# Two surfaces:
+# =============================================================================
+# UMG deliveries portal (umg.genly.pro)
+# =============================================================================
+# Two surfaces:
 #   1. /admin/deliveries/*   — JWT auth, admin role only. Used by the
 #      "Enviar a UMG" button in JobDetail.jsx.
 #   2. /api/deliveries/*     — portal-token auth (X-Portal-Token header).
@@ -20838,7 +20840,8 @@ async def youtube_metadata_preview(
 # — same convention gen_page.py used. The listing endpoint signs URLs
 # on demand with 7-day expiry (R2 max) and caches the response 60 s in
 # memory so a page refresh doesn't re-sign 80+ URLs per click.
-# ======================================================================
+# =============================================================================
+
 # File type → filename in R2 + extension + label. Single source of truth
 # for the portal listing. Adding a new file type (e.g. lossless audio)
 # means appending here and the rest of the pipeline picks it up.
