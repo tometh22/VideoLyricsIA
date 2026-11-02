@@ -532,7 +532,7 @@ def list_campaigns(
     pipelines = pipeline_counts_bulk(db, rows)
     return {"items": [
         {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
-    ]}
+    ], "can_view_accounts": current_user.get("role") == "admin"}
 
 
 @router.get("/campaigns/{campaign_id}")

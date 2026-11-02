@@ -7,6 +7,8 @@ import {
 } from "../../lib/campaignPipeline";
 import CampaignDeliveryProgress from "../CampaignDeliveryProgress";
 import CampaignSearch from "../CampaignSearch";
+import DeliveryPlan from "../DeliveryPlan";
+import { assignedBackground } from "../../lib/campaignCreative";
 import BulkActionBar from "./BulkActionBar";
 import BulkApproveDialog from "./BulkApproveDialog";
 import CampaignSettings from "./CampaignSettings";
@@ -137,6 +139,7 @@ export default function CampaignDetailPage({ id }) {
   const order = params.get("order") === "learning" ? "learning" : "effort";
   const [styleTargets, setStyleTargets] = useState(null);
   const [styleBusy, setStyleBusy] = useState(false);
+  const [planBusy, setPlanBusy] = useState(false);
   const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
   const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
   const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) });
@@ -147,7 +150,7 @@ export default function CampaignDetailPage({ id }) {
   const portalSends = campaign?.destination_portal !== FILES_DESTINATION;
   const counts = pipe.data?.counts || {};
   const songs = useMemo(() => buildSongs(pipe.data?.items || [], {
-    reviewRows: lyrics.data?.items, creativeItems: creative.data?.items, videos: report.data?.videos,
+    reviewRows: lyrics.data?.items, creativeItems: creative.data?.items?.map(item => ({ ...item, requires_background_assignment: creative.data.requires_background_assignment })), videos: report.data?.videos,
   }), [pipe.data, lyrics.data, creative.data, report.data]);
   const resend = useMemo(() => resendCounts(songs), [songs]);
   const filters = Object.fromEntries(FILTER_KEYS.map((key) => [key, params.get(key) || ""]));
@@ -307,7 +310,7 @@ export default function CampaignDetailPage({ id }) {
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
     const onKey = (event) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config" || view === "changes") return;
+      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config" || view === "changes" || view === "plan") return;
       if (document.querySelector("[role=dialog]")) return;
       const typing = isTyping(event.target);
       if (event.key === "Escape" && selected.size && !typing) { setSelected(new Set()); return; }
@@ -372,6 +375,12 @@ export default function CampaignDetailPage({ id }) {
   const emptyCopy = EMPTY[view] || EMPTY.all;
   const filtered = FILTER_KEYS.some((key) => params.get(key));
 
+  if (view === "plan" && lyric && campaign) return <div className="mx-auto max-w-[1500px] space-y-5 pb-16">
+    <Button disabled={planBusy} onClick={() => { void refresh(); setView("all"); }}>← Volver a la campaña</Button>
+    <h1 className="text-2xl font-bold">{campaign.name}</h1>
+    <DeliveryPlan campaignId={id} onBusyChange={setPlanBusy} />
+  </div>;
+
   return <div className="mx-auto max-w-[1500px] space-y-5 pb-28">
     <button type="button" onClick={() => navigate("/campaigns")} className="text-sm text-ink-secondary transition hover:text-white">← Campañas</button>
 
@@ -391,6 +400,7 @@ export default function CampaignDetailPage({ id }) {
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
+        {lyric && <Button variant="ghost" onClick={() => setView("plan")}>Plan de entrega</Button>}
         {canManage && lyric && <Button variant="ghost" onClick={() => updateParams({ view: "config", section: "upload", song: null }, { push: true })}>Subir audios</Button>}
         {(inboxEnabled || view === "changes") && <Button variant={view === "changes" ? "secondary" : "ghost"} aria-pressed={view === "changes"} onClick={() => (view === "changes" ? setView("all") : setView("changes"))}>
           Cambios del cliente{openRequests > 0 && <span className="ml-1.5 rounded-full bg-amber-400/20 px-1.5 text-xs tabular-nums text-amber-200">{openRequests}</span>}</Button>}
@@ -429,6 +439,7 @@ export default function CampaignDetailPage({ id }) {
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
+    {view === "ready" && creative.data?.requires_background_assignment && creative.data.items?.some(item => item.status === "lyrics_approved" && assignedBackground(item) === "unknown") && <Banner tone="warning" action={<Button onClick={() => setView("plan")}>Abrir Plan de entrega</Button>}>Hay canciones aprobadas sin fondo asignado. Elegí Veo o foto + efecto antes de generar.</Banner>}
     {view === "priority"
       ? <PriorityReview songs={songs} onOpen={openPriorityReview} />
       : view === "changes"

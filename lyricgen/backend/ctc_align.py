@@ -58,6 +58,8 @@ import time
 import unicodedata
 from typing import Optional
 
+from ctc_audio import audio_info, load_audio
+
 logger = logging.getLogger("uvicorn.error")
 
 MODEL_ID = os.environ.get(
@@ -237,9 +239,8 @@ def skip_arc_align(emission, targets, line_token_ranges, blank_id: int,
     pass per frame is exact).
 
     With lam=inf this degenerates to vanilla forced alignment — the
-    parity test pins it against torchaudio's forced_align. Replacing the
-    torchaudio call also removes the dependency on an API deleted in
-    torchaudio 2.9.
+    parity test pins it against torchaudio's forced_align. This path is
+    independent of the native aligner retained by current TorchAudio.
 
     Args:
       emission: (T, C) log-probs (star column already appended).
@@ -1055,11 +1056,11 @@ def window_emissions(audio_path: str, start: float, end: float):
     import torchaudio
 
     model, dictionary, blank_id = _load_model()
-    info = torchaudio.info(audio_path)
+    info = audio_info(audio_path)
     source_sr = info.sample_rate or SR
     offset = max(0, int(start * source_sr))
     frames = max(1, int((end - start) * source_sr))
-    wav, sr = torchaudio.load(
+    wav, sr = load_audio(
         audio_path, frame_offset=offset, num_frames=frames,
     )
     wav = wav.mean(0, keepdim=True)
@@ -1251,11 +1252,11 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
         if real_tokens / characters < 0.60:
             return None
 
-        info = torchaudio.info(audio_path)
+        info = audio_info(audio_path)
         source_sr = info.sample_rate or SR
         offset = max(0, int(start * source_sr))
         frames = max(1, int(duration * source_sr))
-        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav, sr = load_audio(audio_path, frame_offset=offset, num_frames=frames)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1320,28 +1321,14 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
 
 
 def _load_window(audio_path: str, start: float, end: float):
-    """Mono 16 kHz de [start, end]. Usa torchaudio.info si existe (pin de
-    producción) y cae a soundfile en versiones que lo quitaron."""
-    import torch
+    """Decode only [start, end], then produce mono audio at 16 kHz."""
     import torchaudio
 
-    duration = end - start
-    if hasattr(torchaudio, "info"):
-        info = torchaudio.info(audio_path)
-        source_sr = info.sample_rate or SR
-        wav, sr = torchaudio.load(
-            audio_path, frame_offset=max(0, int(start * source_sr)),
-            num_frames=max(1, int(duration * source_sr)),
-        )
-    else:
-        import soundfile
-
-        sr = soundfile.info(audio_path).samplerate
-        data, _ = soundfile.read(
-            audio_path, start=max(0, int(start * sr)), stop=int(end * sr),
-            dtype="float32", always_2d=True,
-        )
-        wav = torch.from_numpy(data.T.copy())
+    source_sr = audio_info(audio_path).sample_rate or SR
+    wav, sr = load_audio(
+        audio_path, frame_offset=max(0, int(start * source_sr)),
+        num_frames=max(1, int((end - start) * source_sr)),
+    )
     wav = wav.mean(0, keepdim=True)
     if sr != SR:
         wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1528,11 +1515,11 @@ def align_structural_anchors(audio_path: str, texts: list[str],
             if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
             else None
         )
-        info = torchaudio.info(audio_path)
+        info = audio_info(audio_path)
         source_sr = info.sample_rate or SR
         offset = max(0, int(start * source_sr))
         frames = max(1, int((end - start) * source_sr))
-        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav, sr = load_audio(audio_path, frame_offset=offset, num_frames=frames)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1725,10 +1712,10 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         t0 = time.time()
         # Duration guard BEFORE decoding: a multi-hour upload would expand
-        # to several GB of float32 in RAM if we torchaudio.load() first
+        # to several GB of float32 in RAM if we load_audio() first
         # (OOM risk in the uvicorn/ShortWorker containers).
         try:
-            info = torchaudio.info(audio_path)
+            info = audio_info(audio_path)
             est_dur = info.num_frames / (info.sample_rate or SR)
         except Exception:
             est_dur = None
@@ -1736,7 +1723,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             logger.info("[CTC] decline: audio %.0fs out of range (job=%s)",
                         est_dur, job_id)
             return None
-        wav, sr = torchaudio.load(audio_path)
+        wav, sr = load_audio(audio_path)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1755,7 +1742,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             # Our own Viterbi with per-line skip arcs: a ghost line (lrclib
             # studio text over a live that skips it) costs lam instead of
             # stealing audio from its neighbours. Also removes the
-            # torchaudio.forced_align dependency (deleted in 2.9).
+            # torchaudio.forced_align dependency (retained by current TorchAudio).
             tok_pos, line_ranges, line_of_range = 0, [], []
             for li, _raw, n_tok in words:
                 if li >= 0:
@@ -1842,7 +1829,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             anchored_norms = [re.sub(r"\W+", "", lines[i].lower())
                               for i in range(len(lines))
                               if i not in skipped_lines and len(lines[i]) > 10]
-            mwav, msr = torchaudio.load(mix_path)
+            mwav, msr = load_audio(mix_path)
             mwav = mwav.mean(0, keepdim=True)
             if msr != SR:
                 mwav = torchaudio.functional.resample(mwav, msr, SR)

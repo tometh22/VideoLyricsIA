@@ -10,6 +10,16 @@ export const REVIEW_FIELDS = {
   lyricFontKey: "lyric_font_key", lyricAltColor: "lyric_alt_color", lyricAccentColor: "lyric_accent_color",
 };
 
+export function assignedBackground(item) {
+  const s = item.settings || {}, requirement = item.assignment?.requirement;
+  if (requirement === "photo_effect" && s.movement_style === "foto-parallax"
+      && s.effect && !["none", "foto_viva"].includes(s.effect)
+      && !s.animate_image && !s.enable_scenes && s.background_mode !== "variation") return "photo_effect";
+  if (requirement === "veo" && s.movement_style && !["foto-parallax", "foto-estatica"].includes(s.movement_style)
+      && !s.background_id && s.effect !== "foto_viva") return "veo";
+  return "unknown";
+}
+
 export function reviewCreativeSettings(review, top) {
   const out = {};
   for (const [camel, snake] of Object.entries(REVIEW_FIELDS)) {
