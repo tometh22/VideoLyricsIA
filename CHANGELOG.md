@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.156] - 2026-11-03
+
+### Fixed
+
+- Allow explicitly granted campaign reviewers to confirm reviewed lyrics and
+  quality windows across team boundaries, matching their existing editor
+  access. The confirmation buttons no longer return a hidden 404 for shared
+  campaigns. Revision/content binding, audit attribution and revoked-grant
+  isolation remain enforced; confirmation does not approve or change lyrics.
+
 ## [1.1.155] - 2026-11-03
 
 ### Added
