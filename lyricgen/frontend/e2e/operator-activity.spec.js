@@ -24,6 +24,10 @@ test("personal production is visible from campaigns and home, with yesterday and
   await page.route("**/batch/campaigns", (route) => route.fulfill({ json: { items: campaigns.map((c) => ({ ...c, kind: "lyric_video", status: "active", pipeline: { counts: { qc: c.count } } })) } }));
   await page.goto("/campaigns");
   const card = page.getByRole("region", { name: "Mi producción en campañas" });
+  await expect(card).toBeHidden();
+  await expect(page.getByRole("region", { name: "Lista de campañas" })).toBeVisible();
+  await page.screenshot({ path: "test-results/campaign-home-overview.png", fullPage: true });
+  await page.getByText("Mi actividad de producción", { exact: true }).click();
   await expect(card.getByText("Canciones convertidas a video", { exact: true })).toBeVisible();
   await card.getByRole("button", { name: "Ayer", exact: true }).click();
   await expect(card.getByRole("button", { name: "Ayer", exact: true })).toHaveAttribute("aria-pressed", "true");
