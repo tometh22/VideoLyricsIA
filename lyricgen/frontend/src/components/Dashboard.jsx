@@ -1,3 +1,4 @@
+import OperatorActivity from "./OperatorActivity";
 import { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
@@ -338,6 +339,8 @@ export default function Dashboard({ user, history, historyError, historyLoaded =
         </div>
         </div>
       </div>
+
+      <OperatorActivity key={user?.id} optional />
 
       {/* ─── Hero KPI 3-up (Aprobar · Renderizando · Cuota) ───────────
             Una sola tarjeta con divide-x — leído como una unidad horizontal

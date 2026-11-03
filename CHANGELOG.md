@@ -10,6 +10,26 @@
   campaigns. Revision/content binding, audit attribution and revoked-grant
   isolation remain enforced; confirmation does not approve or change lyrics.
 
+## [1.1.155] - 2026-11-03
+
+### Added
+
+- A three-step campaign batch designer: choose the photo/video split and photo
+  effects, select compatible lyric looks, then review exact counts and generate.
+  Mix songs with a stable seed while preserving exact background quotas and
+  balanced look/effect counts; preview account impact separately from the lot.
+  Frozen confirmation preserves pinned designs and excludes unready songs from
+  generation, with current-revision checks before submitting the confirmed set.
+- Personal campaign production on Home and Campaigns, with Today/Yesterday,
+  an Argentina-time date selector, campaign breakdown and song list. Attribute
+  first successful renders to the initiating operator, not the account owner;
+  show re-edit requests separately and enforce current campaign access.
+
+### Changed
+
+- Typography and lyric edit descriptions explain asset reuse and the required
+  new render instead of promising no additional cost.
+
 ## [1.1.154] - 2026-11-03
 
 ### Fixed

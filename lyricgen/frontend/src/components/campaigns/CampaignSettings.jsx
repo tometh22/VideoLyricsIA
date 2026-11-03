@@ -6,7 +6,7 @@ import { CampaignReviewerSummary } from "../CampaignReviewerStatus";
 import ArtTrackPanel from "./ArtTrackPanel";
 import CampaignAudioUploader from "./CampaignAudioUploader";
 import ContractReport from "./ContractReport";
-import StyleAssignment from "./StyleAssignment";
+import StyleAssignment from "./BatchMixDesigner";
 import { Banner, Button, Field, Modal, Skeleton, inputClass } from "./ui";
 
 const STATUS = [["active", "Activa"], ["paused", "Pausada"], ["completed", "Completada"]];
@@ -154,7 +154,7 @@ export default function CampaignSettings({ campaign, section, onSection, canMana
             : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cargar audios.</p>}
         </Section>
         : <Section title="Audios y portadas"><ArtTrackPanel campaign={campaign} onChanged={onChanged} />{canManage && <div className="mt-5"><TerminalUploader campaignId={campaign.id} art /></div>}</Section>)}
-      {active === "style" && <Section title="Estilo y reparto" description="Elegí foto fija o video y un efecto. Los ajustes de detalle están en Opciones avanzadas. Para cambiar sólo algunas canciones, seleccionalas en la lista y usá «Elegir fondo».">
+      {active === "style" && <Section title="Estilo y reparto" description="Repartí looks, foto/video y efectos. Para trabajar sólo con algunas canciones, seleccionalas en la lista y usá «Preparar lote».">
         {!creative ? <Skeleton className="h-40" /> : !creative.can_manage
           ? <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar estilos.</p>
           : <StyleAssignment campaignId={campaign.id} creative={creative} itemIds={activeItems} onSaved={onChanged} />}
