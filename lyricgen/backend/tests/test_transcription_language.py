@@ -426,7 +426,10 @@ def test_approval_endpoint_enforces_language_review_server_side():
 
 
 def test_language_resolution_endpoint_exists_and_is_revision_scoped():
-    src = _ast.get_source_segment(_MAIN_SRC, _func("resolve_language_review"))
+    endpoint = _ast.get_source_segment(_MAIN_SRC, _func("resolve_language_review"))
+    assert "_resolve_language_review_locked(" in endpoint
+    assert "db.rollback()" in endpoint
+    src = _ast.get_source_segment(_MAIN_SRC, _func("_resolve_language_review_locked"))
     assert "language_resolution" in src
     assert "stale_revision" in src          # rejects an edit made under it
     assert "segments_hash" in src           # bound to content, not just revision

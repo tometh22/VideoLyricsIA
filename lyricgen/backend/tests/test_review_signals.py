@@ -85,7 +85,7 @@ def test_alembic_upgrade_creates_review_signal_records(tmp_path):
     } <= columns
     assert "ix_review_signal_records_job_id" in indexes
     assert "ix_review_signal_records_kind_created" in indexes
-    assert version == "a6c8e0f2b4d6"
+    assert version == "f4a6c8e0b2d4"
 
 
 def test_single_alembic_head():
@@ -95,7 +95,31 @@ def test_single_alembic_head():
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cfg = Config(os.path.join(backend_dir, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["a6c8e0f2b4d6"]
+    assert ScriptDirectory.from_config(cfg).get_heads() == ["f4a6c8e0b2d4"]
+
+
+@pytest.mark.parametrize("parent", ["a6c8e0f2b4d6", "b7d9f1a3c5e7"])
+def test_promotion_from_either_environment_preserves_published_delivery(tmp_path, parent):
+    db_path = tmp_path / f"promotion_{parent}.db"
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "DATABASE_URL": f"sqlite:///{db_path}", "ENVIRONMENT": "test"}
+    def upgrade(target):
+        result = subprocess.run([sys.executable, "-m", "alembic", "upgrade", target],
+                                cwd=backend_dir, env=env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr
+    upgrade(parent)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("""INSERT INTO deliveries
+            (job_id, label, file_types, artist_snapshot, song_title_snapshot,
+             tenant_snapshot, portal_id, product_category, added_by_user_id, added_at)
+            VALUES ('releasecheck', 'Art Track', '["video"]', 'Artist', 'Song',
+                    'test', 'chile', 'artists_art', 1, '2026-11-03')""")
+    upgrade("head")
+    upgrade("head")  # repeat deploy is a no-op
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchall() == [("f4a6c8e0b2d4",)]
+        assert conn.execute("SELECT job_id, portal_id, product_category, file_types FROM deliveries").fetchall() == [
+            ("releasecheck", "chile", "artists_art", '["video"]')]
 
 
 # ---------------------------------------------------------------------------

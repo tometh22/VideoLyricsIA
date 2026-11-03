@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import uuid
 from collections import Counter, defaultdict
@@ -198,12 +199,14 @@ def collect(db, ddb, user, campaign_id=None, portal_id=None, period="", peer=Non
     publications = list({(d.job_id, d.portal_id or "argentina"): d for d in reversed(publications)}.values())
     publication_ids = {d.job_id for d in publications}
     jobs_by_key, calls, cache_calls, first_dates = {}, defaultdict(list), defaultdict(list), {}
+    job_sources = {}
     for name, session, cs, items, jobs in sources:
         missing = publication_ids - {j.job_id for j in jobs}
         if missing:
             jobs += _jobs(session, Job.job_id.in_(missing))
         for j in jobs:
             jobs_by_key.setdefault((j.job_id, j.tenant_id), j)
+            job_sources.setdefault((j.job_id, j.tenant_id), name)
         ids = list({j.job_id for j in jobs})
         provenance_fields = (AIProvenance.job_id, AIProvenance.step, AIProvenance.tool_name, AIProvenance.response_summary, AIProvenance.created_at)
         records = session.query(AIProvenance).options(load_only(*provenance_fields)).filter(AIProvenance.job_id.in_(ids), AIProvenance.step.in_(["video_bg", "image_bg"])).all() if ids else []
@@ -246,13 +249,13 @@ def collect(db, ddb, user, campaign_id=None, portal_id=None, period="", peer=Non
         if outdated and kind != "art_track":
             kind = "unknown"
         if kind == "unknown":
-            issues.append({"job_id": d.job_id, "title": d.song_title_snapshot, "campaign_id": job.campaign_id if job else None,
+            issues.append({"job_id": d.job_id, "source": job_sources.get(key, "missing"), "title": d.song_title_snapshot, "campaign_id": job.campaign_id if job else None,
                            "reason": "La versión publicada difiere del render actual" if outdated else "Falta evidencia del fondo publicado"})
         if kind == "art_track":
             excluded_art += 1
         else:
             buckets["delivered"][kind] += 1
-            video_rows.append({"item_id": f"delivery:{d.job_id}:{country}", "campaign_id": job.campaign_id if job else None,
+            video_rows.append({"item_id": f"delivery:{d.job_id}:{country}", "source": job_sources.get(key, "missing"), "campaign_id": job.campaign_id if job else None,
                                "campaign_name": "", "title": d.song_title_snapshot, "artist": d.artist_snapshot,
                                "job_id": d.job_id, "status": job.status if job else "done", "type": kind,
                                "effect": ((job.render_params or {}).get("campaign_render_evidence") or {}).get("effect_applied", "") if job else "",
@@ -312,13 +315,13 @@ def collect(db, ddb, user, campaign_id=None, portal_id=None, period="", peer=Non
                 if kind == "art_track":
                     continue
                 buckets["generated"][kind] += 1
-                video_rows.append({"item_id": f"generated:{source}:{j.job_id}", "campaign_id": c.id,
+                video_rows.append({"item_id": f"generated:{source}:{j.job_id}", "source": source, "campaign_id": c.id,
                                    "campaign_name": c.name, "title": j.song_title or j.filename, "artist": j.artist,
                                    "job_id": j.job_id, "status": j.status, "type": kind, "effect": evidence.get("effect_applied", ""),
                                    "stage": "generated", "editable": False, "ready": False, "pinned": False,
                                    "blocked_reason": "Generado, pendiente de entregar"})
                 if kind == "unknown":
-                    issues.append({"job_id": j.job_id, "title": j.song_title or j.filename, "campaign_id": c.id,
+                    issues.append({"job_id": j.job_id, "stage": "generated", "source": source, "title": j.song_title or j.filename, "campaign_id": c.id,
                                    "reason": "Falta evidencia del fondo generado"})
                 signatures.append((source, j.job_id, j.status, j.completed_at, evidence, kind))
             for i in items:
@@ -367,7 +370,9 @@ def collect(db, ddb, user, campaign_id=None, portal_id=None, period="", peer=Non
     proposal = balance(fixed, len(candidates))
     projected = buckets["delivered"] + buckets["generated"] + buckets["in_progress"] + buckets["pending"]
     scope = f"campaign:{campaign_id}" if campaign else f"portal:{portal_id}"
-    result = {"scope": scope, "name": campaign.name if campaign else PORTALS[portal_id],
+    environment = os.environ.get("RAILWAY_ENVIRONMENT_NAME", os.environ.get("ENVIRONMENT", "")).lower()
+    peer_frontend_url = {"production": "https://staging.genly.pro", "prod": "https://staging.genly.pro", "staging": "https://genly.pro"}.get(environment)
+    result = {"scope": scope, "name": campaign.name if campaign else PORTALS[portal_id], "peer_frontend_url": peer_frontend_url,
               "portal_id": (campaign.destination_portal if campaign else portal_id),
               "period": period, "campaign_period": _campaign_period(campaign) if campaign else None,
               "target": {"veo": 50, "photo_effect": 50}, "buckets": {k: dict(v) for k, v in buckets.items()},

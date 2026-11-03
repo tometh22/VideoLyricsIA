@@ -95,6 +95,36 @@ def test_distinct_portals_not_producer_tenants_and_no_double_count(db, setup):
     assert error.value.status_code == 403
 
 
+@pytest.mark.parametrize("environment,origin", [("production", "https://staging.genly.pro"), ("staging", "https://genly.pro")])
+def test_account_links_identify_peer_and_missing_original_jobs(db, setup, monkeypatch, environment, origin):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from database import Base
+    _, actor, _, publish = setup
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT_NAME", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    try:
+        with Session(engine) as peer:
+            peer.add(User(id=actor["id"], username="peer-audit", hashed_password="unused", tenant_id=actor["tenant_id"]))
+            campaign = BatchCampaign(id=uuid.uuid4().hex[:12], name="Remote", tenant_id=actor["tenant_id"], created_by=actor["id"], kind="lyric_video", status="active", destination_portal="argentina")
+            peer.add(campaign); peer.flush()
+            jobs = [Job(job_id=uuid.uuid4().hex[:12], campaign_id=campaign.id, tenant_id=actor["tenant_id"], user_id=actor["id"], artist="Remote artist", song_title="Remote song", filename="remote.wav", status="done", video_url="video", render_params={}) for _ in range(2)]
+            peer.add_all(jobs); peer.commit()
+            publish(jobs[0])
+            missing = SimpleNamespace(job_id=uuid.uuid4().hex[:12], tenant_id=actor["tenant_id"], artist="Legacy", song_title="Missing original")
+            publish(missing); db.commit()
+            result = plan.collect(db, db, actor, portal_id="argentina", peer=peer)
+            assert result["peer_frontend_url"] == origin
+            rows = {r["job_id"]: r for r in result["items"]}
+            assert rows[jobs[0].job_id]["source"] == rows[jobs[1].job_id]["source"] == "peer"
+            assert rows[missing.job_id]["source"] == "missing"
+            assert {i["source"] for i in result["issues"]} == {"peer", "missing"}
+    finally:
+        engine.dispose()
+
+
 def test_generated_unpublished_pins_discard_and_cancelled_are_handled(db, setup):
     c, actor, make, publish = setup
     _, j = make(status="done", kind="veo", video=True); publish(j)
