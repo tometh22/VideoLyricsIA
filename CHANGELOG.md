@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.158] - 2026-11-03
+
+### Changed
+
+- Simplify the campaign home to one list with confirmed deliveries, pending
+  work and direct next actions. Separate ongoing, attention and finished
+  campaigns; retain product filters, account plans and the creation wizard.
+  Approved videos are no longer counted as delivered, and unavailable portal
+  status is shown explicitly. File-only campaigns label ready files separately.
+- Default campaign lyric review to calendar order while retaining effort and
+  learning modes and preserving the order of recently saved drafts.
+
 ## [1.1.157] - 2026-11-03
 
 ### Changed

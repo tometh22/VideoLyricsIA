@@ -1,4 +1,5 @@
 import BulkPrompts from "./BulkPrompts";
+import { campaignOrder } from "../../lib/campaignOverview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource, { invalidateCampaignResources, mutateCampaignResource } from "../../hooks/useCampaignResource";
@@ -92,8 +93,8 @@ function SongToolbar({ view, params, setParam, songs, lyricSongs, searchRef, onH
         <select aria-label="Versión" value={params.get("version") || ""} onChange={(event) => setParam("version", event.target.value)} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
           <option value="">Estudio y vivo</option><option value="studio">Estudio</option><option value="live">Vivo</option>
         </select>
-        <select aria-label="Orden" value={params.get("order") === "learning" ? "learning" : "effort"} onChange={(event) => setParam("order", event.target.value === "learning" ? "learning" : "")} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
-          <option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20 %)</option>
+        <select aria-label="Orden" value={campaignOrder(params.get("order"))} onChange={(event) => setParam("order", event.target.value)} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
+          <option value="calendar">Orden del calendario</option><option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20 %)</option>
         </select>
         <InfoTip label="Cómo leer las alertas">Las alertas orientan dónde escuchar primero; no son un porcentaje de acierto ni una confianza calibrada. Toda canción requiere escuchar y confirmar letra y tiempos. La falta de referencia externa no significa por sí sola que la letra esté mal.</InfoTip>
       </>}
@@ -137,7 +138,7 @@ export default function CampaignDetailPage({ id }) {
   const view = requestedView === "priority" && id !== RICARDO_PRIORITY_CAMPAIGN ? "all" : requestedView;
   // `?view=contract` predates the settings tab; it still lands on the report.
   const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
-  const order = params.get("order") === "learning" ? "learning" : "effort";
+  const order = campaignOrder(params.get("order"));
   const [styleTargets, setStyleTargets] = useState(null);
   const [promptTargets, setPromptTargets] = useState(null);
   const [promptBusy, setPromptBusy] = useState(false);
