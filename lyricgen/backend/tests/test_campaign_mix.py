@@ -70,9 +70,10 @@ def test_preview_apply_scoping_pins_ready_ids_and_no_generation(db, setup):
     campaign, items, actor = setup
     for n, item in enumerate(items):
         db.add(Job(job_id=f'mix-{n:08d}', campaign_id=campaign.id, campaign_item_id=item.id, user_id=actor['id'],
-                   tenant_id=campaign.tenant_id, artist="Artista", filename=item.filename, status='lyrics_approved' if n < 20 else 'transcribed_pending'))
+                   tenant_id=campaign.tenant_id, workload_class="batch", artist="Artista", filename=item.filename, status='lyrics_approved' if n < 20 else 'transcribed_pending'))
     items[0].render_overrides = {**items[0].render_overrides, creative.ASSIGNMENT: {'pinned': True}}
     db.commit()
+    generation_receipts = db.query(AuditLog).filter_by(action='campaign.creative.generation').count()
     result = mix.preview_mix(campaign.id, request(items), actor, db)
     assert result['mix']['total'] == 38 and result['mix']['photo_effect'] == result['mix']['veo'] == 19
     assert result['skipped'] == [items[0].id] and len(result['ready_item_ids']) == 19
@@ -87,7 +88,7 @@ def test_preview_apply_scoping_pins_ready_ids_and_no_generation(db, setup):
     assert saved['revision'] == 1
     assert creative.apply(campaign.id, creative.CommitRequest(preview_id=result['preview_id']), actor, db)['deduplicated']
     assert db.query(Job).filter_by(campaign_id=campaign.id, status='lyrics_approved').count() == 20
-    assert not db.query(AuditLog).filter_by(action='campaign.creative.generation').count()
+    assert db.query(AuditLog).filter_by(action='campaign.creative.generation').count() == generation_receipts
     assert items[0].render_overrides[creative.ASSIGNMENT] == {'pinned': True}
     for item in items[1:]:
         db.refresh(item)
@@ -103,7 +104,7 @@ def test_stale_previews_and_rendered_songs_are_not_applied(db, setup):
         creative.apply(campaign.id, creative.CommitRequest(preview_id=result['preview_id']), actor, db)
     assert exc.value.status_code == 409
     db.add(Job(job_id='already-done', user_id=actor['id'], tenant_id=campaign.tenant_id, campaign_id=campaign.id,
-               campaign_item_id=items[0].id, artist='Artista', filename='song.wav', status='done')); db.commit()
+               campaign_item_id=items[0].id, workload_class="batch", artist='Artista', filename='song.wav', status='done')); db.commit()
     with pytest.raises(HTTPException) as exc:
         mix.preview_mix(campaign.id, request(items), actor, db)
     assert exc.value.status_code == 409
