@@ -209,6 +209,19 @@ class UndoRequest(Strict):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class SongPrompt(Strict):
+    item_id: str = Field(min_length=1, max_length=100)
+    scene: str = Field(default="", max_length=4000)
+
+
+class PromptRequest(Strict):
+    revision: int = Field(ge=0)
+    common: str = Field(default="", max_length=3000)
+    songs: list[SongPrompt] = Field(min_length=1, max_length=512)
+    source: Literal["prompt_improved", "prompt_literal"] = "prompt_improved"
+    replace_exceptions: bool = False
+
+
 def apportion(groups, count, mode):
     weights = [g.weight for g in groups]
     if mode == "count":
@@ -307,7 +320,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
     ]}
     from campaign_mix import catalog as mix_catalog
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
-            "mix_catalog": mix_catalog(), "portal_id": campaign.destination_portal,
+            "mix_catalog": mix_catalog(), "features": {"bulk_prompts": True}, "portal_id": campaign.destination_portal,
             "delivery_plan_period": (campaign.default_render_params or {}).get("delivery_plan_period", ""),
             "can_view_account_balance": current_user.get("role") == "admin",
             "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
@@ -384,6 +397,38 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             "changes": [{**{k: c[k] for k in ("item_id", "artist", "title", "group")},
                          "before": effective_settings(campaign, c["before"]),
                          "after": effective_settings(campaign, c["after"])} for c in changes]}
+
+
+@router.post("/{campaign_id}/creative/prompts-preview")
+def preview_prompts(campaign_id: str, body: PromptRequest, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Assign explicit prompts to their songs through the existing frozen ledger.
+
+    One count=1 group per editable song, in the same seeded order used by
+    preview(). Keeping this mapping server-side avoids swapping scenes when
+    the UI selection order changes. Apply/undo retain the normal guards.
+    """
+    campaign = _campaign(db, campaign_id, current_user, True)
+    by_id = {song.item_id: song for song in body.songs}
+    if len(by_id) != len(body.songs):
+        fail("La selección contiene canciones repetidas")
+    selected = [item for item in _items(db, campaign) if item.id in by_id]
+    if len(selected) != len(by_id):
+        fail("Selección ajena a la campaña", 404)
+    available = [item for item in selected if body.replace_exceptions or not (item.render_overrides or {}).get(ASSIGNMENT, {}).get("pinned")]
+    if not available:
+        fail("Todos los diseños están fijados. Activá su reemplazo si querés cambiar los prompts.")
+    seed = "song-prompts-v1"
+    groups = []
+    for item in sorted(available, key=lambda item: digest([seed, item.id])):
+        prompt = "\n\n".join(part.strip() for part in (body.common, by_id[item.id].scene) if part.strip())
+        if not prompt or len(prompt) > 4000:
+            fail(f"{item.title or item.filename}: el prompt debe tener entre 1 y 4000 caracteres")
+        groups.append(Group(id="prompt-" + digest(item.id)[:20], name=("Prompt · " + (item.title or item.filename))[:100],
+            weight=1, requirement="creative", settings={"scene_source": body.source, "background_hint": prompt,
+                "background_id": None, "background_mode": "as_is"}))
+    return preview(campaign_id, PlanRequest(revision=body.revision, item_ids=list(by_id), groups=groups,
+        mode="count", seed=seed, replace_exceptions=body.replace_exceptions, preserve_existing_pins=True,
+        reason="Edición de prompts de fondo en lote"), current_user, db)
 
 
 @router.post("/{campaign_id}/creative/apply")

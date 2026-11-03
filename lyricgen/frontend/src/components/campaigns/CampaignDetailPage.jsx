@@ -1,3 +1,4 @@
+import BulkPrompts from "./BulkPrompts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource, { invalidateCampaignResources, mutateCampaignResource } from "../../hooks/useCampaignResource";
@@ -138,11 +139,13 @@ export default function CampaignDetailPage({ id }) {
   const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
   const order = params.get("order") === "learning" ? "learning" : "effort";
   const [styleTargets, setStyleTargets] = useState(null);
+  const [promptTargets, setPromptTargets] = useState(null);
+  const [promptBusy, setPromptBusy] = useState(false);
   const [styleBusy, setStyleBusy] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
   const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
   const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
-  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) });
+  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) || Boolean(promptTargets) });
   const report = useCampaignResource(`${prefix}report`, ({ signal }) => campaignRequest(`${base}/creative/report`, { signal }), { enabled: needs(["all", "qc", "approved", "delivered"], ["contract"]) });
 
   const canManage = Boolean(pipe.data?.can_manage);
@@ -351,6 +354,7 @@ export default function CampaignDetailPage({ id }) {
     else if (action === "send") setDialog({ type: "send", songs: list });
     else if (action === "discard" || action === "restore") setDialog({ type: "discard", songs: list, mode: action });
     else if (action === "retry") void runRetry(list);
+    else if (action === "prompts") setPromptTargets(list.map((song) => song.id));
     else if (action === "style") setStyleTargets(list.map((song) => song.id));
   };
 
@@ -465,7 +469,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} canEditPrompts={Boolean(creative.data?.features?.bulk_prompts)} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}
@@ -531,6 +535,10 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: result.failed.length ? "warning" : "success", text: `${result.done} ${result.done === 1 ? "canción" : "canciones"} ${dialog.mode === "restore" ? "recuperada" : "descartada"}${result.done === 1 ? "" : "s"}.` });
       void refresh();
     }} />}
+    {promptTargets && <Modal label="Editar prompts en lote" busy={promptBusy} onClose={() => setPromptTargets(null)} width="max-w-4xl">
+      <div className="mb-5 flex items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Editar prompts · {promptTargets.length} canciones</h2><p className="mt-1 text-sm text-ink-secondary">Un mismo criterio visual, escenas diferentes.</p></div><Button size="sm" variant="ghost" disabled={promptBusy} onClick={() => setPromptTargets(null)} aria-label="Cerrar">✕</Button></div>
+      {creative.data?.can_manage ? <BulkPrompts campaignId={id} creative={creative.data} itemIds={promptTargets} onBusyChange={setPromptBusy} onSaved={refresh} /> : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar los prompts.</p>}
+    </Modal>}
     {styleTargets && <Modal label="Preparar lote" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
       <div className="mb-5 flex items-start justify-between gap-3">
         <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Producción por lote</p>
