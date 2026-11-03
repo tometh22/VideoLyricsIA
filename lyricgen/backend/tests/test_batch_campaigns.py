@@ -1171,6 +1171,15 @@ def test_review_queue_separates_text_and_timing_priority_with_visible_reasons(
     assert [row["job_id"] for row in result["items"]] == [
         jobs[2].job_id, jobs[1].job_id, jobs[0].job_id,
     ]
+    calendar = batch.review_queue(
+        campaign.id, stage="lyrics", order="calendar", scope="pending", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": user.id, "tenant_id": campaign.tenant_id, "role": "admin",
+        }, db=db,
+    )
+    assert calendar["order"] == "calendar"
+    assert [row["job_id"] for row in calendar["items"]] == [job.job_id for job in jobs]
     assert [row["review_priority"] for row in result["items"]] == [
         "timing_targeted", "timing_targeted", "manual_full",
     ]

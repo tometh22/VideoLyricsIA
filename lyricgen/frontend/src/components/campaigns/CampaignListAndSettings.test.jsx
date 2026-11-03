@@ -27,80 +27,59 @@ const deferred = () => { let resolve; const promise = new Promise((done) => { re
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); clearCampaignResourceCache(); localStorage.clear(); });
 
 describe("campaign list", () => {
-  it("never shows a false empty state and summarizes each campaign with its next step", async () => {
+  it("shows confirmed deliveries separately from approvals and links directly to the next step", async () => {
     const request = deferred();
     vi.stubGlobal("fetch", vi.fn(() => request.promise));
     render(<MemoryRouter initialEntries={["/campaigns"]}><Location /><Routes><Route path="/campaigns" element={<CampaignsPage />} /><Route path="/campaigns/:campaignId" element={<p>Detalle</p>} /></Routes></MemoryRouter>);
     expect(screen.getByText("Cargando campañas…")).toHaveAttribute("role", "status");
     expect(screen.queryByText("Todavía no hay campañas")).not.toBeInTheDocument();
     await act(async () => request.resolve(json({ items: [
-      { id: "a", name: "UMG Agosto", status: "active", kind: "lyric_video", registered_count: 10, pipeline: { counts: { lyrics: 4, qc: 1, approved: 2, delivered: 3 } } },
+      { id: "a", name: "UMG Agosto", status: "active", registered_count: 10, pipeline: { portal_status_available: true, counts: { lyrics: 4, qc: 1, approved: 2, delivered: 3 } } },
       { id: "b", name: "Chile Art Tracks", status: "paused", kind: "art_track", registered_count: 2, counters: { final_review: 2 } },
     ] })));
-    const todo = await screen.findByRole("region", { name: /Para hacer/ });
-    const card = within(todo).getByRole("button", { name: /UMG Agosto/ });
-    expect(card).toHaveTextContent("50%");
-    expect(card).toHaveTextContent("5 de 10 terminadas");
-    expect(card).toHaveTextContent("Revisar 4 letras");
-    expect(within(todo).getByRole("button", { name: /Chile Art Tracks/ })).toHaveTextContent("Revisar 2 videos");
-    fireEvent.click(screen.getByRole("radio", { name: "Pausadas" }));
-    expect(screen.queryByRole("button", { name: /UMG Agosto/ })).not.toBeInTheDocument();
-    fireEvent.click(within(screen.getByRole("region", { name: /Para hacer/ })).getByRole("button", { name: /Chile Art Tracks/ }));
-    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/b");
+    const list = await screen.findByRole("region", { name: "Lista de campañas" });
+    expect(within(list).getAllByText("UMG Agosto")).toHaveLength(1);
+    expect(list).toHaveTextContent("3 de 10");
+    expect(list).toHaveTextContent("2 aprobadas, sin enviar");
+    expect(list).toHaveTextContent("Sin confirmar");
+    fireEvent.click(within(list).getByRole("button", { name: /Preparar entrega/ }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/a?view=approved&order=calendar");
   });
 
-  it("flags open client change requests on the campaign card with the age of the oldest", async () => {
+  it("keeps delivered campaigns with client changes in attention and opens the change inbox", async () => {
     const oldest = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
     vi.stubGlobal("fetch", vi.fn(async () => json({ items: [
-      { id: "a", name: "UMG Agosto", status: "active", kind: "lyric_video", registered_count: 10,
-        pipeline: { counts: { delivered: 3 }, flags: { change_requests: 2, change_requests_open: 3, oldest_change_request_at: oldest } } },
-      { id: "b", name: "Sin pedidos", status: "active", kind: "lyric_video", registered_count: 4,
-        pipeline: { counts: { delivered: 1 }, flags: { change_requests_open: 0 } } },
-    ] })));
-    render(<MemoryRouter initialEntries={["/campaigns"]}><Routes><Route path="/campaigns" element={<CampaignsPage />} /></Routes></MemoryRouter>);
-    const todo = await screen.findByRole("region", { name: /Para hacer/ });
-    const card = within(todo).getByRole("button", { name: /UMG Agosto/ });
-    expect(card).toHaveTextContent("3 cambios pedidos por el cliente · el más antiguo: hace 2 días");
-    expect(within(todo).queryByRole("button", { name: /Sin pedidos/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Sin pedidos/ })).not.toHaveTextContent("cambio");
-  });
-
-  it("puts pending work first and indexes the rest by lot, with cancelled campaigns out of the way", async () => {
-    const days = (n) => new Date(Date.now() - n * 24 * 3600 * 1000).toISOString();
-    vi.stubGlobal("fetch", vi.fn(async () => json({ items: [
-      { id: "oct", name: "UMG Chile — Octubre 2026 — Lyrics", status: "active", registered_count: 28, updated_at: days(0), pipeline: { counts: { lyrics: 5, delivered: 23 } } },
-      { id: "sep", name: "UMG Chile — Septiembre 2026 — Lyrics", status: "completed", registered_count: 39, updated_at: days(20), pipeline: { counts: { delivered: 39 } } },
-      { id: "rb", name: "UMG Agosto 2026 — Rata Blanca — Magos, Espadas y Rosas", status: "completed", kind: "art_track", registered_count: 9, updated_at: days(7), pipeline: { counts: { delivered: 9 } } },
-      { id: "git", name: "UMG Agosto 2026 — GIT — Vol 1", status: "completed", kind: "art_track", registered_count: 9, updated_at: days(7), pipeline: { counts: { delivered: 9 } } },
-      { id: "e1", name: "UMG Agosto 2026 — Etapa 1 — 300", status: "active", registered_count: 300, updated_at: days(14),
-        pipeline: { counts: { delivered: 300 }, flags: { change_requests_open: 5, oldest_change_request_at: days(1) } } },
-      { id: "qa", name: "QA 1.1.17 — Reabrir transcripción aprobada", status: "cancelled", registered_count: 2, updated_at: days(16), pipeline: { counts: { lyrics: 2 } } },
-      { id: "solo", name: "Prueba suelta", status: "completed", registered_count: 1, updated_at: days(3), pipeline: { counts: { delivered: 1 } } },
+      { id: "a", name: "UMG Agosto", status: "completed", registered_count: 10,
+        pipeline: { portal_status_available: true, counts: { delivered: 10 }, flags: { change_requests_open: 3, oldest_change_request_at: oldest } } },
+      { id: "b", name: "Sin pedidos", status: "active", pipeline: { portal_status_available: true, counts: { lyrics: 1 } } },
     ] })));
     render(<MemoryRouter initialEntries={["/campaigns"]}><Location /><Routes><Route path="/campaigns" element={<CampaignsPage />} /><Route path="/campaigns/:campaignId" element={<p>Detalle</p>} /></Routes></MemoryRouter>);
-    const todo = await screen.findByRole("region", { name: /Para hacer/ });
-    // Client change requests outrank lyrics to review; cancelled work never asks for attention.
-    expect(within(todo).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual([
-      "UMG Agosto 2026 — Etapa 1 — 300 · Activa", "UMG Chile — Octubre 2026 — Lyrics · Activa",
-    ]);
-    const index = screen.getByRole("region", { name: /por lote/ });
-    const lots = within(index).getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent.replace(/^▶/, "").split(" · ")[0]);
-    expect(lots).toEqual(["UMG Chile2 campañas", "UMG Agosto 20263 campañas", "Otras campañas1 campaña", "Canceladas1 campaña"]);
-    // Lots with live work are open and show the name without the lot prefix.
-    const agosto = within(index).getByRole("button", { name: /^UMG Agosto 2026/, expanded: true });
-    expect(agosto).toHaveTextContent("1 con pendientes");
-    expect(within(index).getByRole("button", { name: /^UMG Chile/, expanded: true })).toHaveTextContent("67 canciones · 93% terminadas");
-    expect(within(index).getByRole("button", { name: /Rata Blanca — Magos/ })).toHaveTextContent(/^Rata Blanca — Magos, Espadas y Rosas/);
-    // A prefix used once is not a lot; cancelled campaigns wait collapsed at the end.
-    expect(within(index).getByRole("button", { name: /^Otras campañas/, expanded: false })).toHaveTextContent("1 campaña");
-    const cancelled = within(index).getByRole("button", { name: /^Canceladas/, expanded: false });
-    expect(within(index).queryByRole("button", { name: /QA 1.1.17/ })).not.toBeInTheDocument();
-    fireEvent.click(cancelled);
-    expect(within(index).getByRole("button", { name: /QA 1.1.17/ })).not.toHaveTextContent("Revisar");
-    // Searching opens every matching lot.
-    fireEvent.change(screen.getByLabelText("Buscar campañas"), { target: { value: "suelta" } });
-    fireEvent.click(await within(screen.getByRole("region", { name: /por lote/ })).findByRole("button", { name: /Prueba suelta/ }));
-    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/solo");
+    await screen.findByText("UMG Agosto");
+    fireEvent.click(screen.getByRole("button", { name: /Necesitan atención/ }));
+    expect(screen.getByRole("region", { name: "Lista de campañas" })).toHaveTextContent("3 cambios pedidos por el cliente");
+    expect(screen.getByText("Pedido más antiguo: hace 2 días")).toBeInTheDocument();
+    expect(screen.queryByText("Sin pedidos")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Revisar cambios/ }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/a?view=changes&order=calendar");
+  });
+
+  it("shows ongoing campaigns by default, finished ones in their view, and cancelled ones when searched", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ items: [
+      { id: "oct", name: "Octubre", status: "active", pipeline: { portal_status_available: true, counts: { lyrics: 5, delivered: 23 } } },
+      { id: "sep", name: "Septiembre", status: "completed", pipeline: { portal_status_available: true, counts: { delivered: 39 } } },
+      { id: "qa", name: "QA cancelada", status: "cancelled", pipeline: { counts: { lyrics: 2 } } },
+    ] })));
+    render(<MemoryRouter initialEntries={["/campaigns"]}><Location /><Routes><Route path="/campaigns" element={<CampaignsPage />} /><Route path="/campaigns/:campaignId" element={<p>Detalle</p>} /></Routes></MemoryRouter>);
+    await screen.findByText("Octubre");
+    expect(screen.queryByText("Septiembre")).not.toBeInTheDocument();
+    expect(screen.queryByText("QA cancelada")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Finalizadas/ }));
+    expect(screen.getByText("Septiembre")).toBeInTheDocument();
+    expect(screen.queryByText("Octubre")).not.toBeInTheDocument();
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Progreso de campañas" })).getByRole("button", { name: /Todas/ }));
+    fireEvent.change(screen.getByLabelText("Buscar campañas"), { target: { value: "QA" } });
+    fireEvent.click(screen.getByRole("button", { name: "QA cancelada" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/qa");
   });
 
   it("creates a campaign, saves a visual base style and offers the browser uploader", async () => {
