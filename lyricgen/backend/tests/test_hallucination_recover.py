@@ -11,6 +11,7 @@ the timestamps in the editor before approving the render.
 """
 
 from unittest.mock import patch, MagicMock
+import pytest
 
 from pipeline import (
     _align_whisper_to_plain,
@@ -708,6 +709,17 @@ def test_collapse_normalizes_text_when_comparing():
 
 
 # ----- _is_whisper_hallucination (Amara.org credits) ----------------------
+
+@pytest.mark.parametrize("text", [
+    "Субтитры сделал DimaTorzok",
+    " СУБТИТРЫ  СОЗДАВАЛ DimaTorzok ",
+])
+def test_cyrillic_subtitle_credits_do_not_survive_ascii_fold(text):
+    assert _is_whisper_hallucination(text)
+
+
+def test_cyrillic_lyrics_are_not_subtitle_credits():
+    assert not _is_whisper_hallucination("Путешествие в сердце, путешествие в центре солнца")
 #
 # Regression: "Lamento Boliviano — Enanitos Verdes" (2026-06-01). Whisper
 # transcribed the training-data credit WITHOUT the dot ("…comunidad de

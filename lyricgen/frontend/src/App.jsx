@@ -2,6 +2,7 @@ import { reviewCreativeSettings } from "./lib/campaignCreative";
 import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
+import { pollReanchorTask } from "./lib/reanchorTask";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
 import { clearCampaignResourceCache } from "./hooks/useCampaignResource";
@@ -1793,42 +1794,6 @@ function VariantWizardRoute({
   }
   return wizardScreen;
 }
-
-// Sondeo del modo tarea del re-anclado (ver reanchorSegmentsOnBackend).
-const REANCHOR_TASK_POLL_MS = 3000;
-const REANCHOR_TASK_TIMEOUT_MS = 12 * 60 * 1000;
-const pollReanchorTask = async (jobId, taskId, onProgress) => {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < REANCHOR_TASK_TIMEOUT_MS) {
-    await new Promise((resolve) => setTimeout(resolve, REANCHOR_TASK_POLL_MS));
-    const elapsedS = Math.round((Date.now() - startedAt) / 1000);
-    if (typeof onProgress === "function") {
-      try { onProgress({ elapsedS, taskId }); } catch { /* progress is best-effort */ }
-    }
-    let res;
-    try {
-      res = await authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, { cache: "no-store" });
-    } catch (err) {
-      console.warn("[reanchor] task poll network error", err);
-      continue; // transient: keep polling until the deadline
-    }
-    if (res.status === 404) {
-      console.warn("[reanchor] task registry lost", taskId);
-      return { ok: false, reason: "task-lost" };
-    }
-    if (!res.ok) continue;
-    let record = null;
-    try { record = await res.json(); } catch { continue; }
-    if (record?.status !== "done") continue;
-    const httpStatus = Number(record.http_status);
-    const payload = record.payload || {};
-    if (httpStatus >= 200 && httpStatus < 300) return payload;
-    console.warn("[reanchor] task failed", httpStatus, payload?.detail || payload?.code || "");
-    return reanchorHttpFailure(httpStatus, payload, { terminal: true });
-  }
-  console.warn("[reanchor] task poll timed out", taskId);
-  return { ok: false, reason: "task-lost" };
-};
 
 export default function App() {
   const { t } = useI18n();
@@ -3820,10 +3785,9 @@ export default function App() {
   // Pedimos async_mode: el backend contesta 202 {task_id} al instante y acá
   // sondeamos GET /reanchor/tasks/{task_id} hasta que termine, devolviendo
   // EXACTAMENTE la misma forma que el camino síncrono (LyricsEditor no
-  // cambia). Si el registro se perdió (404: réplica reemplazada) o el
-  // sondeo vence, devolvemos reason "task-lost" y el editor cae en su
-  // reconciliación por revisión. Un backend viejo responde 200/4xx directo
-  // y sigue el manejo síncrono de siempre.
+  // cambia). Conservamos task_id durante toda la espera: una revisión nueva
+  // de autosave no demuestra que esta tarea terminó. Un backend viejo responde
+  // 200/4xx directo y sigue el manejo síncrono de siempre.
   const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
     const { onProgress, ...requestExtra } = extra || {};
@@ -3838,7 +3802,10 @@ export default function App() {
         try { started = await res.clone().json(); } catch { /* non-JSON body */ }
         const taskId = started?.task_id;
         if (!taskId) return { ok: false, reason: "task-lost" };
-        return await pollReanchorTask(jobId, taskId, onProgress);
+        return await pollReanchorTask({
+          taskId, onProgress,
+          request: (options) => authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, options),
+        });
       }
       if (!res.ok) {
         let detail = "";

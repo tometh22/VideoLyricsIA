@@ -2983,6 +2983,10 @@ def _is_whisper_hallucination(text: str) -> bool:
     if not text:
         return False
     raw = " ".join(text.lower().split())
+    # Check subtitle credits before the ASCII fold discards Cyrillic. These
+    # are attribution phrases, not a blanket rejection of Russian lyrics.
+    if any(credit in raw for credit in ("субтитры сделал", "субтитры создавал")):
+        return True
     for needle in _WHISPER_HALLUCINATION_LITERALS:
         if needle in raw:
             return True

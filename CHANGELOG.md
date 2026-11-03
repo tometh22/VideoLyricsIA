@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.154] - 2026-11-03
+
+### Fixed
+
+- Detect the language independently for each vocal section during automatic
+  WhisperX transcription. A quiet or instrumental intro no longer assigns one
+  uncertain language to the entire song. Retry uncertain sections with an
+  independent recognizer under a shared deadline, retain recognition evidence,
+  and preserve absolute timestamps and mixed-language lyrics.
+- Decline Spanish-only CTC alignment for mixed-language text, and keep re-sync
+  polling attached to the original task until completion or its bounded timeout.
+  Failed re-sync attempts preserve the operator's pasted lyrics.
+
 ## [1.1.152] - 2026-11-02
 
 ### Security
