@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.156] - 2026-11-03
+## [1.1.157] - 2026-11-03
 
 ### Changed
 - Release editor row locks before returning stale-revision conflicts, preventing concurrent saves from blocking the API.
@@ -8,6 +8,16 @@
 - Promote the audited staging release to production, including campaign batch designs, lyric looks, delivery planning and operator activity.
 - Join production and staging migration histories with a no-op merge revision; retain existing production delivery product snapshots.
 - Preserve the updated audio dependencies and empty security exception list.
+
+## [1.1.156] - 2026-11-03
+
+### Fixed
+
+- Allow explicitly granted campaign reviewers to confirm reviewed lyrics and
+  quality windows across team boundaries, matching their existing editor
+  access. The confirmation buttons no longer return a hidden 404 for shared
+  campaigns. Revision/content binding, audit attribution and revoked-grant
+  isolation remain enforced; confirmation does not approve or change lyrics.
 
 ## [1.1.155] - 2026-11-03
 

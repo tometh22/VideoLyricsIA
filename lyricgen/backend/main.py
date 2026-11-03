@@ -16361,8 +16361,10 @@ async def resolve_language_review(
     """
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
     is_platform_admin = _is_platform_admin_user(current_user)
+    # Match the editor's explicit campaign-review grant. A shared reviewer
+    # must be able to attest the saved revision they are allowed to edit.
     if (not job or (not is_platform_admin
-                    and job.tenant_id != current_user["tenant_id"])):
+                    and not can_review_campaign_job(db, job, current_user))):
         raise HTTPException(status_code=404, detail="Job not found.")
     current_revision = int(job.segments_revision or 0)
     if body.base_revision != current_revision:
@@ -16420,8 +16422,10 @@ async def acknowledge_transcription_quality(
     """Persist an explicit, revision+content-scoped operator decision."""
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
     is_platform_admin = _is_platform_admin_user(current_user)
+    # Match the editor's explicit campaign-review grant. A shared reviewer
+    # must be able to attest the saved revision they are allowed to edit.
     if (not job or (not is_platform_admin
-                    and job.tenant_id != current_user["tenant_id"])):
+                    and not can_review_campaign_job(db, job, current_user))):
         raise HTTPException(status_code=404, detail="Job not found.")
     current_revision = int(job.segments_revision or 0)
     from transcription_quality import effective_policy_mode
