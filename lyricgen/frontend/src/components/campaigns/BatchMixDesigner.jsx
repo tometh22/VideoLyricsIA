@@ -83,6 +83,8 @@ export function BatchMixDesigner({ campaignId, creative, itemIds, onSaved, onBus
   const count = eligible.length - (replace ? 0 : fixed.length);
   const photoCount = Math.floor((count * photoPercent + 50) / 100);
   const readyCount = preview?.ready_item_ids?.length || 0;
+  const readyIds = new Set(preview?.ready_item_ids || []);
+  const readyPhotos = preview?.changes.filter((change) => readyIds.has(change.item_id) && change.after.movement_style === "foto-parallax").length || 0;
   const disabled = !count || !looks.length || (photoCount > 0 && !effects.length);
   const selectionKey = [...itemIds].sort().join(",");
   useEffect(() => { setPreview(null); setSaved(""); setStep(1); }, [selectionKey, creative.plan.revision]);
@@ -163,7 +165,10 @@ export function BatchMixDesigner({ campaignId, creative, itemIds, onSaved, onBus
       <p className="text-lg"><strong>{preview.mix.photo_effect}</strong> foto + efecto <span className="mx-2 text-ink-secondary">+</span><strong>{preview.mix.veo}</strong> video = <strong>{preview.mix.total} canciones</strong></p>
       <div className="grid gap-4 sm:grid-cols-2"><div><h4 className="mb-2 font-semibold">Looks</h4>{Object.entries(preview.mix.looks).map(([look, n]) => <p key={look} className="flex justify-between gap-4 text-sm"><span>{lookLabels[look] || look}</span><strong>{n}</strong></p>)}</div><div><h4 className="mb-2 font-semibold">Efectos en las fotos</h4>{Object.entries(preview.mix.effects).map(([effect, n]) => <p key={effect} className="flex justify-between gap-4 text-sm"><span>{effectLabels[effect] || effect}</span><strong>{n}</strong></p>)}{!preview.mix.photo_effect && <p className="text-sm text-ink-secondary">Este lote no incluye fotos.</p>}</div></div>
       {preview.skipped.length > 0 && <p className="text-sm text-amber-200">{preview.skipped.length} diseños fijados quedan fuera de este reparto y de la generación.</p>}
-      {readyCount < preview.mix.total && <p className="text-sm text-amber-200">{readyCount} listas para generar. Las otras {preview.mix.total - readyCount} conservarán el diseño y necesitan terminar la revisión de letra y timing.</p>}
+      {readyCount < preview.mix.total && <div className="space-y-1 rounded-xl bg-amber-400/10 p-3 text-sm text-amber-200">
+        <p>{readyCount} listas para generar. Las otras {preview.mix.total - readyCount} conservarán el diseño y necesitan terminar la revisión de letra y timing.</p>
+        <p>Se enviarán ahora: <strong>{readyPhotos} foto + efecto y {readyCount - readyPhotos} video.</strong> El reparto total se completa cuando generes las canciones restantes.</p>
+      </div>}
       <details><summary className="cursor-pointer text-sm text-brand-light">Ver diseño por canción</summary><ul className="mt-2 max-h-64 space-y-2 overflow-auto text-sm">{preview.changes.map((c) => <li key={c.item_id} className="border-b border-white/5 pb-2"><strong>{c.artist} · {c.title}</strong><span className="block text-ink-secondary">{lookLabels[c.after.lyric_look] || c.after.lyric_look} · {c.after.movement_style === "foto-parallax" ? `Foto + ${effectLabels[c.after.effect] || c.after.effect}` : "Video · Veo Lite"}</span></li>)}</ul></details>
       <BatchAccountBalance campaignId={campaignId} creative={creative} changes={preview.changes} disabled={busy} />
       <p className="text-xs text-ink-secondary">Los fondos se inspiran en cada letra. Generar consume el cupo y los recursos correspondientes. La cola puede enviar una parte y dejar el resto pendiente si alcanza su límite.</p>

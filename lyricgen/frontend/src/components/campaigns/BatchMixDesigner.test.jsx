@@ -114,6 +114,7 @@ it("does not include pinned or unready songs in the confirmed generation", async
   campaignPost.mockImplementation(async (path) => path.endsWith("mix-preview") ? { ...response(), skipped: ["i49"], ready_item_ids: ["i0", "i1"], mix: { ...response().mix, total: 49 } } : { revision: 5 });
   reviewBatch();
   await screen.findByText(/2 listas para generar/);
+  expect(screen.getByText("2 foto + efecto y 0 video.")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Generar 2 videos" }));
   await waitFor(() => expect(prepare).toHaveBeenCalledWith({ startImmediately: true, itemIds: ["i0", "i1"], expectedRevision: 5 }));
 });
