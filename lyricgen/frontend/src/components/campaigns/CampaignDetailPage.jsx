@@ -20,7 +20,7 @@ import PriorityReview, { RICARDO_PRIORITY, RICARDO_PRIORITY_CAMPAIGN } from "./P
 import ClientChangesInbox from "./ClientChangesInbox";
 import SongDrawer from "./SongDrawer";
 import SongTable from "./SongTable";
-import StyleAssignment from "./StyleAssignment";
+import StyleAssignment from "./BatchMixDesigner";
 import VideoReviewPlayer from "./VideoReviewPlayer";
 import {
   CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canDiscard, canGenerate, canSend, classificationCounts, filterSongs, isApprovedStage, nextLyricSong, primaryAction, sortSongs,
@@ -531,17 +531,20 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: result.failed.length ? "warning" : "success", text: `${result.done} ${result.done === 1 ? "canción" : "canciones"} ${dialog.mode === "restore" ? "recuperada" : "descartada"}${result.done === 1 ? "" : "s"}.` });
       void refresh();
     }} />}
-    {styleTargets && <Modal label="Elegir fondo" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
+    {styleTargets && <Modal label="Preparar lote" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
       <div className="mb-5 flex items-start justify-between gap-3">
-        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Fondo del video</p>
-          <h2 className="mt-1 text-xl font-semibold">Elegir fondo para {styleTargets.length} {styleTargets.length === 1 ? "video" : "videos"}</h2>
-          <p className="mt-1 text-sm text-ink-secondary">Elegí cómo querés verlos. Después revisás el resumen y generás.</p></div>
+        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Producción por lote</p>
+          <h2 className="mt-1 text-xl font-semibold">Preparar {styleTargets.length} {styleTargets.length === 1 ? "video" : "videos"}</h2>
+          <p className="mt-1 text-sm text-ink-secondary">Elegí looks, fondos y efectos. Revisá las cantidades y generá el lote.</p></div>
         <Button variant="ghost" size="sm" disabled={styleBusy} onClick={() => setStyleTargets(null)} aria-label="Cerrar">✕</Button>
       </div>
       {creative.data ? creative.data.can_manage
-        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onBusyChange={setStyleBusy} onSaved={async () => { await refresh(); }} onPrepareGeneration={async ({ startImmediately = false } = {}) => {
+        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onBusyChange={setStyleBusy} onSaved={async () => { await refresh(); }} onPrepareGeneration={async ({ startImmediately = false, itemIds: confirmedIds, expectedRevision } = {}) => {
           const fresh = await campaignRequest(`${base}/creative`);
-          const items = fresh.items.filter(item => styleTargets.includes(item.id) && item.status === "lyrics_approved" && !item.discarded);
+          if (expectedRevision != null && fresh.plan.revision !== expectedRevision) throw new Error("El diseño cambió después de confirmarlo. Volvé a revisar el lote antes de generar.");
+          const targetIds = confirmedIds || styleTargets;
+          const items = fresh.items.filter(item => targetIds.includes(item.id) && item.status === "lyrics_approved" && !item.discarded);
+          if (confirmedIds && (items.length !== confirmedIds.length || items.some(item => item.assignment?.revision !== expectedRevision))) throw new Error("Cambió el estado de una canción. Volvé a revisar el lote antes de generar.");
           if (!items.length) throw new Error("El diseño quedó guardado, pero estas canciones ya no están listas para generar. Revisá su estado actualizado.");
           setStyleBusy(false); setStyleTargets(null); setDialog({ type: "generate", items, startImmediately });
         }} />

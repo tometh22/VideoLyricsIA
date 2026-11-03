@@ -10,14 +10,14 @@ export default function BulkActionBar({ songs, kind, canManage, portalSends = tr
   const discard = songs.filter(canDiscard);
   const restore = songs.filter((song) => song.stage === "discarded");
   const retry = canManage ? songs.filter((song) => song.stage === "attention" || (song.stage === "audio" && song.upload_state === "error")) : [];
-  const style = canManage && kind !== "art_track" ? songs.filter((song) => song.stage !== "discarded") : [];
+  const style = canManage && kind !== "art_track" ? songs.filter((song) => ["audio", "lyrics", "ready"].includes(song.stage)) : [];
   return <div role="region" aria-label="Acciones sobre la selección"
     className="fixed inset-x-3 bottom-4 z-[70] mx-auto flex max-w-4xl flex-wrap items-center gap-2 rounded-2xl bg-surface-3/95 px-4 py-3 shadow-depth-lg ring-1 ring-white/15 backdrop-blur md:inset-x-6">
     <span className="mr-1 text-sm" aria-live="polite"><strong className="tabular-nums">{songs.length}</strong> {songs.length === 1 ? "seleccionada" : "seleccionadas"}
       {hiddenCount > 0 && <span className="block text-xs text-amber-200">{hiddenCount} fuera del filtro actual</span>}</span>
     <Button size="sm" variant="ghost" onClick={onClear}>Limpiar <Kbd className="hidden sm:inline-flex">Esc</Kbd></Button>
     <div className="ml-auto flex flex-wrap items-center gap-2">
-      {style.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("style", style)}>Elegir fondo</Button>}
+      {style.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("style", style)}>Preparar lote ({style.length})</Button>}
       {retry.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("retry", retry)}>Reintentar {retry.length}</Button>}
       {restore.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("restore", restore)}>Recuperar {restore.length}</Button>}
       {discard.length > 0 && <Button size="sm" variant="danger" onClick={() => onAction("discard", discard)}>Descartar {discard.length}</Button>}

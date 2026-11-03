@@ -1,3 +1,4 @@
+import OperatorActivity from "../OperatorActivity";
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource from "../../hooks/useCampaignResource";
@@ -156,6 +157,7 @@ export default function CampaignListPage() {
 
     {list.data?.can_view_accounts && <nav aria-label="Campañas y cuentas" className="flex gap-2">{[["campaigns", "Campañas"], ["accounts", "Cuentas · Plan de entrega"]].map(([value, label]) => <Button key={value} disabled={planBusy} variant={(params.get("view") || "campaigns") === value ? "primary" : "ghost"} onClick={() => setParam("view", value, false)}>{label}</Button>)}</nav>}
     {list.data?.can_view_accounts && params.get("view") === "accounts" ? <DeliveryPlan onBusyChange={setPlanBusy} /> : <>
+    <OperatorActivity />
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       {[["Campañas activas", totals.active], ["Letras por revisar", totals.lyrics], ["Videos por revisar", totals.qc], ["Terminadas", totals.delivered]].map(([label, value]) =>
         <div key={label} className="rounded-card bg-surface-2/40 p-4 ring-1 ring-white/[0.06]">
