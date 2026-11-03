@@ -20,16 +20,16 @@ afterEach(cleanup);
 const show = (props = {}) => render(<BulkPrompts campaignId="c1" creative={creative} itemIds={["second", "first"]} {...props} />);
 const distribute = () => {
   fireEvent.change(screen.getByLabelText("Dirección visual común"), { target: { value: "Rock, luz y ciudad" } });
-  fireEvent.change(screen.getByLabelText("Lista de escenas"), { target: { value: "Avenida nocturna\nTerraza al amanecer" } });
-  fireEvent.click(screen.getByRole("button", { name: "Repartir escenas" }));
+  fireEvent.change(screen.getByLabelText("Lista de fondos"), { target: { value: "Avenida nocturna\nTerraza al amanecer" } });
+  fireEvent.click(screen.getByRole("button", { name: "Repartir fondos" }));
 };
 describe("bulk prompt editing", () => {
   it("maps scenes in calendar order and only applies the frozen preview after confirmation", async () => {
     const saved = vi.fn(); show({ onSaved: saved });
     expect(screen.getByRole("button", { name: "Revisar 2 prompts" })).toBeDisabled();
     distribute();
-    expect(screen.getByLabelText("Escena para Buscando Lio")).toHaveValue("Avenida nocturna");
-    expect(screen.getByLabelText("Escena para Vean")).toHaveValue("Terraza al amanecer");
+    expect(screen.getByLabelText("Fondo para Buscando Lio")).toHaveValue("Avenida nocturna");
+    expect(screen.getByLabelText("Fondo para Vean")).toHaveValue("Terraza al amanecer");
     expect(campaignPost).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Revisar 2 prompts" }));
     await screen.findByRole("button", { name: "Guardar 2 prompts" });
@@ -46,18 +46,18 @@ describe("bulk prompt editing", () => {
     show(); distribute();
     fireEvent.click(screen.getByRole("button", { name: "Revisar 2 prompts" }));
     await screen.findByRole("button", { name: "Guardar 2 prompts" });
-    fireEvent.change(screen.getByLabelText("Escena para Vean"), { target: { value: "Avenida nocturna" } });
+    fireEvent.change(screen.getByLabelText("Fondo para Vean"), { target: { value: "Avenida nocturna" } });
     expect(screen.queryByRole("button", { name: "Guardar 2 prompts" })).not.toBeInTheDocument();
     expect(screen.getByText(/Hay 1 prompt repetido/)).toBeInTheDocument();
   });
   it("requires an exact scene count and retains pinned designs unless explicitly included", () => {
     show({ creative: { ...creative, items: items.map(item => ({ ...item, assignment: { pinned: item.id === "first" } })) } });
-    expect(screen.queryByLabelText("Escena para Buscando Lio")).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Lista de escenas"), { target: { value: "Una escena\nOtra escena" } });
-    expect(screen.getByRole("button", { name: "Repartir escenas" })).toBeDisabled();
+    expect(screen.queryByLabelText("Fondo para Buscando Lio")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Lista de fondos"), { target: { value: "Una escena\nOtra escena" } });
+    expect(screen.getByRole("button", { name: "Repartir fondos" })).toBeDisabled();
     fireEvent.click(screen.getByRole("checkbox", { name: /También cambiar/ }));
-    expect(screen.getByLabelText("Escena para Buscando Lio")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Repartir escenas" })).toBeEnabled();
+    expect(screen.getByLabelText("Fondo para Buscando Lio")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Repartir fondos" })).toBeEnabled();
   });
   it("does not claim a save when the server rejects a stale preview", async () => {
     const saved = vi.fn(); show({ onSaved: saved }); distribute();

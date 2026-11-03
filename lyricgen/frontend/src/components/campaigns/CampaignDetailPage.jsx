@@ -537,7 +537,7 @@ export default function CampaignDetailPage({ id }) {
       void refresh();
     }} />}
     {promptTargets && <Modal label="Editar prompts en lote" busy={promptBusy} onClose={() => setPromptTargets(null)} width="max-w-4xl">
-      <div className="mb-5 flex items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Editar prompts · {promptTargets.length} canciones</h2><p className="mt-1 text-sm text-ink-secondary">Un mismo criterio visual, escenas diferentes.</p></div><Button size="sm" variant="ghost" disabled={promptBusy} onClick={() => setPromptTargets(null)} aria-label="Cerrar">✕</Button></div>
+      <div className="mb-5 flex items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Editar prompts · {promptTargets.length} canciones</h2><p className="mt-1 text-sm text-ink-secondary">Un mismo criterio visual, un fondo distinto por canción.</p></div><Button size="sm" variant="ghost" disabled={promptBusy} onClick={() => setPromptTargets(null)} aria-label="Cerrar">✕</Button></div>
       {creative.data?.can_manage ? <BulkPrompts campaignId={id} creative={creative.data} itemIds={promptTargets} onBusyChange={setPromptBusy} onSaved={refresh} /> : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar los prompts.</p>}
     </Modal>}
     {styleTargets && <Modal label="Preparar lote" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">

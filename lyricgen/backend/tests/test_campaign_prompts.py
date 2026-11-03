@@ -22,10 +22,11 @@ def test_prompts_keep_their_song_and_preserve_design_sources_pins_and_job_status
     original = {}
     for n, item in enumerate(selected):
         item.render_overrides = {**item.render_overrides, 'font': 'poppins-bold', 'font_scale': 1.4,
-            'movement_style': 'foto-parallax', 'effect': 'bokeh', 'lyrics_animation': 'pop',
+            'movement_style': 'foto-parallax', 'effect': ['bokeh', 'rain'][n % 2], 'lyrics_animation': 'pop',
+            'animate_image': False, 'enable_scenes': False,
             creative.ASSIGNMENT: {'group_id': 'photos', 'group_name': 'Fotos', 'requirement': 'photo_effect', 'model': '', 'pinned': n == 4, 'revision': 0}}
         original[item.id] = copy.deepcopy(item.render_overrides)
-        db.add(Job(job_id=f'prompt-{n:08d}', campaign_id=campaign.id, campaign_item_id=item.id,
+        db.add(Job(job_id=f'prompt{n:06d}', campaign_id=campaign.id, campaign_item_id=item.id,
             tenant_id=campaign.tenant_id, user_id=actor['id'], artist='Rescate', filename=item.filename,
             status='lyrics_approved', workload_class='batch'))
     db.commit()
@@ -46,7 +47,7 @@ def test_prompts_keep_their_song_and_preserve_design_sources_pins_and_job_status
         assert item.render_overrides['background_hint'] == expected[item.id]
         assert item.render_overrides['match_lyrics'] is False
         assert item.render_overrides['bg_verbatim'] is False
-        for key in ['font', 'font_scale', 'movement_style', 'effect', 'lyrics_animation', 'source_reference']:
+        for key in ['font', 'font_scale', 'movement_style', 'effect', 'lyrics_animation', 'source_reference', 'animate_image', 'enable_scenes']:
             assert item.render_overrides[key] == original[item.id][key]
         assert item.render_overrides[creative.ASSIGNMENT]['requirement'] == 'photo_effect'
     assert db.query(Job).filter_by(campaign_id=campaign.id, status='lyrics_approved').count() == 11
@@ -92,8 +93,8 @@ def test_invalid_or_unsafe_prompt_selection_is_rejected(db, setup, case):
     if case == 'empty': body.common = ' '; body.songs[0].scene = '\n'
     if case == 'long': body.common = 'a' * 3000; body.songs[0].scene = 'b' * 2000
     if case == 'generated':
-        db.add(Job(job_id='already-rendering', campaign_id=campaign.id, campaign_item_id=items[0].id,
-            tenant_id=campaign.tenant_id, user_id=actor['id'], artist='Rescate', filename=items[0].filename, status='rendering'))
+        db.add(Job(job_id='rendering001', campaign_id=campaign.id, campaign_item_id=items[0].id,
+            tenant_id=campaign.tenant_id, user_id=actor['id'], artist='Rescate', filename=items[0].filename, status='rendering', workload_class='batch'))
     if case == 'pinned': items[0].render_overrides = {creative.ASSIGNMENT: {'pinned': True}}
     if case == 'revision': body.revision = 1
     if case == 'actor': actor = {**actor, 'role': 'user', 'tenant_id': 'another-tenant'}

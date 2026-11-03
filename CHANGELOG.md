@@ -5,10 +5,11 @@
 ### Added
 
 - Edit background prompts for selected campaign songs with a shared direction,
-  individual scenes and calendar-order distribution. Review the complete prompts
+  individual backgrounds and calendar-order distribution. Review the complete prompts
   before saving; preserve typography, motion, effects, source assignments and
   pinned designs. Reuse revision checks, audit history and undo without starting
-  generation. Detect repeated prompts and reject mismatched scene counts.
+  generation or enabling multi-scene mode. Fixed-photo songs keep their assigned
+  overlay effects. Detect repeated prompts and reject mismatched description counts.
 
 ## [1.1.158] - 2026-11-03
 
