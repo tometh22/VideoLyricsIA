@@ -17,6 +17,7 @@ def request(items, **kwargs):
 
 def test_prompts_keep_their_song_and_preserve_design_sources_pins_and_job_status(db, setup):
     campaign, items, actor = setup
+    before_generations = db.query(AuditLog).filter_by(action="campaign.creative.generation").count()
     selected = items[:11]
     original = {}
     for n, item in enumerate(selected):
@@ -30,6 +31,7 @@ def test_prompts_keep_their_song_and_preserve_design_sources_pins_and_job_status
     db.commit()
     result = creative.preview_prompts(campaign.id, request(list(reversed(selected))), actor, db)
     assert len(result['changes']) == 10 and result['skipped'] == [selected[4].id]
+    assert [c['item_id'] for c in result['changes']] == [i.id for i in selected if i != selected[4]]
     for item in selected:
         db.refresh(item)
         assert item.render_overrides == original[item.id]  # preview never applies
@@ -48,7 +50,7 @@ def test_prompts_keep_their_song_and_preserve_design_sources_pins_and_job_status
             assert item.render_overrides[key] == original[item.id][key]
         assert item.render_overrides[creative.ASSIGNMENT]['requirement'] == 'photo_effect'
     assert db.query(Job).filter_by(campaign_id=campaign.id, status='lyrics_approved').count() == 11
-    assert not db.query(AuditLog).filter_by(action='campaign.creative.generation').count()
+    assert db.query(AuditLog).filter_by(action='campaign.creative.generation').count() == before_generations
 
 
 def test_literal_prompts_replace_pinned_background_and_are_undoable(db, setup):

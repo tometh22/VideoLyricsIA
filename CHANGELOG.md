@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.159] - 2026-11-03
+
+### Added
+
+- Edit background prompts for selected campaign songs with a shared direction,
+  individual scenes and calendar-order distribution. Review the complete prompts
+  before saving; preserve typography, motion, effects, source assignments and
+  pinned designs. Reuse revision checks, audit history and undo without starting
+  generation. Detect repeated prompts and reject mismatched scene counts.
+
 ## [1.1.158] - 2026-11-03
 
 ### Changed

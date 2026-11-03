@@ -426,9 +426,12 @@ def preview_prompts(campaign_id: str, body: PromptRequest, current_user=Depends(
         groups.append(Group(id="prompt-" + digest(item.id)[:20], name=("Prompt · " + (item.title or item.filename))[:100],
             weight=1, requirement="creative", settings={"scene_source": body.source, "background_hint": prompt,
                 "background_id": None, "background_mode": "as_is"}))
-    return preview(campaign_id, PlanRequest(revision=body.revision, item_ids=list(by_id), groups=groups,
+    result = preview(campaign_id, PlanRequest(revision=body.revision, item_ids=list(by_id), groups=groups,
         mode="count", seed=seed, replace_exceptions=body.replace_exceptions, preserve_existing_pins=True,
         reason="Edición de prompts de fondo en lote"), current_user, db)
+    positions = {item.id: (item.ordinal, item.id) for item in selected}
+    result["changes"].sort(key=lambda change: positions[change["item_id"]])
+    return result
 
 
 @router.post("/{campaign_id}/creative/apply")
