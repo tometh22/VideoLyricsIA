@@ -14,7 +14,7 @@ for (const width of [1440, 390]) {
     await page.getByRole("checkbox", { name: width < 768 ? "Seleccionar todas (10)" : "Seleccionar 10 canciones" }).check();
     await page.getByRole("region", { name: "Acciones sobre la selección" }).getByRole("button", { name: "Generar 10 videos" }).click();
     await page.getByRole("dialog", { name: "Confirmar generación" }).getByRole("button", { name: "Cambiar fondo" }).click();
-    const assignment = page.getByRole("dialog", { name: "Elegir fondo" });
+    const assignment = page.getByRole("dialog", { name: "Preparar lote" });
     await assignment.getByRole("button", { name: /Foto fija/ }).click();
     await assignment.getByRole("button", { name: "Mitad y mitad" }).click();
     await expect(assignment.getByLabel("Efecto de foto del grupo 1")).not.toBeVisible();

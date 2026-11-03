@@ -188,9 +188,10 @@ class PlanRequest(Strict):
     revision: int = Field(ge=0)
     item_ids: list[str] = Field(min_length=1, max_length=1000)
     mode: Literal["percent", "count"] = "percent"
-    groups: list[Group] = Field(min_length=1, max_length=30)
+    groups: list[Group] = Field(min_length=1, max_length=512)
     seed: str = Field(default="campaign", min_length=1, max_length=100)
     replace_exceptions: bool = False
+    preserve_existing_pins: bool = False
     pin: bool = False
     contract: bool = False
     reason: str = Field(min_length=3, max_length=1000)
@@ -304,7 +305,11 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
         {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
         for group in plan.get("groups", [])
     ]}
+    from campaign_mix import catalog as mix_catalog
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
+            "mix_catalog": mix_catalog(), "portal_id": campaign.destination_portal,
+            "delivery_plan_period": (campaign.default_render_params or {}).get("delivery_plan_period", ""),
+            "can_view_account_balance": current_user.get("role") == "admin",
             "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
             "veo_model": VEO_LITE,
             "veo_models": veo_models(),
@@ -358,7 +363,7 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             effective = effective_settings(campaign, {**before, **patch})
             validate_combination(db, campaign, effective, group, current_user)
             assignment = {"group_id": group.id, "group_name": group.name, "requirement": group.requirement,
-                          "model": group.model, "pinned": body.pin, "revision": body.revision + 1}
+                          "model": group.model, "pinned": body.pin or bool(body.preserve_existing_pins and before.get(ASSIGNMENT, {}).get("pinned")), "revision": body.revision + 1}
             if group.requirement == "creative" and not body.contract and before.get(ASSIGNMENT):
                 assignment = {**before[ASSIGNMENT], "revision": body.revision + 1,
                               "pinned": body.pin or before[ASSIGNMENT].get("pinned", False), "preset_name": group.name}

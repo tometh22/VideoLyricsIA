@@ -681,6 +681,8 @@ app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
 from campaign_creative import router as campaign_creative_router
 app.include_router(campaign_creative_router)
+from campaign_mix import router as campaign_mix_router
+app.include_router(campaign_mix_router)
 from delivery_plan import router as delivery_plan_router
 app.include_router(delivery_plan_router)
 from operator_activity import router as operator_activity_router
