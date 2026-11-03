@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.153] - 2026-11-03
+
+### Added
+
+- Personal campaign production on Home and Campaigns, with Today/Yesterday,
+  an Argentina-time date selector, campaign breakdown and song list. Attribute
+  first successful renders to the initiating operator, not the account owner;
+  show requested re-edits separately and enforce current campaign access.
+
+### Changed
+
+- Typography and lyric edit descriptions explain background reuse and the
+  required new render instead of promising no additional cost.
+
 ## [1.1.152] - 2026-11-02
 
 ### Security
