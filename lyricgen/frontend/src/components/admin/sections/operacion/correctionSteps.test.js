@@ -266,6 +266,7 @@ describe("describePublishError", () => {
     [err(409, { code: "prores_required" }), /archivo profesional/],
     [err(409, "El corte cambió durante la publicación."), "El video cambió mientras se publicaba. Actualizá y reintentá."],
     [err(403, "Admin only"), /permiso/],
+    [err(409, { code: "change_request_newer_than_version", requests: [{ id: 141 }] }), /pedidos abiertos \(#141\) más nuevos que la letra aprobada/],
   ])("traduce %# a un mensaje con qué hacer", (error, expected) => {
     const text = describePublishError(error);
     if (expected instanceof RegExp) expect(text).toMatch(expected);

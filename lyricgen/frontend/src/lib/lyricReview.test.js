@@ -134,3 +134,15 @@ describe("lyric review fixes", () => {
     expect(validItems(undefined)).toEqual([]);
   });
 });
+
+it("keeps inspect-only phrase-structure notices from modifying locked cards", () => {
+  const segments = [{ segment_id: "sueldos-0", text: "Qué locura ver, te manejan Qué locura ver", start: 26.023, end: 31.3145, locked: true }];
+  const before = structuredClone(segments);
+  const result = applyReviewItem(segments, {
+    kind: "phrase_structure", listen: true,
+    occurrences: [occ("sueldos-0", { type: "inspect_structure" }, 26.023)],
+  });
+  expect(result.applied).toBe(0);
+  expect(result.segments).toBe(segments);
+  expect(segments).toEqual(before);
+});

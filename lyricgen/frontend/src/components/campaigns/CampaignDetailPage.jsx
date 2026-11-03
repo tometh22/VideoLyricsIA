@@ -7,6 +7,8 @@ import {
 } from "../../lib/campaignPipeline";
 import CampaignDeliveryProgress from "../CampaignDeliveryProgress";
 import CampaignSearch from "../CampaignSearch";
+import DeliveryPlan from "../DeliveryPlan";
+import { assignedBackground } from "../../lib/campaignCreative";
 import BulkActionBar from "./BulkActionBar";
 import BulkApproveDialog from "./BulkApproveDialog";
 import CampaignSettings from "./CampaignSettings";
@@ -14,10 +16,11 @@ import { RecordDeliveryDialog, SendToPortalDialog } from "./DeliveryDialogs";
 import DiscardDialog from "./DiscardDialog";
 import GenerateDialog, { generationSummary } from "./GenerateDialog";
 import PipelineBar from "./PipelineBar";
+import PriorityReview, { RICARDO_PRIORITY, RICARDO_PRIORITY_CAMPAIGN } from "./PriorityReview";
 import ClientChangesInbox from "./ClientChangesInbox";
 import SongDrawer from "./SongDrawer";
 import SongTable from "./SongTable";
-import StyleAssignment from "./StyleAssignment";
+import StyleAssignment from "./BatchMixDesigner";
 import VideoReviewPlayer from "./VideoReviewPlayer";
 import {
   CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canDiscard, canGenerate, canSend, classificationCounts, filterSongs, isApprovedStage, nextLyricSong, primaryAction, sortSongs,
@@ -129,11 +132,14 @@ export default function CampaignDetailPage({ id }) {
   const outdatedCount = Number(pipe.data?.flags?.portal_outdated) || 0; // kept for API parity; the UI derives the split from the songs
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
-  const view = resolveView(params, kind);
+  const requestedView = resolveView(params, kind);
+  const view = requestedView === "priority" && id !== RICARDO_PRIORITY_CAMPAIGN ? "all" : requestedView;
   // `?view=contract` predates the settings tab; it still lands on the report.
   const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
   const order = params.get("order") === "learning" ? "learning" : "effort";
   const [styleTargets, setStyleTargets] = useState(null);
+  const [styleBusy, setStyleBusy] = useState(false);
+  const [planBusy, setPlanBusy] = useState(false);
   const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
   const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
   const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) });
@@ -144,7 +150,7 @@ export default function CampaignDetailPage({ id }) {
   const portalSends = campaign?.destination_portal !== FILES_DESTINATION;
   const counts = pipe.data?.counts || {};
   const songs = useMemo(() => buildSongs(pipe.data?.items || [], {
-    reviewRows: lyrics.data?.items, creativeItems: creative.data?.items, videos: report.data?.videos,
+    reviewRows: lyrics.data?.items, creativeItems: creative.data?.items?.map(item => ({ ...item, requires_background_assignment: creative.data.requires_background_assignment })), videos: report.data?.videos,
   }), [pipe.data, lyrics.data, creative.data, report.data]);
   const resend = useMemo(() => resendCounts(songs), [songs]);
   const filters = Object.fromEntries(FILTER_KEYS.map((key) => [key, params.get(key) || ""]));
@@ -226,6 +232,10 @@ export default function CampaignDetailPage({ id }) {
     if (!song?.job_id) return;
     navigate(`/review/${encodeURIComponent(song.job_id)}?return_to=${encodeURIComponent(returnPath(song))}`);
   }, [navigate, returnPath]);
+  const openPriorityReview = useCallback((jobId) => {
+    const returnTo = `/campaigns/${encodeURIComponent(id)}?view=priority`;
+    navigate(`/review/${encodeURIComponent(jobId)}?return_to=${encodeURIComponent(returnTo)}`);
+  }, [id, navigate]);
   const openEditLyrics = useCallback((song) => {
     const videoStage = ["qc", "approved", "delivered"].includes(song.stage) && song.current_job_id;
     navigate(videoStage
@@ -300,7 +310,7 @@ export default function CampaignDetailPage({ id }) {
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
     const onKey = (event) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config" || view === "changes") return;
+      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config" || view === "changes" || view === "plan") return;
       if (document.querySelector("[role=dialog]")) return;
       const typing = isTyping(event.target);
       if (event.key === "Escape" && selected.size && !typing) { setSelected(new Set()); return; }
@@ -365,6 +375,12 @@ export default function CampaignDetailPage({ id }) {
   const emptyCopy = EMPTY[view] || EMPTY.all;
   const filtered = FILTER_KEYS.some((key) => params.get(key));
 
+  if (view === "plan" && lyric && campaign) return <div className="mx-auto max-w-[1500px] space-y-5 pb-16">
+    <Button disabled={planBusy} onClick={() => { void refresh(); setView("all"); }}>← Volver a la campaña</Button>
+    <h1 className="text-2xl font-bold">{campaign.name}</h1>
+    <DeliveryPlan campaignId={id} onBusyChange={setPlanBusy} />
+  </div>;
+
   return <div className="mx-auto max-w-[1500px] space-y-5 pb-28">
     <button type="button" onClick={() => navigate("/campaigns")} className="text-sm text-ink-secondary transition hover:text-white">← Campañas</button>
 
@@ -384,6 +400,7 @@ export default function CampaignDetailPage({ id }) {
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
+        {lyric && <Button variant="ghost" onClick={() => setView("plan")}>Plan de entrega</Button>}
         {canManage && lyric && <Button variant="ghost" onClick={() => updateParams({ view: "config", section: "upload", song: null }, { push: true })}>Subir audios</Button>}
         {(inboxEnabled || view === "changes") && <Button variant={view === "changes" ? "secondary" : "ghost"} aria-pressed={view === "changes"} onClick={() => (view === "changes" ? setView("all") : setView("changes"))}>
           Cambios del cliente{openRequests > 0 && <span className="ml-1.5 rounded-full bg-amber-400/20 px-1.5 text-xs tabular-nums text-amber-200">{openRequests}</span>}</Button>}
@@ -392,7 +409,8 @@ export default function CampaignDetailPage({ id }) {
       </div>
     </header>
 
-    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} badges={{ delivered: resend.ready }} />
+    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} badges={{ delivered: resend.ready }}
+      additionalTabs={id === RICARDO_PRIORITY_CAMPAIGN ? [{ key: "priority", label: "Prioritarias", title: "Revisar antes de aprobar o generar", count: RICARDO_PRIORITY.length, tone: null }] : []} />
 
     {approvedSong && <Banner tone="success" action={<div className="flex gap-2">
       {nextAfterApproval && <Button size="sm" variant="primary" onClick={() => openReview(nextAfterApproval)}>Revisar siguiente: {nextAfterApproval.title}</Button>}
@@ -421,7 +439,10 @@ export default function CampaignDetailPage({ id }) {
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
-    {view === "changes"
+    {view === "ready" && creative.data?.requires_background_assignment && creative.data.items?.some(item => item.status === "lyrics_approved" && assignedBackground(item) === "unknown") && <Banner tone="warning" action={<Button onClick={() => setView("plan")}>Abrir Plan de entrega</Button>}>Hay canciones aprobadas sin fondo asignado. Elegí Veo o foto + efecto antes de generar.</Banner>}
+    {view === "priority"
+      ? <PriorityReview songs={songs} onOpen={openPriorityReview} />
+      : view === "changes"
       ? <ClientChangesInbox campaignId={id} isAdmin={Boolean(pipe.data?.is_admin)} canResolve={Boolean(pipe.data?.features?.change_request_actions && canManage)} onChanged={refresh} onOpenSong={(songId) => updateParams({ song: songId }, { push: true })} />
       : view === "config" && campaign
       ? <CampaignSettings campaign={campaign} section={section} onSection={(value) => updateParams({ section: value })} canManage={canManage} isAdmin={canManage}
@@ -444,7 +465,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && view !== "changes" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}
@@ -474,7 +495,7 @@ export default function CampaignDetailPage({ id }) {
       }
       void refresh();
     }} />}
-    {dialog?.type === "generate" && <GenerateDialog items={dialog.items} onClose={() => setDialog(null)} onDone={(result) => {
+    {dialog?.type === "generate" && <GenerateDialog items={dialog.items} startImmediately={dialog.startImmediately} onChangeStyle={canManage ? () => { setStyleTargets(dialog.items.map(item => item.id)); setDialog(null); } : undefined} onClose={() => setDialog(null)} onDone={(result) => {
       setDialog(null);
       const summary = generationSummary(result);
       setSelected((old) => new Set([...old].filter((songId) => !result.sentIds.has(songId))));
@@ -491,10 +512,17 @@ export default function CampaignDetailPage({ id }) {
           setFlash({ tone: "info", text: "Ese envío ya estaba en curso: lo retomamos, no se creó otro." });
           return;
         }
-        const target = `${operation.total_count || total} ${total === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
+        const sent = operation.total_count || total;
+        const target = `${sent} ${sent === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
+        // Canciones que el backend dejó afuera: pedidos del cliente más nuevos
+        // que su letra aprobada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+        const held = operation.blocked_by_change_request || [];
+        const heldText = held.length
+          ? ` No se enviaron ${held.length === 1 ? "1 canción" : `${held.length} canciones`} con pedidos del cliente más nuevos que su letra aprobada: ${held.map((entry) => entry.title || entry.job_id).join(", ")}.`
+          : "";
         setFlash(operation.scheduled === false
-          ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.` }
-          : { tone: "success", text: `Envío iniciado para ${target}. Sigue en segundo plano.` });
+          ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.${heldText}` }
+          : { tone: held.length ? "warning" : "success", text: `Envío iniciado para ${target}. Sigue en segundo plano.${heldText}` });
       }} />}
     {dialog?.type === "record" && <RecordDeliveryDialog campaignId={id} song={dialog.song} onClose={() => setDialog(null)} onDone={() => { setDialog(null); setFlash({ tone: "success", text: "Entrega registrada." }); void refresh(); }} />}
     {dialog?.type === "discard" && <DiscardDialog campaignId={id} songs={dialog.songs} mode={dialog.mode} onClose={() => setDialog(null)} onDone={(result) => {
@@ -503,15 +531,23 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: result.failed.length ? "warning" : "success", text: `${result.done} ${result.done === 1 ? "canción" : "canciones"} ${dialog.mode === "restore" ? "recuperada" : "descartada"}${result.done === 1 ? "" : "s"}.` });
       void refresh();
     }} />}
-    {styleTargets && <Modal label="Asignar estilo" onClose={() => setStyleTargets(null)} width="max-w-4xl">
+    {styleTargets && <Modal label="Preparar lote" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
       <div className="mb-5 flex items-start justify-between gap-3">
-        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Estilo y reparto</p>
-          <h2 className="mt-1 text-xl font-semibold">Asignar estilo a {styleTargets.length} {styleTargets.length === 1 ? "canción" : "canciones"}</h2>
-          <p className="mt-1 text-sm text-ink-secondary">Sólo cambia cómo se generarán estos videos. No genera nada.</p></div>
-        <Button variant="ghost" size="sm" onClick={() => setStyleTargets(null)} aria-label="Cerrar">✕</Button>
+        <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Producción por lote</p>
+          <h2 className="mt-1 text-xl font-semibold">Preparar {styleTargets.length} {styleTargets.length === 1 ? "video" : "videos"}</h2>
+          <p className="mt-1 text-sm text-ink-secondary">Elegí looks, fondos y efectos. Revisá las cantidades y generá el lote.</p></div>
+        <Button variant="ghost" size="sm" disabled={styleBusy} onClick={() => setStyleTargets(null)} aria-label="Cerrar">✕</Button>
       </div>
       {creative.data ? creative.data.can_manage
-        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onSaved={async () => { await refresh(); }} />
+        ? <StyleAssignment campaignId={id} creative={creative.data} itemIds={styleTargets} onBusyChange={setStyleBusy} onSaved={async () => { await refresh(); }} onPrepareGeneration={async ({ startImmediately = false, itemIds: confirmedIds, expectedRevision } = {}) => {
+          const fresh = await campaignRequest(`${base}/creative`);
+          if (expectedRevision != null && fresh.plan.revision !== expectedRevision) throw new Error("El diseño cambió después de confirmarlo. Volvé a revisar el lote antes de generar.");
+          const targetIds = confirmedIds || styleTargets;
+          const items = fresh.items.filter(item => targetIds.includes(item.id) && item.status === "lyrics_approved" && !item.discarded);
+          if (confirmedIds && (items.length !== confirmedIds.length || items.some(item => item.assignment?.revision !== expectedRevision))) throw new Error("Cambió el estado de una canción. Volvé a revisar el lote antes de generar.");
+          if (!items.length) throw new Error("El diseño quedó guardado, pero estas canciones ya no están listas para generar. Revisá su estado actualizado.");
+          setStyleBusy(false); setStyleTargets(null); setDialog({ type: "generate", items, startImmediately });
+        }} />
         : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar estilos.</p>
         : <Skeleton className="h-48" />}
     </Modal>}

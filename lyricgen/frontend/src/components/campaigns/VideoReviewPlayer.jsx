@@ -85,7 +85,7 @@ export default function VideoReviewPlayer({ queue, startId, onClose, onApproved,
         <Button variant="ghost" size="sm" disabled={busy} onClick={() => onClose?.({ finished: false })}>Cerrar <Kbd>Esc</Kbd></Button>
       </div>
       <div className="flex max-h-[62vh] min-h-52 items-center justify-center overflow-hidden rounded-xl bg-black ring-1 ring-white/10">
-        {url ? <video ref={videoRef} key={jobId} className="max-h-[62vh] w-full" src={url} controls autoPlay playsInline preload="metadata">Tu navegador no puede reproducir este video.</video>
+        {url ? <video ref={videoRef} key={jobId} className="max-h-[62vh] w-full" src={url} controls playsInline preload="metadata">Tu navegador no puede reproducir este video.</video>
           : <p role="status" className="p-8 text-sm text-ink-secondary">Preparando el reproductor…</p>}
       </div>
       {error && <p role="alert" className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</p>}

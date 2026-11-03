@@ -11,7 +11,7 @@ async function harness(page) {
 test("39-song contract assignment survives reload, generates only approved songs and reports compliance", async ({ page }) => {
   const api = await harness(page);
   await page.goto("/campaigns/chile1?view=config&section=style");
-  await expect(page.getByText("39 canciones en este reparto")).toBeVisible();
+  await page.getByText("Opciones avanzadas", { exact: true }).click();
   await page.getByLabel("Requisito del grupo 1").selectOption("photo_effect");
   await page.getByLabel("Nombre del grupo 1").fill("Foto fija con efecto");
   await page.getByLabel("Cantidad del grupo 1").fill("50");
@@ -21,20 +21,22 @@ test("39-song contract assignment survives reload, generates only approved songs
   await page.getByLabel("Requisito del grupo 2").selectOption("veo");
   await expect(page.getByText("Modelo de fondo: Veo Lite.")).toBeVisible();
   await expect(page.getByLabel("Modelo del grupo 2")).toHaveCount(0);
+  if (!(await page.getByLabel("Registrar este reparto como acuerdo contractual").isVisible())) await page.getByText("Opciones avanzadas", { exact: true }).click();
   await page.getByLabel("Registrar este reparto como acuerdo contractual").check();
   await page.getByLabel("Acuerdo contractual", { exact: true }).fill("Contrato Chile: mitad foto con efecto, mitad Veo");
   await page.getByLabel("Aceptación del redondeo").fill("Aceptado 20 fotos y 19 Veo");
   await page.getByLabel("Motivo del cambio").fill("Acuerdo de campaña");
   await page.screenshot({ path: "test-results/campaign-style-settings.png", fullPage: true });
-  await page.getByRole("button", { name: "Ver reparto antes de guardar" }).click();
-  await expect(page.getByText(/20 \(51.28%\)/)).toBeVisible();
+  await page.getByRole("button", { name: "Continuar" }).click();
+  await expect(page.getByText("20 · Bokeh")).toBeVisible();
   expect(api.generations).toHaveLength(0);
   expect(api.lastPreview.item_ids).toHaveLength(39);
   expect(api.lastPreview.groups[0].settings.effect).toBe("bokeh");
   expect(api.lastPreview.groups[1].model).toBe("veo-3.1-lite-generate-001");
-  await page.getByRole("button", { name: "Guardar esta asignación" }).click();
+  await page.getByRole("button", { name: "Guardar diseño" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.reload();
+  await page.getByText("Opciones avanzadas", { exact: true }).click();
   await expect(page.getByLabel("Nombre del grupo 1")).toHaveValue("Foto fija con efecto");
 
   await page.getByRole("tab", { name: /^Lista/ }).click();
@@ -106,11 +108,12 @@ test("printed campaign reports paginate outside the scrolling app and do not hid
   const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
   await page.addLocatorHandler(announcement, async () => announcement.getByRole("button", { name: "Cancelar" }).click());
   await page.goto("/campaigns/chile1?view=config&section=style");
+  if (!(await page.getByLabel("Registrar este reparto como acuerdo contractual").isVisible())) await page.getByText("Opciones avanzadas", { exact: true }).click();
   await page.getByLabel("Registrar este reparto como acuerdo contractual").check();
   await page.getByLabel("Acuerdo contractual", { exact: true }).fill("Contrato impreso");
   await page.getByLabel("Motivo del cambio").fill("Acuerdo");
-  await page.getByRole("button", { name: "Ver reparto antes de guardar" }).click();
-  await page.getByRole("button", { name: "Guardar esta asignación" }).click();
+  await page.getByRole("button", { name: "Continuar" }).click();
+  await page.getByRole("button", { name: "Guardar diseño" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.goto("/campaigns/chile1?view=contract");
   await page.locator("#campaign-contract-report").waitFor();

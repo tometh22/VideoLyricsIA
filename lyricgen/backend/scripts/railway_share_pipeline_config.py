@@ -34,7 +34,8 @@ DEFAULT_SERVICES = {
     "production": ("api", "Worker", "ShortWorker", "quality-worker"),
     "staging": ("api", "Worker", "ShortWorker", "quality-worker", "BatchWorker", "BatchShortWorker"),
 }
-TIMING_KEYS = ("LYRIC_LEAD_IN_S", "LYRIC_HOLD_S", "LYRIC_LEAD_IN_MS", "STABLE_PITCH_TAIL_ENABLED")
+TIMING_KEYS = ("LYRIC_LEAD_IN_S", "LYRIC_HOLD_S", "LYRIC_LEAD_IN_MS", "STABLE_PITCH_TAIL_ENABLED",
+               "LYRIC_MIN_GAP_MS", "LYRIC_MIN_GAP_AB_ENABLED", "LYRIC_MIN_GAP_AB_ARM_B_MS")
 _REF = "${{shared.%s}}"
 
 
@@ -46,7 +47,11 @@ def config_keys() -> tuple[str, ...]:
         "TRANSCRIPTION_QUALITY_RELEASE_REPORT_PATH", "TRANSCRIPTION_QUALITY_RELEASE_REPORT_SHA256",
         "TRANSCRIPTION_QUALITY_BENCHMARK_MANIFEST_PATH",
     )
-    return tuple(dict.fromkeys((*_PIPELINE_CONFIG_KEYS, *calibration, *TIMING_KEYS)))
+    display_grant = (
+        "DISPLAY_SEGMENTATION_AUTHORIZATION_PATH", "DISPLAY_SEGMENTATION_AUTHORIZATION_SHA256",
+        "DISPLAY_SEGMENTATION_PUBLIC_KEYS",
+    )
+    return tuple(dict.fromkeys((*_PIPELINE_CONFIG_KEYS, *calibration, *TIMING_KEYS, *display_grant)))
 
 
 def plan(raw: dict[str, dict[str, str]], keys) -> tuple[dict[str, str], dict[str, list[str]], list[str]]:

@@ -1024,6 +1024,24 @@ def fetch_r2(period: str) -> SourceCost:
 # Replicate — whisperX / forced-align / demucs.
 # ---------------------------------------------------------------------------
 
+# Tarifa por segundo según el hardware de cada modelo (precio de lista de
+# replicate.com). Con una sola tarifa mezclada (la de una T4) WhisperX, que
+# corre en A100, quedaba 6x subvaluado: septiembre daba 10,45 en vez de 15,21.
+REPLICATE_MODEL_RATES = (
+    ("whisperx", 0.0014),       # A100 80GB
+    ("demucs", 0.000225),       # T4
+    ("force-align", 0.0001),    # CPU
+)
+
+
+def replicate_rate(model: str, default: float) -> float:
+    name = (model or "").lower()
+    for needle, rate in REPLICATE_MODEL_RATES:
+        if needle in name:
+            return rate
+    return default
+
+
 def fetch_replicate(period: str) -> SourceCost:
     """Replicate spend, derived from prediction run-times.
 
@@ -1109,12 +1127,14 @@ def fetch_replicate(period: str) -> SourceCost:
 
     return SourceCost(
         source="replicate", period=period,
-        amount_usd=round(total_seconds * blended_rate, 2), is_estimate=True,
-        detail=(f"{total_seconds:.0f}s de compute × ${blended_rate}/s "
-                f"(tarifa mezclada)"),
+        amount_usd=round(sum(v["seconds"] * replicate_rate(m, blended_rate)
+                             for m, v in per_model.items()), 2),
+        is_estimate=True,
+        detail=(f"{total_seconds:.0f}s de compute × tarifa del hardware de "
+                f"cada modelo (resto a ${blended_rate}/s)"),
         breakdown=[
             {"model": m, "runs": v["runs"], "seconds": round(v["seconds"], 1),
-             "cost": round(v["seconds"] * blended_rate, 4)}
+             "cost": round(v["seconds"] * replicate_rate(m, blended_rate), 4)}
             for m, v in sorted(per_model.items(),
                                key=lambda kv: -kv[1]["seconds"])
         ],

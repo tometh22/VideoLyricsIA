@@ -19,8 +19,8 @@ function Location() {
   return <><output data-testid="location">{location.pathname}{location.search}</output><button onClick={() => navigate(-1)}>Atrás navegador</button></>;
 }
 
-function mount(api, path = "/campaigns/c1") {
-  vi.stubGlobal("fetch", api.fetchMock);
+function mount(api, path = "/campaigns/c1", fetchMock = api.fetchMock) {
+  vi.stubGlobal("fetch", fetchMock);
   return render(<MemoryRouter initialEntries={[path]}><Location /><Routes>
     <Route path="/campaigns" element={<CampaignsPage />} />
     <Route path="/campaigns/:campaignId" element={<CampaignsPage />} />
@@ -34,6 +34,26 @@ const tab = (name) => screen.getByRole("tab", { name: new RegExp(`^${name}`) });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); clearCampaignResourceCache(); localStorage.clear(); });
 
 describe("campaign workspace", () => {
+  it("opens Ricardo's 17-song priority tab only in the audited campaign and links to the exact lyric editor", async () => {
+    const campaignId = "5f1bd3aa1b31";
+    const api = createCampaignApi({ songs: [makeSong(1, "ready", { job_id: "49c027206392" })] });
+    mount(api, `/campaigns/${campaignId}`, (input, options) => api.fetchMock(String(input).replaceAll(`/batch/campaigns/${campaignId}`, "/batch/campaigns/c1"), options));
+    await screen.findByText("Generar 1 video");
+    expect(screen.getAllByRole("tab").map((item) => item.textContent)).toContain("Prioritarias17");
+    const priority = screen.getByRole("tab", { name: /Prioritarias/ });
+    fireEvent.click(priority);
+    expect(location()).toContain("view=priority");
+    expect(await screen.findByText("Canciones prioritarias para revisar")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Abrir letra" })).toHaveLength(17);
+    fireEvent.click(screen.getAllByRole("button", { name: "Abrir letra" })[0]);
+    expect(location()).toContain("/review/49c027206392");
+    expect(location()).toContain("return_to=");
+    cleanup(); clearCampaignResourceCache();
+    mount(api);
+    await screen.findByText("Campaña de prueba");
+    expect(screen.queryByRole("tab", { name: /Prioritarias/ })).toBeNull();
+  });
+
   it("offers the client changes inbox only when the backend enables it and opens it as its own view", async () => {
     const off = createCampaignApi({ songs: [makeSong(1, "qc")] });
     mount(off);
@@ -227,9 +247,11 @@ describe("campaign workspace", () => {
     mount(api, "/campaigns/c1?view=qc&q=garcia");
     await screen.findByText("Canción 3");
     fireEvent.click(screen.getByRole("button", { name: "Revisar video · Canción 1" }));
-    await screen.findByRole("dialog", { name: "Reproducir Canción 1" });
+    const firstVideo = (await screen.findByRole("dialog", { name: "Reproducir Canción 1" })).querySelector("video");
+    expect(firstVideo.autoplay).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Aprobar y siguiente" }));
-    await screen.findByRole("dialog", { name: "Reproducir Canción 3" });
+    const nextVideo = (await screen.findByRole("dialog", { name: "Reproducir Canción 3" })).querySelector("video");
+    expect(nextVideo.autoplay).toBe(false);
     const approvals = api.state.calls.filter((call) => call.path.startsWith("/approve/"));
     expect(approvals.map((call) => call.path)).toEqual(["/approve/j1"]);
     expect(approvals[0].body).toEqual({ notes: "Revisión final desde el reproductor de campaña" });
@@ -363,7 +385,7 @@ describe("campaign workspace", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Carga de audios" }));
     expect(await screen.findByText(/Entrega por archivos/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enviar aprobados" })).not.toBeInTheDocument();
-    expect(screen.getByText(/portada fija \+ título/)).toBeInTheDocument();
+    expect(screen.getByText(/portada a la izquierda \+ título/)).toBeInTheDocument();
   });
 
   it("moves through songs with the keyboard and acts with Enter", async () => {

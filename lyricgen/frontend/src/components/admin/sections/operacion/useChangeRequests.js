@@ -62,6 +62,13 @@ function proposalMatchesSummary(proposal, item) {
     || revision === proposal.lyrics_context.revision;
 }
 
+// Pedidos que la publicación dejó abiertos porque el texto pedido no está
+// en la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+function keptOpenText(kept) {
+  return (kept || []).map((entry) => ` El pedido #${entry.id} sigue abierto: la letra publicada no tiene ${
+    (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}.`).join("");
+}
+
 export const INTERPRETATION_POLL_MS = 4000;
 
 export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
@@ -528,7 +535,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   // The corrected cut is already in the portal (sent from a campaign without
   // ticking this request): record the close as a publication, bound to the
   // exact cut the operator is looking at. No note needed.
-  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems) => {
+  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems, textReview) => {
     if (!publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: id, tone: "error", text: "Falta verificar el corte publicado. Actualizá el pedido y reintentá." });
       return;
@@ -545,16 +552,27 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           reviewed_render_fingerprint: publication.render_fingerprint,
           reviewed_editor_revision: publication.editor_revision,
           ...(Number.isInteger(confirmedItems) && confirmedItems > 0 ? { confirmed_items: confirmedItems } : {}),
+          ...(textReview?.publicationToken ? {
+            publication_review_token: textReview.publicationToken,
+            publication_review_reason: textReview.reason, confirmed_published_review: true,
+          } : textReview ? { text_review_token: textReview.token,
+            text_review_reason: textReview.reason } : {}),
         }),
       });
       if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
       setCrPublishNotice({ requestId: id, tone: "ok", text: data.already_resolved
         ? "El pedido ya figura cerrado."
-        : `Pedido resuelto con la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
+        : `Pedido resuelto ${textReview?.publicationToken ? "con revisión humana de" : textReview ? "con revisión manual de" : "con"} la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
       await loadChangeRequests();
     } catch (err) {
       const unknown = mutationOutcomeUnknown(err);
+      const review = err?.detail?.code === "requested_text_not_found"
+        && typeof err.detail.review_token === "string" && Array.isArray(err.detail.missing)
+        ? { token: err.detail.review_token, missing: err.detail.missing,
+          renderFingerprint: publication.render_fingerprint, editorRevision: publication.editor_revision }
+        : null;
       setCrPublishNotice({ requestId: id, outcomeUnknown: unknown, tone: unknown ? "wait" : "error",
+        ...(review ? { textReview: review } : {}),
         text: unknown ? "No pudimos confirmar el cierre. Actualizando el estado del pedido."
           : `No pude cerrar el pedido: ${err?.detail?.message || err.message || err}` });
       await loadChangeRequests({ silent: true });
@@ -699,7 +717,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             data.resolved_change_requests?.length
               ? ` y se cerraron ${data.resolved_change_requests.length} pedido(s)`
               : ""
-          }.${data.hidden_from_client ? HIDDEN_HINT : ""}`,
+          }.${keptOpenText(data.kept_open_change_requests)}${data.hidden_from_client ? HIDDEN_HINT : ""}`,
         });
       } else {
         setCrPublishNotice({

@@ -27,6 +27,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from auth import get_current_user, has_art_track_access
+from campaign_review_access import granted_campaign_ids, has_reviewer_grant
 from database import (
     AuditLog,
     BatchCampaign,
@@ -69,6 +70,7 @@ MAX_AUDIO_DURATION = float(os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600"))
 _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "transcribing"})
 _ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
+_POST_RENDER_REVIEW = frozenset({"pending_review", "done", "rejected"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _DISCARDABLE = _FAILURE | {"transcribed", "transcribed_pending"}
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -79,6 +81,14 @@ _ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES | {"discar
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _allows_song_review(campaign: BatchCampaign, job: Job) -> bool:
+    # Completion closes the initial batch, but delivered songs can still need
+    # corrections. Keep pause/cancel authoritative and never restart the feeder.
+    return campaign.status == "active" or (
+        campaign.status == "completed" and job.status in _POST_RENDER_REVIEW
+    )
 
 
 def art_track_feature_enabled() -> bool:
@@ -169,11 +179,12 @@ def _require_scope(user: dict) -> None:
 
 
 def _campaign_or_404(db: Session, campaign_id: str, user: dict) -> BatchCampaign:
-    query = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id)
-    if user.get("role") != "admin":
-        query = query.filter(BatchCampaign.tenant_id == user["tenant_id"])
-    campaign = query.first()
-    if campaign is None:
+    campaign = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).first()
+    if campaign is None or (
+        user.get("role") != "admin"
+        and campaign.tenant_id != user["tenant_id"]
+        and not has_reviewer_grant(db, campaign_id, user["id"])
+    ):
         raise HTTPException(status_code=404, detail="Campaign not found.")
     return campaign
 
@@ -512,13 +523,16 @@ def list_campaigns(
     _require_scope(current_user)
     query = db.query(BatchCampaign)
     if current_user.get("role") != "admin":
-        query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
+        query = query.filter(or_(
+            BatchCampaign.tenant_id == current_user["tenant_id"],
+            BatchCampaign.id.in_(granted_campaign_ids(db, current_user["id"])),
+        ))
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     from campaign_pipeline import pipeline_counts_bulk
     pipelines = pipeline_counts_bulk(db, rows)
     return {"items": [
         {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
-    ]}
+    ], "can_view_accounts": current_user.get("role") == "admin"}
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -698,6 +712,8 @@ def restore_campaign_item(
 def _set_item_discard(db, campaign_id, item_id, user, reason):
     _require_scope(user)
     campaign = _campaign_or_404(db, campaign_id, user)
+    if user.get("role") != "admin" and campaign.tenant_id != user["tenant_id"]:
+        raise HTTPException(status_code=403, detail="Reviewers cannot discard campaign items.")
     job = db.query(Job).filter(
         Job.campaign_id == campaign.id, Job.campaign_item_id == item_id,
         Job.tenant_id == campaign.tenant_id,
@@ -1259,8 +1275,6 @@ def approve_campaign_lyrics(
     """Bind one explicit song-level approval to the exact editor snapshot."""
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
-    if campaign.status != "active":
-        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     job = db.query(Job).filter(
         Job.job_id == job_id,
         Job.campaign_id == campaign.id,
@@ -1273,6 +1287,8 @@ def approve_campaign_lyrics(
     ).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Campaign job not found.")
+    if not _allows_song_review(campaign, job):
+        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     if not (
         body.lyrics_confirmed
         and body.timings_confirmed
@@ -1284,7 +1300,7 @@ def approve_campaign_lyrics(
         )
     quality = dict(job.transcription_quality or {})
     existing = quality.get("pre_background_approval") or {}
-    post_render_statuses = {"pending_review", "done", "rejected"}
+    post_render_statuses = _POST_RENDER_REVIEW
     preserves_rendered_status = job.status in post_render_statuses
     if job.status == "lyrics_approved" or preserves_rendered_status:
         try:
@@ -1321,6 +1337,42 @@ def approve_campaign_lyrics(
                 audio_sha256=str(job.input_audio_sha256 or ""),
                 audio_revision=int(job.audio_revision or 0),
             )
+            recovery_source = "editor_document.machine_evidence"
+            recovery_source_job_id = job.job_id
+            # Historical variants have no machine snapshot of their own. A
+            # post-render human approval may reuse the parent's immutable
+            # full-audio evidence only for the exact same tenant/audio/revision.
+            # Never replace invalid child evidence or inherit edited lyrics,
+            # a parent's human approval, or its mutable quality reference.
+            if (
+                recovered_reference is None
+                and job.parent_job_id
+                and preserves_rendered_status
+                and not job.machine_snapshot_required
+                and document_for_recovery.machine_evidence is None
+            ):
+                parent = db.query(Job).filter(
+                    Job.job_id == job.parent_job_id,
+                    Job.job_id != job.job_id,
+                    Job.tenant_id == job.tenant_id,
+                    Job.input_audio_sha256 == job.input_audio_sha256,
+                    Job.audio_revision == job.audio_revision,
+                ).first()
+                parent_document = (
+                    db.query(EditorDocument).filter(
+                        EditorDocument.job_id == parent.job_id,
+                        EditorDocument.tenant_id == job.tenant_id,
+                    ).first() if parent is not None else None
+                )
+                if parent_document is not None:
+                    recovered_reference, recovery_reason = recover_from_machine_evidence(
+                        parent_document.machine_evidence,
+                        original_segments=list(parent_document.original_segments or []),
+                        audio_sha256=str(job.input_audio_sha256 or ""),
+                        audio_revision=int(job.audio_revision or 0),
+                    )
+                    recovery_source = "parent_editor_document.machine_evidence"
+                    recovery_source_job_id = parent.job_id
             if recovered_reference is not None:
                 quality["reference_hypothesis"] = recovered_reference
                 quality.pop("reference_hypothesis_unavailable", None)
@@ -1335,7 +1387,8 @@ def approve_campaign_lyrics(
                         "audio_revision": int(job.audio_revision or 0),
                         "segments_revision": int(job.segments_revision or 0),
                         "reference_sha256": recovered_reference["reference_sha256"],
-                        "source": "editor_document.machine_evidence",
+                        "source": recovery_source,
+                        "source_job_id": recovery_source_job_id,
                     },
                 ))
             else:
@@ -2278,7 +2331,7 @@ def claim_next_stage_review(
         BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
     ).outerjoin(EditorDocument, EditorDocument.job_id == Job.job_id).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status == "pending_review",
         or_(
             EditorDocument.job_id.is_(None),
@@ -2658,7 +2711,7 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     campaign = db.query(BatchCampaign).filter(
         BatchCampaign.id == job.campaign_id,
     ).with_for_update().first()
-    if campaign is None or campaign.status != "active":
+    if campaign is None or not _allows_song_review(campaign, job):
         raise HTTPException(status_code=409, detail="Campaign is not active.")
     final_review = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,

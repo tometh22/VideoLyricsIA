@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 import batch_campaigns as batch
-from transcription_worker import _maybe_apply_catalog_reference
+from transcription_worker import _maybe_apply_catalog_reference, _sung_catalog_text
 
 
 TEXT = "primera frase de prueba\nsegunda estrofa del ejemplo\nultima linea del canto"
@@ -128,6 +128,31 @@ def test_catalogue_application_keeps_independent_reference(monkeypatch):
     out = run(reference(), monkeypatch, aligner)
     assert out["catalog_reference"]["used"]
     assert out["reference_lyrics"] == result()["reference_lyrics"]
+
+
+def test_exact_editorial_heading_is_removed_before_attestation_and_alignment(monkeypatch):
+    ref = reference()
+    ref["text"] = "Letra de Track\n" + TEXT
+    ref["text_sha256"] = hashlib.sha256(ref["text"].encode()).hexdigest()
+    seen = {}
+
+    async def aligner(base, path, job_id, text, **kwargs):
+        seen["text"] = text
+        base["anchor_alignment"] = {"status": "applied", "timing_source": "ctc_timing_only"}
+        return base
+
+    out = run(ref, monkeypatch, aligner)
+    assert seen["text"] == TEXT
+    assert out["catalog_reference"]["used"] is True
+    assert out["catalog_reference"]["text_sha256"] == ref["text_sha256"]
+    assert out["catalog_reference"]["effective_text_sha256"] == hashlib.sha256(TEXT.encode()).hexdigest()
+    assert out["catalog_reference"]["normalization"] == "editorial_title_heading_removed"
+
+
+def test_only_matching_title_heading_is_removed():
+    ref = reference()
+    ref["text"] = "Letra de Another Track\n" + TEXT
+    assert _sung_catalog_text(ref) == (ref["text"], "")
 
 
 @pytest.mark.parametrize("raises", [False, True])

@@ -1,11 +1,24 @@
 export const REVIEW_FIELDS = {
   font: "font", fontScale: "font_scale", textCase: "text_case", lyricColor: "lyric_color",
   lyricSungColor: "lyric_sung_color", textContrast: "text_contrast", lyricsAnimation: "lyrics_animation",
-  lineTransition: "line_transition", movementStyle: "movement_style", effect: "effect", genre: "genre",
+  lineTransition: "line_transition", lyricLook: "lyric_look", movementStyle: "movement_style", effect: "effect", genre: "genre",
   concept: "concept", backgroundHint: "background_hint", titleTemplate: "title_template",
   titleSize: "title_size", titleArtistFont: "title_artist_font", titleSongFont: "title_song_font",
   titleSongBreak: "title_song_break", frameFormat: "frame_format",
+  // Variante del look (lib/lyricLookVariants): "" = automático.
+  lyricGenre: "lyric_genre", lyricVariant: "lyric_variant", lyricFontMain: "lyric_font_main",
+  lyricFontKey: "lyric_font_key", lyricAltColor: "lyric_alt_color", lyricAccentColor: "lyric_accent_color",
 };
+
+export function assignedBackground(item) {
+  const s = item.settings || {}, requirement = item.assignment?.requirement;
+  if (requirement === "photo_effect" && s.movement_style === "foto-parallax"
+      && s.effect && !["none", "foto_viva"].includes(s.effect)
+      && !s.animate_image && !s.enable_scenes && s.background_mode !== "variation") return "photo_effect";
+  if (requirement === "veo" && s.movement_style && !["foto-parallax", "foto-estatica"].includes(s.movement_style)
+      && !s.background_id && s.effect !== "foto_viva") return "veo";
+  return "unknown";
+}
 
 export function reviewCreativeSettings(review, top) {
   const out = {};
@@ -32,4 +45,13 @@ export function campaignGenerateForm(item, job) {
     if (value != null) form.set(key, String(value));
   }
   return form;
+}
+
+export function photoEffectGroups(effects) {
+  return effects.map(effect => ({
+    id: `foto-${effect}`, name: `Foto fija + ${effect === "embers" ? "Chispas" : "Bokeh"}`,
+    weight: 100 / effects.length, requirement: "photo_effect", model: "",
+    settings: { background_id: null, background_mode: "as_is", scene_source: "lyrics",
+      movement_style: "foto-parallax", effect, animate_image: false, enable_scenes: false },
+  }));
 }

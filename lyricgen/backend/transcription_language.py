@@ -214,6 +214,11 @@ def resolve_transcription_language(
     reference_languages = detect_text_languages(reference_text)
     if len(reference_languages) == 1:
         return next(iter(reference_languages))
+    if len(reference_languages) > 1:
+        # A mixed reference is positive evidence for multiple languages, not
+        # missing evidence. Falling through lets a failed primary decode pick
+        # the language of its own rescue (es/fr audio -> English-only rescue).
+        return None
     result_languages = detect_text_languages(result or {})
     if len(result_languages) == 1:
         return next(iter(result_languages))

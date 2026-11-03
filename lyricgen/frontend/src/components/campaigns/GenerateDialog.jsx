@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { campaignRequest } from "../../lib/campaignApi";
 import { campaignGenerateForm } from "../../lib/campaignCreative";
 import { Button, Modal, ProgressBar } from "./ui";
@@ -49,10 +49,11 @@ export function generationSummary({ sent, failures, deferred, capacityMessage })
   return { message, notice, error };
 }
 
-export default function GenerateDialog({ items, onClose, onDone }) {
+export default function GenerateDialog({ items, onClose, onDone, startImmediately = false, onChangeStyle }) {
   const [progress, setProgress] = useState(null);
   const running = useRef(false);
-  const busy = Boolean(progress);
+  const busy = Boolean(progress) || startImmediately;
+  const autoStart = useRef(startImmediately);
   const confirm = async () => {
     if (running.current) return;
     running.current = true;
@@ -64,6 +65,11 @@ export default function GenerateDialog({ items, onClose, onDone }) {
       setProgress(null);
     }
   };
+  useEffect(() => {
+    // The previous screen already confirmed this frozen batch. A ref keeps
+    // Strict Mode's effect replay from submitting the same batch twice.
+    if (autoStart.current) { autoStart.current = false; void confirm(); }
+  }, []);
   const groups = items.reduce((map, item) => {
     const name = item.assignment?.group_name || "Estilo base";
     map.set(name, (map.get(name) || 0) + 1);
@@ -88,10 +94,11 @@ export default function GenerateDialog({ items, onClose, onDone }) {
         <p className="text-xs text-ink-secondary">No cierres esta ventana. Cada video se envía una sola vez.</p>
       </div>}
       <div className="flex flex-wrap justify-end gap-2">
-        <Button variant="ghost" disabled={busy} onClick={onClose}>Cancelar</Button>
-        <Button variant="primary" disabled={busy || !items.length} onClick={confirm}>
+        {!startImmediately && onChangeStyle && <Button variant="ghost" disabled={busy} onClick={onChangeStyle}>Cambiar fondo</Button>}
+        {!startImmediately && <Button variant="ghost" disabled={busy} onClick={onClose}>Cancelar</Button>}
+        {!startImmediately && <Button variant="primary" disabled={busy || !items.length} onClick={confirm}>
           {progress ? progress.attempted < progress.total ? `Enviando ${progress.attempted + 1} de ${progress.total}…` : "Actualizando estado…" : "Confirmar generación"}
-        </Button>
+        </Button>}
       </div>
     </div>
   </Modal>;

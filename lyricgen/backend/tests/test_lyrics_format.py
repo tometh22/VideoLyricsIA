@@ -1,8 +1,4 @@
-"""Tests for lyrics_format — orthographic correction + line splitting.
-
-All tests mock the OpenAI client (no network). Timing tests exercise
-_split_by_words directly to verify timestamp assignment.
-"""
+"""Orthographic formatting never assigns clocks or splits cards. No network."""
 import asyncio
 import os
 import sys
@@ -136,7 +132,7 @@ def test_unchanged_text_keeps_same_object(monkeypatch):
 
 # ── line splitting — timing with word timestamps ───────────────────────────────
 
-def test_split_uses_word_timestamps(monkeypatch):
+def test_formatter_declines_unsolicited_split_with_word_timestamps(monkeypatch):
     """Long segment with word timestamps → sub-lines get timestamps from word list."""
     words = [
         _word("para",     0.0,  0.3),
@@ -160,19 +156,11 @@ def test_split_uses_word_timestamps(monkeypatch):
     result = _run(lf.format_lyrics_pass(_result([seg]), language="es"))
     out = result["segments"]
 
-    assert len(out) == 2
-    # First sub-line covers roughly the first half of words
-    assert out[0]["start"] == 0.0
-    assert out[0]["end"] > 0.0
-    assert out[0]["end"] <= out[1]["start"] or out[0]["end"] == out[1]["start"]
-    # Second sub-line ends at original segment end
-    assert out[1]["end"] == 3.5
-    # Texts are correct
-    assert "santos" in out[0]["text"]
-    assert "diablo" in out[1]["text"]
+    # Unsolicited model splitting cannot change clocks, evidence or IDs.
+    assert out == [seg]
 
 
-def test_split_proportional_fallback_no_words(monkeypatch):
+def test_formatter_never_invents_timing_without_words(monkeypatch):
     """Segment without word timestamps → proportional character-count split."""
     seg = _seg("para que tus santos tengan fe para que el diablo pierda",
                10.0, 20.0)  # 10s span, no words key
@@ -183,13 +171,7 @@ def test_split_proportional_fallback_no_words(monkeypatch):
     result = _run(lf.format_lyrics_pass(_result([seg]), language="es"))
     out = result["segments"]
 
-    assert len(out) == 2
-    assert out[0]["start"] == 10.0
-    assert out[1]["end"] == 20.0
-    # Non-overlapping
-    assert out[0]["end"] <= out[1]["start"]
-    # Total span preserved
-    assert out[1]["end"] - out[0]["start"] == pytest.approx(10.0, abs=0.01)
+    assert out == [seg]  # Missing clocks must never produce count-based timing.
 
 
 def test_no_split_short_segment(monkeypatch):
@@ -203,7 +185,7 @@ def test_no_split_short_segment(monkeypatch):
     assert result["segments"][0]["end"] == 8.0
 
 
-def test_split_timing_monotonic(monkeypatch):
+def test_formatter_rejects_three_part_response_without_truncation(monkeypatch):
     """Sub-segment timestamps must be strictly non-decreasing."""
     words = [_word(f"w{i}", i * 0.5, i * 0.5 + 0.4) for i in range(12)]
     seg = _seg(" ".join(f"w{i}" for i in range(12)), 0.0, 6.0, words=words)
@@ -214,13 +196,7 @@ def test_split_timing_monotonic(monkeypatch):
     result = _run(lf.format_lyrics_pass(_result([seg]), language="es"))
     out = result["segments"]
 
-    assert len(out) == 3
-    for prev, nxt in zip(out, out[1:]):
-        assert prev["end"] <= nxt["start"] + 0.01, (
-            f"non-monotonic: {prev['end']} > {nxt['start']}"
-        )
-    assert out[0]["start"] >= 0.0
-    assert out[-1]["end"] == pytest.approx(6.0, abs=0.01)
+    assert out == [seg]
 
 
 def test_multi_segment_mixed(monkeypatch):
@@ -240,17 +216,11 @@ def test_multi_segment_mixed(monkeypatch):
     result = _run(lf.format_lyrics_pass(_result(segs), language="es"))
     out = result["segments"]
 
-    assert len(out) == 4
+    assert len(out) == 3
     assert out[0]["text"] == "Frágil espejo de voz"
-    assert out[0]["start"] == 0.0 and out[0]["end"] == 3.0
-    # Split segment
-    assert "santos" in out[1]["text"]
-    assert "diablo" in out[2]["text"]
-    assert out[1]["start"] == 5.0
-    assert out[2]["end"] == 10.0
-    # Third original segment
-    assert out[3]["text"] == "Tanto miedo"
-    assert out[3]["start"] == 12.0 and out[3]["end"] == 14.0
+    assert out[1] == segs[1]
+    assert out[2]["text"] == "Tanto miedo"
+    assert [(s["start"], s["end"]) for s in out] == [(s["start"], s["end"]) for s in segs]
 
 
 def test_code_switched_line_is_never_translated(monkeypatch):
@@ -564,40 +534,6 @@ def test_display_layout_runs_when_formatter_is_disabled(monkeypatch):
     assert result["segments"][0]["text"] == "No sé"
 
 
-# ── _split_by_words unit tests (timing contract) ──────────────────────────────
-
-def test_split_by_words_exact_boundary():
-    """Word timestamps: first sub-line ends where second begins."""
-    words = [
-        _word("a", 0.0, 1.0),
-        _word("b", 1.0, 2.0),
-        _word("c", 2.0, 3.0),
-        _word("d", 3.0, 4.0),
-    ]
-    seg = _seg("a b c d", 0.0, 4.0, words=words)
-    result = lf._split_by_words(seg, ["a b", "c d"])
-
-    assert len(result) == 2
-    assert result[0]["start"] == 0.0
-    assert result[0]["end"] > 0.0
-    assert result[1]["end"] == pytest.approx(4.0, abs=0.01)
-    # No gap: second starts where first ends
-    assert result[0]["end"] <= result[1]["start"] + 0.01
-
-
-def test_split_by_words_single_passthrough():
-    seg = _seg("only one line", 5.0, 8.0)
-    result = lf._split_by_words(seg, ["Only one line"])
-    assert len(result) == 1
-    assert result[0]["text"] == "Only one line"
-    assert result[0]["start"] == 5.0
-    assert result[0]["end"] == 8.0
-
-
-def test_split_by_words_no_words_proportional():
-    seg = _seg("aaaa bbbb", 0.0, 10.0)  # no "words" key
-    result = lf._split_by_words(seg, ["aaaa", "bbbb"])
-    assert len(result) == 2
-    assert result[0]["start"] == 0.0
-    assert result[1]["end"] == 10.0
-    assert result[0]["end"] == pytest.approx(result[1]["start"], abs=0.001)
+def test_repeated_indices_preserve_the_full_response_for_rejection():
+    parts = [f"1. parte {i}" for i in range(30)]
+    assert lf._parse_response("\n".join(parts), 1) == {1: [f"parte {i}" for i in range(30)]}

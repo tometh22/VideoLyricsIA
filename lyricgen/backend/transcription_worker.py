@@ -151,6 +151,8 @@ def _catalog_reference_summary(
     reason: str = "",
     attestation: dict | None = None,
     timing_source: str = "",
+    normalization: str = "",
+    effective_text_sha256: str = "",
 ) -> dict:
     """Persist provenance and decisions without duplicating raw lyric text."""
     summary = {
@@ -167,10 +169,39 @@ def _catalog_reference_summary(
         "source_audio_sha256": str(reference.get("source_audio_sha256") or "")[:64],
         "text_sha256": str(reference.get("text_sha256") or "")[:64],
         "timing_source": str(timing_source or "")[:80],
+        "normalization": str(normalization or "")[:80],
+        "effective_text_sha256": str(effective_text_sha256 or "")[:64],
     }
     if isinstance(attestation, dict):
         summary["attestation"] = attestation
     return summary
+
+
+def _sung_catalog_text(reference: dict) -> tuple[str, str]:
+    """Remove an exact editorial title heading; never change sung lines.
+
+    Some client sheets place ``Letra de <track>`` above the actual lyric. The
+    manifest retains the original text and hash. This derived text is used
+    only for audio attestation and timing, with its own hash in the outcome.
+    """
+    import unicodedata
+
+    text = str(reference.get("text") or "").strip()
+    lines = text.splitlines()
+    if not lines:
+        return text, ""
+
+    def heading_key(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        plain = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+        return " ".join(re.findall(r"[^\W_]+", plain, re.UNICODE))
+
+    expected = heading_key(f"Letra de {reference.get('track') or ''}")
+    if reference.get("track") and heading_key(lines[0]) == expected:
+        sung = "\n".join(lines[1:]).strip()
+        if sung:
+            return sung, "editorial_title_heading_removed"
+    return text, ""
 
 
 def _lrclib_candidate_enabled() -> bool:
@@ -302,6 +333,9 @@ async def _maybe_apply_catalog_reference(
         )
         return result
 
+    text, normalization = _sung_catalog_text(reference)
+    effective_text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     from pipeline import _audio_duration
     from reference_attestation import assess_reference_attestation, reference_gate_action
     try:
@@ -323,6 +357,8 @@ async def _maybe_apply_catalog_reference(
             used=False,
             reason=f"attestation_{action}",
             attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return result
 
@@ -336,6 +372,8 @@ async def _maybe_apply_catalog_reference(
         original["catalog_reference"] = _catalog_reference_summary(
             reference, status="alignment_declined", used=False,
             reason=f"alignment_{_safe_exception_code(exc)}", attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return original
     alignment = dict(aligned.get("anchor_alignment") or {}) if isinstance(aligned, dict) else {}
@@ -346,6 +384,8 @@ async def _maybe_apply_catalog_reference(
             used=False,
             reason=str(alignment.get("reason") or "alignment_declined"),
             attestation=report,
+            normalization=normalization,
+            effective_text_sha256=effective_text_sha256,
         )
         return original
     # Keep the independent acoustic reference separate from catalogue text.
@@ -356,6 +396,8 @@ async def _maybe_apply_catalog_reference(
         used=True,
         attestation=report,
         timing_source=str(alignment.get("timing_source") or ""),
+        normalization=normalization,
+        effective_text_sha256=effective_text_sha256,
     )
     return aligned
 
@@ -446,7 +488,7 @@ def _coverage_de(r) -> float | None:
 
 def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                            audio_path: str = "", *, strip_internal: bool = True,
-                           live_hint: bool = False):
+                           live_hint: bool = False, allow_timing_mutation: bool = True):
     """Loguea la cobertura final y la compara con la de la cascada y la
     previa al formateador. Saca `_asr_words` del result (transporte interno:
     no se persiste ni llega al cliente). Nunca levanta.
@@ -481,7 +523,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # This happens after word consistency, never trims, and skips
             # operator-locked boundaries.
             from timing_review_suggestions import automatic_tail_enabled
-            if _stem and automatic_tail_enabled():
+            if allow_timing_mutation and _stem and automatic_tail_enabled():
                 try:
                     from pathlib import Path
                     from timing_review_suggestions import (
@@ -523,6 +565,12 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 r.get("segments") or [], _stem, audio_duration=_dur,
                 rescue_skipped=_skip, include_leading=live_hint,
             )
+            # Fase 5.2: el stem se borra al salir; los huecos se guardan acá.
+            import line_signals_v2 as _ls2
+            if _ls2.enabled():
+                r.setdefault("postpass_stats", {})["voiced_gaps_v2"] = [
+                    dict(gap) for gap in (_vg or [])
+                ]
             _independent = r.get("_independent_asr_words") or []
             _lexical_verification = {
                 "total": 0, "verified": 0, "unverified": 0, "details": [],
@@ -749,7 +797,8 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                                   timing_consistency_fn, *, live_hint: bool = False,
                                   source_audio_sha256: str = "",
                                   source_audio_revision: int = 0,
-                                  source_segments_revision: int = 0):
+                                  source_segments_revision: int = 0,
+                                  fresh_transcription: bool = False):
     """Measure, retry only unsafe windows, and persist one final verdict."""
     from transcription_quality import POLICY_VERSION, calibration_identity, evaluate
     from line_evidence import annotate_provider_evidence
@@ -1082,6 +1131,70 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                 auto_trace["status"] = "timing_candidate_generation_failed"
             auto_trace["abstained_count"] += 1
 
+    # One final owner of display boundaries, after all retries/formatting and
+    # before the final quality verdict and immutable machine snapshot.
+    from display_segmentation import run as segment_display
+    from display_segmentation_policy import runtime_authorization as display_authorization
+    display_previous_result = copy.deepcopy(r)
+    display_before = copy.deepcopy(r.get("segments") or [])
+    display_report = None
+    try:
+        from line_evidence import evidence_issues as display_parent_issues
+        display_source = {
+            "job_id": job_id, "audio_sha256": source_audio_sha256,
+            "audio_revision": int(source_audio_revision or 0),
+            "segments_revision": int(source_segments_revision or 0),
+            "protected_quality_indices": sorted({
+                issue["segment_index"] for issue in display_parent_issues(display_before)
+            }),
+        }
+        display_fresh = bool(
+            fresh_transcription and source_segments_revision == 0
+            and len(source_audio_sha256) == 64 and source_audio_revision > 0
+            and not r.get("approved_text_reuse")
+        )
+        display_rows, display_report, display_proposal = segment_display(
+            display_before, source=display_source, fresh=display_fresh,
+            authorization=display_authorization(),
+        )
+        if display_report and display_report.get("applied_count"):
+            from display_segmentation import digest as display_digest
+            expected_display_hash = display_digest(display_rows)
+            r["segments"] = display_rows
+            # Old counts/indices belong to the old cards. Remeasure without
+            # allowing the stable-pitch measurement helper to retime them.
+            r["postpass_stats"] = dict(r.get("postpass_stats") or {})
+            for key in ("coverage_final", "quality_windows", "voiced_gaps_v2"):
+                r["postpass_stats"].pop(key, None)
+            r = _medir_cobertura_final(
+                r, job_id, antes_fmt, audio_path, strip_internal=False,
+                live_hint=live_hint, allow_timing_mutation=False,
+            )
+            if display_digest(r.get("segments")) != expected_display_hash:
+                raise ValueError("post_segmentation_timing_changed")
+            post = r.get("postpass_stats") or {}
+            windows = post.get("quality_windows") or []
+            from machine_evidence import snapshot_hash
+            display_report["source_snapshot_sha256"] = snapshot_hash(display_before)
+            display_report["source_segments_hash"] = _segments_hash(display_before)
+            r["_pre_display_segmentation_segments"] = display_before
+        if display_proposal is not None:
+            r["_display_segmentation_proposal"] = display_proposal
+    except Exception as exc:
+        # Optional segmentation can abstain, never leave a partially changed
+        # document or certify old per-card metrics against the new structure.
+        r = display_previous_result
+        post = r.get("postpass_stats") or {}
+        windows = post.get("quality_windows") or []
+        display_report = {
+            "policy_version": "display-phrases-v1", "status": "unavailable",
+            "failure_code": _safe_exception_code(exc), "applied_count": 0,
+            "before": len(display_before), "after": len(display_before),
+        }
+        r.pop("_pre_display_segmentation_segments", None)
+        logger.warning("[DISPLAY-SEGMENTATION] abstained job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
     from quality_jobs import _sanitize_analytical_evidence
@@ -1135,7 +1248,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             transformation = str(hypothesis.get("transformation") or "")
             if transformation == "cache_hit_raw":
                 asr_calls["whisperx_cache_hits"] += 1
-            elif transformation == "replicate_raw":
+            elif transformation == "replicate_raw" or transformation.startswith("replicate_raw:offset="):
                 asr_calls["whisperx_real_calls"] += 1
         asr_calls["asr_actually_ran"] = asr_calls["whisperx_real_calls"] > 0
         final_metrics["asr_calls"] = asr_calls
@@ -1154,11 +1267,32 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         # Missing witnesses force router abstention rather than agreement.
         pass
     final["metrics"] = final_metrics
+    # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
+    # escritas sobre los segmentos finales antes de congelar la versión 0.
+    # Solo agrega claves: segments_hash y las decisiones no cambian.
+    try:
+        import line_signals_v2
+        if line_signals_v2.enabled():
+            line_signals_v2.attach(
+                r, final_metrics,
+                asr_words=r.get("_asr_words") or [],
+                independent_words=r.get("_independent_asr_words") or [],
+                voiced_gaps=(r.get("postpass_stats") or {}).get("voiced_gaps_v2") or [],
+                voiced_gap_warn_s=float(os.environ.get("VOICED_GAP_WARN_S", "10")),
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
+        logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
+                       job_id, _safe_exception_code(exc))
     if auto_trace["status"] == "authorized":
         auto_trace["status"] = (
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
         )
     final["auto_repair"] = auto_trace
+    if display_report is not None:
+        if display_report.get("applied_count"):
+            from machine_evidence import snapshot_hash
+            display_report["result_snapshot_sha256"] = snapshot_hash(r.get("segments") or [])
+        final["display_segmentation"] = display_report
     r["transcription_quality"] = final
     if auto_trace["applied_count"] > 0:
         # Keep the exact machine output before automatic changes in the
@@ -1188,6 +1322,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
     r.pop("_pre_auto_repair_segments", None)
+    r.pop("_pre_display_segmentation_segments", None)
+    r.pop("_display_segmentation_proposal", None)
+    r.pop("_transcription_source", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
     r.pop("_reconcile_capture", None)
@@ -1197,6 +1334,37 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_lora_asr_family", None)
     r.pop("_lora_family_role", None)
     return r
+
+
+def _line_gap_assignment(job_id: str) -> dict | None:
+    """Brazo de la prueba del aire mínimo, o None. Nunca rompe la transcripción."""
+    try:
+        import line_gap_experiment
+        from database import Job, SessionLocal
+
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            return line_gap_experiment.assign(db, job) if job is not None else None
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — sin asignación = brazo A sin registro
+        logger.warning("[LINE_GAP_AB] job=%s sin asignación: %s", job_id, type(exc).__name__)
+        return None
+
+
+def _record_line_gap_exposure(job_id: str, assignment: dict, stats: dict) -> None:
+    try:
+        import line_gap_experiment
+        from database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            line_gap_experiment.record_exposure(db, job_id, assignment, stats)
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[LINE_GAP_AB] job=%s exposición sin registrar: %s", job_id, type(exc).__name__)
 
 
 def run_transcription_job(
@@ -1337,6 +1505,7 @@ def run_transcription_job(
     source_audio_sha256 = sha256_file(audio_path)
     source_audio_revision = 0
     source_segments_revision = 0
+    fresh_transcription = False
     # Establish the immutable source identity before the expensive pipeline.
     # Direct browser PUTs necessarily start at a mutable upload key because
     # the server does not see their bytes; the first worker materialization
@@ -1384,6 +1553,8 @@ def run_transcription_job(
             )
         source_audio_revision = int(_identity_row.audio_revision or 0)
         source_segments_revision = int(_identity_row.segments_revision or 0)
+        from display_segmentation_policy import fresh_job
+        fresh_transcription = fresh_job(_identity_db, _identity_row)
         _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
@@ -1452,6 +1623,12 @@ def run_transcription_job(
                 live=live, reference_required=reference_required,
                 workload_class=workload_class,
                 parallel_audio_reference=parallel_audio_reference,
+                transcription_source={
+                    "job_id": job_id, "audio_sha256": source_audio_sha256,
+                    "audio_revision": source_audio_revision,
+                    "segments_revision": source_segments_revision,
+                    "fresh": fresh_transcription,
+                },
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -1516,7 +1693,8 @@ def run_transcription_job(
                 _record_reconcile_result(r, "post:_maybe_apply_approved_reuse")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
-                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title,
+                                            language=language or "")
                 _record_reconcile_result(r, "post:_maybe_ctc_retime")
             _post_lang = _resolve_postprocess_language(
                 language, r, job_id=job_id,
@@ -1561,6 +1739,7 @@ def run_transcription_job(
                 source_audio_sha256=source_audio_sha256,
                 source_audio_revision=source_audio_revision,
                 source_segments_revision=source_segments_revision,
+                fresh_transcription=fresh_transcription,
             )
             if isinstance(r.get("catalog_reference"), dict):
                 quality = dict(r.get("transcription_quality") or {})
@@ -1581,7 +1760,17 @@ def run_transcription_job(
                 is_live=live or _looks_live(title, filename),
             )
 
-        result = asyncio.run(_run_with_retime())
+        # Prueba prospectiva del aire mínimo (LYRIC_MIN_GAP_AB_ENABLED): el
+        # brazo se fija una vez por job y viaja por ContextVar a los polish.
+        _gap_assignment = _line_gap_assignment(job_id)
+        if _gap_assignment is None:
+            result = asyncio.run(_run_with_retime())
+        else:
+            import lead_in as _gap_lead_in
+            _gap_stats: dict = {}
+            with _gap_lead_in.min_gap_override(int(_gap_assignment.get("gap_ms") or 0), _gap_stats):
+                result = asyncio.run(_run_with_retime())
+            _record_line_gap_exposure(job_id, _gap_assignment, _gap_stats)
     except Exception as exc:
         error_type = _safe_exception_code(exc)
         anchor_declined = str(exc) == "operator_reference_alignment_declined"
@@ -1712,6 +1901,13 @@ def run_transcription_job(
                     "job_id": job_id, "status": "discarded",
                     "reason": "source_segments_revision_changed",
                 }
+            display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
+            if display_trace.get("applied_count"):
+                from display_segmentation_policy import fresh_job
+                if current_revision != source_segments_revision or not fresh_job(_persist_db, row):
+                    _persist_db.rollback()
+                    return {"job_id": job_id, "status": "discarded",
+                            "reason": "display_segmentation_source_changed"}
             if current_revision > 0 and segments != row.segments_json:
                 # An operator edited while the ASR was running. Preserve the
                 # human version and do not attach a verdict for discarded data.
@@ -1754,6 +1950,14 @@ def run_transcription_job(
                         quality["learning_shadow"] = {
                             "available": False, "reason": "prediction_failed",
                             "mutated_segments": False,
+                        }
+                    from transcription_quality import segments_hash as _persisted_segments_hash
+                    quality["segments_hash"] = _persisted_segments_hash(document.current_segments or [])
+                    if isinstance(quality.get("display_segmentation"), dict) and quality["display_segmentation"].get("applied_count"):
+                        from machine_evidence import snapshot_hash as _persisted_snapshot_hash
+                        quality["display_segmentation"] = {
+                            **quality["display_segmentation"],
+                            "result_snapshot_sha256": _persisted_snapshot_hash(document.original_segments or []),
                         }
                     from transcription_quality import quality_fingerprint
                     quality["quality_fingerprint"] = quality_fingerprint(

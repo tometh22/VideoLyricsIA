@@ -3,6 +3,11 @@
 Build estático compartido por `umg.genly.pro` y `umgchile.genly.pro`.
 El dominio determina el país; la API valida el token y el destino de cada fila.
 
+Argentina muestra las cinco categorías pedidas por UMG, además de **Todos los
+entregables** y **Otros videos** para material histórico sin canal. La API
+entrega la categoría guardada al publicar; el portal no la infiere del nombre
+de archivo. Chile conserva su división actual.
+
 Todos los videos publicados ofrecen **Generar y descargar** en ProRes,
 incluidos lyrics y art tracks históricos sin master guardado. Un click prepara
 el archivo, muestra **Preparando…** y descarga automáticamente al terminar.

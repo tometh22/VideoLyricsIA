@@ -1,3 +1,5 @@
+// The personal activity card has its own endpoint and focused tests.
+vi.mock("../OperatorActivity", () => ({ default: () => null }));
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -141,8 +143,8 @@ describe("campaign list", () => {
     fireEvent.change(within(wizard).getByLabelText("Portal de destino"), { target: { value: "files" } });
     expect(within(wizard).getByRole("button", { name: "Crear y seguir" })).toBeEnabled();
     expect(within(wizard).getByRole("radio", { name: /Portada \+ onda/ })).toHaveAttribute("aria-checked", "true");
-    fireEvent.click(within(wizard).getByRole("radio", { name: /Portada fija/ }));
-    expect(within(wizard).getByRole("radio", { name: /Portada fija/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(wizard).getByRole("radio", { name: /Portada a la izquierda/ }));
+    expect(within(wizard).getByRole("radio", { name: /Portada a la izquierda/ })).toHaveAttribute("aria-checked", "true");
   });
 });
 
@@ -192,29 +194,31 @@ describe("style assignment", () => {
     const calls = setup();
     const onSaved = vi.fn();
     render(<StyleAssignment campaignId="c1" creative={creative()} itemIds={["i1", "i2"]} onSaved={onSaved} />);
+    fireEvent.click(screen.getByText("Opciones avanzadas"));
     fireEvent.click(screen.getByText("Cambiar Tipografía"));
     fireEvent.change(screen.getByLabelText("Estilo 1: Tipografía"), { target: { value: "anton" } });
     fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Tipografía acordada" } });
-    fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
-    await screen.findByRole("button", { name: "Guardar esta asignación" });
+    fireEvent.click(screen.getByRole("button", { name: "Continuar" }));
+    await screen.findByRole("button", { name: "Guardar diseño" });
     expect(calls.find((call) => call.path.endsWith("/preview")).body).toMatchObject({ item_ids: ["i1", "i2"], groups: [{ settings: { font: "anton" } }] });
     expect(calls.some((call) => call.path.endsWith("/apply"))).toBe(false);
     fireEvent.change(screen.getByLabelText("Cantidad del grupo 1"), { target: { value: "90" } });
-    expect(screen.queryByRole("button", { name: "Guardar esta asignación" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Ver reparto antes de guardar" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Guardar diseño" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continuar" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Cantidad del grupo 1"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Guardar esta asignación" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continuar" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Guardar diseño" }));
     await screen.findByText("Asignación guardada. No se generaron videos.");
     expect(onSaved).toHaveBeenCalled();
   });
   it("always uses Veo Lite, even for groups saved with a faster model", async () => {
     const calls = setup();
     render(<StyleAssignment campaignId="c1" itemIds={["i1"]} creative={creative({ revision: 2, groups: [{ id: "legacy", name: "Legacy", weight: 100, requirement: "veo", model: "veo-3.1-fast-generate-001", settings: { movement_style: "estandar" } }] })} />);
+    fireEvent.click(screen.getByText("Opciones avanzadas"));
     expect(screen.getByText(/Modelo de fondo: Veo Lite/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Lite obligatorio" } });
-    fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
-    await screen.findByRole("button", { name: "Guardar esta asignación" });
+    fireEvent.click(screen.getByRole("button", { name: "Continuar" }));
+    await screen.findByRole("button", { name: "Guardar diseño" });
     expect(calls.find((call) => call.path.endsWith("/preview")).body.groups[0].model).toBe("veo-3.1-lite-generate-001");
   });
 });

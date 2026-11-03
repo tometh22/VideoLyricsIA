@@ -1,5 +1,6 @@
 """Editor drafts, versions, locks and workspace collaboration."""
 
+import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,47 @@ def _token_for(user):
         return start_login_session(db, user)
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("operation", ["patch", "restore", "resolve"])
+def test_revision_conflict_releases_locks_before_response_teardown(operation):
+    import main
+    from fastapi import HTTPException
+
+    first, _, job_id = _users_and_job()
+    actor = {"id": first.id, "role": "user", "tenant_id": first.tenant_id,
+             "features": {"editor_v2": True}}
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, [
+            {"start": 0, "end": 1, "text": "latest human correction"},
+        ], "manual")
+        db.commit()
+        version_id = db.query(EditorVersion).filter_by(job_id=job_id, revision=0).one().id
+
+    handlers = {
+        "patch": (main.patch_editor_document, main.EditorPatchRequest(
+            base_revision=0, segments=[{"start": 0, "end": 1, "text": "stale"}])),
+        "restore": (main.restore_editor_version, main.EditorRestoreRequest(
+            base_revision=0, version_id=version_id)),
+        "resolve": (main.resolve_editor_conflict, main.EditorConflictRequest(
+            server_revision=0, strategy="use_server")),
+    }
+    handler, body = handlers[operation]
+    with SessionLocal() as db:
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(handler(job_id, body, current_user=actor, db=db))
+        assert caught.value.status_code == 409
+        assert caught.value.detail["server_revision"] == 1
+        assert caught.value.detail["server_segments"][0]["text"] == "latest human correction"
+        # The dependency is deliberately still open: ASGI cleanup must not
+        # be responsible for releasing locks needed by the next request.
+        assert not db.in_transaction()
+        if engine.dialect.name == "postgresql":
+            with SessionLocal() as contender:
+                assert contender.query(Job).filter_by(job_id=job_id).with_for_update(nowait=True).one()
+                assert contender.query(EditorDocument).filter_by(job_id=job_id).with_for_update(nowait=True).one()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -1530,6 +1572,104 @@ def test_analytics_rejects_cross_tenant_nested_and_oversized_batches(client):
     )
     assert too_many.status_code == 422
     assert other_first.id != first.id
+
+
+def test_platform_admin_editor_analytics_on_client_job_are_recorded(client):
+    """agus77 (admin de plataforma) revisa canciones de universal_music.
+
+    El editor lo deja trabajar (_editor_document_or_404), pero el lookup
+    tenant-only de /analytics/events descartaba TODOS sus eventos sobre esas
+    canciones: 0 seeks, 0 aperturas, 0 aprobaciones desde el 7-sep.
+    """
+    _, _, job_id = _users_and_job("editor_analytics_client")
+    with SessionLocal() as db:
+        admin = create_user(
+            db, f"analytics_admin_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            role="admin", tenant_id="analytics_platform_admin",
+        )
+        regular = create_user(
+            db, f"analytics_user_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            tenant_id="analytics_other_team",
+        )
+    events = {"events": [
+        {"name": "editor_seek", "job_id": job_id,
+         "properties": {"position_ms": 12_000, "source": "editor"}},
+    ]}
+    admin_response = client.post("/analytics/events", headers=auth(_token_for(admin)), json=events)
+    assert admin_response.json() == {"accepted": 1, "rejected": 0}
+    # Un usuario común de otro tenant sigue aislado.
+    regular_response = client.post("/analytics/events", headers=auth(_token_for(regular)), json=events)
+    assert regular_response.json() == {"accepted": 0, "rejected": 1}
+    with SessionLocal() as db:
+        rows = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+        ).all()
+        assert [(row.user_id, row.tenant_id) for row in rows] == [
+            (admin.id, "analytics_platform_admin"),
+        ]
+
+
+def test_analytics_events_store_client_time_or_fall_back_to_arrival(client):
+    first, _, job_id = _users_and_job("editor_analytics_time")
+    token = _token_for(first)
+    client_time = datetime.now(timezone.utc) - timedelta(seconds=30)
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_seek", "job_id": job_id,
+             "occurred_at": client_time.isoformat().replace("+00:00", "Z"),
+             "properties": {"position_ms": 1_000, "source": "editor"}},
+            # Cliente viejo: sin occurred_at.
+            {"name": "editor_seek", "job_id": job_id,
+             "properties": {"position_ms": 2_000, "source": "editor"}},
+            # Reloj del navegador absurdo.
+            {"name": "editor_seek", "job_id": job_id, "occurred_at": "2001-01-01T00:00:00Z",
+             "properties": {"position_ms": 3_000, "source": "editor"}},
+        ]},
+    )
+    assert response.json() == {"accepted": 3, "rejected": 0}
+    with SessionLocal() as db:
+        rows = {
+            row.properties["position_ms"]: row
+            for row in db.query(ProductEvent).filter(
+                ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+            )
+        }
+    assert all(row.occurred_at is not None for row in rows.values())
+    assert abs((rows[1_000].occurred_at - client_time).total_seconds()) < 0.01
+    for position in (2_000, 3_000):
+        lag = abs((rows[position].occurred_at - rows[position].created_at).total_seconds())
+        assert lag < 60, position
+
+
+def test_audio_played_ranges_are_persisted_and_bounded(client):
+    first, _, job_id = _users_and_job("editor_audio_played")
+    token = _token_for(first)
+    session_id = str(uuid.uuid4())
+    valid = {
+        "ranges": [[0, 12_000], [60_000, 64_250]], "played_ms": 16_250,
+        "playback_rate": 1, "audio_duration_ms": 215_400,
+        "flush_reason": "approve", "session_id": session_id,
+    }
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_audio_played", "job_id": job_id, "properties": valid},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[5_000, 1_000]]}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, 1]] * 65}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, "hoy te vi pasar"]]}},
+        ]},
+    )
+    assert response.json() == {"accepted": 1, "rejected": 3}
+    with SessionLocal() as db:
+        row = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_audio_played",
+        ).one()
+    assert row.properties["ranges"] == [[0, 12_000], [60_000, 64_250]]
+    assert row.properties["session_id"] == session_id
 
 
 def test_transaction_rollback_never_leaves_partial_editor_state():

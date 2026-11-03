@@ -74,6 +74,19 @@ function renderPanelItems(items, props = {}) {
   );
 }
 
+it("offers human resolution even when the normal flow requires ProRes or another render", () => {
+  const confirm = vi.fn();
+  renderPanel({
+    publication: { ...BASE_PUBLICATION, needs_publish: true, prores_pending: ["umg_master"], render_matches_editor: false },
+    published_review: { review_token: "a".repeat(64), published_revision: 6 },
+    delivery: { ...REQUEST.delivery, video_url: "https://example.test/candidate.mp4", published_video_url: "https://example.test/published-6.mp4" },
+  }, { confirmChangeRequestPublication: confirm });
+  fireEvent.click(screen.getByRole("button", { name: "Resolver con revisión humana" }));
+  expect(screen.getByLabelText("Versión publicada para revisión humana")).toHaveAttribute("src", "https://example.test/published-6.mp4");
+  expect(screen.getByRole("button", { name: "Confirmar pedido resuelto" })).toBeDisabled();
+  expect(confirm).not.toHaveBeenCalled();
+});
+
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
   it.each([null, {}, { job_status: "done" }])("does not invent a published revision from %j", publication => {
@@ -980,6 +993,29 @@ describe("cerrar un pedido ya publicado", () => {
   const published = { ...BASE_PUBLICATION, revision: 2, render_fingerprint: "cut-2", editor_revision: 14,
     render_matches_editor: true, answers_request: true };
 
+  it("offers manual text review only for the exact cut rejected by the server", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ segments: [] }) })));
+    const confirm = vi.fn();
+    const notice = { requestId: 7, tone: "error", text: "La frase no coincide", textReview: {
+      token: "a".repeat(64), missing: ["despirerta"], renderFingerprint: "cut-2", editorRevision: 14,
+    } };
+    const item = { comment: "0:13 despirerta", workflow: confirmWorkflow, publication: published };
+    renderPanel(item, { crPublishNotice: notice, confirmChangeRequestPublication: confirm });
+    expect(screen.getByRole("region", { name: "Revisión manual de las diferencias" })).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Está en el video: 0:13 despirerta"));
+    fireEvent.change(screen.getByLabelText("Motivo de la revisión manual"), { target: { value: "Verifiqué despierta en el video." } });
+    fireEvent.click(screen.getByLabelText(/Revisé estas diferencias en el video/));
+    expect(screen.getByRole("button", { name: "Dar por resuelto" })).toBeDisabled();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resolver con revisión manual" }));
+    expect(confirm).toHaveBeenCalledWith(7, published, 1, { token: "a".repeat(64), reason: "Verifiqué despierta en el video." });
+    cleanup();
+    renderPanel({ ...item, publication: { ...published, editor_revision: 15 } }, { crPublishNotice: notice });
+    expect(screen.queryByRole("region", { name: "Revisión manual de las diferencias" })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
   it("no deja dar por resuelto hasta marcar cada punto contra el video", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ segments: [{ start: 13, text: "¿Quién sos?" }] }) })));
     const confirm = vi.fn();
@@ -996,7 +1032,7 @@ describe("cerrar un pedido ya publicado", () => {
     fireEvent.click(screen.getByLabelText("Está en el video: 1:02 decir amor"));
     await waitFor(() => expect(button).toBeEnabled());
     fireEvent.click(button);
-    expect(confirm).toHaveBeenCalledWith(7, published, 2);
+    expect(confirm).toHaveBeenCalledWith(7, published, 2, undefined);
     vi.unstubAllGlobals();
   });
 });

@@ -40,6 +40,14 @@ def field(label, group, kind="text", **kw):
     return {"label": label, "group": group, "kind": kind, **kw}
 
 
+import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
+import lyric_recipes as _lyric_recipes  # noqa: E402
+
+# Looks that paint the whole frame in every genre. Cinético does it only in
+# pop (its original design), so a Veo group needs the campaign's genre set to
+# one where it uses the song's background (lyric_recipes.may_own_background).
+_ALWAYS_OWN_BACKGROUND = {"pop70", "degrade"}
+
 FIELDS = {
     "font": field("Tipografía", "Letra", "select", options=[""] + CATALOG["fonts"]),
     "font_scale": field("Tamaño de letra", "Letra", "number", min=.6, max=1.5, step=.05),
@@ -49,6 +57,15 @@ FIELDS = {
     "text_contrast": field("Contraste", "Letra", "select", options=["subtle", "medium", "strong"]),
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
+    "lyric_look": field("Look de letra", "Letra", "select", options=["", *_lyric_looks.LOOKS]),
+    # Look variant: genre ("" = detectar), variant ("" = automática, sin
+    # repetir entre canciones de la campaña) and operator overrides.
+    "lyric_genre": field("Género del look", "Letra", "select", options=["", *_lyric_recipes.GENRES]),
+    "lyric_variant": field("Variante del look", "Letra", "text", max_length=4),
+    "lyric_font_main": field("Letra principal del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_font_key": field("Letra destacada del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_alt_color": field("Color secundario del look", "Letra", "color"),
+    "lyric_accent_color": field("Color destacado del look", "Letra", "color"),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),
@@ -75,7 +92,9 @@ FIELDS = {
 RENDER_KEYS = (set(FIELDS) - {"scene_source"}) | {"match_lyrics", "bg_verbatim"}
 DEFAULTS = {"font": "", "font_scale": 1., "text_case": "upper", "text_contrast": "medium",
             "lyric_color": "#FFFFFF", "lyric_sung_color": "#FFFFFF", "lyrics_animation": "none",
-            "line_transition": "none", "background_id": None, "background_mode": "as_is",
+            "line_transition": "none", "lyric_look": "", "lyric_genre": "", "lyric_variant": "",
+            "lyric_font_main": "", "lyric_font_key": "", "lyric_alt_color": "", "lyric_accent_color": "",
+            "background_id": None, "background_mode": "as_is",
             "match_lyrics": True, "bg_verbatim": False, "background_hint": "", "genre": "", "concept": "",
             "movement_style": "", "effect": "", "style": "auto", "custom_colors": "",
             "animate_image": False, "enable_scenes": False, "title_template": "auto", "title_size": 1.,
@@ -109,6 +128,18 @@ def normalize_settings(settings):
         if not spec:
             fail(f"Ajuste no permitido: {key}")
         kind = spec["kind"]
+        if key == "lyric_variant":
+            # "" = automatic; else a variant number (the editor sends ints).
+            if value in ("", None):
+                value = ""
+            elif type(value) is int or (isinstance(value, str) and value.isdigit()):
+                if not 0 <= int(value) <= 9999:
+                    fail(f"{spec['label']}: fuera de rango")
+                value = str(int(value))
+            else:
+                fail(f"{spec['label']}: valor no válido")
+            out[key] = value
+            continue
         if kind == "boolean":
             if type(value) is not bool:
                 fail(f"{spec['label']}: se requiere sí/no")
@@ -125,7 +156,9 @@ def normalize_settings(settings):
                 fail(f"{spec['label']}: opción no disponible")
             if kind == "color":
                 import re
-                if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                # "" = automatic for colours whose default is "" (look variant).
+                if not (value == "" and DEFAULTS.get(key) == "") and \
+                        not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
                     fail("Color no válido")
         out[key] = value
     source = out.pop("scene_source", None)
@@ -155,9 +188,10 @@ class PlanRequest(Strict):
     revision: int = Field(ge=0)
     item_ids: list[str] = Field(min_length=1, max_length=1000)
     mode: Literal["percent", "count"] = "percent"
-    groups: list[Group] = Field(min_length=1, max_length=30)
+    groups: list[Group] = Field(min_length=1, max_length=512)
     seed: str = Field(default="campaign", min_length=1, max_length=100)
     replace_exceptions: bool = False
+    preserve_existing_pins: bool = False
     pin: bool = False
     contract: bool = False
     reason: str = Field(min_length=3, max_length=1000)
@@ -213,7 +247,9 @@ def _items(db, campaign):
 def _snapshot(db, campaign):
     jobs = db.query(Job).filter(Job.campaign_id == campaign.id).all()
     docs = db.query(EditorDocument).filter(EditorDocument.job_id.in_([j.job_id for j in jobs])).all()
-    return digest({"defaults": campaign.default_render_params,
+    # Product routing is campaign metadata; changing its tab must not stale a creative preview.
+    defaults = {k: v for k, v in (campaign.default_render_params or {}).items() if k != "product_channel"}
+    return digest({"defaults": defaults,
                    "items": [(i.id, i.render_overrides, i.discard_record) for i in _items(db, campaign)],
                    "jobs": sorted((j.job_id, j.status, j.render_params) for j in jobs),
                    "docs": sorted((d.job_id, d.revision, str(d.lock_expires_at)) for d in docs)})
@@ -239,6 +275,11 @@ def validate_combination(db, campaign, settings, group, user):
             fail("Fondo no disponible para esta campaña", 404)
     if settings.get("enable_scenes") and (asset or not has_scenes_access(user)):
         fail("Escenas requiere acceso habilitado y fondo IA")
+    if (group.requirement in ("veo", "photo_effect") and settings.get("lyric_look")
+            and (settings.get("lyric_look") in _ALWAYS_OWN_BACKGROUND
+                 or _lyric_recipes.may_own_background(settings.get("lyric_look"),
+                                                      settings.get("lyric_genre") or ""))):
+        fail("Este look no usa fondo (pinta todo el cuadro): elegí otro look o un grupo sin fondo IA")
     if group.requirement == "photo_effect":
         if settings.get("effect") in (None, "", "none", "foto_viva"):
             fail("Foto fija requiere un efecto de superposición; Foto viva no es foto fija")
@@ -264,7 +305,12 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
         {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
         for group in plan.get("groups", [])
     ]}
+    from campaign_mix import catalog as mix_catalog
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
+            "mix_catalog": mix_catalog(), "portal_id": campaign.destination_portal,
+            "delivery_plan_period": (campaign.default_render_params or {}).get("delivery_plan_period", ""),
+            "can_view_account_balance": current_user.get("role") == "admin",
+            "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
             "veo_model": VEO_LITE,
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
@@ -317,7 +363,7 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             effective = effective_settings(campaign, {**before, **patch})
             validate_combination(db, campaign, effective, group, current_user)
             assignment = {"group_id": group.id, "group_name": group.name, "requirement": group.requirement,
-                          "model": group.model, "pinned": body.pin, "revision": body.revision + 1}
+                          "model": group.model, "pinned": body.pin or bool(body.preserve_existing_pins and before.get(ASSIGNMENT, {}).get("pinned")), "revision": body.revision + 1}
             if group.requirement == "creative" and not body.contract and before.get(ASSIGNMENT):
                 assignment = {**before[ASSIGNMENT], "revision": body.revision + 1,
                               "pinned": body.pin or before[ASSIGNMENT].get("pinned", False), "preset_name": group.name}
@@ -451,6 +497,10 @@ def generation_receipt(db, job, submitted_revision, settings, actor):
     campaign = db.query(BatchCampaign).filter_by(id=job.campaign_id).one()
     item = db.query(BatchCampaignItem).filter_by(id=job.campaign_item_id).first()
     assignment = effective_veo_assignment((item.render_overrides or {}).get(ASSIGNMENT) if item else None)
+    if campaign.kind == "lyric_video" and (campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")):
+        from delivery_plan import assignment_type
+        if assignment_type(settings, assignment) == "unknown":
+            fail("Asigná Veo o Foto + efecto en el Plan de entrega antes de generar.", 409)
     if not assignment:
         return
     if str(assignment["revision"]) != str(submitted_revision):

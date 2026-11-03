@@ -899,6 +899,24 @@ class BatchCampaign(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class BatchCampaignReviewer(Base):
+    """Explicit access to one campaign's lyric review workspace."""
+
+    __tablename__ = "batch_campaign_reviewers"
+    __table_args__ = (
+        Index("ix_batch_campaign_reviewers_user", "user_id", "revoked_at"),
+    )
+
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    granted_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class BatchCampaignItem(Base):
     """One source audio registered before a Job is promoted for transcription."""
 
@@ -1371,8 +1389,8 @@ class Delivery(Base):
         String(20), nullable=False, default="argentina",
         server_default="argentina", index=True,
     )
-    # Stable product snapshot for the UMG portal. Source jobs may live only
-    # in staging or be deleted later, so the portal must read this row alone.
+    # Product shown in the UMG portal. Snapshot at publication time so the
+    # portal does not depend on a Job or campaign from another environment.
     product_category = Column(String(32), nullable=True, index=True)
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -2503,6 +2521,96 @@ class StatusComponentEvent(Base):
     __table_args__ = (
         Index("ix_status_events_component_seen", "component", "last_seen_at"),
     )
+
+
+class ReviewSignalRecord(Base):
+    """Señales de revisión automática tal como se calcularon, para medirlas.
+
+    Dos señales se calculaban y se perdían: los puntos de la revisión rápida
+    (``lyric_review``, que vivían sólo en una caché LRU del proceso) y las
+    propuestas de ``repetition_reconcile`` (las que un gate declinaba sólo
+    iban al log). Esta tabla las guarda para poder cruzarlas después con los
+    pedidos de cambio del cliente (precisión/recall por señal).
+
+    Sólo se escribe con ``REVIEW_SIGNALS_PERSIST_ENABLED=1`` y en un hilo
+    aparte (``review_signals.py``); nada del producto la lee. Sin FK a
+    ``jobs`` a propósito: el insert no toma locks sobre la fila del job (que
+    el aprobar del editor tiene ``FOR UPDATE``). ``dedupe_key`` evita
+    duplicados cuando el mismo punto se recalcula para la misma revisión.
+    """
+    __tablename__ = "review_signal_records"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_review_signal_records_dedupe_key"),
+        Index("ix_review_signal_records_job_id", "job_id"),
+        Index("ix_review_signal_records_kind_created", "kind", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False)
+    tenant_id = Column(String(100), nullable=True)
+    # lyric_review_item | repetition_proposal
+    kind = Column(String(32), nullable=False)
+    # heard_different, missing, question_marks… | repetition_insert,
+    # repetition_reassign, repetition_group
+    item_type = Column(String(40), nullable=False)
+    # proposed | declined | applied
+    decision = Column(String(16), nullable=False)
+    reason = Column(String(80), nullable=True)
+    # Identidad de lo que se miró: revisión del editor (lyric_review), hash de
+    # los segmentos de entrada y release del código que lo calculó.
+    editor_revision = Column(Integer, nullable=True)
+    segments_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=True)
+    # Línea al momento del cálculo (puede moverse después).
+    line_index = Column(Integer, nullable=True)
+    start_s = Column(Float, nullable=True)
+    end_s = Column(Float, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    dedupe_key = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class FinanceEntry(Base):
+    """Un renglón de la planilla de finanzas del admin (sólo super-admin).
+
+    Lo que ninguna API devuelve sola vive acá: facturas verificadas a mano,
+    mano de obra pagada (Upwork) o imputada, gastos de estructura, cobros,
+    los términos de cada contrato y los parámetros del reparto. El ingreso
+    devengado NO se carga: sale de las entregas del portal × precio del
+    contrato (``finance_ledger.operations``).
+
+    ``period`` es el mes al que se DEVENGA el renglón (YYYY-MM), no el mes en
+    que se pagó: la factura de Railway del 20-ago al 20-sep es de dos meses.
+    ``basis`` dice de dónde sale el número (factura, api, captura, estimado,
+    imputado, acuerdo) para que nadie confunda una estimación con un hecho.
+    Los montos nunca se versionan en el repo (es público): se cargan desde la
+    UI o importando un CSV.
+    """
+    __tablename__ = "finance_entries"
+    __table_args__ = (
+        Index("ix_finance_entries_period", "period"),
+        Index("ix_finance_entries_section", "section"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False)
+    # ingreso | costo_directo | mano_obra | estructura | cobro | pago_socio
+    # | contrato | parametros
+    section = Column(String(24), nullable=False)
+    category = Column(String(40), nullable=True)
+    provider = Column(String(80), nullable=True)
+    concept = Column(String(200), nullable=True)
+    amount_usd = Column(Float, nullable=True)
+    basis = Column(String(16), nullable=True)
+    contract = Column(String(80), nullable=True)
+    evidence = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    created_by_user_id = Column(Integer, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import StatusBadge from "../../primitives/StatusBadge";
 function choicesLine(c) {
   if (!c) return null;
   const parts = [
+    c.lyric_look ? `look ${c.lyric_look}` : null,
     c.lyrics_animation && c.lyrics_animation !== "none" ? `anim ${c.lyrics_animation}` : null,
     c.line_transition && c.line_transition !== "none" ? `trans ${c.line_transition}` : null,
     c.font || null,

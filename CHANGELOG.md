@@ -1,10 +1,400 @@
 # Changelog
 
-## [1.1.110] - 2026-10-28
+## [1.1.157] - 2026-11-03
+
+### Changed
+- Release editor and campaign-confirmation row locks before returning conflicts, refusals or no-op responses, preventing concurrent requests from blocking the API.
+- Open account delivery reviews in the environment that owns the original job; do not offer broken links for deleted originals.
+- Promote the audited staging release to production, including campaign batch designs, lyric looks, delivery planning and operator activity.
+- Join production and staging migration histories with a no-op merge revision; retain existing production delivery product snapshots.
+- Preserve the updated audio dependencies and empty security exception list.
+
+## [1.1.156] - 2026-11-03
+
+### Fixed
+
+- Allow explicitly granted campaign reviewers to confirm reviewed lyrics and
+  quality windows across team boundaries, matching their existing editor
+  access. The confirmation buttons no longer return a hidden 404 for shared
+  campaigns. Revision/content binding, audit attribution and revoked-grant
+  isolation remain enforced; confirmation does not approve or change lyrics.
+
+## [1.1.155] - 2026-11-03
 
 ### Added
 
-- Las entregas del portal UMG conservan la categoría de producto al publicarse y la exponen en el listado, para las pestañas de Argentina por canal y formato.
+- A three-step campaign batch designer: choose the photo/video split and photo
+  effects, select compatible lyric looks, then review exact counts and generate.
+  Mix songs with a stable seed while preserving exact background quotas and
+  balanced look/effect counts; preview account impact separately from the lot.
+  Frozen confirmation preserves pinned designs and excludes unready songs from
+  generation, with current-revision checks before submitting the confirmed set.
+- Personal campaign production on Home and Campaigns, with Today/Yesterday,
+  an Argentina-time date selector, campaign breakdown and song list. Attribute
+  first successful renders to the initiating operator, not the account owner;
+  show re-edit requests separately and enforce current campaign access.
+
+### Changed
+
+- Typography and lyric edit descriptions explain asset reuse and the required
+  new render instead of promising no additional cost.
+
+## [1.1.154] - 2026-11-03
+
+### Fixed
+
+- Detect the language independently for each vocal section during automatic
+  WhisperX transcription. A quiet or instrumental intro no longer assigns one
+  uncertain language to the entire song. Retry uncertain sections with an
+  independent recognizer under a shared deadline, retain recognition evidence,
+  and preserve absolute timestamps and mixed-language lyrics.
+- Decline Spanish-only CTC alignment for mixed-language text, and keep re-sync
+  polling attached to the original task until completion or its bounded timeout.
+  Failed re-sync attempts preserve the operator's pasted lyrics.
+
+## [1.1.152] - 2026-11-02
+
+### Security
+
+- Upgrade CPU PyTorch to 2.13.0 and TorchAudio to 2.11.1, removing all eight
+  expired security exceptions. Preserve the CTC aligner and use bounded
+  SoundFile decoding in place of the removed TorchAudio I/O APIs.
+
+### Added
+
+- Delivery plans by campaign and client portal account, with delivered,
+  generated, in-progress and pending Veo/photo-effect totals, monthly filters
+  and a reviewed 50/50 allocation that preserves pinned choices. Background
+  assignment and generation are separate actions; stale plans require a new
+  preview. Art Tracks remain outside the lyric-video mix.
+
+## [1.1.151] - 2026-10-30
+
+### Added
+
+- La campaña CancioneroRock de septiembre muestra una pestaña de 17 canciones prioritarias de la auditoría de Ricardo, con líneas concretas, motivo de revisión, estado actual y acceso directo al editor. Distingue las correcciones guardadas de los casos que requieren escucha manual antes de generar.
+
+## [1.1.150] - 2026-10-28
+
+### Added
+
+- El portal Argentina separa Art Tracks Artistas, HitsDeSiempre Lyrics/Art Tracks y CancioneroRock Lyrics/Art Tracks. Conserva Todos y Otros videos para las entregas históricas sin clasificación.
+- La categoría de producto queda guardada al publicar cada entrega y viaja en el listado del portal; no depende del nombre de la canción ni de una consulta al Job de staging.
+
+## [1.1.149] - 2026-10-27
+
+### Added
+
+- Acceso de revisión por campaña para usuarios de otro espacio de trabajo: la campaña aparece en su lista y permite abrir audio, forma de onda y editor de letras sin conceder acceso al resto de los jobs del propietario. El permiso queda en una tabla revocable y se registra al asignarlo.
+
+## [1.1.148] - 2026-10-27
+
+### Fixed
+
+- La reparación de letras de campaña también reevalúa borradores sin encabezado editorial cuando la transcripción acústica final corrigió el rechazo inicial. Mantiene las mismas verificaciones de audio, letra y revisión del editor antes de sincronizar.
+- El arranque de la API en pruebas ya no deja hilos de mantenimiento vivos entre instancias de TestClient, evitando interferencias en verificaciones de auditoría y conexiones PostgreSQL.
+
+## [1.1.147] - 2026-10-27
+
+### Fixed
+
+- Las letras oficiales de campañas omiten el encabezado editorial `Letra de <título>` al comparar y sincronizar con el audio. Se conserva el texto original y su huella; la letra cantada tiene una huella propia en la auditoría.
+- Herramienta de reparación para borradores de campaña sin cambios humanos: vuelve a comprobar la letra contra el audio exacto y sincroniza solo las canciones que superan el control acústico. Conserva revisión del editor y auditoría; deja intactas las discrepancias.
+
+## [1.1.146] - 2026-10-27
+
+### Fixed
+
+- Los videos de revisión de campañas esperan que la persona pulse Play. Al aprobar y avanzar al siguiente, el nuevo video tampoco reproduce audio automáticamente.
+
+## [1.1.145] - 2026-10-27
+
+### Added
+
+- Campañas separadas por producto y canal: Art Tracks Artistas, HitsDeSiempre Lyrics y Art Tracks, y CancioneroRock Lyrics y Art Tracks. La selección acompaña la creación y puede corregirse desde la configuración.
+- Cargador de Art Tracks por terminal con subidas paralelas y reanudables para lotes grandes.
+
+### Fixed
+
+- El importador de Art Tracks reconoce archivos `Título_Artista_ISRC` y asocia la portada del mismo nombre. Un año dentro del título ya no se confunde con el código técnico; repetir el manifiesto repara portadas pendientes sin duplicar canciones.
+- El cambio de producto de una campaña no invalida una previsualización creativa en curso.
+
+## [1.1.144] - 2026-10-24
+
+### Fixed
+
+- La división de frases detecta cualquier capa vocal anterior que siga activa, aunque termine la tarjeta inmediatamente anterior. Ante superposiciones anidadas conserva todas las tarjetas para revisión; una voz ya terminada no bloquea cortes posteriores. Incluye regresiones del caso y de la preservación atómica.
+
+## [1.1.143] - 2026-10-23
+
+### Added
+
+- División final de frases para transcripciones nuevas, con propuesta en shadow por defecto, aplicación condicionada a evidencia validada y autorización propia, preservación de texto y bordes, IDs únicos y pendientes de escucha. Worker y rutas HTTP comparten el mismo contrato.
+- Evidencia privada recuperable y aviso de cortes aplicados/propuestos en el editor, conservados frente a reevaluaciones y marcados como anteriores después de editar. Incluye previsualización local sin escrituras en canciones.
+
+### Fixed
+
+- Conserva el arreglo de audio del editor y las alertas de frases largas/repetidas por aparición, sin sustituir los cambios recientes de campañas y finanzas de staging.
+- El formateador ortográfico ya no acepta dividir tarjetas ni inventar tiempos proporcionales. Las divisiones usan únicamente relojes actuales, completos y contenidos, y se rechazan si cambian el audio, la revisión o el documento durante el cálculo.
+- La calidad y los hashes finales se vinculan a la precisión temporal que persiste el editor. No se vuelve a retimar durante la medición posterior a una división.
+
+
+## [1.1.140] - 2026-10-22
+
+### Changed
+
+- Campañas: la lista deja de ser una grilla plana ordenada por fecha de creación. Arriba, **Para hacer**: sólo las campañas con letras, videos o cambios del cliente esperando, primero los pedidos del cliente más antiguos. Abajo, **todas las campañas agrupadas por lote** (el primer tramo del nombre: "UMG Chile", "UMG Agosto 2026"), en filas compactas que muestran el nombre sin el prefijo del lote, así lo que distingue a cada campaña ya no queda cortado. Los lotes con trabajo vivo arrancan abiertos y con lo activo primero; los terminados, cerrados. Un prefijo usado una sola vez va a "Otras campañas" y las canceladas quedan juntas y cerradas al final, sin botones de "Revisar". Buscar abre todos los lotes.
+
+## [1.1.139] - 2026-10-21
+
+### Changed
+
+- Simplify campaign video generation to photo or video, then Bokeh, Chispas or a half-and-half photo split. Keep typography, custom distributions, contracts and technical controls inside collapsed advanced options.
+- Show the actual assignment before generating, then save the design and start the approved songs from one final action. Keep Veo Lite for video backgrounds and preserve approved lyrics and timings.
+
+### Fixed
+
+- Remove the unexplained required change-note blocker by recording an automatic audit reason when the optional note is empty.
+- Prevent duplicate submission when entering generation from the design summary; preserve queue-capacity handling and review of pinned exceptions.
+
+## [1.1.138] - 2026-10-21
+
+### Added
+
+- Finanzas → **Mix de fondos**: cuántos video lyrics publicados en los portales de UMG llevan fondo de video Veo y cuántos foto + efecto (el contrato pide 50/50). Se tildan las campañas que entran en la cuenta y calcula el porcentaje, cuántas fotos faltan para empatar, cuántas de cada tipo faltan para una meta de videos, y marca los Veo que no son Lite. El tipo de fondo sale de lo que generó el pipeline, no del estilo elegido en el wizard. Sólo lectura.
+
+## [1.1.137] - 2026-10-21
+
+### Security
+
+- Pillow 12.3.0 → 13.0.0: corrige ocho vulnerabilidades al abrir archivos TIFF, GIF, PDF, PPM y EPS maliciosos (CVE-2026-112395, -112397, -112400, -112404, -112895, -112896, -112897 y -112899). Las fuentes, la onda de los art tracks y los efectos dan idénticos; los redimensionados cambian por redondeo, sin diferencia visible (PSNR de 55 a 66 dB en portadas y thumbnails).
+
+## [1.1.136] - 2026-10-19
+
+### Fixed
+
+- Los Art Tracks creados individualmente se publican en el portal UMG como referencias al render vigente, con ProRes bajo demanda y la etiqueta "Art Track". No se copian archivos al publicar.
+
+## [1.1.135] - 2026-10-16
+
+### Fixed
+
+- Finanzas: una cuota cerrada con los números acordados, pero todavía no pagada, sigue mostrando el botón "Registrar pago al socio" y el pago conserva la liquidación acordada. Antes el botón desaparecía al cerrarla.
+
+## [1.1.134] - 2026-10-16
+
+### Changed
+
+- **Finanzas se completa solo y cada liquidación es confiable.**
+  - La producción (IA y operadores) se asigna sola a la cuota de las piezas que produjo, por orden de entregas (FIFO), sin marcarla a mano.
+  - Servidores y herramientas van a su mes. Con contratos superpuestos, cada entrega cuenta para un solo contrato y los costos se reparten según el peso de cada cuota.
+  - Operadores externos automáticos: letras aprobadas × tarifa + comisión, por persona.
+  - Producción interna automática: días hábiles × horas × tarifa, desde una fecha. Sin esa fecha no se calcula.
+  - OpenAI entra en los costos automáticos con `FINANCE_OPENAI_AUTO=1`.
+  - Botones **Registrar cobro** (pesos y tipo de cambio, admite cobro parcial) y **Registrar pago al socio**.
+  - Al pagar al socio, la liquidación queda **congelada** con los números pagados. Lo que llega después va a la próxima cuota abierta, y si se edita un renglón ya pagado, se avisa la diferencia.
+
+### Fixed
+
+- Lo hallado en dos auditorías:
+  - **Cobros y pagos al socio exigen cuota.** No pueden caer en la cuota de su mes de carga. Los renglones viejos que no la tienen toman la de su propio mes.
+  - **Recurrentes:** ya no arrastran la cuota ni datos de cobro, y un cambio de precio reemplaza al anterior.
+  - **Lo cargado a mano pisa a lo automático** según la fuente: "R2" equivale a "Cloudflare R2", y Google Workspace ya no tapa a Google Cloud.
+  - **Ingreso:** en una cuota cobrada es lo que entró, no la cuota completa.
+  - **Cuotas sin cobrar:** no muestran ganancia ni socio, y lo copiado sale marcado como PROYECCIÓN.
+  - **Rango Desde/Hasta:** la liquidación ya no depende de él.
+  - **Importar y exportar:** el CSV exporta el payload, el contrato y los parámetros. La importación no duplica renglones idénticos y nunca borra el contrato ni los parámetros. El reemplazo se hace por mes, sección, proveedor y contrato.
+  - **Números en formato es-AR:** "1.535" se lee como 1535 y se pueden tipear decimales.
+  - **Borrar:** vaciar una celda borra el renglón con confirmación (un monto vacío dejaba el costo en 0). Borrar desde Movimientos también pide confirmación.
+  - **Fecha del pago:** se toma la local.
+  - **Métricas:** respetan el rango visible.
+
+## [1.1.133] - 2026-10-15
+
+### Changed
+
+- La barra lateral del admin vuelve a la identidad de Genly: fondo oscuro, logo, etiqueta "Admin" y acentos violeta. El contenido sigue en claro para leer números.
+- Finanzas → **Liquidación por cuota** pasa a ser un dashboard:
+  - Cuatro números grandes: cobrado (con ARS y BNA), costos, ganancia con margen y la parte del socio con su estado de pago.
+  - Una barra "a dónde va cada dólar" que reparte la cuota entre costos, socio y Genly, con etiquetas.
+  - Costos por categoría como barras desplegables, con el detalle por proveedor y su comprobante.
+  - Las 6 cuotas del contrato, cada una con su estado: cobrada, sin cobrar, futura o pagada.
+  - El acuerdo con el socio, plegable.
+
+## [1.1.132] - 2026-10-15
+
+### Changed
+
+- **El admin pasa a ser un entorno aparte**, a pantalla completa y con barra lateral propia. Ya no lleva la barra lateral ni la barra superior de la app, y tiene un botón "Volver a Genly".
+  - El tema es claro, con más contraste y letra más grande para leer cifras y tablas.
+  - Todas las secciones existentes se adaptan solas, sin cambios de lógica.
+- **Finanzas usa un solo criterio para el reparto con el socio: la liquidación por cuota.**
+  - "Contrato y reparto" suma solo las cuotas cobradas. Las cuotas sin cobrar se muestran como proyección.
+  - Se quitaron los escenarios por tarifa por hora.
+  - "Resultado por mes" queda como vista contable por mes calendario.
+  - Las métricas de horas salen de los renglones de operadores.
+
+### Fixed
+
+- Las sparklines de las tarjetas ya no se pintan negras cuando la etiqueta tiene espacios o acentos.
+- El panel de ayuda cerrado ya no proyecta una franja de sombra en el borde derecho.
+
+## [1.1.131] - 2026-10-15
+
+### Added
+
+- Finanzas → **Liquidación por cuota**: la tabla que se le manda al socio cada mes. Muestra lo cobrado y su tipo de cambio, IA, servidores, herramientas y operadores (personas y horas), total de costos, ganancia y la parte del socio en dólares y en pesos.
+  - Muestra cuánto le corresponde al socio, cuánto se le pagó y cuánto queda pendiente, junto con el acuerdo vigente.
+  - Incluye un botón para copiar la liquidación como texto y mandarla.
+  - Los costos de producción se imputan a la cuota de las piezas que produjeron (nueva columna "Cuota" en Movimientos). Servidores y herramientas van al mes en que se usaron, y cada costo se cuenta una sola vez.
+
+## [1.1.130] - 2026-10-15
+
+### Fixed
+
+- El costo de Replicate se calcula con la tarifa del hardware de cada modelo: WhisperX corre en A100. Antes se usaba una única tarifa de T4 y WhisperX quedaba unas 6 veces por debajo.
+
+### Added
+
+- Nueva sección **Finanzas** en el admin, sólo para super-admin. **Resultado por mes** es una planilla por devengado: ingreso de lo entregado por el precio del contrato, costos directos, mano de obra pagada, margen bruto, estructura, resultado operativo, trabajo del equipo y reparto. Las celdas se cargan con un clic y cada número indica su base: factura, API, captura, estimado o imputado. **Contrato y reparto** muestra el cupo, lo recibido, lo entregado, lo cobrado y el anticipo de cada contrato, la cuenta del socio con parámetros editables y escenarios por tarifa por hora. **Métricas** muestra indicadores de negocio y de operación: piezas, material recibido, tiempo de entrega, pedidos de cambio y letras aprobadas por persona. **Movimientos** permite editar renglón por renglón e importar o exportar CSV. **Criterio** explica cómo se calcula y qué mira cada rol.
+- Los montos no viven en el repositorio: se cargan desde la UI o importando un CSV y se guardan en la nueva tabla `finance_entries` (migración aditiva). El audit registra cada cambio, sin montos.
+- La planilla se completa sola cada mes:
+  - Railway, Google Cloud, R2 y Replicate salen del recolector diario de costos, y se marca si el mes está incompleto.
+  - Los gastos marcados como mensuales se repiten.
+  - El pago a operadores se calcula como letras aprobadas × tarifa por canción, más la comisión.
+  - Lo cargado a mano siempre reemplaza al valor automático.
+  - Un recuadro de cierre del mes muestra qué falta.
+  - El reparto con el socio se puede ver en pesos y junto al historial de pagos.
+
+## [1.1.129] - 2026-10-14
+
+### Fixed
+
+- Guardar una edición de Art Track libera la transacción de base de datos antes de consultar storage, subir la portada o cancelar prewarms. La comprobación del audio tiene un límite de dos segundos y distingue una caída del servicio de un archivo ausente. Título, artista, portada, parámetros y orden de render se guardan juntos; una edición concurrente se rechaza y el portal se marca para actualizar sólo después del guardado.
+- Ante una desconexión, el formulario conserva los cambios y explica cuándo hay que revisar el estado antes de reintentar. No reenvía automáticamente una operación cuyo resultado no se pudo confirmar y evita renders duplicados por doble clic.
+
+## [1.1.128] - 2026-10-14
+
+### Fixed
+
+- **Resolver con revisión humana** permite cerrar un pedido cuyo video corregido ya está en el portal, aunque el editor, ProRes o el control textual no puedan acreditar el cambio. Muestra la versión publicada, exige revisar cada punto, un motivo visible al cliente y confirmación explícita. La decisión queda vinculada al pedido y a esa publicación; si cambian, hay que revisar otra vez. Cierra sólo el pedido elegido y conserva la aprobación independiente del cliente, los archivos y los demás pedidos.
+
+## [1.1.127] - 2026-10-14
+
+### Fixed
+
+- Los administradores pueden corregir art tracks de otra cuenta, igual que al revisarlos y aprobarlos. La edición ya no falla con «Job not found»; la portada y el render conservan la cuenta y el plan del dueño original. El acceso queda auditado y los usuarios regulares siguen limitados a su propia cuenta.
+
+## [1.1.126] - 2026-10-13
+
+### Fixed
+
+- Los pedidos de cambio cuyo comentario tiene errores de escritura pueden cerrarse con **Resolver con revisión manual** después de revisar el video publicado. El operador tiene la decisión final: debe marcar todos los puntos, explicar las diferencias y confirmar que el pedido está atendido. El motivo queda visible al cliente y la auditoría registra las frases rechazadas y la versión revisada. Si cambia el pedido, la letra o el corte, se exige una nueva revisión. El cierre no edita la letra ni vuelve a publicar el video.
+- La frase de Tango «Y tu figura de LARGURA interminable» ya no se ignora por confundir «interminable» con una instrucción de timing.
+- El detalle de un pedido adapta sus columnas al ancho disponible para que el checklist y el motivo de cierre se lean en tarjetas angostas.
+
+## [1.1.124] - 2026-10-09
+
+### Security
+
+- El JWT pasa de `python-jose` (sin mantenimiento; CVE-2026-85394 sin versión corregida) a PyJWT 2.15. Los tokens emitidos antes siguen valiendo, así que nadie pierde la sesión. Se siguen exigiendo HS256 y el vencimiento, y un `iat` apenas en el futuro (diferencia de reloj entre réplicas) se acepta como antes. Se retiran las excepciones de `python-jose` y `ecdsa`.
+
+## [1.1.123] - 2026-10-08
+
+### Added
+
+- Tabla interna `review_signal_records` (revisión Alembic `c1d3e5f7a9b2`) que guarda, tal como se calcularon, los puntos de la revisión rápida (una fila por punto, job y revisión del editor) y las propuestas de `repetition_reconcile`, tanto las aplicadas como las declinadas con el motivo del gate. Con el gate de mutación cerrado, el post-pass corre en sombra sólo para registrar lo que habría hecho, como declinado con motivo `mutation_not_authorized`, sin cambiar el resultado del job. Sirve para medir después cuántos errores de texto reportados por el cliente ya estaban marcados por cada señal. Detrás de `REVIEW_SIGNALS_PERSIST_ENABLED`, apagada por defecto. La escritura se hace en segundo plano, sin duplicados y sin frenar al editor ni al pipeline: si falla, se registra en el log y el proceso sigue. Nada del producto lee esta tabla.
+
+## [1.1.122] - 2026-10-08
+
+### Added
+
+- Evento de medición `editor_audio_played`: qué tramos del audio sonaron de verdad en el editor. Acumula los intervalos reproducidos (un salto abre un tramo nuevo, la pausa no cuenta, los tramos que se tocan se fusionan) y los envía como pares `[inicio_ms, fin_ms]` (hasta 64 por evento) junto con el tiempo reproducido, la velocidad y la duración del audio: cada 30 s mientras suena, 5 s después de una pausa o del final, al aprobar y al ocultar o cerrar la pestaña. Solo números: nunca texto de la letra. El backend valida los pares con un validador dedicado (enteros, inicio < fin, dentro de 0..86.400.000).
+- `scripts/report_listening_coverage.py` (solo lectura): por operador y por canción, % de líneas de la primera versión aprobada que se escucharon antes de aprobar y % de la canción reproducida.
+
+### Fixed
+
+- Los eventos del editor guardan la hora en que ocurrieron (`occurred_at`). El cliente nunca la mandaba y quedaba vacía; si falta o es implausible (posterior a la llegada o de más de 24 h antes) se usa la hora de llegada.
+- Los eventos del editor de un admin de plataforma sobre canciones de otro tenant ya no se descartan. El editor le permite trabajar sobre esas canciones, pero `/analytics/events` buscaba el job sólo dentro del tenant del usuario y rechazaba en silencio todos sus seeks, aperturas, guardados y aprobaciones. No cambia el editor ni lo que ve el operador.
+
+## [1.1.121] - 2026-10-08
+
+### Added
+
+- `CHANGE_REQUEST_PUBLISH_GUARD_ENABLED` (apagada por defecto): publicar o re-enviar una canción cuya letra aprobada es anterior a un pedido de cambio que sigue abierto (incluidas variantes y regenerados de la misma canción) se rechaza con `change_request_newer_than_version` y la lista de pedidos. Vale para el envío por campaña (canción por canción: las demás siguen), para "Enviar a UMG" y para la publicación desde Cambios. "Publicar igual" exige un motivo y queda auditado. Un pedido sólo visual se compara contra el último render, no contra la letra. El diálogo de envío muestra las canciones frenadas con sus pedidos y ofrece "Publicar igual" con motivo obligatorio.
+- Con la misma variable, un pedido de texto ya no se cierra "por publicación" si el texto pedido no aparece en la letra publicada (cerca del tiempo citado o en cualquier parte de la canción, sin distinguir mayúsculas, tildes ni puntuación): queda abierto, se registra qué frases faltan y la publicación sigue igual. Los pedidos de timing, visuales o de prosa sin texto extraíble se cierran como hasta ahora.
+
+## [1.1.120] - 2026-10-08
+
+### Added
+
+- `WHISPERX_RECONCILE_KEEP_WORDS` (apagada por defecto): cada línea de WhisperX reconciliada con la letra de referencia conserva las palabras de la ventana donde se ancló, con su score. Antes se volvían a pegar por posición, se corrían en cuanto el alineado saltaba una palabra y, sin score, el pipeline las borraba: el 95 % de esas líneas llegaba al editor sin palabras. Una línea cuyas palabras no describen su texto queda sin palabras, como hoy. No cambia el texto ni el inicio ni el fin de ninguna línea. La clave entra en la huella de configuración del pipeline.
+
+## [1.1.119] - 2026-10-07
+
+### Fixed
+
+- Las copias históricas de videos pueden recuperar la referencia de letra desde la evidencia inmutable de audio completo de su original, si coinciden cuenta, archivo y revisión del audio. Se admiten las hipótesis de audio completo capturadas sin referencia previa. La recuperación mantiene la aprobación humana de cada versión y rechaza evidencia dañada, snapshots faltantes obligatorios y audio diferente.
+
+## [1.1.118] - 2026-10-07
+
+### Added
+
+- Evento de medición `editor_line_structure_changed` cada vez que el operador parte o une una línea. Registra cómo se resolvió el timing (palabras reales, palabras que ya no coinciden con el texto, uno solo de los dos lados con palabras o línea sin palabras), qué lo disparó (Enter, botón, división masiva, diálogo de wrap, referencia o Backspace en línea vacía) y la duración de la línea. Solo contadores y enums: nunca texto de la letra. No cambia cómo se parte ni cómo se une.
+
+## [1.1.117] - 2026-10-06
+
+### Fixed
+
+- Los efectos reactivos, incluido pulso de graves, renderizan canciones con cientos de beats sin exceder la profundidad del parser de FFmpeg. La máscara conserva todos los pulsos y su intensidad, y se calcula sobre una imagen pequeña antes de ampliarla al tamaño del video.
+
+### Added
+
+- Preset reutilizable UMG de foto fija inspirada en la letra, Poppins Bold en mayúsculas y reparto equilibrado entre bokeh, luces, polvo de luz, chispas, confeti, película y pulso de graves. El ayudante por API guarda estilos, verifica las aprobaciones existentes y envía una selección fija por tandas, con progreso persistente y reanudación sin duplicados.
+
+## [1.1.116] - 2026-10-06
+
+### Fixed
+
+- El editor conserva la revisión asociada a la letra en pantalla cuando una consulta de diagnóstico encuentra cambios de otra sesión. El siguiente guardado combina las versiones antes de escribir, evitando que una copia anterior sobrescriba una corrección completa. Las acciones que reemplazan la letra adoptan el texto y su revisión juntos.
+
+## [1.1.115] - 2026-10-05
+
+### Added
+
+- `CTC_ALIGN_UNKNOWN_LANG_JOB_ES` (apagada por defecto): el alineado CTC acepta una letra cuyo idioma el detector de texto no puede decidir ("unknown", típico de textos cortos o repetitivos) si el job está en español. El piso de mediana de score sigue declinando un idioma equivocado; un texto detectado como inglés sigue fuera.
+
+## [1.1.114] - 2026-10-05
+
+### Changed
+
+- `/health` muestra, para cada variable de timing, el valor efectivo, su origen (`env`, `default`, `empty` o `invalid`) y el valor crudo, en `timing_config_parity.effective_*`. Antes, "sin setear" y "0" se veían iguales: `LYRIC_LEAD_IN_MS` aparecía en 0 aunque se aplicaban 80 ms. La vista es informativa y no cambia el gate de paridad.
+
+## [1.1.113] - 2026-10-05
+
+### Fixed
+
+- Permitir aprobar y re-renderizar correcciones de videos ya generados en campañas completadas. Las campañas pausadas o canceladas siguen bloqueadas, y se conservan la aprobación de letra/audio/revisión y los límites de generación y revisión final. No se reabre la campaña ni se inicia una nueva tanda de transcripciones.
+
+## [1.1.112] - 2026-10-05
+
+### Added
+
+- Aire mínimo antes de la línea siguiente (`LYRIC_MIN_GAP_MS`, apagado por defecto). Con un valor mayor a 0, el fin de una línea se recorta para dejar ese aire, sin cortar más de 0,10 s de la última palabra ni dejar la línea en menos de 0,3 s, y sin tocar líneas bloqueadas. Con 0 el comportamiento es el de siempre.
+- Prueba prospectiva A/B del aire mínimo en campañas UMG nuevas de staging (`LYRIC_MIN_GAP_AB_ENABLED`). La asignación alterna por job y queda en el registro de auditoría: brazo A sin cambios, brazo B con 300 ms. Los jobs ya aprobados nunca participan.
+
+## [1.1.111] - 2026-10-05
+
+### Added
+
+- Con `EVIDENCE_PERSIST_V2` (apagada por defecto), cada línea de máquina guarda señales que antes se calculaban y se descartaban:
+  - parecido entre el texto y lo que oyó el ASR;
+  - canto sin cartel antes y después de la línea;
+  - milisegundos por carácter (línea truncada);
+  - mediana y mínimo del score por palabra;
+  - un marcador positivo de la validación de timing por palabra.
+
+  El acuerdo del consenso dirigido por línea queda en el registro de auditoría. Es solo escritura: no cambia texto, timing ni decisiones.
 
 ## [1.1.109] - 2026-10-03
 

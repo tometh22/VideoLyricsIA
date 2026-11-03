@@ -17,6 +17,8 @@
 import { computeFieldDiff } from "./editWizardDiff.js";
 import { normalizeSegmentsForEdit } from "./lyricsEditSubmit.js";
 import { normalizeMovementCode } from "./catalogCodes.js";
+import { normalizeLyricLook } from "./lyricLooks.js";
+import { lookVariantFieldsFromParams, pickLookVariantFields } from "./lyricLookVariants.js";
 
 // Prioridad de edit_type: el más complejo de los presentes gana.
 // background_library (swap curado, $0, sin slot) supersede al regen IA;
@@ -119,6 +121,7 @@ export function buildEditReview(job, snapReview = null) {
   // `undefined`/`null` siguen cayendo al valor del job: eso sí es "no seteado".
   const pickSnapOr = (snapKey, fallback) =>
     (snapR && snapR[snapKey] != null) ? snapR[snapKey] : fallback;
+  const paramsVariant = lookVariantFieldsFromParams(params);
 
   const initialFields = {
     artist: pickSnapOr("artist", job.artist || ""),
@@ -129,7 +132,17 @@ export function buildEditReview(job, snapReview = null) {
     fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
     lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
     lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
+    lyricLook: normalizeLyricLook(pickSnapOr("lyricLook", params.lyric_look || "")),
     lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
+    // Variante del look (género / número / fuentes / colores). El backend
+    // guarda el número y el género que usó, así que reabrir el video muestra
+    // ESA variante; "" = automático. El snap del autosave gana, como el resto.
+    ...pickLookVariantFields({
+      ...paramsVariant,
+      ...Object.fromEntries(Object.keys(paramsVariant)
+        .filter((k) => snapR && snapR[k] != null)
+        .map((k) => [k, snapR[k]])),
+    }),
     lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
     // Normalizado en LOS DOS lados (acá y en baseline): el backend persiste el
     // valor crudo, así que un job con "dinamico"/"static"/"fija" no matchearía
@@ -162,6 +175,11 @@ export function buildEditReview(job, snapReview = null) {
     // los tests ejercitan. La primera versión lo pasaba por afuera y el gate
     // terminó siendo código muerto con tests en verde.
     scenePlan: (job && job.scene_plan) || null,
+    // Display-only (no está en baseline ni en buildEditCurrent → nunca difea
+    // ni viaja): el video se renderizó SIN fondo generado porque su look pinta
+    // todo el cuadro. El wizard/editor avisan si el operador elige un look que
+    // sí usa el fondo. Sale siempre del job: es un hecho del render, no del snap.
+    backgroundOwnedByLook: !!params.background_owned_by_look,
   };
 
   const baseline = {
@@ -173,8 +191,12 @@ export function buildEditReview(job, snapReview = null) {
     fontScale: String(params.font_scale || "1.0"),
     lyricsAnimation: params.lyrics_animation || "none",
     lineTransition: params.line_transition || "none",
+    // Normalizado en los dos lados (igual que movementStyle): un código viejo
+    // o desconocido es "" para el backend, y sin normalizar difearía solo.
+    lyricLook: normalizeLyricLook(params.lyric_look || ""),
     lyricColor: params.lyric_color || "#FFFFFF",
     lyricSungColor: params.lyric_sung_color || "#FFFFFF",
+    ...paramsVariant,
     movementStyle: normalizeMovementCode(params.movement_style || ""),
     genre: params.genre || "",
     concept: params.concept || "",
@@ -222,18 +244,24 @@ export function buildEditCurrent(review, opts = {}) {
     textContrast: r.textContrast,
     lyricsAnimation: r.lyricsAnimation,
     lineTransition: r.lineTransition,
+    lyricLook: r.lyricLook,
     effect: r.effect,
     backgroundHint: r.backgroundHint,
     bgVerbatim: r.bgVerbatim,
     backgroundMode: r.backgroundMode,
     movementStyle: r.movementStyle,
     frameFormat: r.frameFormat,
-    // lyricColor/lyricSungColor: `computeFieldDiff` no tiene rama para ellos
-    // (nunca salen del browser), pero van acá igual para que el contrato
-    // baseline↔current sea simétrico — el test estructural lo exige, y si
-    // algún día se cablean no van a pisar el valor del job.
+    // lyricColor: viaja en typography (lo edita el panel «Variante» de un
+    // look; con look el blanco default = "el de la variante").
+    // lyricSungColor: `computeFieldDiff` no tiene rama (nunca sale del
+    // browser en edición), pero va acá para que baseline↔current sea simétrico.
     lyricColor: r.lyricColor,
     lyricSungColor: r.lyricSungColor,
+    // Variante del look: valores crudos del operador + lo último que resolvió
+    // el backend para esta canción (`lookResolved`). computeFieldDiff decide
+    // con los dos (ver ahí): si el operador no tocó nada, no viaja nada.
+    ...pickLookVariantFields(r),
+    lookResolved: r.lookResolved || null,
     // Ejes de escena editables en edición (cableados 2026-07-24). Llegan a
     // r.* vía onEditFieldChange (genre/concept por updateBatchDefault;
     // matchLyrics por selectSceneMode). baseline los siembra del mismo

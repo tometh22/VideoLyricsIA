@@ -278,6 +278,10 @@ def build_machine_evidence(result: dict) -> dict:
             "pre_auto_repair", "pre-auto-repair-output", "segments",
             pre_auto_repair, allow_empty=True,
         )
+    pre_display = result.get("_pre_display_segmentation_segments")
+    if isinstance(pre_display, list):
+        add("pre_display_segmentation", "pre-display-segmentation-output",
+            "segments", pre_display, allow_empty=True)
     selected_family = _provider_family(selected)
     add("selected", selected_family, "segments", selected)
     if not any(item.get("role") == "selected" for item in hypotheses):
@@ -302,6 +306,8 @@ def build_machine_evidence(result: dict) -> dict:
     return {
         "schema": SCHEMA,
         "captured_at": datetime.now(timezone.utc).isoformat(),
+        **({"display_segmentation_proposal": _safe_json(result["_display_segmentation_proposal"])}
+           if isinstance(result.get("_display_segmentation_proposal"), dict) else {}),
         "hypotheses_by_family": hypotheses,
         "capture": {
             **({"reconcile_stages": reconcile_capture} if reconcile_capture is not None else {}),
@@ -312,6 +318,7 @@ def build_machine_evidence(result: dict) -> dict:
             "independent_present": bool(result.get("_independent_asr_words")),
             "pre_anchor_present": bool(result.get("_pre_anchor_provider_segments")),
             "pre_auto_repair_present": isinstance(pre_auto_repair, list),
+            **({"pre_display_segmentation_present": True} if isinstance(pre_display, list) else {}),
         },
     }
 
@@ -352,7 +359,12 @@ def finalize_machine_evidence(
         "audio_sha256": str(audio_sha256 or "")[:64] or None,
         "audio_revision": max(0, int(audio_revision or 0)),
     }
-    quality_payload = dict(quality) if isinstance(quality, dict) else {}
+    quality_payload = deepcopy(quality) if isinstance(quality, dict) else {}
+    display_trace = quality_payload.get("display_segmentation")
+    if isinstance(display_trace, dict) and display_trace.get("applied_count"):
+        # The editor persists outer clocks at 0.1ms precision. Bind its exact
+        # durable snapshot, retaining the raw contract result separately.
+        display_trace["result_snapshot_sha256"] = snapshot_hash(canonical_selected)
     payload["decisions"] = {
         "quality": _safe_json(quality_payload),
         "song_quality_signal": quality_training_signal(quality_payload),
@@ -441,6 +453,32 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                 or source[0].get("events_sha256") != auto_repair["source_snapshot_sha256"]
             ):
                 raise MachineSnapshotMissing("machine_auto_repair_source_missing")
+        display_trace = quality_decision.get("display_segmentation") if isinstance(quality_decision, dict) else None
+        if isinstance(display_trace, dict) and display_trace.get("applied_count"):
+            sources = [item for item in hypotheses if item.get("role") == "pre_display_segmentation"]
+            display_source = display_trace.get("source") or {}
+            if (display_source.get("audio_sha256") != pre_human.get("audio_sha256")
+                    or display_source.get("audio_revision") != pre_human.get("audio_revision")
+                    or display_source.get("segments_revision") != 0
+                    or len(sources) != 1 or sources[0].get("kind") != "segments"
+                    or sources[0].get("events_sha256") != display_trace.get("source_snapshot_sha256")
+                    or pre_human.get("segments_sha256") != display_trace.get("result_snapshot_sha256")):
+                raise MachineSnapshotMissing("machine_display_segmentation_source_missing")
+            from display_segmentation import apply as apply_display
+            proposal = evidence.get("display_segmentation_proposal")
+            try:
+                if not isinstance(proposal, dict) or proposal.get("proposal_hash") != display_trace.get("proposal_hash"):
+                    raise ValueError("proposal_missing")
+                applied = apply_display(sources[0]["events"], proposal, source=display_trace["source"])
+                # Final analytical signals can be attached after division.
+                from transcription_quality import segments_hash
+                editor_precision = [{**row, "start": round(float(row["start"]), 4),
+                                     "end": round(float(row["end"]), 4)} for row in applied]
+                if (segments_hash(applied) != segments_hash(original_segments)
+                        and segments_hash(editor_precision) != segments_hash(original_segments)):
+                    raise ValueError("result_changed")
+            except (ValueError, TypeError, KeyError):
+                raise MachineSnapshotMissing("machine_display_segmentation_proposal_invalid") from None
         if evidence_schema == SCHEMA:
             capture = evidence.get("capture")
             if not isinstance(capture, dict):

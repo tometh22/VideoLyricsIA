@@ -21,6 +21,8 @@ import RequestVideo from "./RequestVideo";
 import { byPublicationMode, byRowMode } from "./publicationMode";
 import { ClientVisibilityControl } from "./ClientVisibility";
 import PublishedRequestChecklist from "./PublishedRequestChecklist";
+import PublishedTextReview from "./PublishedTextReview";
+import PublishedHumanReview from "./PublishedHumanReview";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -405,7 +407,7 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
-              onConfirmPublication={(confirmedItems) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems)}
+              onConfirmPublication={(confirmedItems, textReview) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems, textReview)}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
@@ -519,6 +521,13 @@ function ChangeRequestCard({
   // decide `correctionSteps` (puro y testeado); acá sólo se le conecta cada
   // acción con su handler o su enlace.
   const [closeOpen, setCloseOpen] = useState(false);
+  const [humanReviewOpen, setHumanReviewOpen] = useState(false);
+  const humanReviewRef = useRef(null);
+  const canReviewPublication = !isResolved && item.published_review?.review_token && d.published_video_url;
+  useEffect(() => { setHumanReviewOpen(false); }, [item.id, isResolved, item.published_review?.review_token]);
+  useEffect(() => {
+    if (humanReviewOpen) humanReviewRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  }, [humanReviewOpen]);
   const closeRef = useRef(null);
   // A different request, or this one resolved/reopened, never inherits an open form.
   useEffect(() => { setCloseOpen(false); }, [item.id, isResolved]);
@@ -528,6 +537,10 @@ function ChangeRequestCard({
     && workflow.allowed_actions.includes("confirm_publication");
   const [checklist, setChecklist] = useState({ ready: false, count: 0 });
   const onChecklistChange = useCallback((ready, count) => setChecklist({ ready, count }), []);
+  const textReview = confirmsPublication
+    && actionNotice?.textReview?.renderFingerprint === item.publication?.render_fingerprint
+    && actionNotice?.textReview?.editorRevision === item.publication?.editor_revision
+    ? actionNotice.textReview : null;
   const view = correctionSteps(workflow, {
     isResolved,
     hasJob: Boolean(d.job_id),
@@ -539,7 +552,7 @@ function ChangeRequestCard({
     proposalEnabled,
     qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
     busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim(),
-      unchecked: confirmsPublication && !checklist.ready },
+      unchecked: confirmsPublication && (!checklist.ready || Boolean(textReview)) },
   });
   const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   const primaryWiring = {
@@ -570,14 +583,14 @@ function ChangeRequestCard({
       // the shortcut must never run the PRIMARY action, which may be publishing.
       if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, button, a, summary, [contenteditable='true'], [role='dialog']")
         || document.querySelector("[role='dialog'][aria-modal='true']")) return;
-      if (primaryAction.disabled) return;
+      if (primaryAction.disabled || humanReviewOpen) return;
       event.preventDefault();
       if (primaryAction.onClick) primaryAction.onClick();
       else if (primaryAction.href) window.location.assign(primaryAction.href);
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [primaryAction.disabled, primaryAction.href, primaryAction.onClick]);
+  }, [primaryAction.disabled, primaryAction.href, primaryAction.onClick, humanReviewOpen]);
 
   return (
     <article className="min-w-0 rounded-2xl bg-surface-2/25 ring-1 ring-white/[0.07]">
@@ -616,7 +629,8 @@ function ChangeRequestCard({
         </span>
       </header>
 
-      <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
+      <div className="grid min-w-0 gap-5 p-4 sm:p-5"
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 18rem), 1fr))" }}>
         <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
           <RequestWorkflowStepper workflow={workflow} steps={view.steps} sentence={view.sentence} />
 
@@ -704,13 +718,30 @@ function ChangeRequestCard({
             </p>
           </section>
 
-          {confirmsPublication && (
+          {humanReviewOpen && canReviewPublication && (
+            <div ref={humanReviewRef}>
+              <PublishedHumanReview key={item.published_review.review_token} item={item} busy={resolving}
+                onConfirm={onConfirmPublication} onCancel={() => setHumanReviewOpen(false)} />
+            </div>
+          )}
+
+          {confirmsPublication && !humanReviewOpen && (
             <PublishedRequestChecklist
               key={`${item.id}:${item.publication?.render_fingerprint || ""}`}
               requestId={item.id}
               comment={item.comment}
               onReadyChange={onChecklistChange}
               onSeek={seekVideo}
+            />
+          )}
+
+          {textReview && (
+            <PublishedTextReview
+              key={textReview.token}
+              review={textReview}
+              checklistReady={checklist.ready}
+              busy={resolving}
+              onConfirm={(reason) => onConfirmPublication?.(checklist.count, { token: textReview.token, reason })}
             />
           )}
 
@@ -820,7 +851,12 @@ function ChangeRequestCard({
           {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : ""}
         </p>
         <div className="ml-auto flex flex-col items-end gap-1.5">
-          {primaryAction.href ? (
+          {canReviewPublication && <button type="button" disabled={resolving || publishing}
+            onClick={() => setHumanReviewOpen(true)}
+            className="rounded-xl bg-emerald-600 px-4 py-2.5 text-caption font-semibold text-white disabled:opacity-40">
+            Resolver con revisión humana
+          </button>}
+          {!humanReviewOpen && (primaryAction.href ? (
             <a
               href={primaryAction.href}
               className="rounded-xl bg-brand px-4 py-2.5 text-caption font-semibold text-white shadow-lg shadow-brand/15 hover:bg-brand-light"
@@ -838,7 +874,7 @@ function ChangeRequestCard({
               {primaryAction.label}
               {!primaryAction.disabled && <span className="ml-2 hidden text-[10px] opacity-60 sm:inline">⌘↵</span>}
             </button>
-          )}
+          ))}
           {view.secondary.length > 0 && (
             <div role="group" aria-label="Otras acciones" className="flex flex-wrap justify-end gap-x-3 gap-y-1">
               {view.secondary.map((link) => {

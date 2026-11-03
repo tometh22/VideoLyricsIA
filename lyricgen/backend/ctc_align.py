@@ -58,6 +58,8 @@ import time
 import unicodedata
 from typing import Optional
 
+from ctc_audio import audio_info, load_audio
+
 logger = logging.getLogger("uvicorn.error")
 
 MODEL_ID = os.environ.get(
@@ -82,6 +84,16 @@ _MODEL = None        # lazy singleton: (forward_fn, dictionary, blank_id)
 
 def is_enabled() -> bool:
     return os.environ.get("CTC_ALIGN_ENABLED", "0").strip().lower() in _TRUE
+
+
+def unknown_lang_job_es_enabled() -> bool:
+    """CTC_ALIGN_UNKNOWN_LANG_JOB_ES: alinear texto de idioma "unknown"
+    cuando el job está en español. Apagada por defecto."""
+    return os.environ.get("CTC_ALIGN_UNKNOWN_LANG_JOB_ES", "0").strip().lower() in _TRUE
+
+
+def _is_spanish(language: Optional[str]) -> bool:
+    return str(language or "").strip().lower() in {"es", "spa", "spanish", "español", "espanol"}
 
 
 def _star_delta() -> float:
@@ -227,9 +239,8 @@ def skip_arc_align(emission, targets, line_token_ranges, blank_id: int,
     pass per frame is exact).
 
     With lam=inf this degenerates to vanilla forced alignment — the
-    parity test pins it against torchaudio's forced_align. Replacing the
-    torchaudio call also removes the dependency on an API deleted in
-    torchaudio 2.9.
+    parity test pins it against torchaudio's forced_align. This path is
+    independent of the native aligner retained by current TorchAudio.
 
     Args:
       emission: (T, C) log-probs (star column already appended).
@@ -334,12 +345,21 @@ _EN_STOP = frozenset(
 
 
 def guess_text_lang(lines: list[str]) -> str:
-    """'es' / 'en' / 'unknown' by exclusive function-word voting.
+    """Conservative language guard for a Spanish-only acoustic model.
 
     Shared words (notably ``no`` and ``me``) are not language evidence.
     Counting them for both sides made Spanish live choruses with repeated
     ``no`` look ambiguous and disabled CTC before any acoustic work.
     """
+    # Spanish/English voting alone treats French as Spanish because both
+    # use de/la/que/en. A dominant Spanish chorus must not authorize Spanish
+    # forced alignment over a French verse (Congreso incident).
+    from transcription_language import detect_text_languages
+    languages = set(detect_text_languages(lines))
+    for line in lines:
+        languages.update(detect_text_languages([line]))
+    if languages - {"es"}:
+        return "mixed" if len(languages) > 1 else next(iter(languages))
     es = en = 0
     for line in lines:
         for w in line.lower().split():
@@ -1045,11 +1065,11 @@ def window_emissions(audio_path: str, start: float, end: float):
     import torchaudio
 
     model, dictionary, blank_id = _load_model()
-    info = torchaudio.info(audio_path)
+    info = audio_info(audio_path)
     source_sr = info.sample_rate or SR
     offset = max(0, int(start * source_sr))
     frames = max(1, int((end - start) * source_sr))
-    wav, sr = torchaudio.load(
+    wav, sr = load_audio(
         audio_path, frame_offset=offset, num_frames=frames,
     )
     wav = wav.mean(0, keepdim=True)
@@ -1241,11 +1261,11 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
         if real_tokens / characters < 0.60:
             return None
 
-        info = torchaudio.info(audio_path)
+        info = audio_info(audio_path)
         source_sr = info.sample_rate or SR
         offset = max(0, int(start * source_sr))
         frames = max(1, int(duration * source_sr))
-        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav, sr = load_audio(audio_path, frame_offset=offset, num_frames=frames)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1307,6 +1327,103 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
             "[CTC-STRUCTURAL] decline on error: %s (job=%s)", exc, job_id,
         )
         return None
+
+
+def _load_window(audio_path: str, start: float, end: float):
+    """Decode only [start, end], then produce mono audio at 16 kHz."""
+    import torchaudio
+
+    source_sr = audio_info(audio_path).sample_rate or SR
+    wav, sr = load_audio(
+        audio_path, frame_offset=max(0, int(start * source_sr)),
+        num_frames=max(1, int((end - start) * source_sr)),
+    )
+    wav = wav.mean(0, keepdim=True)
+    if sr != SR:
+        wav = torchaudio.functional.resample(wav, sr, SR)
+    return wav
+
+
+def align_line(audio_path: str, text: str, window_start: float,
+               window_end: float, job_id: str = "") -> dict:
+    """Alinea UNA línea dentro de una ventana acotada (realineado tras
+    corregir el texto). Nunca cambia nada: devuelve una propuesta o un
+    motivo de declive.
+
+    Las estrellas antes y después del texto absorben el canto de las líneas
+    vecinas que cae dentro del margen. ``score`` es el promedio del score por
+    palabra (probabilidad media de sus tokens) y ``min_score`` el de la peor.
+    """
+    result = {"status": "declined", "reason": "", "window": [
+        round(float(window_start), 3), round(float(window_end), 3)]}
+    try:
+        if not is_enabled():
+            result["reason"] = "ctc_disabled"
+            return result
+        if not audio_path or not os.path.exists(audio_path):
+            result["reason"] = "audio_missing"
+            return result
+        clean = " ".join(str(text or "").split())
+        start, end = max(0.0, float(window_start)), float(window_end)
+        if not clean:
+            result["reason"] = "empty_text"
+            return result
+        if not (end - start >= 0.5 and end - start <= 45.0):
+            result["reason"] = "window_out_of_range"
+            return result
+
+        import torch
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        targets, words = build_targets([clean], dictionary, star_id, word_sep_id=word_sep_id)
+        real_words = [w for w in words if w[0] >= 0]
+        if not real_words:
+            result["reason"] = "no_alignable_words"
+            return result
+        wav = _load_window(audio_path, start, end)
+        if len(targets) >= wav.shape[1] // FRAME:
+            result["reason"] = "window_too_short_for_text"
+            return result
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        aligned, scores = AF.forced_align(
+            emission.unsqueeze(0),
+            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+            blank=blank_id,
+        )
+        token_spans = AF.merge_tokens(aligned[0], scores[0].exp(), blank=blank_id)
+        spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+        line = spans_to_lines(spans, words, 1, FRAME / SR)[0]
+        if line is None or not line[2]:
+            result["reason"] = "no_word_spans"
+            return result
+        local_start, local_end, word_spans = line
+        word_scores = [float(w[3]) for w in word_spans]
+        result.update({
+            "status": "ok",
+            "reason": "",
+            "start": round(start + local_start, 3),
+            "end": round(start + local_end, 3),
+            "score": round(sum(word_scores) / len(word_scores), 4),
+            "min_score": round(min(word_scores), 4),
+            "words": [
+                {"word": w, "start": round(start + ws, 3), "end": round(start + we, 3),
+                 "score": round(float(sc), 4)}
+                for w, ws, we, sc in word_spans
+            ],
+            "word_coverage": round(len(word_spans) / len(real_words), 3),
+        })
+        return result
+    except Exception as exc:  # noqa: BLE001 — una propuesta nunca rompe el editor
+        logger.warning("[CTC-LINE] decline on error: %s (job=%s)", type(exc).__name__, job_id)
+        result["reason"] = "error"
+        return result
 
 
 def _structural_anchor_slots(
@@ -1407,11 +1524,11 @@ def align_structural_anchors(audio_path: str, texts: list[str],
             if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
             else None
         )
-        info = torchaudio.info(audio_path)
+        info = audio_info(audio_path)
         source_sr = info.sample_rate or SR
         offset = max(0, int(start * source_sr))
         frames = max(1, int((end - start) * source_sr))
-        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav, sr = load_audio(audio_path, frame_offset=offset, num_frames=frames)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1526,7 +1643,8 @@ def retime_segments(audio_path: str, segments: list[dict],
                     job_id: str = "",
                     mix_path: Optional[str] = None,
                     max_skip_frac: Optional[float] = None,
-                    vocal_stem: Optional[bool] = None) -> Optional[list[dict]]:
+                    vocal_stem: Optional[bool] = None,
+                    language_hint: Optional[str] = None) -> Optional[list[dict]]:
     """Align the segments' text onto `audio_path` (vocal stem preferred)
     and return NEW segments with replaced start/end + word stamps.
     Texts pass through verbatim. Returns None to decline (caller keeps
@@ -1559,6 +1677,14 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         lines = [(s.get("text") or "").strip() for s in segments]
         lang = guess_text_lang(lines)
+        if lang == "unknown" and unknown_lang_job_es_enabled() and _is_spanish(language_hint):
+            # Textos cortos o repetitivos no juntan palabras función para
+            # decidir y quedan "unknown". Si el job es en español, se alinea:
+            # el piso de mediana de score (CTC_ALIGN_MIN_MED_SCORE) sigue
+            # atajando un idioma equivocado.
+            logger.info("[CTC] text language=unknown, job language=%s — aligning (job=%s)",
+                        language_hint, job_id)
+            lang = "es"
         if lang != "es":
             # The model is Spanish-only; English aligns silently wrong
             # (it passes the char gate with ratio 1.0). Until a per-language
@@ -1595,10 +1721,10 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         t0 = time.time()
         # Duration guard BEFORE decoding: a multi-hour upload would expand
-        # to several GB of float32 in RAM if we torchaudio.load() first
+        # to several GB of float32 in RAM if we load_audio() first
         # (OOM risk in the uvicorn/ShortWorker containers).
         try:
-            info = torchaudio.info(audio_path)
+            info = audio_info(audio_path)
             est_dur = info.num_frames / (info.sample_rate or SR)
         except Exception:
             est_dur = None
@@ -1606,7 +1732,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             logger.info("[CTC] decline: audio %.0fs out of range (job=%s)",
                         est_dur, job_id)
             return None
-        wav, sr = torchaudio.load(audio_path)
+        wav, sr = load_audio(audio_path)
         wav = wav.mean(0, keepdim=True)
         if sr != SR:
             wav = torchaudio.functional.resample(wav, sr, SR)
@@ -1625,7 +1751,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             # Our own Viterbi with per-line skip arcs: a ghost line (lrclib
             # studio text over a live that skips it) costs lam instead of
             # stealing audio from its neighbours. Also removes the
-            # torchaudio.forced_align dependency (deleted in 2.9).
+            # torchaudio.forced_align dependency (retained by current TorchAudio).
             tok_pos, line_ranges, line_of_range = 0, [], []
             for li, _raw, n_tok in words:
                 if li >= 0:
@@ -1712,7 +1838,7 @@ def retime_segments(audio_path: str, segments: list[dict],
             anchored_norms = [re.sub(r"\W+", "", lines[i].lower())
                               for i in range(len(lines))
                               if i not in skipped_lines and len(lines[i]) > 10]
-            mwav, msr = torchaudio.load(mix_path)
+            mwav, msr = load_audio(mix_path)
             mwav = mwav.mean(0, keepdim=True)
             if msr != SR:
                 mwav = torchaudio.functional.resample(mwav, msr, SR)

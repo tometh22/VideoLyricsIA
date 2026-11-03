@@ -6,6 +6,25 @@ envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
 
 ## Alcance
 
+### Pestañas por producto en Argentina
+
+Las entregas nuevas guardan `product_category` al publicarse según el canal de
+la campaña: Art Tracks Artistas, HitsDeSiempre Lyrics/Art Tracks y
+CancioneroRock Lyrics/Art Tracks. El portal conserva **Todos los entregables**
+y **Otros videos** para versiones históricas sin canal. Chile conserva la
+división vigente. La categoría es un snapshot de la entrega; no se infiere del
+título, artista o archivo.
+
+Para el despliegue, la base compartida de entregas de producción debe tener la
+columna aditiva `product_category` antes de iniciar la API de staging que la
+consulta. La migración Alembic crea la columna e identifica como Art Tracks
+Artistas los Art Tracks anteriores. Después de actualizar ambas APIs, ejecutar
+`scripts/backfill_umg_product_categories.py` con URLs de staging y entregas,
+primero en modo lectura y luego con `--apply`: clasifica los 49 Art Tracks de
+HitsDeSiempre ya publicados mediante los ID de canción de su campaña. Publicar
+el HTML del portal solo después de comprobar que las categorías suman el total
+de entregas visibles.
+
 - `umg.genly.pro`: mantiene compatibilidad con el listado histórico de
   entregas de Argentina. Las filas históricas sin destino explícito se
   interpretan como Argentina.

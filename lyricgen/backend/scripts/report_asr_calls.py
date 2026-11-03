@@ -34,7 +34,7 @@ def _from_evidence(evidence: dict | None) -> dict[str, int]:
         transformation = str(hypothesis.get("transformation") or "")
         if transformation == "cache_hit_raw":
             counters["whisperx_cache_hits"] += 1
-        elif transformation == "replicate_raw":
+        elif transformation == "replicate_raw" or transformation.startswith("replicate_raw:offset="):
             counters["whisperx_real_calls"] += 1
     return counters
 

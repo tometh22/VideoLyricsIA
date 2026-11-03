@@ -226,6 +226,20 @@ it.each([undefined, 502])("reports uncertain publication after lost response/sta
   expect(mocks.fetchJson.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(1);
 });
 
+it("says which request stayed open because its text is not in the published lyrics", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")
+    ? Promise.resolve({ ok: true, content_changed: true, revision: 3, portal_id: "chile", job_id: "job-85",
+      resolved_change_requests: [], kept_open_change_requests: [{ id: 85, reason: "requested_text_not_found",
+        missing: ["Pintamos el mono, pero NOS DA lo mismo"] }] })
+    : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, { editor_revision: 4, render_fingerprint: "render4" }));
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "ok" });
+  expect(result.current.crPublishNotice.text).toContain("Publicada la versión 3");
+  expect(result.current.crPublishNotice.text).toContain("El pedido #85 sigue abierto: la letra publicada no tiene «Pintamos el mono, pero NOS DA lo mismo».");
+});
+
 it("confirms a lost publication response from the request's publication resolution", async () => {
   const previous = mocks.fetchJson.getMockImplementation();
   mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")
@@ -566,4 +580,52 @@ it("never confirms a publication close without the reviewed cut identity", async
   await act(() => result.current.confirmChangeRequestPublication(85, { editor_revision: 14 }));
   expect(mocks.fetchJson.mock.calls.some(([url]) => url.endsWith("/confirm-publication"))).toBe(false);
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "error" });
+});
+
+it("sends an explicit human publication decision without publishing another version", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.endsWith("/confirm-publication")
+    ? Promise.resolve({ ok: true, human_review: true, resolved_by_revision: 6 }) : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85,
+    { render_fingerprint: "candidate", editor_revision: 141 }, 5,
+    { publicationToken: "b".repeat(64), reason: "Revisé la versión publicada." }));
+  const posts = mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith("/confirm-publication"));
+  expect(posts).toHaveLength(1);
+  expect(JSON.parse(posts[0][1].body)).toMatchObject({ publication_review_token: "b".repeat(64),
+    publication_review_reason: "Revisé la versión publicada.", confirmed_published_review: true, confirmed_items: 5 });
+  expect(JSON.parse(posts[0][1].body)).not.toHaveProperty("text_review_token");
+  expect(mocks.fetchJson.mock.calls.some(([url]) => /from-job|\/approve\//.test(url))).toBe(false);
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok" });
+});
+
+it("exposes the exact text rejection and sends human review only on explicit confirmation", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  const token = "a".repeat(64);
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (!url.endsWith("/confirm-publication")) return previous(url, opts);
+    const body = JSON.parse(opts.body);
+    if (body.text_review_token) return Promise.resolve({ ok: true, resolved_by_revision: 6 });
+    return Promise.reject(Object.assign(new Error("La frase no coincide"), { status: 409, detail: {
+      code: "requested_text_not_found", missing: ["me despirerta por las noches"], review_token: token,
+      message: "Revisá el pedido contra el video.",
+    } }));
+  });
+  const publication = { render_fingerprint: "cut-6", editor_revision: 141 };
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85, publication, 5));
+  expect(result.current.crPublishNotice.textReview).toEqual({ token, missing: ["me despirerta por las noches"],
+    renderFingerprint: "cut-6", editorRevision: 141 });
+  const calls = () => mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith("/confirm-publication"));
+  expect(calls()).toHaveLength(1); // no automatic retry or typo replacement
+  expect(JSON.parse(calls()[0][1].body)).not.toHaveProperty("text_review_token");
+  await act(() => result.current.confirmChangeRequestPublication(85, publication, 5,
+    { token, reason: "Revisé despierta en el video; el pedido tiene un typo." }));
+  expect(JSON.parse(calls()[1][1].body)).toMatchObject({ text_review_token: token,
+    text_review_reason: "Revisé despierta en el video; el pedido tiene un typo.",
+    reviewed_render_fingerprint: "cut-6", reviewed_editor_revision: 141, confirmed_items: 5 });
+  expect(result.current.crPublishNotice.text).toContain("revisión manual");
+  expect(result.current.crPublishNotice.textReview).toBeUndefined();
 });

@@ -259,3 +259,81 @@ def test_merged_lines_are_not_a_chorus_correction():
     screen = [dict(original[0], text="Ehy, quiebro razón justo a tiempo ya ahora"), original[1]]
     review = build_review(screen, original_segments=original, title="")
     assert [i for i in review["items"] if i["kind"] == "chorus_propagate"] == []
+
+
+def test_sueldos_repeated_phrase_is_reviewed_below_old_length_limits():
+    text = "Qué locura ver, te manejan Qué locura ver"
+    segments = [_line(text, 26.023, 31.3145, "sueldos-0", locked=True)]
+    assert len(text) < 60 and len(text.split()) < 11
+    from copy import deepcopy
+    original = deepcopy(segments)
+    review = build_review(segments)
+    [item] = [i for i in review['items'] if i['kind'] == 'phrase_structure']
+    assert item['group'] == 'layout'
+    assert item['listen'] is True and item['required'] is False
+    assert 'Qué locura ver' in item['why']
+    assert item['occurrences'][0]['before'] == text
+    assert item['occurrences'][0]['after'] == text
+    assert item['occurrences'][0]['fix'] == {'type': 'inspect_structure'}
+    assert segments == original  # Includes operator locks and exact outer times.
+
+
+def test_phrase_structure_keeps_every_repetition_and_distinct_dismissal_keys():
+    segments = [
+        _line('Qué locura ver, te manejan Qué locura ver', 26, 31, 'a'),
+        _line('Qué locura ver, te manejan Qué locura ver', 32, 38, 'b'),
+        _line('Qué locura ver, te manejan con un sueldo, qué locura ver', 52, 58, 'c'),
+    ]
+    items = [i for i in build_review(segments)['items'] if i['kind'] == 'phrase_structure']
+    assert [len(i['occurrences']) for i in items] == [1, 1, 1]
+    assert len({i['id'] for i in items}) == 3
+    assert set(items[0]['keys']).isdisjoint(items[1]['keys'])
+    dismissed = dict(segments[0], qa_dismissed=items[0]['keys'])
+    remaining = [i for i in build_review([dismissed, *segments[1:]])['items'] if i['kind'] == 'phrase_structure']
+    assert len(remaining) == 2
+    assert remaining[0]['occurrences'][0]['line_segment_id'] == 'b'
+
+
+def test_phrase_structure_does_not_flag_short_adlibs_or_separate_chorus_cards():
+    segments = [
+        _line('Oh oh oh oh oh oh', 0, 8),
+        _line('Nadie es el dueño', 8, 10),
+        _line('Nadie es el dueño', 12, 14),
+        _line('Que venga la noche y bailemos juntos', 15, 20),
+    ]
+    assert not [i for i in build_review(segments)['items'] if i['kind'] == 'phrase_structure']
+
+
+def test_phrase_structure_legacy_ids_and_changed_timing_do_not_share_acceptance():
+    text = 'Qué locura ver, te manejan Qué locura ver'
+    segments = [_line(text, 26, 31, _id=0), _line(text, 32, 38, _id=1)]
+    items = [i for i in build_review(segments)['items'] if i['kind'] == 'phrase_structure']
+    assert len(items) == 2 and set(items[0]['keys']).isdisjoint(items[1]['keys'])
+    decided = dict(segments[0], qa_dismissed=items[0]['keys'])
+    assert not [i for i in build_review([decided])['items'] if i['kind'] == 'phrase_structure']
+    changed = dict(decided, end=32)
+    assert [i for i in build_review([changed])['items'] if i['kind'] == 'phrase_structure']
+
+
+def test_viaje_compound_phrases_need_review_below_old_length_limits():
+    from copy import deepcopy
+    segments = [
+        _line('Vuelvo al lugar, me vuelvo a drogar, que toc toc toca', 15.534, 19.275, 'viaje-15'),
+        _line('Yo viajo en un viaje sin rumbo y voy a chocar', 89.308, 92.3882, 'viaje-chorus', locked=True),
+    ]
+    assert all(len(s['text']) < 60 and len(s['text'].split()) <= 11 for s in segments)
+    before = deepcopy(segments)
+    items = [i for i in build_review(segments)['items'] if i['kind'] == 'phrase_structure']
+    assert len(items) == 2
+    assert all(i['listen'] and not i['required'] for i in items)
+    assert all(i['occurrences'][0]['fix'] == {'type': 'inspect_structure'} for i in items)
+    assert segments == before
+
+
+def test_few_long_words_also_need_display_length_review():
+    text = 'La extraordinaria transformación de nuestra realidad'
+    assert len(text.split()) <= 8 and len(text) > 42
+    items = [i for i in build_review([_line(text, 0, 3, 'wide')])['items']
+             if i['kind'] == 'phrase_structure']
+    assert len(items) == 1 and items[0]['occurrences'][0]['after'] == text
+    assert items[0]['required'] is False and items[0]['listen'] is True

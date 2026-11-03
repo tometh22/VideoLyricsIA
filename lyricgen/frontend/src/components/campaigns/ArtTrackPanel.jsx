@@ -8,6 +8,18 @@ async function digest(file) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function audioMetadata(filename) {
+  const stem = filename.replace(/\.[^.]+$/, "");
+  const dashed = stem.split(" - ");
+  if (dashed.length > 1) return { artist: dashed[0], title: dashed.slice(1).join(" - ") };
+  const underscored = stem.split("_");
+  if (underscored.length === 3 && /^AR[A-Z0-9]{8,}$/i.test(underscored[2])) {
+    return { title: underscored[0], artist: underscored[1], technical_code: underscored[2].toUpperCase() };
+  }
+  if (underscored.length === 2) return { title: underscored[0], artist: underscored[1] };
+  return { title: stem, artist: "" };
+}
+
 async function uploadAsset(asset) {
   const ticket = await campaignPost(`/batch/art-track-assets/${asset.id}/ticket`);
   if (ticket.complete) return;
@@ -54,11 +66,19 @@ export default function ArtTrackPanel({ campaign, onChanged }) {
       const relative = file.webkitRelativePath || file.name;
       const sha = await digest(file);
       if (/\.(wav|mp3)$/i.test(file.name)) {
-        const bits = file.name.replace(/\.[^.]+$/, "").split(" - ");
-        audios.push({ client_id: sha, filename: file.name, relative_path: relative, artist: bits.length > 1 ? bits[0] : "", title: bits.length > 1 ? bits.slice(1).join(" - ") : bits[0], size_bytes: file.size, sha256: sha });
+        audios.push({ client_id: sha, filename: file.name, relative_path: relative, ...audioMetadata(file.name), size_bytes: file.size, sha256: sha });
       } else if (/\.(jpg|jpeg|png)$/i.test(file.name)) {
         covers.push({ filename: file.name, relative_path: relative, size_bytes: file.size, sha256: sha, mime_type: file.type || undefined });
       }
+    }
+    const coversByStem = new Map();
+    for (const cover of covers) {
+      const stem = cover.filename.replace(/\.[^.]+$/, "").toLocaleLowerCase();
+      coversByStem.set(stem, coversByStem.has(stem) ? null : cover.relative_path);
+    }
+    for (const audio of audios) {
+      const stem = audio.filename.replace(/\.[^.]+$/, "").toLocaleLowerCase();
+      audio.cover_file = coversByStem.get(stem) || undefined;
     }
     const manifest = await campaignPost(`/batch/art-track-campaigns/${id}/manifest`, { audios, covers });
     const assets = await campaignRequest(`/batch/art-track-campaigns/${id}/assets`);

@@ -47,6 +47,7 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
   const fileRef = useRef(null);
 
   const [saving, setSaving] = useState(false);
+  const saveLockRef = useRef(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -85,6 +86,8 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
   };
 
   const handleSave = async () => {
+    if (saveLockRef.current) return;
+    saveLockRef.current = true;
     setSaving(true);
     setError("");
     try {
@@ -103,15 +106,21 @@ export default function ArtTrackEditPanel({ job, onEdited }) {
       });
       if (!res.ok) {
         let detail = "";
-        try { detail = (await res.json())?.detail || ""; } catch { /* noop */ }
-        throw new Error(detail || `HTTP ${res.status}`);
+        try {
+          const data = await res.json();
+          detail = typeof data.detail === "string" ? data.detail : data.detail?.message || "";
+        } catch { /* noop */ }
+        throw new Error(detail || `No se pudo guardar la edición (HTTP ${res.status}). Tus cambios siguen en el formulario.`);
       }
       const resp = await res.json();
       if (onEdited) onEdited({ ...resp, edit_type: "art_track" });
     } catch (e) {
-      setError(e.message || (t("artedit.error") || "No se pudo guardar la edición."));
+      setError(e instanceof TypeError
+        ? "No pudimos confirmar el guardado por un problema de conexión. Tus cambios siguen en el formulario; revisá el estado del video antes de reintentar."
+        : e.message || (t("artedit.error") || "No se pudo guardar la edición."));
     } finally {
       setSaving(false);
+      saveLockRef.current = false;
     }
   };
 

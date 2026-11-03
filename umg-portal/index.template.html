@@ -1830,7 +1830,25 @@ async function fetchItems() {
 let SONGS = [];
 let ARTISTS = []; // [{name, songs[], pendingChanges}]
 let SELECTED_ARTIST = null;
-let SELECTED_CATEGORY = "all"; // all | art_track | other
+let SELECTED_CATEGORY = "all";
+const PRODUCT_TABS = [
+  ["artists_art", "Art Tracks Artistas"],
+  ["hits_lyrics", "HitsDeSiempre Lyrics"],
+  ["hits_art", "HitsDeSiempre Art Tracks"],
+  ["rock_lyrics", "CancioneroRock Lyrics"],
+  ["rock_art", "CancioneroRock Art Tracks"],
+];
+function versionProduct(version) {
+  const category = version.product_category;
+  if (PRODUCT_TABS.some(([key]) => key === category)) return category;
+  return version.label === "Art Track" ? "artists_art" : "other";
+}
+function categoryLabel(key) {
+  if (key === "all") return "Todos los entregables";
+  if (key === "art_track") return "Art Tracks";
+  if (key === "other") return "Otros videos";
+  return PRODUCT_TABS.find(([id]) => id === key)?.[1] || "Todos los entregables";
+}
 let SEARCH = "";
 let SELECTED_STATUS = null; // null = todos | "approved" | "pending" | "changes"
 let SELECTED_DATE = null; // null = todas | today | yesterday | week | month | custom
@@ -2015,7 +2033,9 @@ function filteredSongs({ includeArtist = true } = {}) {
         ...s,
         versions: (s.versions || []).filter(v =>
           (SELECTED_CATEGORY === "all" ||
-            (SELECTED_CATEGORY === "art_track") === (v.label === "Art Track")) &&
+            (getPortalId() === "chile"
+              ? ((SELECTED_CATEGORY === "art_track") === (v.label === "Art Track"))
+              : versionProduct(v) === SELECTED_CATEGORY)) &&
           matchesDateFilter(v, SELECTED_DATE) &&
           (!SELECTED_STATUS || versionStatus(v) === SELECTED_STATUS)
         ),
@@ -2105,7 +2125,10 @@ function selectArtist(name) {
 }
 
 function selectCategory(category) {
-  if (!["all", "art_track", "other"].includes(category)) return;
+  const allowed = getPortalId() === "chile"
+    ? ["all", "art_track", "other"]
+    : ["all", ...PRODUCT_TABS.map(([key]) => key), "other"];
+  if (!allowed.includes(category)) return;
   SELECTED_CATEGORY = category;
   SELECTED_ARTIST = null;
   renderSidebar();
@@ -2114,12 +2137,17 @@ function selectCategory(category) {
 
 function renderCategoryTabs() {
   const versions = SONGS.flatMap(song => song.versions || []);
-  const artTracks = versions.filter(v => v.label === "Art Track").length;
-  const categories = [
-    ["all", "Todos los entregables", versions.length],
-    ["art_track", "Art Tracks", artTracks],
-    ["other", "Otros videos", versions.length - artTracks],
-  ];
+  const categories = getPortalId() === "chile"
+    ? [
+        ["all", "Todos los entregables", versions.length],
+        ["art_track", "Art Tracks", versions.filter(v => v.label === "Art Track").length],
+        ["other", "Otros videos", versions.filter(v => v.label !== "Art Track").length],
+      ]
+    : [
+        ["all", "Todos los entregables", versions.length],
+        ...PRODUCT_TABS.map(([key, label]) => [key, label, versions.filter(v => versionProduct(v) === key).length]),
+        ["other", "Otros videos", versions.filter(v => versionProduct(v) === "other").length],
+      ];
   return `<nav class="delivery-sections" aria-label="Secciones de entregables">${categories.map(([key, label, count]) =>
     `<button type="button" class="delivery-section${SELECTED_CATEGORY === key ? " active" : ""}"
       aria-pressed="${SELECTED_CATEGORY === key}" onclick="selectCategory('${key}')">${label}<span class="delivery-section-count">${count}</span></button>`
@@ -2230,7 +2258,7 @@ function renderMain() {
   } else {
     const songCount = songs.length;
     headerHtml = `<div class="main-header">
-      <h2>${SEARCH ? "Resultados" : SELECTED_CATEGORY === "art_track" ? "Art Tracks" : SELECTED_CATEGORY === "other" ? "Otros videos" : "Todos los entregables"}</h2>
+      <h2>${SEARCH ? "Resultados" : categoryLabel(SELECTED_CATEGORY)}</h2>
       <p class="subline">${songCount} ${songCount === 1 ? "canción" : "canciones"}${SEARCH ? ` para "${escapeHtml(SEARCH)}"` : ""}</p>
     </div>`;
   }
