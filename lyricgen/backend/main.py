@@ -14678,6 +14678,22 @@ def _editor_conflict_payload(db: Session, document: EditorDocument) -> dict:
     }
 
 
+def _editor_revision_conflict(db: Session, job_id: str, current_user: dict) -> HTTPException:
+    """Snapshot the latest revision, releasing row locks before ASGI unwinds.
+
+    Dependency teardown yields to the event loop. Keeping the refreshed Job
+    and EditorDocument locks until that teardown lets a second synchronous
+    SELECT FOR UPDATE block the loop that must schedule the first rollback.
+    """
+    db.rollback()
+    try:
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        detail = _editor_conflict_payload(db, document)
+    finally:
+        db.rollback()
+    return HTTPException(status_code=409, detail=detail)
+
+
 class PilotTestCopyRequest(BaseModel):
     source_job_id: str = Field(..., max_length=12)
     pilot_id: str = Field(..., min_length=1, max_length=64,
@@ -14941,12 +14957,7 @@ async def patch_editor_document(
                 ))
         db.commit()
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409,
-            detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -15429,12 +15440,7 @@ async def restore_editor_version(
     except LookupError:
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409,
-            detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         "job_id": job_id,
@@ -15543,11 +15549,7 @@ async def resolve_editor_conflict(
             )
         db.commit()
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409, detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None

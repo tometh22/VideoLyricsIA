@@ -3,6 +3,7 @@
 ## [1.1.156] - 2026-11-03
 
 ### Changed
+- Release editor row locks before returning stale-revision conflicts, preventing concurrent saves from blocking the API.
 - Open account delivery reviews in the environment that owns the original job; do not offer broken links for deleted originals.
 - Promote the audited staging release to production, including campaign batch designs, lyric looks, delivery planning and operator activity.
 - Join production and staging migration histories with a no-op merge revision; retain existing production delivery product snapshots.
