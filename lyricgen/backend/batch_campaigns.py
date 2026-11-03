@@ -1931,7 +1931,7 @@ def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
 def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
-    order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
+    order: str = Query(default="effort", pattern="^(calendar|delivery|effort|learning)$"),
     scope: str = Query(default="pending", pattern="^(pending|approved|all|discarded|drafts)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
@@ -2164,6 +2164,8 @@ def review_queue(
     counter_rows = list(rows)
     if scope == "drafts":
         rows.sort(key=lambda row: (row["last_reviewed_at"] or "", -row["ordinal"]), reverse=True)
+    elif order == "calendar":
+        rows.sort(key=lambda row: row["ordinal"])
     elif order == "learning":
         rows.sort(key=lambda row: (-row["disagreement"], row["ordinal"]))
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]

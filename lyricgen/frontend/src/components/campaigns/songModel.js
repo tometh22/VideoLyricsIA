@@ -139,7 +139,7 @@ const STAGE_ORDER = ["attention", "lyrics", "qc", "ready", "approved", "audio", 
 export function sortSongs(songs, view) {
   const list = [...songs];
   if (view === "lyrics") {
-    // Keep the backend's effort order (fewest alerts first); drafts filter
+    // Keep the selected backend queue order (calendar, effort or learning); drafts filter
     // already comes sorted by most recent save.
     return list.sort((a, b) => (a.review?.queuePosition ?? 1e9) - (b.review?.queuePosition ?? 1e9) || a.ordinal - b.ordinal);
   }
