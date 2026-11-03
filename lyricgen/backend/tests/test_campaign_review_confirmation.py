@@ -1,5 +1,7 @@
 """Campaign reviewers can attest their saved work without gaining tenant access."""
 from copy import deepcopy
+import asyncio
+import inspect
 from datetime import datetime, timezone
 import uuid
 
@@ -117,3 +119,42 @@ def test_reviewer_must_still_confirm_every_quality_window(client, shared_review)
     result = post_confirmation(client, shared_review, "transcription-quality/acknowledge", confirmed_window_ids=[])
     assert result.status_code == 422
     assert result.json()["detail"]["code"] == "unsafe_windows_not_confirmed"
+
+
+@pytest.mark.parametrize("endpoint,_record,_action", ENDPOINTS)
+@pytest.mark.parametrize("outcome", ["stale", "revoked", "success_and_repeat"])
+def test_confirmation_releases_locks_before_dependency_teardown(
+    client, db, shared_review, endpoint, _record, _action, outcome,
+):
+    import main
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from database import SessionLocal, engine
+
+    if outcome == "revoked":
+        shared_review["grant"].revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    acknowledgement = endpoint.endswith("acknowledge")
+    handler = inspect.unwrap(main.acknowledge_transcription_quality if acknowledgement
+                             else main.resolve_language_review)
+    body_data = {"base_revision": 6 if outcome == "stale" else 7}
+    if acknowledgement:
+        body_data["confirmed_window_ids"] = ["qw_review"]
+    body = (main.TranscriptionQualityAckRequest if acknowledgement
+            else main.LanguageResolutionRequest)(**body_data)
+    request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
+    for _ in range(2 if outcome == "success_and_repeat" else 1):
+        try:
+            result = asyncio.run(handler(request=request, job_id=shared_review["job_id"],
+                body=body, current_user=shared_review["reviewer"], db=db))
+            assert outcome != "revoked"
+            if outcome == "stale":
+                assert result.status_code == 409
+            else:
+                assert result["ok"] is True
+        except HTTPException as exc:
+            assert outcome == "revoked" and exc.status_code == 404
+        assert not db.in_transaction()
+        if engine.dialect.name == "postgresql":
+            with SessionLocal() as contender:
+                assert contender.query(Job).filter_by(job_id=shared_review["job_id"]).with_for_update(nowait=True).one()

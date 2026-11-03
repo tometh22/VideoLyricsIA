@@ -14678,6 +14678,22 @@ def _editor_conflict_payload(db: Session, document: EditorDocument) -> dict:
     }
 
 
+def _editor_revision_conflict(db: Session, job_id: str, current_user: dict) -> HTTPException:
+    """Snapshot the latest revision, releasing row locks before ASGI unwinds.
+
+    Dependency teardown yields to the event loop. Keeping the refreshed Job
+    and EditorDocument locks until that teardown lets a second synchronous
+    SELECT FOR UPDATE block the loop that must schedule the first rollback.
+    """
+    db.rollback()
+    try:
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        detail = _editor_conflict_payload(db, document)
+    finally:
+        db.rollback()
+    return HTTPException(status_code=409, detail=detail)
+
+
 class PilotTestCopyRequest(BaseModel):
     source_job_id: str = Field(..., max_length=12)
     pilot_id: str = Field(..., min_length=1, max_length=64,
@@ -14941,12 +14957,7 @@ async def patch_editor_document(
                 ))
         db.commit()
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409,
-            detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -15429,12 +15440,7 @@ async def restore_editor_version(
     except LookupError:
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409,
-            detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         "job_id": job_id,
@@ -15543,11 +15549,7 @@ async def resolve_editor_conflict(
             )
         db.commit()
     except RuntimeError:
-        db.rollback()
-        _, document = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409, detail=_editor_conflict_payload(db, document),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -16349,6 +16351,16 @@ async def resolve_language_review(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Persist the human resolution of a language discrepancy for the saved revision."""
+    # Even a denied/stale/no-op response must release the row lock before
+    # dependency teardown yields control to another synchronous DB request.
+    try:
+        return _resolve_language_review_locked(job_id, body, current_user, db)
+    finally:
+        db.rollback()
+
+
+def _resolve_language_review_locked(job_id, body, current_user, db):
     """Persist an explicit, revision-scoped human resolution of a language /
     reference discrepancy so approval can proceed.
 
@@ -16417,6 +16429,16 @@ async def acknowledge_transcription_quality(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Persist an explicit, revision- and content-scoped quality decision."""
+    # Even a denied/stale/no-op response must release the row lock before
+    # dependency teardown yields control to another synchronous DB request.
+    try:
+        return _acknowledge_transcription_quality_locked(job_id, body, current_user, db)
+    finally:
+        db.rollback()
+
+
+def _acknowledge_transcription_quality_locked(job_id, body, current_user, db):
     """Persist an explicit, revision+content-scoped operator decision."""
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
     is_platform_admin = _is_platform_admin_user(current_user)

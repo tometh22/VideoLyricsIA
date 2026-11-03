@@ -1,5 +1,6 @@
 """Editor drafts, versions, locks and workspace collaboration."""
 
+import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,47 @@ def _token_for(user):
         return start_login_session(db, user)
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("operation", ["patch", "restore", "resolve"])
+def test_revision_conflict_releases_locks_before_response_teardown(operation):
+    import main
+    from fastapi import HTTPException
+
+    first, _, job_id = _users_and_job()
+    actor = {"id": first.id, "role": "user", "tenant_id": first.tenant_id,
+             "features": {"editor_v2": True}}
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, [
+            {"start": 0, "end": 1, "text": "latest human correction"},
+        ], "manual")
+        db.commit()
+        version_id = db.query(EditorVersion).filter_by(job_id=job_id, revision=0).one().id
+
+    handlers = {
+        "patch": (main.patch_editor_document, main.EditorPatchRequest(
+            base_revision=0, segments=[{"start": 0, "end": 1, "text": "stale"}])),
+        "restore": (main.restore_editor_version, main.EditorRestoreRequest(
+            base_revision=0, version_id=version_id)),
+        "resolve": (main.resolve_editor_conflict, main.EditorConflictRequest(
+            server_revision=0, strategy="use_server")),
+    }
+    handler, body = handlers[operation]
+    with SessionLocal() as db:
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(handler(job_id, body, current_user=actor, db=db))
+        assert caught.value.status_code == 409
+        assert caught.value.detail["server_revision"] == 1
+        assert caught.value.detail["server_segments"][0]["text"] == "latest human correction"
+        # The dependency is deliberately still open: ASGI cleanup must not
+        # be responsible for releasing locks needed by the next request.
+        assert not db.in_transaction()
+        if engine.dialect.name == "postgresql":
+            with SessionLocal() as contender:
+                assert contender.query(Job).filter_by(job_id=job_id).with_for_update(nowait=True).one()
+                assert contender.query(EditorDocument).filter_by(job_id=job_id).with_for_update(nowait=True).one()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
