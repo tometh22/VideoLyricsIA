@@ -113,7 +113,7 @@
 .hm-proof__stack img { width: 46px; height: 46px; object-fit: cover; border: 2px solid var(--hm-ink); border-radius: 50%; }
 .hm-proof__stack img + img { margin-left: -14px; }
 .hm-feature__media { position: relative; display: block; overflow: hidden; aspect-ratio: 16 / 9; border: 1px solid var(--hm-line-strong); border-radius: 22px; background: var(--hm-ink-3); box-shadow: 0 40px 90px rgba(0, 0, 0, .55); }
-.hm-feature__media img { width: 100%; height: 100%; object-fit: cover; transition: transform .6s var(--hm-ease); }
+.hm-feature__media img, .hm-feature__media video { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .6s var(--hm-ease); }
 .hm-feature figcaption { display: grid; gap: 6px; margin-top: 20px; }
 .hm-feature__tag { display: inline-flex; align-items: center; gap: 9px; color: var(--hm-muted); font-size: 12.5px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase; }
 .hm-feature__tag .hm-live { width: 6px; height: 6px; box-shadow: none; }

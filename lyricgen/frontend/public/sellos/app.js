@@ -45,7 +45,8 @@ const english = {
   "mobileCta": "Get a free sample",
   "heroProof": "We produce for a multinational label in Chile and Argentina. We’ve made lyric videos for <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> and many more artists.",
   "featureTag": "Made with Genly",
-  "featureMeta": "Lyric video · 5:12",
+  "featureTitle": "<strong>New styles</strong> Brush and Cosmic",
+  "featureMeta": "Lyric video · Excerpt",
   "workEyebrow": "Our work",
   "workTitle": "A few lyric videos we’ve made.",
   "workBody": "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
@@ -207,7 +208,8 @@ const portuguese = {
   "mobileCta": "Pedir uma amostra grátis",
   "heroProof": "Produzimos para uma gravadora multinacional no Chile e na Argentina. Fizemos lyric videos de <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> e muitos outros artistas.",
   "featureTag": "Feito com Genly",
-  "featureMeta": "Lyric video · 5:12",
+  "featureTitle": "<strong>Estilos novos</strong> Pincel e Cósmico",
+  "featureMeta": "Lyric video · Trecho",
   "workEyebrow": "Nosso trabalho",
   "workTitle": "Alguns lyric videos que fizemos.",
   "workBody": "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com o seu visual e a letra revisada linha por linha.",
@@ -375,6 +377,14 @@ function syncHeadline() {
     if (elapsed < total) requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
+}
+
+// Hero clip: with reduced motion it stays on its poster frame.
+const featureVideo = document.querySelector('#feature-video');
+if (reducedMotion) {
+  featureVideo.removeAttribute('autoplay');
+  featureVideo.preload = 'none';
+  featureVideo.pause();
 }
 
 // Published work reel: duplicated rows loop unless motion is reduced.
@@ -561,6 +571,7 @@ function setLanguage(lang) {
   syncHeadline();
   updateReelToggle();
   setLook(selectedLook);
+  featureVideo.setAttribute('aria-label',tr('Fragmento de un lyric video con los estilos de letra Pincel y Cósmico, sobre un callejón bajo la lluvia.','Excerpt from a lyric video with the Brush and Cosmic lyric styles, over a rainy alley.','Trecho de um lyric video com os estilos de letra Pincel e Cósmico, sobre um beco na chuva.'));
   document.querySelector('.look-chips').setAttribute('aria-label',tr('Estilos de letra','Lyric styles','Estilos de letra'));
   if (!briefPreview.hidden) updatePreparedInquiry();
   closeMenu();

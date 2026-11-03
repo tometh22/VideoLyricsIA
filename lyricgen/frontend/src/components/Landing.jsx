@@ -9,7 +9,7 @@ const SALES_EMAIL = "tomas@genly.pro";
 
 // Lyric videos hechos con Genly. Las imágenes son fotogramas reales (con la
 // letra en pantalla). No se enlaza ni se nombra dónde están publicados.
-const FEATURED = { id: "enanitos-verdes-salpicandonos", artist: "Enanitos Verdes", title: "Salpicandonos", duration: "5:12" };
+const HERO_CLIP = { src: "/landing/hero/estilos-pincel-cosmico.mp4", poster: "/landing/hero/estilos-pincel-cosmico.jpg" };
 const WORK = [
   [
     { id: "illya-kuryaki-jugo", artist: "Illya Kuryaki and the Valderramas", title: "Jugo" },
@@ -63,7 +63,9 @@ const COPY = {
     pathsNote: "Se pueden combinar: usás Platform para el día a día y nos pasás los lotes grandes a Studio.",
     proof: ["Producimos para un sello multinacional en Chile y Argentina. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
     featureTag: "Hecho con Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["Estilos nuevos", "Pincel y Cósmico"],
+    featureMeta: "Lyric video · Fragmento",
+    featureAlt: "Fragmento de un lyric video con los estilos de letra Pincel y Cósmico, sobre un callejón bajo la lluvia.",
     workEyebrow: "Nuestro trabajo",
     workTitle: "Algunos lyric videos que hicimos.",
     workBody: "Para catálogos de rock nacional, folklore, pop y cuarteto. Cada canción con su estética y la letra revisada línea por línea.",
@@ -169,7 +171,9 @@ const COPY = {
     pathsNote: "You can combine them: use Platform day to day and send the big batches to Studio.",
     proof: ["We produce for a multinational label in Chile and Argentina. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
     featureTag: "Made with Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["New styles", "Brush and Cosmic"],
+    featureMeta: "Lyric video · Excerpt",
+    featureAlt: "Excerpt from a lyric video with the Brush and Cosmic lyric styles, over a rainy alley.",
     workEyebrow: "Our work",
     workTitle: "A few lyric videos we’ve made.",
     workBody: "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
@@ -275,7 +279,9 @@ const COPY = {
     pathsNote: "Dá para combinar: você usa a Platform no dia a dia e manda os lotes grandes para o Studio.",
     proof: ["Produzimos para uma gravadora multinacional no Chile e na Argentina. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
     featureTag: "Feito com Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["Estilos novos", "Pincel e Cósmico"],
+    featureMeta: "Lyric video · Trecho",
+    featureAlt: "Trecho de um lyric video com os estilos de letra Pincel e Cósmico, sobre um beco na chuva.",
     workEyebrow: "Nosso trabalho",
     workTitle: "Alguns lyric videos que fizemos.",
     workBody: "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com sua estética e a letra revisada linha por linha.",
@@ -565,12 +571,13 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             </div>
             <figure className="hm-feature">
               <div className="hm-feature__media">
-                <img src={`/landing/work/${FEATURED.id}.jpg`} alt={`${FEATURED.artist} — ${FEATURED.title}`} width="1280" height="720" fetchpriority="high" />
+                {/* Con movimiento reducido queda la imagen fija del mismo fragmento. */}
+                <video key={reducedMotion ? "still" : "motion"} src={HERO_CLIP.src} poster={HERO_CLIP.poster} aria-label={c.featureAlt} width="1280" height="720" autoPlay={!reducedMotion} muted loop playsInline preload={reducedMotion ? "none" : "auto"} />
               </div>
               <figcaption>
                 <span className="hm-feature__tag"><span className="hm-live" aria-hidden="true" />{c.featureTag}</span>
-                <span className="hm-feature__title"><strong>{FEATURED.artist}</strong> {FEATURED.title}</span>
-                <span className="hm-feature__meta">{c.featureMeta} · {FEATURED.duration}</span>
+                <span className="hm-feature__title"><strong>{c.featureTitle[0]}</strong> {c.featureTitle[1]}</span>
+                <span className="hm-feature__meta">{c.featureMeta}</span>
               </figcaption>
             </figure>
           </div>
