@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import DeliveryPlan from "./DeliveryPlan";
+import DeliveryPlan, { DeliveryReviewLink } from "./DeliveryPlan";
 
 let report, calls, applyError;
 const empty = () => ({ veo: 0, photo_effect: 0, unknown: 0 });
@@ -33,6 +33,18 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 const mount = (campaignId, route = "/campaigns?view=accounts&account=argentina") => render(<MemoryRouter initialEntries={[route]}><DeliveryPlan campaignId={campaignId} /></MemoryRouter>);
+
+it("opens peer reviews in their own environment, never a broken local campaign", () => {
+  render(<MemoryRouter><DeliveryReviewLink row={{ source: "peer", campaign_id: "remote", stage: "generated" }} peerOrigin="https://staging.genly.pro">Revisar video</DeliveryReviewLink></MemoryRouter>);
+  expect(screen.getByRole("link")).toHaveAttribute("href", "https://staging.genly.pro/campaigns/remote?view=qc");
+  expect(screen.getByRole("link")).toHaveAttribute("rel", "noopener noreferrer");
+});
+
+it("does not invent links for missing jobs or unknown peer origins", () => {
+  render(<MemoryRouter><DeliveryReviewLink row={{ source: "missing", job_id: "gone" }}>Ver entregable</DeliveryReviewLink><DeliveryReviewLink row={{ source: "peer", job_id: "remote" }} peerOrigin="https://unknown.example">Revisar video</DeliveryReviewLink></MemoryRouter>);
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  expect(screen.getByText(/consultar portal/)).toBeInTheDocument();
+});
 
 describe("Delivery plan", () => {
   it("uses portal account and period, never the operator tenant", async () => {
