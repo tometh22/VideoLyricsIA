@@ -1,18 +1,37 @@
 # Changelog
 
-## [1.1.153] - 2026-11-03
+## [1.1.155] - 2026-11-03
 
 ### Added
 
+- A three-step campaign batch designer: choose the photo/video split and photo
+  effects, select compatible lyric looks, then review exact counts and generate.
+  Mix songs with a stable seed while preserving exact background quotas and
+  balanced look/effect counts; preview account impact separately from the lot.
+  Frozen confirmation preserves pinned designs and excludes unready songs from
+  generation, with current-revision checks before submitting the confirmed set.
 - Personal campaign production on Home and Campaigns, with Today/Yesterday,
   an Argentina-time date selector, campaign breakdown and song list. Attribute
   first successful renders to the initiating operator, not the account owner;
-  show requested re-edits separately and enforce current campaign access.
+  show re-edit requests separately and enforce current campaign access.
 
 ### Changed
 
-- Typography and lyric edit descriptions explain background reuse and the
-  required new render instead of promising no additional cost.
+- Typography and lyric edit descriptions explain asset reuse and the required
+  new render instead of promising no additional cost.
+
+## [1.1.154] - 2026-11-03
+
+### Fixed
+
+- Detect the language independently for each vocal section during automatic
+  WhisperX transcription. A quiet or instrumental intro no longer assigns one
+  uncertain language to the entire song. Retry uncertain sections with an
+  independent recognizer under a shared deadline, retain recognition evidence,
+  and preserve absolute timestamps and mixed-language lyrics.
+- Decline Spanish-only CTC alignment for mixed-language text, and keep re-sync
+  polling attached to the original task until completion or its bounded timeout.
+  Failed re-sync attempts preserve the operator's pasted lyrics.
 
 ## [1.1.152] - 2026-11-02
 

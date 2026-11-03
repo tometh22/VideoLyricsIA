@@ -8671,6 +8671,16 @@ async def _run_transcription_for_job(
                     if _dropped:
                         logger.warning("[WC] dropped %d whisperX hallucination phrase(s)", _dropped)
 
+                if (_wx_segs and _canonical
+                        and _reference_candidate_state.get("complete_audio_verified") is True
+                        and _reference_candidate_state.get("source_kind") == "gemini_complete_audio_derived"):
+                    # A conflicting full-audio hypothesis warrants another
+                    # listen. It never supplies the words of the replacement.
+                    from whisperx_windows import recover_reference_conflict
+                    _wx_segs = await asyncio.to_thread(
+                        recover_reference_conflict, _aa, _wx_segs, _canonical,
+                    )
+
                 # Catalogue text is a candidate, never truth by declaration.
                 # Compare it with clean audio-first WhisperX before it can own
                 # vocabulary or whole-song structure. Catalogue candidates
