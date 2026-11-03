@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.156] - 2026-11-03
+
+### Changed
+- Promote the audited staging release to production, including campaign batch designs, lyric looks, delivery planning and operator activity.
+- Join production and staging migration histories with a no-op merge revision; retain existing production delivery product snapshots.
+- Preserve the updated audio dependencies and empty security exception list.
+
 ## [1.1.155] - 2026-11-03
 
 ### Added
