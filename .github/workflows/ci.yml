@@ -52,6 +52,10 @@ jobs:
           pip install ruff
           'sqlalchemy>=2.0.0,<2.1.0'
           'alembic>=1.13.0,<2.0.0'
+          pytest
+
+      - name: Verify test partitioning and coverage gate
+        run: python -m unittest discover -s ../../ci/tests -v
 
       - name: Lint — undefined names (F821)
         run: ruff check --select F821 .
@@ -68,7 +72,12 @@ jobs:
           test "$(grep -c '(head)' <<<"$heads")" -eq 1
 
   # ─── Backend tests ───
-  backend:
+  backend_shards:
+    name: backend-shard (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     # Compatibility mode is fail-safe: until merge queue is proven and the
     # repository variable is explicitly enabled, full CI still runs on PRs.
     if: >-
@@ -129,6 +138,10 @@ jobs:
           pip install -r requirements.txt
           pip install pytest httpx ruff
 
+      - name: Verify test partitioning and coverage gate
+        if: matrix.shard == 0
+        run: python -m unittest discover -s ../../ci/tests -v
+
       # Lint gate contra shipping NameErrors al prod. INCIDENT 2026-05-26:
       # el PR `0bcc936 feat(lyrics): color customizable` shipeó 3 NameErrors
       # encadenados (`re`, `lyric_color`, `lyric_sung_color`) que bloquearon
@@ -185,7 +198,24 @@ jobs:
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
         # `-rs` lista el motivo de cada skip; el paso siguiente lo audita.
-        run: python -m pytest tests/ -v --tb=short -rs | tee /tmp/pytest_out.txt; exit ${PIPESTATUS[0]}
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+          python -m pytest -p ci.pytest_shard tests/ -v --tb=short -rs \
+            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-report=/tmp/shard-${{ matrix.shard }}.json \
+            --durations=20 | tee /tmp/pytest_out.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Preserve shard inventory and test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-shard-${{ matrix.shard }}
+          path: |
+            /tmp/shard-${{ matrix.shard }}.json
+            /tmp/pytest_out.txt
+          if-no-files-found: error
+          retention-days: 7
 
       # Un test saltado en silencio es PEOR que uno en rojo: el job sale verde
       # sin haber ejercitado nada. Pasó el 2026-08-29 — un archivo con
@@ -217,6 +247,7 @@ jobs:
           echo "OK — sin skips por infraestructura"
 
       - name: Real MoviePy + libass render gates
+        if: matrix.shard == 0
         env:
           DATABASE_URL: "postgresql+psycopg2://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
@@ -227,6 +258,7 @@ jobs:
           tests/test_ass_integration_render.py -v --tb=short
 
       - name: Dependency vulnerability gate
+        if: matrix.shard == 0
         run: |
           pip install pip-audit
           python scripts/security_audit.py
@@ -239,6 +271,30 @@ jobs:
               ast.parse(open(f).read())
               print(f'{f}: OK')
           "
+
+  # Preserve the existing required check name; a missing/failed shard or
+  # incomplete collection can never make this gate green.
+  backend:
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.base_ref != 'staging' ||
+       vars.STAGING_MERGE_QUEUE_ENABLED != 'true')
+    needs: [backend_shards]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require every shard to succeed
+        env:
+          SHARDS_RESULT: ${{ needs.backend_shards.result }}
+        run: test "$SHARDS_RESULT" = success
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: backend-shard-*
+          path: .ci-shards
+          merge-multiple: true
+      - name: Verify exact test coverage across runners
+        run: python ci/shards.py .ci-shards --count 4 --commit "$GITHUB_SHA"
 
   # ─── Frontend build ───
   frontend:
@@ -404,17 +460,12 @@ jobs:
 
   # ─── Docker build ───
   docker:
+    # Build in parallel with tests. ci-gate still requires ALL results.
     if: >-
-      always() &&
-      (github.event_name != 'pull_request' ||
-       github.base_ref != 'staging' ||
-       vars.STAGING_MERGE_QUEUE_ENABLED != 'true') &&
-      needs.backend.result == 'success' &&
-      needs.frontend.result == 'success' &&
-      needs['editor-collaboration'].result == 'success' &&
-      needs.sentinel.result == 'success'
+      github.event_name != 'pull_request' ||
+      github.base_ref != 'staging' ||
+      vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
     runs-on: ubuntu-latest
-    needs: [backend, frontend, editor-collaboration, sentinel]
 
     steps:
       - uses: actions/checkout@v4
