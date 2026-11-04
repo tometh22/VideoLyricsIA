@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.160] - 2026-11-04
+
+### Fixed
+
+- Empty lyric drafts now explain how to recover text, expose version history
+  directly and disable approval until text exists. The quick-review panel no
+  longer presents missing text as ready to approve; a clear issue queue only
+  means there are no pending observations, not that the transcript is correct.
+
 ## [1.1.159] - 2026-11-03
 
 ### Added

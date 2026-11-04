@@ -29,6 +29,14 @@ function renderPanel(items, extra = {}, props = {}) {
 }
 
 describe("LyricReviewPanel", () => {
+  it("does not treat an empty lyric as ready even with no pending issues", () => {
+    renderPanel([], {}, { hasLyrics: false });
+    expect(screen.getByTestId("lyric-review-heading")).toHaveTextContent("No hay letra para revisar");
+    expect(screen.queryByText("Todo listo para aprobar")).toBeNull();
+    expect(screen.queryByText("Sin puntos para revisar en esta letra.")).toBeNull();
+    expect(screen.getByText(/Recuperá una versión anterior/)).toBeInTheDocument();
+  });
+
   it("shows one active card with the change, and hides suggestions until asked", () => {
     renderPanel([missing, suggestion]);
     expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Faltan 1 para aprobar");
@@ -71,7 +79,7 @@ describe("LyricReviewPanel", () => {
 
   it("picks another option with its number", () => {
     const props = renderPanel([suggestion]);
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Todo listo para aprobar");
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Sin observaciones pendientes");
     expect(screen.queryByTestId("lyric-review-active")).toBeNull();
     fireEvent.click(screen.getByText("Ver 1 sugerencia (opcional)"));
     fireEvent.keyDown(screen.getByTestId("lyric-review-panel"), { key: "1" });
@@ -113,7 +121,7 @@ describe("LyricReviewPanel", () => {
 
   it("shows the all-set state, the difficult-song warning and survives partial data", () => {
     renderPanel([], { risk: { level: "high" } });
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Todo listo para aprobar");
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Sin observaciones pendientes");
     expect(screen.queryByTestId("lyric-review-risk")).toBeNull();
   });
 
