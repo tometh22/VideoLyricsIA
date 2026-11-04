@@ -6,8 +6,8 @@ import { installCampaignApi, song, expectNoHorizontalOverflow } from "./campaign
 import { LYRIC_LOOK_CODES } from "../src/lib/lyricLooks";
 import { EFFECT_CODES } from "../src/lib/catalogCodes";
 
-for (const width of [1440, 390]) {
-  test(`50-song mixed batch: choose looks/effects, review exact split and generate at ${width}px`, async ({ page }) => {
+for (const width of [1440, 390]) for (const classic of [false, true]) {
+  test(`50-song ${classic ? "classic" : "pack"} batch: review exact split and generate at ${width}px`, async ({ page }) => {
     await mkdir(path.resolve("../../.context"), { recursive: true });
     await page.setViewportSize({ width, height: width < 768 ? 844 : 1050 });
     await installEditorHarness(page, { jobId: "song-1", role: "admin" });
@@ -16,7 +16,7 @@ for (const width of [1440, 390]) {
       onRequest: async ({ path: routePath, request, state, json }) => {
         if (routePath === '/batch/campaigns/workflow/creative') return json({
           plan: state.plan, can_manage: true, portal_id: 'argentina', can_view_account_balance: true,
-          mix_catalog: { looks: LYRIC_LOOK_CODES.filter(Boolean).map(id => ({ id, compatible: !['pop70', 'degrade', 'cinetico'].includes(id), reason: 'Puede reemplazar el fondo; no participa del reparto foto/video.' })),
+          mix_catalog: { looks: LYRIC_LOOK_CODES.map(id => ({ id, compatible: !['pop70', 'degrade', 'cinetico'].includes(id), reason: 'Puede reemplazar el fondo; no participa del reparto foto/video.' })),
             effects: EFFECT_CODES.filter(e => e && !['none', 'foto_viva'].includes(e)), editable_statuses: ['lyrics_approved', 'transcribed_pending'] },
           items: state.songs.map(s => ({ id: s.item_id, job_id: s.job_id, title: s.title, artist: s.artist, status: s.stage === 'ready' ? 'lyrics_approved' : 'queued', settings: s.settings || {}, assignment: s.assignment || {} })),
         });
@@ -51,18 +51,24 @@ for (const width of [1440, 390]) {
     const dialog = page.getByRole('dialog', { name: 'Preparar lote' });
     await expect(dialog.getByLabel('25 fotos y 25 videos')).toBeVisible();
     await dialog.getByRole('button', { name: 'Lluvia', exact: true }).click();
-    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-background-${width}.png`), animations: 'disabled' });
+    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-background-${classic ? "classic" : "pack"}-${width}.png`), animations: 'disabled' });
     await dialog.getByRole('button', { name: 'Elegir looks →' }).click();
     await expect(dialog.getByRole('button', { name: 'Look Cinético', exact: true })).toBeDisabled();
-    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-design-${width}.png`), animations: 'disabled' });
+    if (classic) {
+      for (const name of ['Pincel', 'Cósmico', 'Cine']) await dialog.getByRole('button', { name: `Look ${name}`, exact: true }).click();
+      await expect(dialog.getByRole('button', { name: 'Revisar reparto de 50 canciones' })).toBeDisabled();
+      await dialog.getByRole('button', { name: 'Look Clásico — letra simple', exact: true }).click();
+      await expect(dialog.getByRole('button', { name: 'Revisar reparto de 50 canciones' })).toBeEnabled();
+    }
+    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-design-${classic ? "classic" : "pack"}-${width}.png`), animations: 'disabled' });
     await dialog.getByRole('button', { name: 'Revisar reparto de 50 canciones' }).click();
     const review = dialog.getByRole('region', { name: 'Revisar lote' });
     await expect(review.getByRole('row', { name: 'Con este lote 35 65 0' })).toBeVisible();
     expect(api.generations).toHaveLength(0);
-    expect(api.mixRequest.looks).toEqual(['pincel', 'cosmico', 'cine']);
+    expect(api.mixRequest.looks).toEqual(classic ? [''] : ['pincel', 'cosmico', 'cine']);
     expect(api.mixRequest.effects).toEqual(['bokeh', 'embers', 'rain']);
     await expectNoHorizontalOverflow(page, expect);
-    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-review-${width}.png`), animations: 'disabled' });
+    await page.screenshot({ path: path.resolve(`../../.context/batch-mix-review-${classic ? "classic" : "pack"}-${width}.png`), animations: 'disabled' });
     await review.getByRole('button', { name: 'Generar 50 videos' }).click();
     await expect(page.getByText(/50 trabajos enviados/)).toBeVisible({ timeout: 20000 });
     expect(api.generations).toHaveLength(50);
@@ -70,7 +76,7 @@ for (const width of [1440, 390]) {
     const photos = api.generations.filter(body => field(body, 'movement_style') === 'foto-parallax');
     expect(photos).toHaveLength(25);
     expect(['bokeh', 'embers', 'rain'].map(effect => photos.filter(body => field(body, 'effect') === effect).length).sort()).toEqual([8, 8, 9]);
-    expect(['pincel', 'cosmico', 'cine'].map(look => api.generations.filter(body => field(body, 'lyric_look') === look).length).sort()).toEqual([16, 17, 17]);
+    expect((classic ? [''] : ['pincel', 'cosmico', 'cine']).map(look => api.generations.filter(body => field(body, 'lyric_look') === look).length).sort()).toEqual(classic ? [50] : [16, 17, 17]);
     expect(new Set(api.generations.map(body => field(body, 'job_id'))).size).toBe(50);
   });
 }
