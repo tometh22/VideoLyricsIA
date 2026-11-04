@@ -62,8 +62,10 @@ export default function BatchDesign(props) {
 export function BatchMixDesigner({ campaignId, creative, itemIds, onSaved, onBusyChange, onPrepareGeneration }) {
   const { t } = useI18n();
   const catalog = creative.mix_catalog;
-  const lookLabels = LYRIC_LOOK_LABELS(t), effectLabels = EFFECT_LABELS(t);
-  const options = lyricLookOptions(t).filter((look) => catalog.looks.some((v) => v.id === look.code));
+  const lookLabels = { ...LYRIC_LOOK_LABELS(t), "": "Clásico — letra simple" }, effectLabels = EFFECT_LABELS(t);
+  const options = lyricLookOptions(t).filter((look) => catalog.looks.some((v) => v.id === look.code))
+    .map((look) => look.code === "" ? { ...look, label: lookLabels[""],
+      desc: "Sin look del nuevo pack: letra tradicional, con tipografía automática y sin animación de texto." } : look);
   const availableLooks = catalog.looks.filter((look) => look.compatible).map((look) => look.id);
   const [looks, setLooks] = useState(() => ["pincel", "cosmico", "cine"].filter((look) => availableLooks.includes(look)));
   const [effects, setEffects] = useState(() => ["bokeh", "embers"].filter((effect) => catalog.effects.includes(effect)));
@@ -135,7 +137,7 @@ export function BatchMixDesigner({ campaignId, creative, itemIds, onSaved, onBus
     </section>}
     {step === 2 && <section aria-label="Looks del nuevo pack" className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-lg font-semibold"><span className="mr-2 text-brand-light">2.</span>¿Qué looks querés mezclar?</h3><Button size="sm" variant="ghost" onClick={() => change(() => setLooks(looks.length === availableLooks.length ? [] : availableLooks))}>{looks.length === availableLooks.length ? "Quitar todos" : "Elegir todos los compatibles"}</Button></div>
-      <p className="text-sm text-ink-secondary">{looks.length} elegidos · rotan con cantidades iguales o una canción de diferencia. Las variantes de cada look quedan en automático.</p>
+      <p className="text-sm text-ink-secondary">{looks.length} elegidos · rotan con cantidades iguales o una canción de diferencia. Las variantes de los looks del pack quedan en automático.</p>
       <div className="grid max-h-[42vh] grid-cols-2 gap-3 overflow-y-auto p-1 sm:grid-cols-3 lg:grid-cols-4">{options.map((look) => {
         const rule = catalog.looks.find((v) => v.id === look.code), chosen = looks.includes(look.code);
         return <button key={look.code} type="button" disabled={!rule.compatible || busy} aria-pressed={chosen} aria-label={`Look ${look.label}`} title={rule.reason || look.desc}

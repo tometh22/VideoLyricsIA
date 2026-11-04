@@ -46,6 +46,30 @@ it("offers visual multi-selects and 25/25 before any mutation, excludes unsafe l
   expect(campaignPost).not.toHaveBeenCalled();
 });
 
+it("accepts classic alone as a selection, reviews it by name and confirms generation", async () => {
+  const prepare = vi.fn();
+  const classic = { ...mixCreative, mix_catalog: { ...mixCreative.mix_catalog,
+    looks: [{ id: "", compatible: true }, ...mixCreative.mix_catalog.looks] } };
+  setup({ creative: classic, onSaved: vi.fn(), onPrepareGeneration: prepare });
+  campaignPost.mockImplementation(async (path) => path.endsWith("mix-preview") ? {
+    ...response(), mix: { ...response().mix, looks: { "": 50 } },
+    changes: response().changes.map((change) => ({ ...change, after: { ...change.after, lyric_look: "" } })),
+  } : { revision: 5 });
+  fireEvent.click(screen.getByRole("button", { name: "2. Looks" }));
+  for (const name of ["Pincel", "Cósmico", "Cine"]) fireEvent.click(screen.getByRole("button", { name: `Look ${name}` }));
+  const next = screen.getByRole("button", { name: "Revisar reparto de 50 canciones" });
+  expect(next).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Look Clásico — letra simple" }));
+  expect(next).toBeEnabled();
+  expect(screen.queryByText("Elegí al menos un look.")).not.toBeInTheDocument();
+  fireEvent.click(next);
+  const review = await screen.findByRole("region", { name: "Revisar lote" });
+  expect(campaignPost.mock.calls[0][1]).toMatchObject({ looks: [""], photo_percent: 50 });
+  expect(within(review).getAllByText("Clásico — letra simple").length).toBeGreaterThan(0);
+  fireEvent.click(screen.getByRole("button", { name: "Generar 50 videos" }));
+  await waitFor(() => expect(prepare).toHaveBeenCalledWith({ startImmediately: true, itemIds: response().ready_item_ids, expectedRevision: 5 }));
+});
+
 it("shows exact review, account impact and generates only after an explicit confirmation", async () => {
   const prepare = vi.fn(), saved = vi.fn(); setup({ onSaved: saved, onPrepareGeneration: prepare });
   fireEvent.click(screen.getByRole("button", { name: "Lluvia" }));

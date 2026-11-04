@@ -49,6 +49,19 @@ def test_50_songs_yields_25_25_and_9_8_8_not_independent_random_draws():
     assert [g.model_dump() for g in groups] == [g.model_dump() for g in mix.groups_for(request(), 50)]
 
 
+@pytest.mark.parametrize('looks', [[''], ['', 'pincel']])
+def test_classic_is_an_explicit_choice_and_balances_with_pack_looks(looks):
+    body = mix.MixRequest(revision=0, item_ids=['song'], looks=looks, effects=['bokeh', 'embers'])
+    groups = mix.groups_for(body, 8)
+    assert totals(groups, 'background') == {'photo_effect': 4, 'veo': 4}
+    assert totals(groups, 'lyric_look') == {look: 8 // len(looks) for look in looks}
+    for group in groups:
+        if group.settings['lyric_look'] == '':
+            assert 'Clásico' in group.name
+            assert group.settings['lyric_variant'] == ''
+            assert group.settings['lyrics_animation'] == 'none'
+
+
 @pytest.mark.parametrize('patch', [{'looks': ['pop70']}, {'looks': ['cinetico']}, {'looks': ['unknown']},
                                     {'looks': ['pincel', 'pincel']}, {'effects': ['foto_viva']}, {'effects': []}, {'effects': ['bokeh', 'bokeh']}])
 def test_rejects_unsafe_or_invalid_choices(patch):
@@ -93,6 +106,20 @@ def test_preview_apply_scoping_pins_ready_ids_and_no_generation(db, setup):
     for item in items[1:]:
         db.refresh(item)
         assert item.render_overrides['source_reference'] == {'status': 'absent'}
+        assert item.render_overrides['lyric_variant'] == ''
+
+
+def test_classic_preview_and_apply_clear_previous_pack_look(db, setup):
+    campaign, items, actor = setup
+    items[0].render_overrides = {'lyric_look': 'pincel', 'lyric_variant': '12'}
+    db.commit()
+    body = request(items).model_copy(update={'looks': ['']})
+    result = mix.preview_mix(campaign.id, body, actor, db)
+    assert result['mix']['looks'] == {'': len(items)}
+    creative.apply(campaign.id, creative.CommitRequest(preview_id=result['preview_id']), actor, db)
+    for item in items:
+        db.refresh(item)
+        assert item.render_overrides['lyric_look'] == ''
         assert item.render_overrides['lyric_variant'] == ''
 
 
