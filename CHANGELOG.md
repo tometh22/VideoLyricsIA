@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.162] - 2026-11-04
+
+### Fixed
+- Add “Clásico — letra simple” to the campaign batch look selector and review summary. Treat the classic renderer as an explicit selection so operators can review and generate a classic-only batch while keeping balanced photo/video and effect quotas.
+- Clear previous pack look variants when applying a classic batch, and preserve the existing reviewed-confirmation and ready-song generation checks.
+
 ## [1.1.161] - 2026-11-04
 
 ### Fixed

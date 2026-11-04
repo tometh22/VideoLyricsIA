@@ -21,7 +21,8 @@ EDITABLE = {"transcribed_pending", "transcribed", "lyrics_approved", "transcribi
 
 @lru_cache(maxsize=1)
 def catalog():
-    looks = []
+    # The empty code is the traditional renderer, not an absent selection.
+    looks = [{"id": "", "compatible": True, "reason": ""}]
     for look in creative._lyric_looks.LOOKS:
         compatible = look not in creative._ALWAYS_OWN_BACKGROUND and not any(
             creative._lyric_recipes.may_own_background(look, genre)
@@ -36,7 +37,7 @@ def catalog():
 class MixRequest(creative.Strict):
     revision: int = Field(ge=0)
     item_ids: list[str] = Field(min_length=1, max_length=1000)
-    looks: list[str] = Field(min_length=1, max_length=16)
+    looks: list[str] = Field(min_length=1, max_length=17)
     effects: list[str] = Field(default_factory=list, max_length=40)
     photo_percent: int = Field(default=50, ge=0, le=100, strict=True)
     seed: str = Field(default="campaign", min_length=1, max_length=100)
@@ -72,7 +73,7 @@ def groups_for(body, count):
                     "effect": effect, "background_id": None, "background_mode": "as_is",
                     "animate_image": False, "enable_scenes": False, "scene_source": "lyrics"}
         groups.append(creative.Group(id="mix-" + creative.digest([kind, effect, look])[:20],
-            name=f"{'Foto + ' + effect if effect else 'Video'} · {look}", weight=total,
+            name=f"{'Foto + ' + effect if effect else 'Video'} · {look or 'Clásico'}", weight=total,
             requirement=kind, model=creative.VEO_LITE if kind == "veo" else "", settings=settings))
     return groups
 
