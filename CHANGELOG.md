@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.160] - 2026-11-04
+
+### Added
+
+- Staging-only vocal endpoint correction for fresh transcriptions. Follow the
+  clock-verified vocal stem, require periodic evidence inside each extension,
+  preserve locked/approved lines and provider word clocks, and persist the
+  adjustment before the final quality verdict and immutable editor snapshot.
+  `VOCAL_CONTINUITY_MODE=apply` enables the pilot in staging; production and
+  unknown environments decline application. Default remains `off`.
+
+
 ## [1.1.159] - 2026-11-03
 
 ### Added
