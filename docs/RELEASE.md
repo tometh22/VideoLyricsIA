@@ -24,6 +24,21 @@ can kill an in-flight render). Never ship two risky changes together.
 
 ---
 
+## CI execution
+
+Backend tests run in four file-based partitions on separate runners, each with
+its own PostgreSQL service. The required `backend` check verifies that every
+partition succeeded and that their manifests cover the exact collected test
+inventory once, with no missing, duplicated or foreign tests. Existing marker
+exclusions and the infrastructure-skip audit remain in force. Real MoviePy/libass
+and the dependency vulnerability gate run on partition 0 and remain blocking.
+
+Docker image builds run alongside the test jobs. `ci-gate` still requires the
+backend, frontend, real editor collaboration, Sentinel and both image builds.
+Parallel execution does not change the release or staging verification gates.
+Shard inventories and test output are retained as CI artifacts for seven days.
+Compare workflow job timings to measure the critical path and diagnose failures.
+
 ## Pre-deploy checklist
 
 - [ ] CI green; `make check` passes locally (pre-push hook enforces it)
