@@ -523,7 +523,9 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # This happens after word consistency, never trims, and skips
             # operator-locked boundaries.
             from timing_review_suggestions import automatic_tail_enabled
-            if allow_timing_mutation and _stem and automatic_tail_enabled():
+            from vocal_continuity import continuity_mode
+            if (allow_timing_mutation and continuity_mode() == "off"
+                    and _stem and automatic_tail_enabled()):
                 try:
                     from pathlib import Path
                     from timing_review_suggestions import (
@@ -790,6 +792,35 @@ def _auto_repair_candidate_action(candidate):
     if timing_changed and not text_changed:
         return "timing_reversible"
     return None
+
+
+
+def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription: bool) -> dict:
+    """Final acoustic endpoint owner, after display segmentation and retries."""
+    from vocal_continuity import continuity_mode, process_vocal_continuity
+    mode = continuity_mode()
+    if mode == "off":
+        return r
+    if mode == "apply" and not fresh_transcription:
+        return {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
+                "vocal_continuity": {"status": "skipped", "mode": mode,
+                    "reason": "fresh_transcription_required", "applied_count": 0,
+                    "mutated_segments": False, "automatic_apply_allowed": False}}}
+    stem = None
+    try:
+        if audio_path and os.path.exists(audio_path):
+            import vocal_sep
+            stem = vocal_sep.separate_vocals(audio_path, cache_only=True)
+        return process_vocal_continuity(r, audio_path, stem)
+    except Exception as exc:
+        logger.info("[VOCAL-CONTINUITY] abstained error_type=%s", _safe_exception_code(exc))
+        return r
+    finally:
+        if stem:
+            try:
+                os.unlink(stem)
+            except OSError:
+                pass
 
 
 async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
@@ -1195,6 +1226,22 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         logger.warning("[DISPLAY-SEGMENTATION] abstained job=%s error_type=%s",
                        job_id, _safe_exception_code(exc))
 
+    # Segmentation has finished. Extend only these final cards, then rebuild
+    # the quality metrics without enabling another timing mutation pass.
+    r = _finalize_vocal_continuity(
+        r, audio_path,
+        fresh_transcription=bool(fresh_transcription and source_segments_revision == 0
+                                 and len(source_audio_sha256) == 64 and source_audio_revision > 0),
+    )
+    continuity_report = (r.get("postpass_stats") or {}).get("vocal_continuity") or {}
+    if continuity_report.get("applied_count"):
+        r = _medir_cobertura_final(
+            r, job_id, antes_fmt, audio_path, strip_internal=False,
+            live_hint=live_hint, allow_timing_mutation=False,
+        )
+    post = r.get("postpass_stats") or {}
+    windows = post.get("quality_windows") or []
+
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
     from quality_jobs import _sanitize_analytical_evidence
@@ -1266,6 +1313,8 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         # Optional telemetry must never make a valid transcription fail.
         # Missing witnesses force router abstention rather than agreement.
         pass
+    if isinstance(post.get("vocal_continuity"), dict):
+        final["vocal_continuity"] = dict(post["vocal_continuity"])
     final["metrics"] = final_metrics
     # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
     # escritas sobre los segmentos finales antes de congelar la versión 0.
@@ -1902,7 +1951,8 @@ def run_transcription_job(
                     "reason": "source_segments_revision_changed",
                 }
             display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
-            if display_trace.get("applied_count"):
+            continuity_trace = (result.get("transcription_quality") or {}).get("vocal_continuity") or {}
+            if display_trace.get("applied_count") or continuity_trace.get("applied_count"):
                 from display_segmentation_policy import fresh_job
                 if current_revision != source_segments_revision or not fresh_job(_persist_db, row):
                     _persist_db.rollback()

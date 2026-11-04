@@ -6512,7 +6512,8 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         or int(row.audio_revision or 0) != inline_audio_revision):
                     raise RuntimeError("transcription_source_audio_changed")
                 display_trace = (finalized.get("transcription_quality") or {}).get("display_segmentation") or {}
-                if display_trace.get("applied_count") and (
+                continuity_trace = (finalized.get("transcription_quality") or {}).get("vocal_continuity") or {}
+                if (display_trace.get("applied_count") or continuity_trace.get("applied_count")) and (
                         revision != inline_segments_revision or not _display_fresh_job(_quality_db, row)):
                     raise RuntimeError("display_segmentation_source_changed")
                 if revision > 0 and segments != row.segments_json:

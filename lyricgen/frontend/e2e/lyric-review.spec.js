@@ -98,7 +98,7 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await panel.press("Backspace");
   await expect.poll(() => (harness.saves.at(-1)?.segments || [])
     .flatMap((segment) => segment.qa_dismissed || [])).toEqual(["tres"]);
-  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Todo listo para aprobar");
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Sin observaciones pendientes");
 
   // Las sugerencias quedan a mano, sin bloquear ni ocupar la tarjeta.
   await expect(page.getByTestId("lyric-review-active")).toHaveCount(0);
