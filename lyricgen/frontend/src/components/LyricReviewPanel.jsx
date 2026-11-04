@@ -198,7 +198,7 @@ function Help({ compared }) {
 const LyricReviewPanel = forwardRef(function LyricReviewPanel({
   review, items, failedIds, decidedCount = 0, status = "", playingId, autoPlay = true,
   onToggleAutoPlay, onPlay, onApply, onDismiss, onEdit, onUndo, canUndo = false,
-  onActivate, onOpenOfficial,
+  onActivate, onOpenOfficial, hasLyrics = true,
 }, ref) {
   const required = useMemo(() => items.filter((item) => item.required), [items]);
   const suggested = useMemo(() => items.filter((item) => !item.required), [items]);
@@ -287,10 +287,12 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
     sources.gemini && "Gemini",
     sources.witness && "testigo",
   ].filter(Boolean);
-  const allClear = required.length === 0;
+  const allClear = hasLyrics && required.length === 0;
   const queue = visible.filter((item) => item.id !== active?.id);
-  const heading = allClear
-    ? "Todo listo para aprobar"
+  const heading = !hasLyrics
+    ? "No hay letra para revisar"
+    : allClear
+    ? "Sin observaciones pendientes"
     : enforce
       ? `Faltan ${required.length} para aprobar`
       : `${required.length} para revisar`;
@@ -316,7 +318,7 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       <header className="flex items-center gap-3 px-4 pt-3.5">
         <span className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${allClear
           ? "bg-emerald-400/15 text-emerald-200" : "bg-amber-300/15 text-amber-200"}`} aria-hidden="true">
-          {allClear ? <Icon path={CHECK} /> : <span className="text-[11px] font-bold tabular-nums">{required.length}</span>}
+          {allClear ? <Icon path={CHECK} /> : !hasLyrics ? "!" : <span className="text-[11px] font-bold tabular-nums">{required.length}</span>}
         </span>
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-white">Revisión rápida</h3>
@@ -368,6 +370,7 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       <footer className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/[0.06] px-4 py-2.5 text-xs">
         {status
           ? <p data-testid="lyric-review-status" className="min-w-0 truncate text-ink-secondary">{status}</p>
+          : !hasLyrics ? <p className="text-white/50">Recuperá una versión anterior o agregá la letra antes de aprobar.</p>
           : !active && !suggested.length && <p className="text-white/50">Sin puntos para revisar en esta letra.</p>}
         <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">
           {canUndo && (

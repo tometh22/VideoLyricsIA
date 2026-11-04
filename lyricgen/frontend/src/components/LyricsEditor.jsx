@@ -3991,6 +3991,7 @@ export default function LyricsEditor({
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
+  const hasLyrics = edited.some((segment) => (segment.text || "").trim());
   const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
@@ -4978,7 +4979,7 @@ export default function LyricsEditor({
           )}
           <button
             onClick={handleApprove}
-            disabled={isApproving || (!requireLineReview && (
+            disabled={!hasLyrics || isApproving || (!requireLineReview && (
               (editorV2Enabled && (!durableHydrated || durableEditor.loading))
               || !!draftRecovery
             ))}
@@ -4994,7 +4995,7 @@ export default function LyricsEditor({
             data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
             data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
-            title={reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
+            title={!hasLyrics ? "Agregá o recuperá la letra antes de aprobar" : reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
             className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
               ? "bg-surface-2 text-white ring-1 ring-white/15 hover:bg-surface-3"
               : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
@@ -5195,10 +5196,23 @@ export default function LyricsEditor({
         currentRevision={durableEditor.document?.revision} currentSegments={edited}
         onSeek={(start) => seekTo(start, true)} />
 
+      {!hasLyrics && (
+        <section role="status" aria-label="Letra vacía" className="mb-4 rounded-xl border border-amber-300/25 bg-amber-300/5 p-4 text-sm text-amber-100">
+          <h3 className="font-semibold">No hay letra para revisar</h3>
+          <p className="mt-1">Agregá la letra o recuperá una versión anterior. La aprobación estará disponible cuando haya texto.</p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            {editorV2Enabled && (
+              <button type="button" onClick={() => setHistoryOpen(true)} className="underline underline-offset-4">Recuperar del historial</button>
+            )}
+          </div>
+        </section>
+      )}
+
       {editorV2Enabled && lyricReview && (
         <LyricReviewPanel
           ref={reviewPanelRef}
           review={lyricReview}
+          hasLyrics={hasLyrics}
           items={pendingReviewItems}
           failedIds={reviewFailedIds}
           decidedCount={reviewDecisions.length}
