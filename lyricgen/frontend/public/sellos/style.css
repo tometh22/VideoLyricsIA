@@ -116,7 +116,7 @@ h2 .accent { background: var(--gradient-brand); -webkit-background-clip: text; b
 
 .feature { margin: 0; }
 .feature-media { position: relative; display: block; overflow: hidden; border-radius: 22px; border: 1px solid var(--line-strong); box-shadow: 0 40px 90px rgba(0, 0, 0, .55), 0 0 0 1px rgba(117, 87, 255, .12); aspect-ratio: 16 / 9; background: var(--ink-3); }
-.feature-media img { width: 100%; height: 100%; object-fit: cover; transition: transform .6s var(--ease); }
+.feature-media img, .feature-media video { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .6s var(--ease); }
 .play { position: absolute; right: 18px; bottom: 18px; display: grid; place-items: center; width: 60px; height: 60px; border-radius: 50%; background: rgba(245, 246, 250, .94); color: var(--ink); box-shadow: 0 12px 40px rgba(0, 0, 0, .45); transition: transform .3s var(--ease), background .2s; }
 .play svg { width: 24px; height: 24px; margin-left: 3px; }
 .feature-media:hover .play { transform: scale(1.08); background: #fff; }
