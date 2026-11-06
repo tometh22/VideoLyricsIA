@@ -1,6 +1,6 @@
 import { campaignCounts, totalOf } from "./campaignPipeline";
 
-export const campaignViews = [["active", "En curso"], ["attention", "Necesitan atención"], ["done", "Finalizadas"], ["all", "Todas"]];
+export const campaignViews = [["all", "Todas las campañas"], ["changes", "Pedidos de cambios"], ["active", "En curso"], ["attention", "Necesitan atención"], ["done", "Finalizadas"]];
 export const campaignOrder = value => ["calendar", "effort", "learning"].includes(value) ? value : "calendar";
 
 /** Delivery is confirmed by the pipeline's portal lookup, never by approval. */
@@ -41,12 +41,12 @@ export function campaignOverview(campaign) {
     else if (counts.ready) action = { label: "Preparar videos", view: "ready" };
     else if (complete) action = { label: files ? "Ver archivos" : "Ver entregas", view: files ? "all" : "delivered" };
   }
-  return { total, delivered, pending, complete, attention, notes, work, files, discarded: counts.discarded,
+  return { total, delivered, pending, complete, attention, requests, notes, work, files, discarded: counts.discarded,
     action: { ...action, href: `/campaigns/${encodeURIComponent(campaign.id)}?view=${action.view}&order=calendar` } };
 }
 
 export function inCampaignView(campaign, view) {
   const summary = campaignOverview(campaign);
-  return view === "all" || (view === "done" ? summary.complete : view === "attention" ? summary.attention
+  return view === "all" || (view === "changes" ? summary.requests > 0 && campaign.status !== "cancelled" : view === "done" ? summary.complete : view === "attention" ? summary.attention
     : !summary.complete && campaign.status !== "cancelled");
 }

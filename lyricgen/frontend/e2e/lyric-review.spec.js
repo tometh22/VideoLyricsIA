@@ -60,7 +60,7 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await harness.open();
 
   const panel = page.getByTestId("lyric-review-panel");
-  const approve = page.getByRole("button", { name: /Aprobar y generar/i });
+  const approve = page.getByRole("button", { name: /Aprobar cambios y generar video/i });
   await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Faltan 3 para aprobar");
   await expect(page.locator('[data-lyric-review-blocked="true"]')).toContainText("Faltan para aprobar");
   await expect(panel).toContainText("Ver 1 sugerencia (no bloquean)");

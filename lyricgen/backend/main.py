@@ -17889,7 +17889,7 @@ def request_edit(
             )
     if getattr(job, "workload_class", "interactive") == "batch":
         from batch_campaigns import enforce_render_capacity
-        enforce_render_capacity(db, job)
+        enforce_render_capacity(db, job, correction=True)
 
     _delivery_qc_actions: list[dict] = []
     if body.delivery_qc_action_ids:
@@ -18798,7 +18798,7 @@ async def regenerate_scene(
         raise HTTPException(status_code=404, detail="Job not found")
     if getattr(job, "workload_class", "interactive") == "batch":
         from batch_campaigns import enforce_render_capacity
-        enforce_render_capacity(db, job)
+        enforce_render_capacity(db, job, correction=True)
 
     plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
     if not plan or not plan.get("scenes"):

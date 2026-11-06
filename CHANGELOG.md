@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.164] - 2026-11-06
+
+### Fixed
+- Allow corrections to existing campaign videos when the final-review backlog is full, while retaining human approval, campaign status, and simultaneous-render limits. New video generation keeps the review backlog limit.
+- Show all campaigns by default and distinguish product and status filters. Add a client change-request view with song names, request text, and direct resolution links, including delivered campaigns.
+- Label post-render approval as “Aprobar cambios y generar video” to explain the next step.
+
 ## [1.1.163] - 2026-11-06
 
 ### Added

@@ -530,9 +530,11 @@ def list_campaigns(
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     from campaign_pipeline import pipeline_counts_bulk
     pipelines = pipeline_counts_bulk(db, rows)
+    from campaign_change_requests import feature_enabled as changes_enabled
     return {"items": [
         {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
-    ], "can_view_accounts": current_user.get("role") == "admin"}
+    ], "can_view_accounts": current_user.get("role") == "admin",
+        "features": {"change_requests_inbox": changes_enabled()}}
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -2699,7 +2701,7 @@ def reconcile_batch_campaigns() -> dict[str, int]:
     return {"promoted": promoted, "dispatched": dispatched}
 
 
-def enforce_render_capacity(db: Session, job: Job) -> None:
+def enforce_render_capacity(db: Session, job: Job, *, correction: bool = False) -> None:
     """Keep campaign rendering bounded without consuming interactive quota."""
     if job.workload_class != "batch" or not job.campaign_id:
         return
@@ -2725,7 +2727,13 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
         # campaign reached FINAL_REVIEW_LIMIT.
         Job.job_id != job.job_id,
     ).scalar() or 0
-    if final_review >= FINAL_REVIEW_LIMIT:
+    # The review backlog bounds new production. Existing-video corrections
+    # must remain possible even when that backlog is full: otherwise operators
+    # have to approve incorrect videos before they can repair delivered work.
+    # Only server-side edit routes opt in, and only post-render states qualify.
+    # Human approval, campaign state and simultaneous-render gates still apply.
+    correcting_existing_video = correction and job.status in _POST_RENDER_REVIEW
+    if final_review >= FINAL_REVIEW_LIMIT and not correcting_existing_video:
         raise HTTPException(
             status_code=429,
             detail={"code": "batch_final_review_full", "limit": FINAL_REVIEW_LIMIT},
