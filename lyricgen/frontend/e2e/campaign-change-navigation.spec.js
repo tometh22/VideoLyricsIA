@@ -16,15 +16,12 @@ for (const width of [1440, 390]) {
       { id: 7, song: 'Luces', artist: 'Babasónicos', comment: 'Corregir la letra del segundo verso.', submitted_at: '2026-11-01T12:00:00Z', song_id: 'luces' },
     ] } }));
     await page.goto('/campaigns');
-    await page.getByRole('dialog', { name: 'Nuevo editor de letras' }).getByRole('button', { name: 'Cancelar', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Canciones Religiosas', exact: true })).toBeVisible();
     await page.getByRole('button', { name: /Ver canciones con pedidos/ }).click();
     await expect(page.getByText('Luces', { exact: false })).toBeVisible();
     await expect(page.getByText('Corregir la letra del segundo verso.')).toBeVisible();
     await expect(page.getByRole('link', { name: 'Abrir y resolver' })).toHaveAttribute('href', '/admin?section=cambios&change_request_id=7');
     await page.reload();
-    const welcome = page.getByRole('dialog', { name: 'Nuevo editor de letras' });
-    if (await welcome.isVisible()) await welcome.getByRole('button', { name: 'Cancelar', exact: true }).click();
     await expect(page.getByText('Corregir la letra del segundo verso.')).toBeVisible();
     await expectNoHorizontalOverflow(page, expect);
     await page.screenshot({ path: path.resolve(`../../.context/campaign-change-requests-${width}.png`), fullPage: true, animations: 'disabled' });
