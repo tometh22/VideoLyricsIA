@@ -68,14 +68,14 @@ test("approved campaign lyrics without a video open, autosave and reload in the 
   await page.getByRole("dialog", { name: "Canción Canción sin video" }).getByRole("button", { name: "Editar letra y tiempos" }).click();
   await expect(page).toHaveURL(/\/review\/approved0001\?return_to=/);
   expect(new URL(page.url()).searchParams.get("return_to")).toContain("tab=approved&order=effort");
-  await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Transcripción aprobada");
+  await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Transcripción aprobada");
   await expect.poll(() => harness.heartbeats.length).toBeGreaterThan(0);
   await page.waitForFunction(() => [...document.querySelectorAll("audio")].some(a => a.readyState >= 1 && a.duration > 0));
   expect(harness.saves).toHaveLength(0);
-  await page.getByLabel("Letra de la línea 1").fill("Transcripción corregida");
+  await page.getByLabel("Letra de esta línea", { exact: true }).fill("Transcripción corregida");
   await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
   expect(harness.saves.at(-1).segments[0].text).toBe("Transcripción corregida");
   await page.reload();
-  await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Transcripción corregida");
+  await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Transcripción corregida");
   expect(forbidden).toEqual([]);
 });
