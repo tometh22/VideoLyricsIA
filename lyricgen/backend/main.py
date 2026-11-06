@@ -14481,7 +14481,7 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
             if body.fresh and rp.get("lyric_look") == look_id and rp.get("lyric_variant_sig"):
                 sibs = set(sibs) | {tuple(tuple(x) if isinstance(x, list) else x
                                           for x in rp["lyric_variant_sig"])}
-            variant = lyric_recipes.choose_auto_variant(look_id, genre, seed_key, sibs)
+            variant = lyric_recipes.choose_auto_variant(look_id, genre, seed_key, sibs, fresh=body.fresh)
     _look, info = lyric_recipes.resolve(
         look_id, genre=genre, variant=variant, seed_key=seed_key, overrides=overrides)
     info["genre_source"] = genre_src

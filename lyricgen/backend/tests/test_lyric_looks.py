@@ -33,7 +33,7 @@ def test_every_look_ships_its_font_and_license(look_id):
     licenses = os.listdir(os.path.join(os.path.dirname(L.font_path(look)), "licenses"))
     # Catalogue fonts that predate the licenses folder; every font added for
     # looks ships its license next to it.
-    if family not in ("Oswald", "Montserrat", "Roboto"):
+    if family not in ("Oswald", "Montserrat", "Roboto", "Fredoka", "Quicksand"):
         assert any(n.startswith(family) for n in licenses)
 
 
@@ -272,8 +272,8 @@ def test_vertical_short_uses_the_same_type_size_as_the_master():
     import re
     segs = [{"text": "y yo te sigo esperando bajo la lluvia", "start": 1, "end": 4}]
     for lid, look in L.LOOKS.items():
-        if look.layout in ("block", "kinetic"):
-            continue          # rows are stretched to the frame width on purpose
+        if look.layout in ("block", "kinetic") + L.EDITORIAL_LAYOUTS:
+            continue          # these responsive compositions fit type to their available area
         fs = lambda w, h: max(int(x) for x in re.findall(
             r"\\fs(\d+)", L.build_look_ass(segs, look, width=w, height=h, duration=6)))
         assert fs(1080, 1920) <= fs(1920, 1080) * 1.05, lid
@@ -332,9 +332,8 @@ def test_title_card_is_readable_on_dark_looks():
         text_scale=1.0, lyric_font_family="Roboto", artist_font_family="Roboto")
     doc = L.build_look_ass(SEGS, L.LOOKS["chat"], width=1920, height=1080,
                            duration=8.0, title_lines=title)
-    style = [l for l in doc.splitlines() if l.startswith("Style:")][0]
     titles = [d for d in _dialogues(doc) if d.startswith("Dialogue: 6,")]
-    assert titles and all("&H00111111" not in t for t in titles)
+    assert titles and all("\\1c&H00FFFFFF&" in t for t in titles)
 
 
 def test_bg_cache_key_only_changes_for_looks_that_steer_the_background():

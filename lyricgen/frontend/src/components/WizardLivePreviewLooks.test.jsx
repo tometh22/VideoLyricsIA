@@ -589,3 +589,15 @@ describe("WizardLivePreview — Cinético con resolve.style", () => {
     expect(container.querySelector('[data-beat-shake="true"]')).toBeNull();
   });
 });
+
+describe("WizardLivePreview — composiciones aprobadas", () => {
+  it.each(["golpe", "recorte", "diptico", "diario", "nube", "puntada"])("%s conecta el selector con su preview propio", (code) => {
+    const { container } = renderLook({ lyricLook: code });
+    expect(container.querySelector(`[data-lyric-look="${code}"]`)).not.toBeNull();
+    expect(container.querySelector(`[data-editorial-look="${code}"]`)).not.toBeNull();
+    if (["diario", "nube", "puntada"].includes(code)) {
+      const texts = [...container.querySelectorAll("[data-editorial-look] text")].map(n => n.textContent).join(" ");
+      expect(texts).toBe(texts.toLowerCase());
+    }
+  });
+});

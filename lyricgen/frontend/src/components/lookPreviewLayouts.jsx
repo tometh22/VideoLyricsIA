@@ -14,6 +14,7 @@
 //     movimientos de línea calculados del currentTime.
 
 import { useId } from "react";
+import { renderEditorialLayout } from "./editorialLookLayouts";
 import {
   kineticRows, blockRows, pickKeyword, handWordTilt,
 } from "../lib/lyricLooks";
@@ -430,6 +431,8 @@ export function BuildDoodles({ lp, live, keyVisible, keyIndex, lineIdx }) {
  */
 export function renderLookLayout(ctx) {
   const { lp } = ctx;
+  const editorial = renderEditorialLayout(ctx);
+  if (editorial) return editorial;
   switch (lp.layout) {
     case "kinetic": return kineticLayout(ctx);
     case "neon": return neonLayout(ctx);

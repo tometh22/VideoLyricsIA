@@ -35,6 +35,7 @@ class Look:
     # "build" (words land one by one in a staggered layout), "chat" (message
     # bubbles that stack up), "block" (rows stretched to one width), "arc"
     # (the line curves around a ring), "floor" (text lying in 3D perspective).
+    # EDITORIAL_LAYOUTS delegate to lyric_editorial for the six approved designs.
     layout: str
     # Motion: "zoom_through" | "cine" | "word_pop" | "fade" | "neon" |
     # "write_on" | "boil".
@@ -82,6 +83,9 @@ class Look:
     # mood, where to leave room for the text). Consumed by the background
     # prompt; "" = no steering.
     bg_hint: str = ""
+
+
+EDITORIAL_LAYOUTS = ("golpe", "recorte", "diptico", "diario", "nube", "puntada")
 
 
 LOOKS: dict[str, Look] = {
@@ -275,8 +279,35 @@ LOOKS: dict[str, Look] = {
 }
 
 
+# Approved source-video compositions. Variant zero is stable across genres.
+LOOKS.update({
+    "golpe": Look("golpe", "Bungee-Regular.ttf", "golpe", "word_pop",
+        "#F4F0E6", accent="#FFD12F", outline=0, shadow=0,
+        extra_fonts=("BigShouldersDisplay-Black.ttf",),
+        grade="eq=contrast=1.20:saturation=0.15:brightness=-0.18,vignette=angle=PI/4"),
+    "recorte": Look("recorte", "RubikWetPaint-Regular.ttf", "recorte", "word_pop",
+        "#F0E6CF", accent="#E64B37", outline=0, shadow=0,
+        grade="eq=contrast=1.25:saturation=0:brightness=-0.08,vignette=angle=PI/4"),
+    "diptico": Look("diptico", "UnifrakturCook-Bold.ttf", "diptico", "word_pop",
+        "#F0F3EF", accent="#A0C9FF", outline=0, shadow=0,
+        line_colors=("#F0F3EF", "#DEE5E8", "#A0C9FF"),
+        extra_fonts=("BigShouldersDisplay-Black.ttf", "BigShouldersDisplay-Light.ttf"),
+        grade="eq=contrast=1.12:saturation=0.15:brightness=-0.18,colorbalance=rs=-0.06:bs=0.08"),
+    "diario": Look("diario", "Caveat-Bold.ttf", "diario", "word_pop",
+        "#725497", accent="#B65276", outline=0, shadow=0, force_case="lower",
+        line_colors=("#725497", "#3E8A7E", "#B65276"),
+        grade="eq=brightness=-0.08:contrast=1.05:saturation=0.90"),
+    "nube": Look("nube", "Fredoka-SemiBold.ttf", "nube", "word_pop",
+        "#FFF4C9", accent="#FFD7DC", outline=0, shadow=0, force_case="lower",
+        extra_fonts=("Nunito-ExtraBold.ttf",),
+        grade="eq=brightness=-0.08:contrast=1.05:saturation=0.90"),
+    "puntada": Look("puntada", "Quicksand-Bold.ttf", "puntada", "word_pop",
+        "#EDF4DD", accent="#F4ADB9", outline=0, shadow=0, force_case="lower",
+        grade="eq=brightness=-0.08:contrast=1.05:saturation=0.90"),
+})
+
+
 # --- Genre skins -------------------------------------------------------------
-#
 # A look keeps its motion and composition, but its typography, palette,
 # decorations and background treatment adapt to the song: the same Cinético
 # reads bubbly-pop on a Karol G single and has to read raw on Almafuerte.
@@ -349,7 +380,7 @@ def get_look(look_id: str | None) -> Look | None:
     return LOOKS.get((look_id or "").strip().lower())
 
 
-WORD_TIMED_LAYOUTS = ("build", "kinetic", "block", "arc")
+WORD_TIMED_LAYOUTS = ("build", "kinetic", "block", "arc") + EDITORIAL_LAYOUTS
 
 
 def needs_word_timings(look_id: str | None) -> bool:
@@ -1772,6 +1803,8 @@ def build_look_ass(
         # Script, neon and handwriting faces read as type only in the lyric's
         # own case; forcing caps on them looks like a ransom note.
         case_fn = None
+    if look.force_case == "lower":
+        case_fn = str.lower
     sc = min(width, height) / 1080.0
     path = font_path(look)
     family, _bold = _ass.font_family(path)
@@ -1797,6 +1830,12 @@ def build_look_ass(
         lines.append((seg, display, start, end))
 
     events: list[str] = []
+
+    if look.layout in EDITORIAL_LAYOUTS:
+        from lyric_editorial import build_events
+        events.extend(build_events(look, lines, width=width, height=height,
+                                   duration=duration, font_scale=user_scale))
+        lines = []
 
     if look.background == "gradient":
         events.extend(_gradient_events(look, width, height, duration))
@@ -1937,7 +1976,11 @@ def build_look_ass(
                     else look.accent)
         styled = []
         for tl in title_lines:
-            upd = {"bold": False}
+            # Only the dialogue events below are copied into the look's
+            # document. Its Lyric style still has the look's own primary
+            # colour, so the title's white fallback must travel as an inline
+            # override (otherwise Chat renders almost black on the photo).
+            upd = {"bold": False, "color": tl.color or ("#FFFFFF" if dark else look.primary)}
             if key_family_t and tl.font_name == key_family_t and accent_t:
                 upd["color"] = accent_t
             styled.append(dataclasses.replace(tl, **upd))
