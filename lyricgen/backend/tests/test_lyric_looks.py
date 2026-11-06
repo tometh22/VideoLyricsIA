@@ -332,9 +332,8 @@ def test_title_card_is_readable_on_dark_looks():
         text_scale=1.0, lyric_font_family="Roboto", artist_font_family="Roboto")
     doc = L.build_look_ass(SEGS, L.LOOKS["chat"], width=1920, height=1080,
                            duration=8.0, title_lines=title)
-    style = [l for l in doc.splitlines() if l.startswith("Style:")][0]
     titles = [d for d in _dialogues(doc) if d.startswith("Dialogue: 6,")]
-    assert titles and all("&H00111111" not in t for t in titles)
+    assert titles and all("\\1c&H00FFFFFF&" in t for t in titles)
 
 
 def test_bg_cache_key_only_changes_for_looks_that_steer_the_background():

@@ -231,3 +231,17 @@ def test_black_ops_artist_green_and_oswald_song_light(tmp_path):
         lower = list(img.crop((0, 365, 1280, 500)).convert('RGB').getdata())
         assert sum(g > 130 and g > r * 1.2 and g > b * 1.5 for r, g, b in upper) > 1000
         assert sum(min(r, g, b) > 140 and max(r, g, b) - min(r, g, b) < 65 for r, g, b in lower) > 500
+
+
+@pytest.mark.skipif(not _has_libass(), reason='requires ffmpeg with libass')
+def test_chat_title_stays_visible_on_dark_background(tmp_path):
+    bg = tmp_path / 'bg.png'
+    Image.new('RGB', (1280, 720), (20, 20, 20)).save(bg)
+    result = pipeline.generate_thumbnail(
+        'Viejas Locas', 'track.mp3', str(tmp_path), bg_source=str(bg),
+        song_title='Me Gustas Mucho', lyric_look='chat',
+        lyric_look_opts=dict(variant=0, genre='', seed_key='viejas-locas'),
+    )
+    with Image.open(result) as img:
+        pixels = img.crop((0, 250, 1280, 480)).convert('RGB').getdata()
+        assert sum(min(rgb) > 160 for rgb in pixels) > 1000

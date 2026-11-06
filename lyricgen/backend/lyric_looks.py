@@ -1930,7 +1930,11 @@ def build_look_ass(
                     else look.accent)
         styled = []
         for tl in title_lines:
-            upd = {"bold": False}
+            # Only the dialogue events below are copied into the look's
+            # document. Its Lyric style still has the look's own primary
+            # colour, so the title's white fallback must travel as an inline
+            # override (otherwise Chat renders almost black on the photo).
+            upd = {"bold": False, "color": tl.color or ("#FFFFFF" if dark else look.primary)}
             if key_family_t and tl.font_name == key_family_t and accent_t:
                 upd["color"] = accent_t
             styled.append(dataclasses.replace(tl, **upd))
