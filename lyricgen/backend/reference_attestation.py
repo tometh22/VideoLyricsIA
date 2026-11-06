@@ -27,14 +27,14 @@ _STOP = {
 }
 
 
-def _tokens(value: Any) -> list[str]:
+def _tokens(value: Any, *, include_stop_words: bool = False) -> list[str]:
     normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
     normalized = "".join(
         char for char in normalized if unicodedata.category(char) != "Mn"
     )
     return [
         token for token in re.findall(r"[^\W_]+", normalized, re.UNICODE)
-        if token not in _STOP
+        if include_stop_words or token not in _STOP
     ]
 
 
@@ -162,6 +162,13 @@ def assess_reference_attestation(
         "require_local_alignment": not global_alignment_supported,
         "reasons": reasons,
         "metrics": {
+            # Line wrapping is editorial, not evidence of another recording.
+            # Keep all words here: the content-token score omits stop words.
+            "normalized_text_matches": bool(
+                _tokens(reference_text, include_stop_words=True)
+                and _tokens(reference_text, include_stop_words=True)
+                == _tokens(_segments_text(asr_segments), include_stop_words=True)
+            ),
             "reference_token_count": len(reference_tokens),
             "asr_token_count": len(asr_tokens),
             "ordered_similarity": round(ordered_similarity, 6),
@@ -211,3 +218,21 @@ def reference_gate_action(
     if not bool(report.get("allow_global_forced_alignment")):
         return "audio_first"
     return "reference_allowed"
+
+
+def effective_reference_gate_mode(
+    configured_mode: str,
+    *,
+    reference_source: str | None,
+    reference_required: bool,
+) -> str:
+    """Never let a catalogue lyric bypass independent audio attestation.
+
+    ``observe`` remains available for non-catalogue diagnostics. External
+    lyrics can replace heard words only after the ASR witness supports both
+    their vocabulary and whole-song structure.
+    """
+    source = str(reference_source or "").strip().lower()
+    if reference_required or source in {"lrclib", "genius", "gemini"}:
+        return "enforce"
+    return str(configured_mode or "off").strip().lower()

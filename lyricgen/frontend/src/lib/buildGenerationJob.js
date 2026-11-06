@@ -1,6 +1,9 @@
 // Canonical adapter between an approved review and the generation queue.
 // Keeping this shape outside App.jsx makes it testable: fields such as the
 // editor selectors and background cache key must survive this boundary.
+import { normalizeLyricLook } from "./lyricLooks.js";
+import { pickLookVariantFields } from "./lyricLookVariants.js";
+
 export function buildGenerationJob(a) {
   return {
     filename: (a.file && a.file.name) || "audio.mp3",
@@ -20,6 +23,15 @@ export function buildGenerationJob(a) {
     fontScale: a.fontScale || "1.0",
     lyricsAnimation: a.lyricsAnimation || "none",
     lineTransition: a.lineTransition || "none",
+    // Look de letra ("" = sin look). Con look el backend ignora font /
+    // lyricsAnimation / lineTransition, pero se conservan igual: si el
+    // operador vuelve a "Sin look" recupera lo que había elegido.
+    lyricLook: normalizeLyricLook(a.lyricLook),
+    // Variante del look ("" = automático) + lo que /resolve eligió para
+    // esta canción en el preview (lookResolved): al enviar, los "automático"
+    // viajan con ese número/género (lib/lyricLookVariants).
+    ...pickLookVariantFields(a),
+    lookResolved: a.lookResolved || null,
     textContrast: a.textContrast || "medium",
     lyricColor: a.lyricColor || "#FFFFFF",
     lyricSungColor: a.lyricSungColor || "#FFFFFF",

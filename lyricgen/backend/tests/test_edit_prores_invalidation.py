@@ -151,6 +151,24 @@ def test_edit_pipeline_invalidation_gated_on_prores_not_delivery_profile():
     )
 
 
+def test_umg_target_controls_source_render_on_legacy_youtube_jobs():
+    """A configured 29.97 fps delivery cannot be rerendered as 24 fps MP4."""
+    import pipeline
+    from render_spec import RenderSpec
+
+    target = {"frame_size": "HD", "fps": 29.97, "prores_profile": 3}
+    assert pipeline._wants_umg_render("youtube", target)
+    assert pipeline._wants_umg_render("umg", None)
+    assert not pipeline._wants_umg_render("youtube", None)
+    assert RenderSpec.umg_intermediate_master(target).fps == 29.97
+    assert "_wants_umg_render(delivery_profile, umg_spec)" in inspect.getsource(
+        pipeline.run_pipeline
+    )
+    assert "_wants_umg_render(delivery_profile, job_row.umg_spec)" in inspect.getsource(
+        pipeline.run_edit_pipeline
+    )
+
+
 def test_edit_pipeline_cancels_inflight_prewarm():
     """The edit must cancel a prewarm still queued from the prior render so it
     can't transcode the stale source and publish over the invalidation."""

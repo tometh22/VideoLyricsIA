@@ -17,7 +17,7 @@ This runs FROM YOUR LAPTOP (or any machine with the WAVs + network
 access to the API), NOT from inside the container — the container
 doesn't have the WAV files. It only needs:
   - Python 3.10+
-  - `requests` and `python-jose[cryptography]` (or just `requests` +
+  - `requests` and `PyJWT` (or just `requests` +
     a pre-fetched bearer token).
   - The WAVs in a folder.
 

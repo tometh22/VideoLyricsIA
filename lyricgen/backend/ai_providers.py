@@ -59,7 +59,7 @@ class TextProvider(ABC):
 
 class VeoVideoProvider(VideoProvider):
     """Google Veo 3.1 via Vertex AI."""
-    name = "veo-3.1-generate-001"
+    name = "veo-3.1-lite-generate-001"
     provider = "google_vertex"
 
     def generate_video(self, prompt, output_path, job_id=None, aspect_ratio="16:9"):

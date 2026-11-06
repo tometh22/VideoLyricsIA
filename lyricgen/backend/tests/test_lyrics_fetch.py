@@ -347,6 +347,8 @@ def test_lrclib_returns_dict_on_success(monkeypatch):
         "plainLyrics": "line one\nline two\nline three",
         "syncedLyrics": "[00:01.00] line one\n[00:03.50] line two",
         "duration": 195.0,
+        "trackName": "Si Antes Te Hubiera Conocido",
+        "artistName": "Karol G",
     }
     captured = {}
     def _fake_get(url, **kwargs):

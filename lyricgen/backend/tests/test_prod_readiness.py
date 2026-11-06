@@ -201,6 +201,9 @@ def test_alembic_upgrade_head_creates_full_schema(tmp_path):
         "veo_budget_ledger",
         "password_reset_tokens", "email_verification_tokens",
         "user_settings", "lyrics_cache",
+        "change_request_proposals",
+        "review_signal_records",
+        "finance_entries",
         "alembic_version",
     }
     missing = expected - tables

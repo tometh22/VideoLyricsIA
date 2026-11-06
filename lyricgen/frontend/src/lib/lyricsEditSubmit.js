@@ -8,7 +8,10 @@
 // module only builds the payload, posts, retries, and returns a result
 // shape the caller can branch on.
 
-import { editorRevisionConflictDetail } from "./editorRevisionConflict";
+import {
+  editorRevisionConflictDetail,
+  isEditorRevisionConflict,
+} from "./editorRevisionConflict";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -72,6 +75,27 @@ export function translateBackendError(raw, t) {
   }
   if (raw && typeof raw === "object" && raw.code === "batch_final_review_full") {
     return "Tu equipo tiene demasiados videos pendientes de revisión final. Revisá y aprobá o rechazá algunos para poder generar más.";
+  }
+  if (
+    raw === "reference_hypothesis_missing"
+    || (raw && typeof raw === "object" && raw.code === "reference_hypothesis_missing")
+  ) {
+    return "No encontramos una referencia de audio válida para confirmar esta canción. La revisión quedó guardada; volvé a abrirla y, si continúa, pedí una reparación técnica.";
+  }
+  if (
+    raw === "reference_hypothesis_invalid"
+    || (raw && typeof raw === "object" && [
+      "reference_hypothesis_invalid",
+      "reference_audio_mismatch",
+      "reference_audio_revision_mismatch",
+      "reference_complete_audio_unverified",
+      "reference_memory_policy_missing",
+    ].includes(raw.code))
+  ) {
+    return "La referencia de audio de esta canción no coincide con la versión que estás revisando. Tus cambios quedaron guardados; recargá antes de volver a aprobar.";
+  }
+  if (raw && typeof raw === "object" && raw.code === "lyric_review_pending") {
+    return raw.message || "Quedan puntos de la revisión rápida por decidir. Abrí el editor, aplicá cada arreglo o marcá que está bien así, y volvé a aprobar.";
   }
   if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
     return tr("edit.error_already_editing") ||
@@ -147,6 +171,16 @@ export function translateBackendError(raw, t) {
   return str;
 }
 
+export function campaignApprovalFailure(response, payload, t) {
+  const conflict = isEditorRevisionConflict(response, payload);
+  return {
+    ok: false,
+    reason: conflict ? "conflict" : `http-${response?.status || 0}`,
+    conflict: conflict ? (payload?.detail || null) : null,
+    message: conflict ? null : translateBackendError(payload?.detail, t),
+  };
+}
+
 // Single POST with the 409 youtube_already_published retry. Returns
 // {ok, status, data, cancelled} so the caller decides what to do.
 // cancelled=true means the operator declined the confirm prompt.
@@ -200,6 +234,7 @@ export async function submitLyricsEdit({
   textContrast,
   lyricsAnimation,
   lineTransition,
+  lyricLook,
   force = false,
   confirmYoutubeDrift,
   t,
@@ -220,11 +255,13 @@ export async function submitLyricsEdit({
     ...(textContrast != null ? { text_contrast: textContrast } : {}),
     ...(lyricsAnimation != null ? { lyrics_animation: lyricsAnimation } : {}),
     ...(lineTransition != null ? { line_transition: lineTransition } : {}),
+    // null/undefined = sin cambio; "" = sacar el look.
+    ...(lyricLook != null ? { lyric_look: lyricLook } : {}),
   };
   if (!force) {
     const typographyChanged =
       font != null || textCase != null || textContrast != null ||
-      lyricsAnimation != null || lineTransition != null;
+      lyricsAnimation != null || lineTransition != null || lyricLook != null;
     const layoutDelta = layoutChanged(baselineSegments, payloadSegments);
     const textChanged = !segmentsUnchanged(baselineSegments, payloadSegments);
     if (!typographyChanged && !layoutDelta && !textChanged) {

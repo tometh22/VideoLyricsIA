@@ -20,7 +20,7 @@ from pathlib import Path
 import requests
 
 
-VEO_FAST_MODEL = "veo-3.1-fast-generate-001"
+VEO_LITE_MODEL = "veo-3.1-lite-generate-001"
 VEO_DEFAULT_TIMEOUT = 600  # 10 min ceiling per generation
 
 
@@ -140,11 +140,13 @@ def _vertex_token() -> str:
     return creds.token
 
 
-def generate_veo(prompt: str, output_path: str, model: str = VEO_FAST_MODEL) -> str:
+def generate_veo(prompt: str, output_path: str, model: str = VEO_LITE_MODEL) -> str:
     """Generate one Veo clip, save to output_path, return the path. Mirrors
     pipeline._generate_veo_video minus the cooldown/retry/cache scaffolding —
     the preflight does not need any of that since runs are intentional and
     bounded by the runner's --validator-budget."""
+    if model != VEO_LITE_MODEL:
+        raise ValueError("Only Veo Lite is enabled for video generation")
     project = os.environ["VERTEX_PROJECT"].strip()
     location = os.environ.get("VERTEX_LOCATION", "us-central1").strip()
 

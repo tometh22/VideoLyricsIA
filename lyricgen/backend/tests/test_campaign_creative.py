@@ -35,7 +35,7 @@ def setup(db, monkeypatch):
 def request(items, **kw):
     return creative.PlanRequest(revision=0, item_ids=[i.id for i in items], reason="Acuerdo de estilos", groups=[
         creative.Group(id="photo", name="Foto y efecto", weight=50, requirement="photo_effect", settings={"movement_style": "foto-parallax", "effect": "rain"}),
-        creative.Group(id="veo", name="Veo", weight=50, requirement="veo", model="veo-3.1-fast-generate-001", settings={"movement_style": "estandar"})], **kw)
+        creative.Group(id="veo", name="Veo", weight=50, requirement="veo", model="veo-3.1-lite-generate-001", settings={"movement_style": "estandar"})], **kw)
 
 
 def test_repartition_stable_exact_preserves_sources_and_native_settings(db, setup):
@@ -229,7 +229,7 @@ def test_generation_snapshot_is_revision_bound_and_native(db, setup):
     assert job.status == "lyrics_approved"  # only the native generate endpoint publishes work
 
 
-def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, setup):
+def test_lite_is_mandatory_for_campaign_and_ordinary_jobs(db, setup):
     from campaign_models import VEO_LITE, model_for_campaign_job
     campaign, items, actor = setup
     body = creative.PlanRequest(revision=0, item_ids=[items[0].id], reason="Contrato Lite", groups=[
@@ -243,11 +243,11 @@ def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, s
     settings = creative.effective_settings(campaign, items[0].render_overrides)
     creative.generation_receipt(db, job, "1", settings, actor); db.commit()
     assert model_for_campaign_job(job.job_id, "ordinary-static-model") == VEO_LITE
-    assert model_for_campaign_job(None, "ordinary-static-model") == "ordinary-static-model"
+    assert model_for_campaign_job(None, "ordinary-static-model") == VEO_LITE
     other = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
                 artist="Ordinary", filename="test.wav", status="done", render_params=job.render_params)
     db.add(other); db.commit()
-    assert model_for_campaign_job(other.job_id, "ordinary-static-model") == "ordinary-static-model"
+    assert model_for_campaign_job(other.job_id, "ordinary-static-model") == VEO_LITE
     body.groups[0].model = "untrusted-model"
     body.revision = 1
     with pytest.raises(HTTPException):
@@ -305,3 +305,99 @@ def test_http_assignment_approval_generate_outbox_history_chain(db, setup, clien
     again = client.post("/generate", headers=auth, data=fields)
     assert again.status_code in (200, 409)
     assert db.query(JobOutboxEvent).filter_by(job_id=job.job_id, event_type="pipeline.enqueue").count() == 1
+
+
+def test_legacy_fast_assignment_generates_lite_without_rewriting_history(db, setup):
+    from campaign_models import VEO_LITE
+    campaign, items, actor = setup
+    old = {"group_id": "legacy", "group_name": "Legacy", "requirement": "veo",
+           "model": "veo-3.1-fast-generate-001", "revision": 0}
+    item = items[0]
+    item.render_overrides = {creative.ASSIGNMENT: old, "movement_style": "estandar"}
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              artist="Test", filename="synthetic.wav", status="lyrics_approved")
+    db.add(job); db.flush()
+    creative.generation_receipt(db, job, "0", creative.effective_settings(campaign, item.render_overrides), actor)
+    db.commit()
+    assignment = job.render_params["campaign_creative_receipt"]["assignment"]
+    assert assignment["model"] == VEO_LITE
+    assert assignment["requested_model"] == old["model"]
+    assert item.render_overrides[creative.ASSIGNMENT] == old
+    live = creative.get_creative(campaign.id, actor, db)
+    assert live["veo_model"] == VEO_LITE
+    assert live["items"][0]["assignment"]["model"] == VEO_LITE
+
+
+def test_history_reads_external_active_portals_and_pending_changes_while_editing(db, setup, monkeypatch):
+    from contextlib import contextmanager
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    campaign, items, actor = setup
+    jobs = []
+    for status in ("editing", "done", "done"):
+        job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+                  campaign_id=campaign.id, campaign_item_id=items[len(jobs)].id,
+                  artist="A", filename="a.wav", status=status, video_url="video", workload_class="batch",
+                  approved_at=None if status == "editing" else datetime.now(timezone.utc))
+        db.add(job)
+        jobs.append(job)
+    db.commit()
+    # Separate physical database: using the application DB would miss these.
+    external = create_engine("sqlite://")
+    with external.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT,"
+            " tenant_snapshot TEXT, removed_at TEXT,"
+            # Frescura de la publicación: la fila del portal describe el corte
+            # que sirve, no sólo que existe.
+            " published_render_fingerprint TEXT, published_revision INTEGER,"
+            " stale_since TEXT, stale_reason TEXT, approved_at TEXT,"
+            " content_updated_at TEXT, published_file_keys TEXT, added_at TEXT, client_visibility TEXT)"
+        ))
+        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
+        # `fingerprint` es el del render publicado. "viejo" no coincide con
+        # ningún render actual, así que esa fila queda desactualizada: es el
+        # caso que el portal ocultaba (mismo label, misma fecha, corte anterior).
+        for n, job, portal, tenant, removed, fingerprint, revision in [
+            (1, jobs[0].job_id, "chile", campaign.tenant_id, None, "viejo", 2),
+            (2, jobs[0].job_id, None, campaign.tenant_id, None, None, 1),
+            (3, jobs[1].job_id, "chile", campaign.tenant_id, "removed", None, 1),
+            (4, jobs[2].job_id, "chile", "foreign", None, None, 1),
+            (5, "outside", "chile", campaign.tenant_id, None, None, 1),
+        ]:
+            conn.execute(text(
+                "INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed,"
+                ":fingerprint,:revision,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"
+            ), dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed,
+                    fingerprint=fingerprint, revision=revision))
+        conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL,'2026-09-20 10:00:00.000000'),(2,1,'resolved','2026-09-19 10:00:00.000000'),(3,2,NULL,'2026-09-20 10:00:00.000000'),(4,3,NULL,'2026-09-20 10:00:00.000000'),(5,4,NULL,'2026-09-20 10:00:00.000000'),(6,5,NULL,'2026-09-20 10:00:00.000000')"))
+
+    @contextmanager
+    def portal_db():
+        with Session(external) as session:
+            yield session
+
+    monkeypatch.setattr(creative, "scoped_deliveries_db", portal_db)
+    try:
+        for rows in [creative.video_history(campaign.id, actor, db)["items"], creative.report(campaign.id, actor, db)["videos"]]:
+            indexed = {row["job_id"]: row for row in rows}
+            sent = indexed[jobs[0].job_id]
+            assert sent["status"] == "editing"
+            assert sent["is_in_umg_portal"] is True
+            assert sent["umg_portals"] == ["argentina", "chile"]
+            assert sent["pending_change_requests"] == 2
+            # El portal tiene un corte que ya no es el del job: hasta que se
+            # vuelva a publicar sigue entregando el anterior, sin decirlo.
+            assert sent["portal_outdated"] is True
+            assert sent["portal_revision"] == 2
+            for job in jobs[1:]:
+                assert indexed[job.job_id]["is_in_umg_portal"] is False
+                assert indexed[job.job_id]["umg_portals"] == []
+                assert indexed[job.job_id]["pending_change_requests"] == 0
+                # Sin publicación activa no hay nada desactualizado que avisar.
+                assert indexed[job.job_id]["portal_outdated"] is False
+                assert indexed[job.job_id]["portal_revision"] == 0
+    finally:
+        external.dispose()

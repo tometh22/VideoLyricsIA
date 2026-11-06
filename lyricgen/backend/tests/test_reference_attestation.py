@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from reference_attestation import (
     assess_reference_attestation,
+    effective_reference_gate_mode,
     reference_gate_action,
 )
 
@@ -33,6 +36,23 @@ def test_wrong_song_reference_is_fail_closed():
     assert result["text_status"] == "unsafe_without_witness"
     assert result["allow_vocabulary_reconciliation"] is False
     assert result["allow_global_forced_alignment"] is False
+
+
+def test_external_lyrics_enforce_audio_gate_even_when_configured_to_observe():
+    wrong = assess_reference_attestation(
+        "Bailando bajo la lluvia con un corazón enamorado",
+        _segments("Todos estos años de gente historias en la ciudad"),
+        audio_duration_s=100,
+    )
+    for source in ("lrclib", "genius", "gemini"):
+        for configured in ("off", "observe"):
+            mode = effective_reference_gate_mode(
+                configured, reference_source=source, reference_required=False,
+            )
+            assert mode == "enforce"
+            assert reference_gate_action(
+                wrong, mode=mode, is_live=False,
+            ) == "audio_first"
 
 
 def test_partial_or_live_reference_never_authorizes_global_alignment():
@@ -102,6 +122,15 @@ def test_live_reference_can_only_be_used_as_local_vocabulary():
     ) == "observe"
 
 
+def test_live_local_only_exits_before_global_catalogue_reconcile():
+    """The live gate must not depend on separate live-policy flags."""
+    source = (Path(__file__).parents[1] / "main.py").read_text()
+    gate = source.index('if _reference_action in {"audio_first", "local_only"}:')
+    emit = source.index("return _emit_segments(", gate)
+    reconcile = source.index("_captured_reconcile(", gate)
+    assert gate < emit < reconcile
+
+
 def test_attestation_never_emits_plain_sha256_identities(monkeypatch):
     monkeypatch.delenv("QUALITY_CONTENT_FINGERPRINT_HMAC_KEY", raising=False)
     monkeypatch.delenv("QUALITY_CONTENT_ATTESTATION_KEY", raising=False)
@@ -145,3 +174,21 @@ def test_structure_guard_keeps_exact_repeated_occurrences_and_small_mishears():
     )
     assert result["allow_global_forced_alignment"] is True
     assert result["metrics"]["longest_unmatched_content_run"] == 1
+
+
+def test_normalized_text_match_ignores_wrapping_case_accents_and_punctuation():
+    report = assess_reference_attestation(
+        "Una CANCIÓN,\npara cantar\ny recordar",
+        _segments("Una cancion para\ncantar y recordar"),
+    )
+    assert report["metrics"]["normalized_text_matches"] is True
+
+
+def test_normalized_text_match_keeps_stop_words_and_repeated_occurrences():
+    for reference, transcript in (
+        ("Camino en la noche", "Camino por la noche"),
+        ("Cantamos juntos\nCantamos juntos", "Cantamos juntos"),
+        ("", ""),
+    ):
+        report = assess_reference_attestation(reference, _segments(transcript))
+        assert report["metrics"]["normalized_text_matches"] is False

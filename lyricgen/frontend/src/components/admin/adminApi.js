@@ -23,7 +23,13 @@ export async function fetchJson(url, opts = {}) {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || `HTTP ${res.status}`);
+    const detail = data.detail;
+    const error = new Error(typeof detail === "string" ? detail
+      : detail?.message || detail?.code || `HTTP ${res.status}`);
+    error.status = res.status;
+    error.detail = detail;
+    error.code = typeof detail === "object" ? detail?.code : detail;
+    throw error;
   }
   return res.json();
 }

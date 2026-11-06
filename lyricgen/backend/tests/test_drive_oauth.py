@@ -103,7 +103,7 @@ def test_state_token_rejects_expired(monkeypatch):
 def test_state_token_rejects_wrong_type():
     """Un JWT con type != drive_oauth_state debería rechazarse incluso
     si está firmado (defensa contra reusar el JWT de auth normal)."""
-    from jose import jwt
+    import jwt
     from auth import JWT_SECRET, JWT_ALGORITHM
     bad = jwt.encode(
         {"user_id": 42, "exp": int(time.time()) + 600, "type": "other"},

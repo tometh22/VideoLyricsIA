@@ -12,7 +12,9 @@ export default function WhatsNewModal({ user }) {
   const { modalEntry, dismissModal } = useChangelog();
   const [open, setOpen] = useState(false);
   const closeButtonRef = useRef(null);
-  const isReviewDelivery = pathname === "/admin/cola" || pathname.startsWith("/review/");
+  // The lyric review queue lives inside each campaign (/campaigns/:id), so
+  // the announcement never interrupts a reviewer there either.
+  const isReviewDelivery = pathname === "/admin/cola" || pathname.startsWith("/review/") || /^\/campaigns\/[^/]+/.test(pathname);
 
   useEffect(() => {
     if (isReviewDelivery) {

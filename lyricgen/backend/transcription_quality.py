@@ -40,6 +40,8 @@ _PIPELINE_CONFIG_KEYS = (
     "CTC_ALIGN_MAX_AUDIO_S",
     "CTC_ALIGN_WORD_SEP", "CTC_ALIGN_SKIP_ARCS", "CTC_ALIGN_SKIP_LAMBDA",
     "CTC_ALIGN_MAX_SKIP_FRAC", "CTC_ALIGN_MIN_MED_SCORE",
+    "CTC_ALIGN_UNKNOWN_LANG_JOB_ES",
+    "WHISPERX_RECONCILE_KEEP_WORDS",
     "CTC_ALIGN_MIX_ACCEPT", "CTC_ALIGN_MIX_ACCEPT_KNOWN",
     "CTC_ALIGN_MIX_RECOVER", "CTC_ALIGN_EDGE_SNAP",
     "CTC_ALIGN_EDGE_SNAP_SCORE", "QUALITY_CTC_CALIBRATION_SHA256",
@@ -61,6 +63,13 @@ _PIPELINE_CONFIG_KEYS = (
     "PERFORMANCE_GRAPH_V6_ENABLED", "QUALITY_V6_ANALYSIS_ENABLED",
     "TARGETED_RESIDUAL_ASR_ENABLED", "QUALITY_V6_MAX_PRIMITIVE_DTW_PAIRS",
     "QUALITY_V6_PROPOSALS_ENABLED", "QUALITY_V6_MODEL_ENABLED",
+    "LYRIC_AUTO_REPAIR_ENABLED", "LYRIC_AUTO_REPAIR_TIMING_ENABLED",
+    "LYRIC_AUTO_REPAIR_CONTENT_ENABLED",
+    "DISPLAY_SEGMENTATION_MODE", "DISPLAY_SEGMENTATION_POLICY_VERSION",
+    "PHRASE_SEGMENTER_ENABLED", "PHRASE_SEG_TARGET_LEN", "PHRASE_SEG_MAX_LEN",
+    "PHRASE_SEG_MIN_LEN", "PHRASE_SEG_MAX_DUR_S", "PHRASE_SEG_GAP_CAP_S",
+    "LLM_SEGMENT_ENABLED", "LYRICS_FORMAT_ENABLED",
+    "QUALITY_LINE_ASR_SCORE_MIN", "QUALITY_LINE_CTC_SCORE_MIN",
 )
 
 RELEASE_REPORT_REQUIRED_CHECKS = frozenset({
@@ -114,6 +123,11 @@ def effective_policy_mode(*, job_id: str = "", tenant_id: str = "") -> str:
 def runtime_identity() -> dict:
     """Immutable release/config identity for operational KPI cohorts."""
     config = {key: os.environ.get(key, "") for key in _PIPELINE_CONFIG_KEYS}
+    from display_segmentation import Config, POLICY_VERSION as DISPLAY_POLICY, mode as display_mode
+    from dataclasses import asdict
+    config["display_segmentation"] = {
+        "policy": DISPLAY_POLICY, "mode": display_mode(), "config": asdict(Config()),
+    }
     encoded = json.dumps(config, sort_keys=True, separators=(",", ":"))
     return {
         "pipeline_release": (

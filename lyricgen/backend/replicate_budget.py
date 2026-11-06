@@ -143,12 +143,54 @@ def start_replicate_provenance(model: str, call_label: str, attempt: int):
         return None
 
 
-def finish_replicate_provenance(recorder, summary: str) -> None:
+def prediction_timing(prediction) -> tuple:
+    """(queue_time_ms, predict_time_ms) de una prediction de Replicate.
+
+    Replicate expone la inferencia real en `metrics.predict_time` y la espera
+    de GPU como `started_at - created_at`. Sin ese desglose, `duration_ms` no
+    distingue "el modelo tardó" de "esperamos GPU" — dos problemas con
+    soluciones opuestas. Medido sobre 238 corridas de demucs (jun-ago 2026):
+    la degradación de agosto fue 100% cola (predict_time mediana 87,6s
+    idéntica antes y después; cola de 23,5s a 204,3s, picos de 1824s).
+
+    Devuelve (None, None) ante cualquier problema: esto es telemetría y no
+    puede romper la llamada.
+    """
+    try:
+        import datetime as _dt
+
+        def _parse(value):
+            if not value:
+                return None
+            if isinstance(value, _dt.datetime):
+                return value
+            return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+        metrics = getattr(prediction, "metrics", None) or {}
+        predict_s = metrics.get("predict_time")
+        predict_ms = int(predict_s * 1000) if predict_s is not None else None
+
+        created = _parse(getattr(prediction, "created_at", None))
+        started = _parse(getattr(prediction, "started_at", None))
+        queue_ms = None
+        if created and started:
+            queue_ms = max(0, int((started - created).total_seconds() * 1000))
+        return queue_ms, predict_ms
+    except Exception:
+        return None, None
+
+
+def finish_replicate_provenance(recorder, summary: str, prediction=None) -> None:
     """Finish an optional recorder without affecting provider execution."""
     if recorder is None:
         return
     try:
-        recorder.finish(response_summary=summary)
+        queue_ms, predict_ms = (
+            prediction_timing(prediction) if prediction is not None
+            else (None, None)
+        )
+        recorder.finish(response_summary=summary,
+                        predict_time_ms=predict_ms, queue_time_ms=queue_ms)
     except Exception as exc:
         logger.warning("Could not finish Replicate provenance: %s", exc)
 
@@ -162,6 +204,7 @@ def _run_predict_with_progress(
     on_progress: Callable[[float], None],
     poll_interval_s: float = 3.0,
     typical_runtime_s: float = 90.0,
+    prediction_sink: list = None,
 ) -> Any:
     """Replacement for `replicate.run()` that pollea the prediction so
     callers can render a moving progress bar while the model runs.
@@ -185,6 +228,11 @@ def _run_predict_with_progress(
     # hash, while `replicate.run` accepts both. Split here defensively.
     version = model.split(":", 1)[1] if ":" in model else model
     prediction = replicate.predictions.create(version=version, input=inputs)
+    # Publicamos la prediction apenas existe para que el caller pueda leerle
+    # el desglose queue/predict incluso cuando la corrida termina en timeout
+    # o error — que es justo el caso que hay que diagnosticar.
+    if prediction_sink is not None:
+        prediction_sink.append(prediction)
     start = _t.monotonic()
     last_emitted = -1.0
 
@@ -218,7 +266,18 @@ def _run_predict_with_progress(
         status = getattr(prediction, "status", "") or ""
         if status in ("succeeded",):
             _emit(1.0)
-            return prediction.output
+            output = prediction.output
+            # WhisperX exposes LID confidence only in logs, not its JSON.
+            # Preserve this numeric evidence without retaining provider logs
+            # (which may contain audio URLs or recognized lyric text).
+            if call_label.upper() == "WHISPERX" and isinstance(output, dict):
+                match = re.search(
+                    r"Detected language:\s*([a-z]{2,3})\s*\((0(?:\.\d+)?|1(?:\.0+)?)\)",
+                    getattr(prediction, "logs", "") or "",
+                )
+                if match:
+                    output = {**output, "_language_detection_probability": float(match[2])}
+            return output
         if status in ("failed", "canceled"):
             err = getattr(prediction, "error", None) or f"prediction {status}"
             raise RuntimeError(str(err))
@@ -304,6 +363,8 @@ def call_with_budget(
         _input = input_factory()
         _closables = [v for v in _input.values() if hasattr(v, "close") and callable(v.close)]
         recorder = start_replicate_provenance(model, call_label, attempt + 1)
+        # Un sink por intento: cada uno crea su propia prediction.
+        _prediction_sink = []
         try:
             # INCIDENT 2026-08-26/28 (UMG Chile): `total_budget_s` SÓLO se
             # hacía cumplir dentro de `_run_predict_with_progress` (que
@@ -330,6 +391,7 @@ def call_with_budget(
                     call_label=call_label,
                     on_progress=on_progress or _noop_progress,
                     typical_runtime_s=typical_runtime_s,
+                    prediction_sink=_prediction_sink,
                 )
             else:
                 # `predictions.create` necesita el version hash; un modelo
@@ -341,12 +403,16 @@ def call_with_budget(
                     "within the call)", call_label, model,
                 )
                 result = replicate.run(model, input=_input)
-            finish_replicate_provenance(recorder, "succeeded")
+            finish_replicate_provenance(
+                recorder, "succeeded",
+                prediction=_prediction_sink[0] if _prediction_sink else None,
+            )
             return result
         except Exception as e:
             finish_replicate_provenance(
                 recorder,
                 f"error: {type(e).__name__}: {str(e)[:300]}",
+                prediction=_prediction_sink[0] if _prediction_sink else None,
             )
             last_err = e
             if is_non_retryable(e):

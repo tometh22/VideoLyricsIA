@@ -22,6 +22,7 @@
  *   });
  */
 import { useEffect, useRef, useState, useCallback } from "react";
+import { normalizeLyricLook } from "../lib/lyricLooks";
 
 // Audit 2026-05-26 cost-leak fix: 2 s was too aggressive for an operator
 // "exploring options" — every micro-adjustment past 2 s of inactivity
@@ -62,12 +63,16 @@ export function shouldEnableBackgroundPreview({
   editMode,
   bgSelectMode,
   enableScenes,
+  // El look pinta todo el cuadro (Cinético / Pop 70s / Degradé): el backend
+  // no genera fondo para él, así que pre-generarlo sería pagar por nada.
+  lookOwnsBackground = false,
 }) {
   return BG_PREVIEW_ENABLED
     && !!hasReview
     && !editMode
     && bgSelectMode === "auto"
-    && !enableScenes;
+    && !enableScenes
+    && !lookOwnsBackground;
 }
 
 function extractParams(entry) {
@@ -87,6 +92,9 @@ function extractParams(entry) {
     background_mode: entry.backgroundMode || "veo",
     animate_image: !!entry.animateImage,
     match_lyrics: entry.matchLyrics !== false,
+    // El look puede guiar el fondo (el backend lo mete en el hash sólo para
+    // los looks con guía de fondo): cambiarlo re-pide el preview.
+    lyric_look: normalizeLyricLook(entry.lyricLook),
     target_duration_s: 30.0,
   };
 }
@@ -271,6 +279,7 @@ export function useBackgroundPreview(entry, {
     entry?.backgroundMode,
     entry?.animateImage,
     entry?.matchLyrics,
+    entry?.lyricLook,
   ]);
 
   // Cleanup al unmount.

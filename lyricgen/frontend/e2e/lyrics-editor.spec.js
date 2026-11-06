@@ -479,7 +479,7 @@ test.describe("lyrics editor browser contract", () => {
 
     const panel = page.locator(".wizard-controls-panel");
     await panel.evaluate((element) => { element.scrollTop = element.scrollHeight; });
-    await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+    await page.getByRole("button", { name: /Aprobar cambios y generar video/i }).click();
 
     const dialog = page.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
     await expect(dialog).toBeVisible();
@@ -500,7 +500,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
     expect(harness.saves[0]).toMatchObject({ base_revision: 0, checkpoint: "draft" });
 
-    await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+    await page.getByRole("button", { name: /Aprobar cambios y generar video/i }).click();
     await expect.poll(() => harness.approvals.length).toBe(1);
     const approved = harness.approvals[0];
     const persisted = harness.saves.at(-1);
@@ -573,7 +573,7 @@ test.describe("lyrics editor browser contract", () => {
             right: Math.round(rect.right),
           }));
       })).toEqual([]);
-      await expect(page.getByRole("button", { name: /Aprobar y generar/i })).toBeVisible();
+      await expect(page.getByRole("button", { name: /Aprobar cambios y generar video/i })).toBeVisible();
     }
   });
 });

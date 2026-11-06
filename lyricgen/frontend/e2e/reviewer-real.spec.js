@@ -84,7 +84,9 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       const approvedResponse = await approveResponse;
       expect(approvedResponse.ok()).toBeTruthy();
       expect((await approvedResponse.json()).status).toBe("lyrics_approved");
-      await expect(page).toHaveURL(new RegExp(`/admin/cola\\?approved=${JOB}`));
+      // Without a return path the editor falls back to /admin/cola, which
+      // forwards to the campaign's lyric stage keeping the approval marker.
+      await expect(page).toHaveURL(new RegExp(`/campaigns/${CAMPAIGN}\\?view=lyrics&approved=${JOB}`));
       const after = await document();
       expect(after.segments[0].text).toBe("Canto aquí");
       expect(after.segments[1]).toEqual(protectedLine);

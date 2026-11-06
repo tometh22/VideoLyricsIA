@@ -108,12 +108,13 @@ def test_generate_veo_video_has_static_branch_with_camera_negatives():
         assert equipment not in src.lower()
 
 
-def test_generate_veo_video_accepts_high_fidelity_and_routes_model():
+def test_generate_veo_video_accepts_high_fidelity_without_cost_override():
     sig = inspect.signature(pipeline._generate_veo_video)
     assert "high_fidelity" in sig.parameters
     src = inspect.getsource(pipeline._generate_veo_video)
-    # Static / verbatim renders can route to a higher-fidelity model via env.
-    assert "VEO_MODEL_STATIC" in src
+    # Static / verbatim requests retain prompt fidelity under the Lite policy.
+    assert "VEO_MODEL_STATIC" not in src
+    assert "model_for_campaign_job(job_id)" in src
 
 
 def test_generate_veo_video_has_source_preserving_live_photo_contract():

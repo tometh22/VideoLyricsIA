@@ -68,7 +68,7 @@ except Exception:
 # Quality tiers for the seed library — overridable via env if a project
 # doesn't have Ultra access.
 IMAGEN_MODEL = os.environ.get("LIBRARY_IMAGEN_MODEL", "imagen-4.0-ultra-generate-001")
-VEO_MODEL    = os.environ.get("LIBRARY_VEO_MODEL", "veo-3.1-generate-001")
+VEO_MODEL    = "veo-3.1-lite-generate-001"
 
 # Each tuple: (concept, asset_type, prompt)
 # asset_type: "image" → Imagen 4 Ultra still

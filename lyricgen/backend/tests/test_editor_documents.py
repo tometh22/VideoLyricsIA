@@ -1,5 +1,6 @@
 """Editor drafts, versions, locks and workspace collaboration."""
 
+import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from editor import (
     operator_suggestion_type_enabled,
     rebase_operator_suggestions_after_manual_edit,
     save_document,
+    serialize_document,
 )
 from transcription_quality import segments_hash
 from quality_v6_contracts import PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA
@@ -72,6 +74,47 @@ def _token_for(user):
         return start_login_session(db, user)
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("operation", ["patch", "restore", "resolve"])
+def test_revision_conflict_releases_locks_before_response_teardown(operation):
+    import main
+    from fastapi import HTTPException
+
+    first, _, job_id = _users_and_job()
+    actor = {"id": first.id, "role": "user", "tenant_id": first.tenant_id,
+             "features": {"editor_v2": True}}
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, [
+            {"start": 0, "end": 1, "text": "latest human correction"},
+        ], "manual")
+        db.commit()
+        version_id = db.query(EditorVersion).filter_by(job_id=job_id, revision=0).one().id
+
+    handlers = {
+        "patch": (main.patch_editor_document, main.EditorPatchRequest(
+            base_revision=0, segments=[{"start": 0, "end": 1, "text": "stale"}])),
+        "restore": (main.restore_editor_version, main.EditorRestoreRequest(
+            base_revision=0, version_id=version_id)),
+        "resolve": (main.resolve_editor_conflict, main.EditorConflictRequest(
+            server_revision=0, strategy="use_server")),
+    }
+    handler, body = handlers[operation]
+    with SessionLocal() as db:
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(handler(job_id, body, current_user=actor, db=db))
+        assert caught.value.status_code == 409
+        assert caught.value.detail["server_revision"] == 1
+        assert caught.value.detail["server_segments"][0]["text"] == "latest human correction"
+        # The dependency is deliberately still open: ASGI cleanup must not
+        # be responsible for releasing locks needed by the next request.
+        assert not db.in_transaction()
+        if engine.dialect.name == "postgresql":
+            with SessionLocal() as contender:
+                assert contender.query(Job).filter_by(job_id=job_id).with_for_update(nowait=True).one()
+                assert contender.query(EditorDocument).filter_by(job_id=job_id).with_for_update(nowait=True).one()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -1531,6 +1574,104 @@ def test_analytics_rejects_cross_tenant_nested_and_oversized_batches(client):
     assert other_first.id != first.id
 
 
+def test_platform_admin_editor_analytics_on_client_job_are_recorded(client):
+    """agus77 (admin de plataforma) revisa canciones de universal_music.
+
+    El editor lo deja trabajar (_editor_document_or_404), pero el lookup
+    tenant-only de /analytics/events descartaba TODOS sus eventos sobre esas
+    canciones: 0 seeks, 0 aperturas, 0 aprobaciones desde el 7-sep.
+    """
+    _, _, job_id = _users_and_job("editor_analytics_client")
+    with SessionLocal() as db:
+        admin = create_user(
+            db, f"analytics_admin_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            role="admin", tenant_id="analytics_platform_admin",
+        )
+        regular = create_user(
+            db, f"analytics_user_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            tenant_id="analytics_other_team",
+        )
+    events = {"events": [
+        {"name": "editor_seek", "job_id": job_id,
+         "properties": {"position_ms": 12_000, "source": "editor"}},
+    ]}
+    admin_response = client.post("/analytics/events", headers=auth(_token_for(admin)), json=events)
+    assert admin_response.json() == {"accepted": 1, "rejected": 0}
+    # Un usuario común de otro tenant sigue aislado.
+    regular_response = client.post("/analytics/events", headers=auth(_token_for(regular)), json=events)
+    assert regular_response.json() == {"accepted": 0, "rejected": 1}
+    with SessionLocal() as db:
+        rows = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+        ).all()
+        assert [(row.user_id, row.tenant_id) for row in rows] == [
+            (admin.id, "analytics_platform_admin"),
+        ]
+
+
+def test_analytics_events_store_client_time_or_fall_back_to_arrival(client):
+    first, _, job_id = _users_and_job("editor_analytics_time")
+    token = _token_for(first)
+    client_time = datetime.now(timezone.utc) - timedelta(seconds=30)
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_seek", "job_id": job_id,
+             "occurred_at": client_time.isoformat().replace("+00:00", "Z"),
+             "properties": {"position_ms": 1_000, "source": "editor"}},
+            # Cliente viejo: sin occurred_at.
+            {"name": "editor_seek", "job_id": job_id,
+             "properties": {"position_ms": 2_000, "source": "editor"}},
+            # Reloj del navegador absurdo.
+            {"name": "editor_seek", "job_id": job_id, "occurred_at": "2001-01-01T00:00:00Z",
+             "properties": {"position_ms": 3_000, "source": "editor"}},
+        ]},
+    )
+    assert response.json() == {"accepted": 3, "rejected": 0}
+    with SessionLocal() as db:
+        rows = {
+            row.properties["position_ms"]: row
+            for row in db.query(ProductEvent).filter(
+                ProductEvent.job_id == job_id, ProductEvent.name == "editor_seek",
+            )
+        }
+    assert all(row.occurred_at is not None for row in rows.values())
+    assert abs((rows[1_000].occurred_at - client_time).total_seconds()) < 0.01
+    for position in (2_000, 3_000):
+        lag = abs((rows[position].occurred_at - rows[position].created_at).total_seconds())
+        assert lag < 60, position
+
+
+def test_audio_played_ranges_are_persisted_and_bounded(client):
+    first, _, job_id = _users_and_job("editor_audio_played")
+    token = _token_for(first)
+    session_id = str(uuid.uuid4())
+    valid = {
+        "ranges": [[0, 12_000], [60_000, 64_250]], "played_ms": 16_250,
+        "playback_rate": 1, "audio_duration_ms": 215_400,
+        "flush_reason": "approve", "session_id": session_id,
+    }
+    response = client.post(
+        "/analytics/events", headers=auth(token),
+        json={"events": [
+            {"name": "editor_audio_played", "job_id": job_id, "properties": valid},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[5_000, 1_000]]}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, 1]] * 65}},
+            {"name": "editor_audio_played", "job_id": job_id,
+             "properties": {**valid, "ranges": [[0, "hoy te vi pasar"]]}},
+        ]},
+    )
+    assert response.json() == {"accepted": 1, "rejected": 3}
+    with SessionLocal() as db:
+        row = db.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id, ProductEvent.name == "editor_audio_played",
+        ).one()
+    assert row.properties["ranges"] == [[0, 12_000], [60_000, 64_250]]
+    assert row.properties["session_id"] == session_id
+
+
 def test_transaction_rollback_never_leaves_partial_editor_state():
     first, _, job_id = _users_and_job("editor_rollback")
     db = SessionLocal()
@@ -1618,6 +1759,35 @@ def test_approval_requires_the_current_exact_snapshot():
         with pytest.raises(RuntimeError, match="editor_revision_conflict"):
             approve_document(db, job, first.id, editor_version_id=version.id)
         db.rollback()
+    finally:
+        db.close()
+
+
+def test_editor_payload_keeps_latest_approved_snapshot_when_a_newer_draft_exists():
+    first, _, job_id = _users_and_job("editor_latest_approved")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        approved_rows = [{"start": 0, "end": 1, "text": "latest approved"}]
+        document, version, _ = save_document(
+            db, job, document, first.id, 0, approved_rows, "manual",
+        )
+        approve_document(
+            db, job, first.id,
+            editor_revision=version.revision, editor_version_id=version.id,
+        )
+        draft_rows = [{"start": 0, "end": 1, "text": "newer unapproved draft"}]
+        document, _, _ = save_document(
+            db, job, document, first.id, version.revision, draft_rows, "draft",
+        )
+        db.commit()
+
+        payload = serialize_document(db, document, job)
+        assert payload["segments"] == draft_rows
+        assert payload["revision"] == 2
+        assert payload["latest_approved_version"]["revision"] == 1
+        assert payload["latest_approved_version"]["segments"] == approved_rows
     finally:
         db.close()
 
@@ -1730,3 +1900,119 @@ def test_postgres_two_simultaneous_locks_exactly_one_gets_lease():
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(locker, [first.id, second.id]))
     assert sorted(outcomes) == [False, True]
+
+
+def test_campaign_human_history_requires_material_editor_work(db):
+    from campaign_review_history import saved_review_history
+    from editor import sync_legacy_snapshot
+
+    first, second, job_id = _users_and_job()
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    # Initial migration attributed to a batch actor is still not human work.
+    doc.updated_by = second.id
+    db.commit()
+    assert saved_review_history(db, [job_id]) == {}
+    _, _, applied = save_document(db, job, doc, first.id, doc.revision,
+                                  list(doc.current_segments), "autosave")
+    assert not applied
+    assert saved_review_history(db, [job_id]) == {}
+    # A fast structural draft must count even when it has no version snapshot
+    # and the older per-line audit cannot associate added/deleted lines.
+    changed = [dict(doc.current_segments[0])]
+    _, version, applied = save_document(db, job, doc, first.id, doc.revision,
+                                       changed, "draft")
+    assert applied and version is None
+    _review_activity(db, doc, first.id)
+    history = saved_review_history(db, [job_id])
+    assert history[job_id]["user_id"] == first.id
+    saved_at = history[job_id]["at"]
+    # A later automatic migration must not impersonate the last reviewer.
+    changed = [dict(doc.current_segments[0], text="automatic update")]
+    save_document(db, job, doc, second.id, doc.revision, changed, "migration")
+    assert saved_review_history(db, [job_id])[job_id] == history[job_id]
+    # The legacy editor remains discoverable too.
+    changed = [dict(doc.current_segments[0], text="human correction")]
+    sync_legacy_snapshot(db, doc, second.id, changed, doc.revision + 1)
+    _review_activity(db, doc, second.id)
+    history = saved_review_history(db, [job_id])
+    assert history[job_id]["user_id"] == second.id
+    assert history[job_id]["at"] >= saved_at
+    assert saved_review_history(db, ["unrelated"]) == {}
+
+
+def test_campaign_legacy_history_needs_edit_checkpoint_and_excludes_machine(db):
+    from campaign_review_history import saved_review_history
+
+    first, _, job_id = _users_and_job()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    for checkpoint in ("migration", "transcription", "reviewer_candidate", "quality_proposal"):
+        db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={
+            "job_id": job_id, "checkpoint": checkpoint,
+        }))
+    db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={
+        "job_id": job_id, "checkpoint": "autosave", "author_kind": "machine_candidate",
+    }))
+    db.flush()
+    assert saved_review_history(db, [job_id]) == {}
+    # A legacy diff without lineage alone is insufficient.
+    db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={"job_id": job_id}))
+    db.flush()
+    assert saved_review_history(db, [job_id]) == {}
+    db.add(EditorVersion(id=str(uuid.uuid4()), job_id=job_id, tenant_id=doc.tenant_id, revision=1,
+        segments=doc.current_segments, created_by=first.id, reason="manual"))
+    db.flush()
+    _review_activity(db, doc, first.id, revision=1)
+    assert saved_review_history(db, [job_id])[job_id]["user_id"] == first.id
+
+
+def test_campaign_history_excludes_registered_automation_even_with_manual_checkpoints(db, monkeypatch):
+    from campaign_review_history import saved_review_history, automation_accounts
+    from editor import sync_legacy_snapshot
+
+    human, automation, job_id = _users_and_job()
+    monkeypatch.setenv("REVIEW_AUTOMATION_USERNAMES", automation.username.upper())
+    assert "batch-universal-staging" in automation_accounts()
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    for reason in ("manual", "autosave", "restore"):
+        changed = [dict(row, text=f"automatic {reason} {i}") for i, row in enumerate(doc.current_segments)]
+        save_document(db, job, doc, automation.id, doc.revision, changed, reason)
+    changed = [dict(row, text=f"automatic legacy {i}") for i, row in enumerate(doc.current_segments)]
+    sync_legacy_snapshot(db, doc, automation.id, changed, doc.revision + 1)
+    # Legacy audit without checkpoint must not sneak through the version fallback.
+    db.add(AuditLog(user_id=automation.id, action="lyrics.segments_diff", detail={"job_id": job_id}))
+    db.flush()
+    assert saved_review_history(db, [job_id]) == {}
+    changed = [dict(row, text=f"human correction {i}") for i, row in enumerate(doc.current_segments)]
+    save_document(db, job, doc, human.id, doc.revision, changed, "draft")
+    _review_activity(db, doc, human.id)
+    expected = saved_review_history(db, [job_id])[job_id]
+    changed = [dict(row, text=f"automatic later {i}") for i, row in enumerate(doc.current_segments)]
+    save_document(db, job, doc, automation.id, doc.revision, changed, "manual")
+    assert saved_review_history(db, [job_id])[job_id] == expected
+    assert expected["user_id"] == human.id
+
+
+def _review_activity(db, doc, actor, *, revision=None, at=None):
+    db.add(ProductEvent(job_id=doc.job_id, tenant_id=doc.tenant_id, user_id=actor,
+        name="editor_activity_heartbeat", created_at=at or datetime.now(timezone.utc),
+        properties={"revision": doc.revision if revision is None else revision}))
+    db.flush()
+
+
+def test_campaign_review_needs_activity_for_same_actor_revision_and_save_time(db):
+    from campaign_review_history import saved_review_history
+
+    human, other, job_id = _users_and_job()
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    changed = [dict(row, text=f"script using personal account {i}") for i, row in enumerate(doc.current_segments)]
+    save_document(db, job, doc, human.id, doc.revision, changed, "manual")
+    assert saved_review_history(db, [job_id]) == {}
+    _review_activity(db, doc, other.id)
+    _review_activity(db, doc, human.id, revision=999)
+    _review_activity(db, doc, human.id, at=datetime.now(timezone.utc) - timedelta(hours=1))
+    assert saved_review_history(db, [job_id]) == {}
+    _review_activity(db, doc, human.id)
+    assert saved_review_history(db, [job_id])[job_id]["user_id"] == human.id

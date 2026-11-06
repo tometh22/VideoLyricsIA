@@ -64,3 +64,25 @@ def test_forced_expired_upload_token_recovers_and_retries(monkeypatch):
     assert auth.token == "renewed-token"
     assert {"forced_expiry", "renewal", "recovered_401"}.issubset(auth.events)
     assert calls[-1][1] == "renewed-token"
+
+
+def test_art_asset_mapping_keeps_audio_and_cover_roles_separate():
+    audio = {"role": "audio", "filename": "cover.mp3", "relative_path": "album/cover.mp3"}
+    cover = {"role": "cover", "filename": "cover.jpg", "relative_path": "album/cover.jpg"}
+    audio_source = {"filename": "cover.mp3", "relative_path": "album/cover.mp3", "path": "/tmp/audio"}
+    cover_source = {"filename": "cover.jpg", "relative_path": "album/cover.jpg", "path": "/tmp/cover"}
+
+    assert uploader.source_for_art_asset(audio, [audio_source], [cover_source]) is audio_source
+    assert uploader.source_for_art_asset(cover, [audio_source], [cover_source]) is cover_source
+
+
+def test_art_manifest_entries_retain_folder_relative_audio_path(tmp_path):
+    folder = tmp_path / "inputs"
+    folder.mkdir()
+    path = folder / "nested" / "song.mp3"
+    path.parent.mkdir()
+    path.write_bytes(b"audio")
+    entry = uploader.inspect_file(path)
+    entry["relative_path"] = str(entry["path"].relative_to(folder))
+
+    assert entry["relative_path"] == "nested/song.mp3"

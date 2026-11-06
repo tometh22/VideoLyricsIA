@@ -97,6 +97,25 @@ def test_audio_equivocado():
     assert "audio" in crs.classify("No esta correcto el audio. Es de rata blanca")
 
 
+def test_lista_de_timecodes_y_repeticiones_se_clasifica_como_letra():
+    tags = crs.classify(
+        '0:13 "Dicen que soy lo peor" en todas las apariciones'
+    )
+    assert {"letra", "repeticiones"} <= set(tags)
+
+
+def test_lista_portal_de_timecodes_sin_verbo_se_clasifica_como_letra():
+    assert "letra" in crs.classify(
+        "0:48 Un caramelo Blanco de limón\n1:11 Y Con el tu corazón"
+    )
+
+
+def test_estructura_de_pantalla():
+    assert "estructura" in crs.classify(
+        "Dejar la frase completa en una sola línea y en la misma pantalla"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Multi-etiqueta y ruido
 # ---------------------------------------------------------------------------

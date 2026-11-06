@@ -46,7 +46,15 @@ const JOB_FULL = {
     font_scale: 1.15,
     lyrics_animation: "karaoke",
     line_transition: "fade",
+    lyric_look: "cine",
     lyric_color: "#FF0000",
+    // Variante del look (lib/lyricLookVariants): el backend guarda lo que usó.
+    lyric_genre: "metal",
+    lyric_variant: 3,
+    lyric_font_main: "rubik-dirt",
+    lyric_font_key: "metal-mania",
+    lyric_alt_color: "#CFC9BE",
+    lyric_accent_color: "#D0101E",
     lyric_sung_color: "#00FF00",
     movement_style: "estatico",
     genre: "rock",
@@ -111,6 +119,23 @@ describe("invariante: un job sin tocar no produce diff", () => {
     expect(out.presentBuckets).toEqual([]);
     expect(out.payload).toBeNull();
     expect(out.editType).toBeNull();
+  });
+
+  it("renderiza la revisión ya guardada cuando viene de un pedido UMG", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const current = currentFrom(JOB_FULL);
+    const out = resolveEditSubmission({
+      baseline,
+      current,
+      jobStatus: "done",
+      forceLyricsRerender: true,
+    });
+    expect(out.presentBuckets).toEqual(["lyrics"]);
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload).toMatchObject({
+      edit_type: "lyrics",
+      segments: current.segments,
+    });
   });
 });
 
@@ -215,6 +240,69 @@ describe("un cambio real sí viaja", () => {
     expect(out.payload.segments).toEqual([
       { start: 1, end: 2, text: "letra corregida" },
     ]);
+  });
+});
+
+describe("look de letra", () => {
+  it("se siembra del render_params (y un código desconocido es sin look)", () => {
+    expect(buildEditReview(JOB_FULL, null).initialFields.lyricLook).toBe("cine");
+    expect(buildEditReview(JOB_FULL, null).baseline.lyricLook).toBe("cine");
+    expect(buildEditReview(JOB_BARE, null).initialFields.lyricLook).toBe("");
+    const legacy = { ...JOB_BARE, render_params: { lyric_look: "vaporwave" } };
+    const { baseline } = buildEditReview(legacy, null);
+    expect(baseline.lyricLook).toBe("");
+    // Sin tocar nada no difea aunque el backend haya guardado un código viejo.
+    expect(computeFieldDiff(baseline, currentFrom(legacy))).toEqual({});
+  });
+
+  it("background_owned_by_look se siembra para avisar, sin entrar al diff", () => {
+    const owned = { ...JOB_BARE, render_params: { lyric_look: "pop70", background_owned_by_look: true } };
+    const { initialFields, baseline } = buildEditReview(owned, null);
+    expect(initialFields.backgroundOwnedByLook).toBe(true);
+    // Display-only: ni baseline ni el diff lo conocen.
+    expect("backgroundOwnedByLook" in baseline).toBe(false);
+    expect(computeFieldDiff(baseline, currentFrom(owned))).toEqual({});
+    expect(buildEditReview(JOB_BARE, null).initialFields.backgroundOwnedByLook).toBe(false);
+    // Es un hecho del render: el snap no lo pisa.
+    expect(buildEditReview(owned, { backgroundOwnedByLook: false }).initialFields.backgroundOwnedByLook).toBe(true);
+  });
+
+  it("el snap del autosave gana (incluido el '' de sacar el look)", () => {
+    const { initialFields } = buildEditReview(JOB_FULL, { lyricLook: "" });
+    expect(initialFields.lyricLook).toBe("");
+  });
+
+  it("cambiar de look viaja como typography con lyric_look", () => {
+    const { baseline } = buildEditReview(JOB_BARE, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(JOB_BARE, { lyricLook: "pop70" }),
+      jobStatus: "pending_review",
+    });
+    expect(out.editType).toBe("typography");
+    expect(out.payload).toEqual({ edit_type: "typography", lyric_look: "pop70" });
+  });
+
+  it("sacar el look manda lyric_look='' (clear explícito)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(JOB_FULL, { lyricLook: "" }),
+      jobStatus: "pending_review",
+    });
+    expect(out.payload.lyric_look).toBe("");
+  });
+
+  it("en un job done el look viaja colgado de una edición de letra", () => {
+    const done = { ...JOB_FULL, status: "done" };
+    const { baseline } = buildEditReview(done, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(done, { lyricLook: "pincel" }),
+      jobStatus: "done",
+    });
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload.lyric_look).toBe("pincel");
   });
 });
 
@@ -557,6 +645,25 @@ describe("job LEGACY con un movement_style no canónico", () => {
 });
 
 describe("backgroundEditBlockedReason: se sabe ANTES de tocar nada", () => {
+  it.each(["done", "rejected"])("admin can regenerate a %s background without dropping the prompt", (jobStatus) => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const options = { jobStatus, allowApprovedBackground: true };
+    expect(backgroundEditBlockedReason(options)).toBeNull();
+    const result = resolveEditSubmission({ ...options, baseline,
+      current: currentFrom(JOB_FULL, { backgroundHint: "Un paisaje nocturno sin personas" }),
+    });
+    expect(result.blocked).toBeNull();
+    expect(result.editType).toBe("background");
+    expect(result.willDrop).toEqual([]);
+    expect(result.payload.background_hint).toBe("Un paisaje nocturno sin personas");
+  });
+
+  it("admin permission does not unlock active renders or replace scene timelines", () => {
+    expect(backgroundEditBlockedReason({ jobStatus: "editing", allowApprovedBackground: true })).toBe("status");
+    expect(backgroundEditBlockedReason({ jobStatus: "done", allowApprovedBackground: true,
+      scenePlan: { scenes: [{ recurrence_key: "coro" }] },
+    })).toBe("scenes");
+  });
   // Detectado manejando la app real con un navegador: el aviso salía sólo
   // DESPUÉS de que el operador configuraba el fondo, porque se derivaba de
   // `resolveEditSubmission`, que corta temprano cuando no hay cambios. Al

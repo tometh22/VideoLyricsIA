@@ -1,20 +1,8 @@
-"""Lyrics text formatting pass — orthographic correction + line splitting via LLM.
+"""Orthographic formatting with a strict one-card-in/one-card-out contract.
 
-Two things Rotor does that we don't (but now do):
-  1. Orthographic correction: fix accents, capitalization, ¿/¡, punctuation.
-  2. Line splitting: break long whisperX segments at musical-phrase boundaries.
-
-Both happen in a single GPT-4o-mini call (temperature=0, < $0.001/song).
-
-Timestamp assignment for splits:
-  - If word-level timestamps are present (whisperX forced-alignment), we assign
-    each sub-line's start/end from the proportional slice of the word list.
-    Proportional by sub-line word count gives ±1 word accuracy, which is
-    < 0.3s for typical vocal tempo.
-  - If word timestamps are absent (adlib or ghost segments), we fall back to
-    proportional split by character count.
-
-Failure mode: any exception returns the original result unchanged.
+Language models never assign timing or split cards. The final deterministic
+``display_segmentation`` stage owns consecutive cards using current clocks.
+Failures preserve source text/timing; no provider response is truncated.
 """
 
 import asyncio
@@ -33,9 +21,6 @@ _LANG_NAMES: dict = {
     "it": "Italian",  "ita": "Italian",
     "de": "German",   "deu": "German",
 }
-
-_SPLIT_MIN_WORDS = 8   # segments shorter than this are never split
-_SPLIT_MAX_PARTS = 3   # never more than 3 sub-lines per segment
 
 # Words that cannot naturally close a Spanish lyric card.  This list is
 # intentionally small: the cross-card repair below is a precision rule, not a
@@ -269,71 +254,6 @@ def polish_display_layout(result: dict) -> dict:
     return polished
 
 
-# ── Timestamp assignment ──────────────────────────────────────────────────────
-
-def _split_by_words(seg: dict, sub_texts: list) -> list:
-    """Split one segment into sub-segments, using word timestamps when available.
-
-    Assigns each sub-text a proportional slice of the word list (by word count).
-    Falls back to proportional character-count split when words are absent.
-    """
-    if len(sub_texts) == 1:
-        return [{**seg, "text": sub_texts[0]}]
-
-    words = seg.get("words") or []
-    seg_start = float(seg.get("start", 0))
-    seg_end   = float(seg.get("end", 0))
-    total_dur = seg_end - seg_start
-
-    if words:
-        # Proportional word-count slice → ≤1-word error, which is < ~0.3s
-        sub_wc = [max(1, len(t.split())) for t in sub_texts]
-        total_wc = sum(sub_wc)
-        result = []
-        widx = 0
-        is_last = [i == len(sub_texts) - 1 for i in range(len(sub_texts))]
-        for i, (text, wc) in enumerate(zip(sub_texts, sub_wc)):
-            if is_last[i]:
-                chunk = words[widx:]
-            else:
-                take = max(1, round(wc / total_wc * len(words)))
-                chunk = words[widx:widx + take]
-                widx += take
-            if chunk:
-                s = float(chunk[0].get("start") or seg_start)
-                # Always use original seg_end for last sub-line (word end can lag by ~0.1s)
-                e = seg_end if is_last[i] else float(chunk[-1].get("end") or seg_end)
-                # guard: mono-increasing
-                s = max(s, seg_start if i == 0 else result[-1]["end"])
-                e = max(e, s + 0.1)
-            else:
-                s = result[-1]["end"] if result else seg_start
-                e = seg_end if is_last[i] else s + total_dur / len(sub_texts)
-            out = {**seg, "text": text, "start": round(s, 3), "end": round(e, 3)}
-            if chunk:
-                out["words"] = chunk
-            elif "words" in out:
-                del out["words"]
-            result.append(out)
-        return result
-    else:
-        # No word timestamps: proportional by character count
-        total_chars = sum(len(t) for t in sub_texts) or 1
-        result = []
-        t = seg_start
-        for i, text in enumerate(sub_texts):
-            frac = len(text) / total_chars
-            end = (t + total_dur * frac) if i < len(sub_texts) - 1 else seg_end
-            end = round(end, 3)
-            out = {k: v for k, v in seg.items() if k != "words"}
-            out["text"] = text
-            out["start"] = round(t, 3)
-            out["end"] = end
-            result.append(out)
-            t = end
-        return result
-
-
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
 def _build_prompt(texts: list, lang: str) -> str:
@@ -379,16 +299,16 @@ def _parse_response(raw: str, n_input: int) -> "dict | None":
     # Every input index must appear; gaps → failure
     if set(groups.keys()) != set(range(1, n_input + 1)):
         return None
-    # Enforce max parts per segment
-    for k in groups:
-        groups[k] = groups[k][:_SPLIT_MAX_PARTS]
+    # The model is an orthographic formatter, not a clock source. Repeated
+    # indices violate the one-input/one-output prompt. Never manufacture
+    # proportional timestamps or silently truncate a provider response.
     return groups
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
-    """Orthographic correction + line splitting on the final segment list.
+    """Orthographic correction; consecutive cards belong to the final segmenter.
 
     Only touches `seg["text"]`, `seg["start"]`, `seg["end"]` (and `seg["words"]`
     for split sub-segments). Returns result unchanged on any failure or when
@@ -451,7 +371,6 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
 
         new_segs: list = []
         n_corrected = 0
-        n_split = 0
         n_rejected = 0
 
         for i, seg in enumerate(segs):
@@ -471,18 +390,18 @@ async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
                 sub_texts = [original_text]
                 n_rejected += 1
 
-            if len(sub_texts) == 1:
-                corrected = sub_texts[0]
-                if corrected != original_text:
-                    n_corrected += 1
-                    new_segs.append({**seg, "text": corrected})
-                else:
-                    new_segs.append(seg)
-            else:
-                # Split: assign timestamps
-                n_split += 1
+            if len(sub_texts) != 1:
+                # Keep safe corrections on other rows. This row needs the
+                # final word-clock planner, not model-invented timestamps.
+                n_rejected += 1
+                new_segs.append(seg)
+                continue
+            corrected = sub_texts[0]
+            if corrected != original_text:
                 n_corrected += 1
-                new_segs.extend(_split_by_words(seg, sub_texts))
+                new_segs.append({**seg, "text": corrected})
+            else:
+                new_segs.append(seg)
 
         logger.info(
             "[FORMAT] %s: %d/%d lines corrected, %d lexical rewrite(s) rejected",

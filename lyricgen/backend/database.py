@@ -95,9 +95,16 @@ DATABASE_URL = os.environ.get(
     "postgresql://genly:genly@localhost:5432/genly",
 )
 
-# Handle Heroku-style postgres:// URLs
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def _normalize_postgres_driver(url: str) -> str:
+    """Pin generic Postgres URLs to the installed psycopg2 DBAPI."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+DATABASE_URL = _normalize_postgres_driver(DATABASE_URL)
 
 # Pool sizing is *per-process*. The formula that has to hold under
 # burst is:
@@ -202,10 +209,7 @@ def get_db():
 # get_db → prod y dev quedan byte-a-byte iguales que hoy. NO se corre
 # create_all contra este engine: la DB externa (prod) es dueña de su schema.
 DELIVERIES_DATABASE_URL = os.environ.get("DELIVERIES_DATABASE_URL", "").strip()
-if DELIVERIES_DATABASE_URL.startswith("postgres://"):
-    DELIVERIES_DATABASE_URL = DELIVERIES_DATABASE_URL.replace(
-        "postgres://", "postgresql://", 1
-    )
+DELIVERIES_DATABASE_URL = _normalize_postgres_driver(DELIVERIES_DATABASE_URL)
 
 # El added_by_user_id de deliveries es FK NOT NULL a users.id de la DB
 # destino. Un user id de staging no existe en prod → al escribir en la DB
@@ -271,8 +275,7 @@ def deliveries_added_by(default_user_id):
 # SOLO LECTURA por convención: no se corre create_all contra este engine y
 # ningún camino de escritura lo usa.
 PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
-if PEER_DATABASE_URL.startswith("postgres://"):
-    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+PEER_DATABASE_URL = _normalize_postgres_driver(PEER_DATABASE_URL)
 
 if (
     PEER_DATABASE_URL
@@ -896,6 +899,24 @@ class BatchCampaign(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class BatchCampaignReviewer(Base):
+    """Explicit access to one campaign's lyric review workspace."""
+
+    __tablename__ = "batch_campaign_reviewers"
+    __table_args__ = (
+        Index("ix_batch_campaign_reviewers_user", "user_id", "revoked_at"),
+    )
+
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    granted_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class BatchCampaignItem(Base):
     """One source audio registered before a Job is promoted for transcription."""
 
@@ -1042,6 +1063,9 @@ class DeliveryBatchItem(Base):
     error_code = Column(String(120), nullable=True)
     error_detail = Column(String(500), nullable=True)
     receipt = Column(JSONB, nullable=True)
+    # Client requests this send was reviewed to close (ids + reviewed cut). The
+    # worker re-validates each one before resolving; never resolves on its own.
+    change_request_intent = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -1072,6 +1096,52 @@ class EditorDocument(Base):
     machine_evidence = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_document")
+
+
+class ChangeRequestProposal(Base):
+    """Revision-bound operator proposal for one external portal request.
+
+    Change requests may live in ``DELIVERIES_DATABASE_URL`` while jobs and
+    editor documents live in the local application database.  The external
+    identifiers therefore cannot be foreign keys; ``job_id`` is the local
+    integrity anchor and every apply revalidates the external request.
+    """
+    __tablename__ = "change_request_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "portal_id", "change_request_id", "request_sha256",
+            "base_revision", name="uq_change_request_proposal_snapshot",
+        ),
+        Index("ix_crp_request_status", "portal_id", "change_request_id", "status"),
+        Index("ix_crp_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    portal_id = Column(String(32), nullable=False, default="argentina")
+    change_request_id = Column(Integer, nullable=False)
+    delivery_id = Column(Integer, nullable=False)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_sha256 = Column(String(64), nullable=False)
+    base_revision = Column(Integer, nullable=False)
+    segments_hash = Column(String(64), nullable=False)
+    segments_content_hash = Column(String(64), nullable=False)
+    audio_revision = Column(Integer, nullable=False, default=0, server_default="0")
+    audio_sha256 = Column(String(64), nullable=False, default="", server_default="")
+    parser_version = Column(String(64), nullable=False)
+    schema_version = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False)
+    operations = Column(JSONB, nullable=False)
+    decision_history = Column(JSONB, nullable=False, default=list)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    applied_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=True)
+    applied_revision = Column(Integer, nullable=True)
+    idempotency_hash = Column(String(64), nullable=True)
 
 
 class JobOutboxEvent(Base):
@@ -1319,6 +1389,9 @@ class Delivery(Base):
         String(20), nullable=False, default="argentina",
         server_default="argentina", index=True,
     )
+    # Product shown in the UMG portal. Snapshot at publication time so the
+    # portal does not depend on a Job or campaign from another environment.
+    product_category = Column(String(32), nullable=True, index=True)
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -1333,6 +1406,45 @@ class Delivery(Base):
     # leave room for per-user portal logins to write usernames here later.
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
+    # ── Freshness of the published content ────────────────────────────
+    # The portal does not store a file or a frozen URL: it rebuilds the
+    # R2 key from (tenant, job_id, file_type) and signs it on demand, so
+    # a re-render silently replaces what the client downloads. That is
+    # the behaviour we want (a correction reaches them without a new
+    # link) and also the hazard: the row kept saying "approved by UMG,
+    # published on <old date>" about content they never saw.
+    #
+    # These four columns make the row describe the content it is
+    # actually serving, so both the portal and the operator can tell a
+    # re-send of the same cut from a genuinely new version.
+    #
+    # published_render_fingerprint: identity of the render that was in
+    # R2 at publish time (delivery_freshness.render_fingerprint). A
+    # publish whose fingerprint differs is new content, not a re-send.
+    published_render_fingerprint = Column(String(64), nullable=True)
+    # Immutable objects served by the portal. Working render keys must never
+    # replace a client's approved cut before an explicit publication.
+    published_file_keys = Column(JSONB, nullable=True)
+    # Human-facing version counter. Starts at 1 and only advances when
+    # the fingerprint changes, so "Versión 2" always means the client
+    # has something new to look at.
+    published_revision = Column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    # When the served files last changed. Distinct from added_at, which
+    # also moves on a plain re-send.
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Set while a re-render is in flight for this job: the files in R2
+    # are about to be replaced (or already partially were — the MP4
+    # lands minutes before the ProRes master). Cleared on the next
+    # publish. Non-null means "do not treat this download as final".
+    stale_since = Column(DateTime(timezone=True), nullable=True)
+    stale_reason = Column(String(40), nullable=True)
+    # What the CLIENT may see of this row. NULL/'auto': hidden while the delivery
+    # has unpublished changes, shown again on publish. 'visible' / 'hidden' are
+    # the operator's manual override (delivery_snapshots.is_hidden_from_client).
+    # Lives on the shared row because the portal is served by another backend.
+    client_visibility = Column(String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -1349,6 +1461,16 @@ class Delivery(Base):
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "approved_by_label": self.approved_by_label,
+            "published_revision": self.published_revision or 1,
+            "content_updated_at": (
+                self.content_updated_at.isoformat()
+                if self.content_updated_at else None
+            ),
+            "stale_since": (
+                self.stale_since.isoformat() if self.stale_since else None
+            ),
+            "stale_reason": self.stale_reason,
+            "client_visibility": self.client_visibility or "auto",
         }
 
 
@@ -1373,6 +1495,11 @@ class DeliveryChangeRequest(Base):
     submitted_at = Column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )
+    # Keep the latest lifecycle change after reopening clears resolved_at.
+    updated_at = Column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+        nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+    )
     # Set when the operator marks the request handled (re-rendered,
     # edited, dismissed). Null = still pending.
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -1380,6 +1507,14 @@ class DeliveryChangeRequest(Base):
         Integer, ForeignKey("users.id"), nullable=True,
     )
     resolution_note = Column(Text, nullable=True)
+    # Which published revision answered this request, when it was closed
+    # by actually shipping a new cut rather than by hand. Lets the portal
+    # say "atendido en la versión 2" instead of a bare "resuelto", and
+    # lets the operator see that a request was auto-closed.
+    resolved_by_revision = Column(Integer, nullable=True)
+    # "manual" (operator ticked it off) | "publication" (a new revision
+    # was published). Null on rows predating this column.
+    resolution_source = Column(String(20), nullable=True)
 
     def to_dict(self):
         return {
@@ -1387,8 +1522,11 @@ class DeliveryChangeRequest(Base):
             "delivery_id": self.delivery_id,
             "comment": self.comment,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
+            "resolved_by_revision": self.resolved_by_revision,
+            "resolution_source": self.resolution_source,
         }
 
 
@@ -1424,6 +1562,16 @@ class Invoice(Base):
             "period_end": self.period_end.isoformat() if self.period_end else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class SystemSetting(Base):
+    """Operator-editable switches that used to be Railway env vars (local DB only)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String(80), primary_key=True)
+    value = Column(String(200), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_by_user_id = Column(Integer, nullable=True)
 
 
 class UserSettings(Base):
@@ -1805,6 +1953,16 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Desglose de `duration_ms` (incidente 2026-08-26/28). El total mide la
+    # ventana entera de la llamada, así que una corrida lenta es ambigua entre
+    # "el modelo tardó" y "esperamos GPU" — dos problemas con soluciones
+    # opuestas. Medido sobre 238 corridas de demucs: la degradación de agosto
+    # fue 100% cola (predict_time mediana 87,6s idéntica antes y después;
+    # cola de 23,5s a 204,3s, picos de 1824s).
+    # NULL cuando el proveedor no expone el desglose (OpenAI, Vertex) o en
+    # filas anteriores a la migración.
+    predict_time_ms = Column(Integer, nullable=True)
+    queue_time_ms = Column(Integer, nullable=True)
     # Only pre-submit Veo budget reservations use this lease. Once the worker
     # crosses the provider POST boundary it is cleared and the row remains in
     # the rolling ceiling as actual/ambiguous spend via response_summary.
@@ -2365,6 +2523,96 @@ class StatusComponentEvent(Base):
     )
 
 
+class ReviewSignalRecord(Base):
+    """Señales de revisión automática tal como se calcularon, para medirlas.
+
+    Dos señales se calculaban y se perdían: los puntos de la revisión rápida
+    (``lyric_review``, que vivían sólo en una caché LRU del proceso) y las
+    propuestas de ``repetition_reconcile`` (las que un gate declinaba sólo
+    iban al log). Esta tabla las guarda para poder cruzarlas después con los
+    pedidos de cambio del cliente (precisión/recall por señal).
+
+    Sólo se escribe con ``REVIEW_SIGNALS_PERSIST_ENABLED=1`` y en un hilo
+    aparte (``review_signals.py``); nada del producto la lee. Sin FK a
+    ``jobs`` a propósito: el insert no toma locks sobre la fila del job (que
+    el aprobar del editor tiene ``FOR UPDATE``). ``dedupe_key`` evita
+    duplicados cuando el mismo punto se recalcula para la misma revisión.
+    """
+    __tablename__ = "review_signal_records"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_review_signal_records_dedupe_key"),
+        Index("ix_review_signal_records_job_id", "job_id"),
+        Index("ix_review_signal_records_kind_created", "kind", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False)
+    tenant_id = Column(String(100), nullable=True)
+    # lyric_review_item | repetition_proposal
+    kind = Column(String(32), nullable=False)
+    # heard_different, missing, question_marks… | repetition_insert,
+    # repetition_reassign, repetition_group
+    item_type = Column(String(40), nullable=False)
+    # proposed | declined | applied
+    decision = Column(String(16), nullable=False)
+    reason = Column(String(80), nullable=True)
+    # Identidad de lo que se miró: revisión del editor (lyric_review), hash de
+    # los segmentos de entrada y release del código que lo calculó.
+    editor_revision = Column(Integer, nullable=True)
+    segments_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=True)
+    # Línea al momento del cálculo (puede moverse después).
+    line_index = Column(Integer, nullable=True)
+    start_s = Column(Float, nullable=True)
+    end_s = Column(Float, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    dedupe_key = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class FinanceEntry(Base):
+    """Un renglón de la planilla de finanzas del admin (sólo super-admin).
+
+    Lo que ninguna API devuelve sola vive acá: facturas verificadas a mano,
+    mano de obra pagada (Upwork) o imputada, gastos de estructura, cobros,
+    los términos de cada contrato y los parámetros del reparto. El ingreso
+    devengado NO se carga: sale de las entregas del portal × precio del
+    contrato (``finance_ledger.operations``).
+
+    ``period`` es el mes al que se DEVENGA el renglón (YYYY-MM), no el mes en
+    que se pagó: la factura de Railway del 20-ago al 20-sep es de dos meses.
+    ``basis`` dice de dónde sale el número (factura, api, captura, estimado,
+    imputado, acuerdo) para que nadie confunda una estimación con un hecho.
+    Los montos nunca se versionan en el repo (es público): se cargan desde la
+    UI o importando un CSV.
+    """
+    __tablename__ = "finance_entries"
+    __table_args__ = (
+        Index("ix_finance_entries_period", "period"),
+        Index("ix_finance_entries_section", "section"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False)
+    # ingreso | costo_directo | mano_obra | estructura | cobro | pago_socio
+    # | contrato | parametros
+    section = Column(String(24), nullable=False)
+    category = Column(String(40), nullable=True)
+    provider = Column(String(80), nullable=True)
+    concept = Column(String(200), nullable=True)
+    amount_usd = Column(Float, nullable=True)
+    basis = Column(String(16), nullable=True)
+    contract = Column(String(80), nullable=True)
+    evidence = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    created_by_user_id = Column(Integer, nullable=True)
+    updated_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
@@ -2487,6 +2735,20 @@ def _migrate_user_columns():
         # release runner.
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS portal_id VARCHAR(20) DEFAULT 'argentina' NOT NULL",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_portal_id ON deliveries(portal_id)",
+        # Publication freshness. The portal serves whatever sits at the
+        # deterministic R2 key, so a re-render replaces the client's
+        # download in place; these columns let the row say which cut it
+        # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
+        # mirror keeps older databases self-healing on boot.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS client_visibility VARCHAR(10)",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).
         # Se setea en los sinks de error del pipeline/reaper vía
         # error_taxonomy.classify_error(). Espejo de la migración Alembic

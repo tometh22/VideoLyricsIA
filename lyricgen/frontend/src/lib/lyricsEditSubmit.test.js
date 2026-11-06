@@ -5,6 +5,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  campaignApprovalFailure,
   submitLyricsEdit,
   normalizeSegmentsForEdit,
   segmentsUnchanged,
@@ -120,6 +121,33 @@ describe("translateBackendError", () => {
   it("returns null when raw is null", () => {
     expect(translateBackendError(null, () => null)).toBeNull();
   });
+
+  it("explains a missing audio reference instead of leaking its code", () => {
+    const out = translateBackendError(
+      { code: "reference_hypothesis_missing" },
+      () => null,
+    );
+    expect(out).toMatch(/referencia de audio válida/);
+    expect(out).toMatch(/revisión quedó guardada/);
+  });
+
+  it("retries only editor conflicts and exposes other campaign 409 errors", () => {
+    const missing = campaignApprovalFailure(
+      { status: 409 },
+      { detail: { code: "reference_hypothesis_missing" } },
+      () => null,
+    );
+    expect(missing.reason).toBe("http-409");
+    expect(missing.message).toMatch(/referencia de audio válida/);
+
+    const revision = campaignApprovalFailure(
+      { status: 409 },
+      { detail: "editor_revision_conflict" },
+      () => null,
+    );
+    expect(revision.reason).toBe("conflict");
+    expect(revision.message).toBeNull();
+  });
 });
 
 describe("submitLyricsEdit", () => {
@@ -178,6 +206,25 @@ describe("submitLyricsEdit", () => {
     expect(body.text_case).toBeUndefined();
     expect(body.text_contrast).toBeUndefined();
     expect(body.line_transition).toBeUndefined();
+    expect(body.lyric_look).toBeUndefined();
+  });
+
+  it("sends lyric_look when given, including '' to remove the look", async () => {
+    for (const lyricLook of ["cine", ""]) {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202, json: async () => ({}) });
+      vi.stubGlobal("fetch", fetchMock);
+      const res = await submitLyricsEdit({
+        jobId: "job-L",
+        segments: [{ start: 0, end: 1, text: "x" }],
+        // Mismo texto: sólo el look cambia, y eso alcanza para no ser no-op.
+        baselineSegments: [{ start: 0, end: 1, text: "x" }],
+        lyricLook,
+        t: () => null,
+      });
+      expect(res.ok).toBe(true);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.lyric_look).toBe(lyricLook);
+    }
   });
 
   it("returns {error} with friendly translation when backend rejects", async () => {

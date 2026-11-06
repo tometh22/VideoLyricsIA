@@ -245,3 +245,50 @@ def test_admin_can_load_cross_tenant_waveform(client, admin_token, db, monkeypat
 
     assert res.status_code == 200, res.text
     assert res.json()["duration"] == 236.4
+
+
+def test_slow_audio_storage_does_not_block_preflight(
+    client, admin_token, db, monkeypatch,
+):
+    """A stalled audio HEAD must not freeze unrelated requests on the API.
+
+    Melaza: browser requests timed out at 8 s while even CORS OPTIONS on the
+    same instance took 90–102 s. Hold the storage probe explicitly and prove
+    the preflight completes before that probe is released.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import storage
+
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_job(db, tenant_id, user_id)
+    entered, release = Event(), Event()
+
+    def stalled_probe(key):
+        entered.set()
+        assert release.wait(5), "test did not release the storage probe"
+        return True
+
+    monkeypatch.setattr(storage, "object_exists", stalled_probe)
+    monkeypatch.setattr(
+        storage, "generate_signed_url",
+        lambda *args, **kwargs: "https://r2.fake/source.wav",
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        audio = executor.submit(
+            client.get, f"/jobs/{job_id}/source-audio-url",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        try:
+            assert entered.wait(2), "audio probe was never entered"
+            preflight = executor.submit(
+                client.options, f"/jobs/{job_id}/source-audio-url",
+                headers={"Origin": "http://localhost:3000",
+                         "Access-Control-Request-Method": "GET"},
+            )
+            response = preflight.result(timeout=1)
+            assert response.status_code == 200
+            assert not audio.done(), "storage probe must still be held"
+        finally:
+            release.set()
+        assert audio.result(timeout=3).status_code == 200

@@ -11,6 +11,7 @@ the timestamps in the editor before approving the render.
 """
 
 from unittest.mock import patch, MagicMock
+import pytest
 
 from pipeline import (
     _align_whisper_to_plain,
@@ -382,12 +383,13 @@ def test_align_skips_hallucinated_segments():
 # auto-recover commits.
 
 
-def _mock_lrclib_response(synced=None, plain=None, duration=180):
+def _mock_lrclib_response(synced=None, plain=None, duration=180, track_name="Y"):
     """Build a fake requests.Response for the lrclib endpoint."""
     payload = {
         "syncedLyrics": synced,
         "plainLyrics": plain,
         "duration": duration,
+        "trackName": track_name,
     }
     res = MagicMock()
     res.status_code = 200
@@ -402,7 +404,9 @@ def test_fetch_lrclib_derives_plain_from_synced_when_missing():
         "[00:10.00]Que cruce, que me anime a ver\n"
     )
     with patch("pipeline._req_get", create=True) if False else patch(
-        "requests.get", return_value=_mock_lrclib_response(synced=synced, plain=None),
+        "requests.get", return_value=_mock_lrclib_response(
+            synced=synced, plain=None, track_name="El Riesgo",
+        ),
     ):
         result = _fetch_lrclib("El Plan de la Mariposa", "El Riesgo")
     assert result is not None
@@ -705,6 +709,17 @@ def test_collapse_normalizes_text_when_comparing():
 
 
 # ----- _is_whisper_hallucination (Amara.org credits) ----------------------
+
+@pytest.mark.parametrize("text", [
+    "Субтитры сделал DimaTorzok",
+    " СУБТИТРЫ  СОЗДАВАЛ DimaTorzok ",
+])
+def test_cyrillic_subtitle_credits_do_not_survive_ascii_fold(text):
+    assert _is_whisper_hallucination(text)
+
+
+def test_cyrillic_lyrics_are_not_subtitle_credits():
+    assert not _is_whisper_hallucination("Путешествие в сердце, путешествие в центре солнца")
 #
 # Regression: "Lamento Boliviano — Enanitos Verdes" (2026-06-01). Whisper
 # transcribed the training-data credit WITHOUT the dot ("…comunidad de

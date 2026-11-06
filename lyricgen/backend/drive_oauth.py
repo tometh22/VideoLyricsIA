@@ -28,12 +28,10 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
-# El proyecto usa python-jose (no pyjwt) — ver requirements.txt y
-# auth.py:from jose import JWTError, jwt. python-jose expone jwt
-# compatible-ish con la API de pyjwt para encode/decode, pero las
-# excepciones viven en jose.exceptions.
-from jose import jwt
-from jose.exceptions import ExpiredSignatureError, JWTError
+# PyJWT, igual que auth.py. ExpiredSignatureError es subclase de
+# InvalidTokenError.
+import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError as JWTError
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -139,12 +137,13 @@ def build_state_token(user_id: int) -> str:
 def verify_state_token(state: str) -> int:
     """Devuelve user_id si state es válido y no expiró. Sino raise.
 
-    python-jose: ExpiredSignatureError es subclass de JWTError. Orden
+    ExpiredSignatureError es subclase de JWTError (InvalidTokenError). Orden
     de except matters — específico primero (expired), genérico después.
     """
     secret, alg = _state_jwt_secret()
     try:
-        payload = jwt.decode(state, secret, algorithms=[alg])
+        from auth import JWT_DECODE_OPTIONS
+        payload = jwt.decode(state, secret, algorithms=[alg], options=JWT_DECODE_OPTIONS)
     except ExpiredSignatureError:
         raise DriveOAuthError("State token expirado. Reintentá el OAuth flow.")
     except JWTError as e:

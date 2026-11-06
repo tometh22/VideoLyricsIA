@@ -61,7 +61,11 @@ CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
       # por ..."*. Con 30 caracteres ese pedido quedaba sin clasificar.
       r"\bcambiar\b.{0,160}\bpor\b",
       r"\bno lo dice\b", r"\bdebe decir\b", r"\bmayuscula\b", r"\bacento\b",
-      r"\ben vez de\b", r"\brevisar\b.{0,20}\bletra\b")),
+      r"\ben vez de\b", r"\brevisar\b.{0,20}\bletra\b",
+      # La tanda de sep-2026 llegó como listas de timecodes + texto citado,
+      # sin repetir "corregir" en cada renglón.
+      r"\b\d{1,2}:\d{2}\b.{0,120}[\"'“”]",
+      r"\b\d{1,2}:\d{2}\b[\s\S]{1,220}\b\d{1,2}:\d{2}\b")),
     ("fondo", "Fondo",
      (r"\bfondo\b", r"\bbackground\b", r"\bprompt\b", r"\bestatico\b",
       r"\banimado\b", r"\bloop\b", r"\bpersonas?\b", r"\bescenario\b")),
@@ -71,6 +75,12 @@ CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("audio", "Audio equivocado",
      (r"\bel audio\b", r"\baudio\b.{0,20}\b(no|incorrect|mal)\b",
       r"\bno esta correcto el audio\b")),
+    ("estructura", "Estructura / layout de letra",
+     (r"\b(unir|separar|dividir|juntar)\b.{0,35}\b(linea|lineas|frase)",
+      r"\bfrase completa\b", r"\bmisma pantalla\b", r"\buna sola linea\b")),
+    ("repeticiones", "Corrección en ocurrencias repetidas",
+     (r"\btodas? las? (apariciones|veces)\b", r"\bcada vez\b",
+      r"\btodos? los? (coros?|estribillos?)\b")),
 )
 
 # Filas que no son pedidos reales del cliente.

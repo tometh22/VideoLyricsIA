@@ -177,9 +177,12 @@ def connectivity_errors(
     if targeted and openai_token:
         try:
             if not openai_probe(openai_token):
-                errors.append("targeted_asr_provider_unreachable")
+                # Targeted ASR is an optional evidence source with fallback.
+                # A transient OpenAI outage or rate limit must not crash-loop
+                # the entire quality queue during worker startup.
+                print("[QUALITY-WORKER][OPTIONAL-PROVIDER] targeted_asr_unreachable")
         except Exception:
-            errors.append("targeted_asr_provider_unreachable")
+            print("[QUALITY-WORKER][OPTIONAL-PROVIDER] targeted_asr_unreachable")
     return errors
 
 
