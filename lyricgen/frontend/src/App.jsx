@@ -6303,7 +6303,7 @@ export default function App() {
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
+            submitLabel={(currentReview.editMode || currentReview.editingJobId || currentReview.changeRequestContext) ? "Aprobar cambios y generar video" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
               ? registerCampaignReviewSafeExit
               : null}

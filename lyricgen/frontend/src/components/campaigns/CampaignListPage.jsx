@@ -10,8 +10,9 @@ import { PRODUCT_TABS, productForCampaign } from "../../lib/campaignProducts";
 import { matchesCampaignSearch } from "../../lib/campaignSearch";
 import CampaignSearch from "../CampaignSearch";
 import DeliveryPlan from "../DeliveryPlan";
+import ClientChangesInbox from "./ClientChangesInbox";
 import CampaignCreateWizard from "./CampaignCreateWizard";
-import { Banner, Button, Chip, EmptyState, Skeleton } from "./ui";
+import { Banner, Button, Chip, EmptyState, Skeleton, inputClass } from "./ui";
 
 const STATUS = [["", "Todas"], ["active", "Activas"], ["paused", "Pausadas"], ["completed", "Completadas"], ["cancelled", "Canceladas"]];
 const STATUS_LABEL = { active: "Activa", paused: "Pausada", completed: "Completada", cancelled: "Cancelada" };
@@ -49,10 +50,15 @@ export default function CampaignListPage() {
   const query = params.get("q") || "";
   const status = params.get("status") || "";
   const product = params.get("product") || "";
-  const scope = campaignViews.some(([key]) => key === params.get("scope")) ? params.get("scope") : (status || query ? "all" : "active");
+  const scope = campaignViews.some(([key]) => key === params.get("scope")) ? params.get("scope") : "all";
+  const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }));
+  const changeCampaigns = useMemo(() => (list.data?.items || []).filter(campaign => inCampaignView(campaign, "changes"))
+    .sort((a, b) => String(a.pipeline?.flags?.oldest_change_request_at || "9999").localeCompare(String(b.pipeline?.flags?.oldest_change_request_at || "9999"))), [list.data]);
+  const selectedChanges = changeCampaigns.find(campaign => campaign.id === params.get("changes_campaign")) || changeCampaigns[0];
+  const inboxEnabled = Boolean(list.data?.features?.change_requests_inbox);
+  const requestCount = changeCampaigns.reduce((sum, campaign) => sum + campaignOverview(campaign).requests, 0);
   const [planBusy, setPlanBusy] = useState(false);
   const [creating, setCreating] = useState(params.get("new") === "1");
-  const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }));
   const items = list.data?.items || [];
   const filtered = useMemo(() => items.filter((campaign) => matchesCampaignSearch(query, campaign.name, campaign.id)
     && (!status || campaign.status === status) && (!product || productForCampaign(campaign) === product)
@@ -69,6 +75,7 @@ export default function CampaignListPage() {
     if (value) next.set(key, value); else next.delete(key);
     setParams(next, { replace });
   };
+  const showChanges = () => setParams({ scope: "changes" });
   return <div className="mx-auto max-w-[1500px] space-y-6 pb-16">
     <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
       <div>
@@ -81,15 +88,31 @@ export default function CampaignListPage() {
 
     {list.data?.can_view_accounts && <nav aria-label="Campañas y cuentas" className="flex gap-2">{[["campaigns", "Campañas"], ["accounts", "Cuentas · Plan de entrega"]].map(([value, label]) => <Button key={value} disabled={planBusy} variant={(params.get("view") || "campaigns") === value ? "primary" : "ghost"} onClick={() => setParam("view", value, false)}>{label}</Button>)}</nav>}
     {list.data?.can_view_accounts && params.get("view") === "accounts" ? <DeliveryPlan onBusyChange={setPlanBusy} /> : <>
+    {list.data && inboxEnabled && requestCount > 0 && scope !== "changes" && <Banner tone="warning" action={<Button variant="primary" onClick={showChanges}>Ver canciones con pedidos →</Button>}>
+      <strong>{requestCount} {requestCount === 1 ? "pedido de cambios pendiente" : "pedidos de cambios pendientes"}</strong> en {changeCampaigns.length} {changeCampaigns.length === 1 ? "campaña" : "campañas"}. Abrí la canción, leé el pedido y continuá la corrección.
+    </Banner>}
     <nav aria-label="Progreso de campañas" className="flex flex-wrap gap-2">
-      {campaignViews.map(([key, label]) => <button key={key} type="button" aria-pressed={scope === key} onClick={() => setParam("scope", key, false)}
+      {campaignViews.filter(([key]) => key !== "changes" || inboxEnabled).map(([key, label]) => <button key={key} type="button" aria-pressed={scope === key} onClick={() => key === "changes" ? showChanges() : setParams({ scope: key })}
         className={`rounded-xl px-4 py-2.5 text-sm font-medium ring-1 transition ${scope === key ? "bg-brand/20 text-white ring-brand/50" : "text-ink-secondary ring-white/10 hover:text-white"}`}>
         {label}<span className="ml-2 text-xs opacity-70">{items.filter(campaign => inCampaignView(campaign, key)).length}</span>
       </button>)}
     </nav>
 
+    {scope === "changes" ? <>
+      <p className="text-sm text-ink-secondary">Pedidos abiertos del cliente, incluso en campañas ya entregadas. Primero la campaña con el pedido más antiguo.</p>
+      {items.some(campaign => campaign.pipeline?.portal_status_available === false) && <Banner tone="warning">No pudimos consultar todos los portales. Puede haber pedidos que todavía no aparecen.</Banner>}
+      {!inboxEnabled ? <Banner tone="info">La bandeja de pedidos no está habilitada en esta cuenta.</Banner> : selectedChanges ? <>
+        <label className="block text-sm text-ink-secondary">Campaña con pedidos
+          <select className={`${inputClass} mt-2 w-full`} value={selectedChanges.id} onChange={event => setParam("changes_campaign", event.target.value, false)}>
+            {changeCampaigns.map(campaign => <option key={campaign.id} value={campaign.id}>{campaign.name} · {campaignOverview(campaign).requests} pedidos</option>)}
+          </select>
+        </label>
+        <ClientChangesInbox key={selectedChanges.id} campaignId={selectedChanges.id} isAdmin={Boolean(list.data?.can_view_accounts)}
+          onOpenSong={songId => navigate(`/campaigns/${encodeURIComponent(selectedChanges.id)}?view=all&song=${encodeURIComponent(songId)}`)} />
+      </> : list.data && <EmptyState title="No hay pedidos de cambios pendientes" description="Las campañas finalizadas siguen disponibles en Todas las campañas." />}
+    </> : <>
     <nav aria-label="Productos" className="flex gap-2 overflow-x-auto pb-1">
-      {[["", "Todas", items.length], ...PRODUCT_TABS.map((tab) => [tab.id, tab.label, productCounts[tab.id] || 0]),
+      {[["", "Todos los productos", items.length], ...PRODUCT_TABS.map((tab) => [tab.id, tab.label, productCounts[tab.id] || 0]),
         ...(productCounts.unclassified ? [["unclassified", "Sin clasificar", productCounts.unclassified]] : [])]
         .map(([key, label, count]) => <button key={key || "all"} type="button" aria-current={product === key ? "page" : undefined}
           onClick={() => setParam("product", key, false)}
@@ -100,18 +123,21 @@ export default function CampaignListPage() {
 
     <div className="flex flex-col gap-3 md:flex-row md:items-center">
       <CampaignSearch className="md:w-80" label="Buscar campañas" placeholder="Nombre de campaña" value={query} onChange={(value) => setParam("q", value)} />
-      <div role="radiogroup" aria-label="Estado de campaña" className="flex gap-1 overflow-x-auto rounded-button bg-black/25 p-1 ring-1 ring-white/10">
-        {STATUS.map(([key, label]) => <button key={key || "all"} type="button" role="radio" aria-checked={status === key} onClick={() => setParam("status", key, false)}
-          className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition ${status === key ? "bg-white/10 text-white" : "text-ink-secondary hover:text-white"}`}>{label}</button>)}
-      </div>
+      <label className="text-sm text-ink-secondary">Estado de campaña
+        <select aria-label="Estado de campaña" value={status} onChange={event => setParam("status", event.target.value, false)} className={`${inputClass} ml-2 !w-auto`}>
+          {STATUS.map(([key, label]) => <option key={key || "all"} value={key}>{key ? label : "Cualquier estado"}</option>)}
+        </select>
+      </label>
+      {(query || status || product || scope !== "all") && <Button size="sm" variant="ghost" onClick={() => setParams({ scope: "all" })}>Quitar filtros y ver todas</Button>}
     </div>
 
+    </>}
     {list.error && <Banner tone="danger" action={<Button size="sm" onClick={list.reload}>Reintentar</Button>}>{list.error.message || "No se pudieron cargar las campañas."}</Banner>}
     {list.loading && <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
       <p role="status" className="sr-only">Cargando campañas…</p>
       {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-40 rounded-card" />)}
     </div>}
-    {list.data && filtered.length > 0 && <section aria-label="Lista de campañas" className="overflow-hidden rounded-card bg-surface-2/40 ring-1 ring-white/[0.07]">
+    {list.data && scope !== "changes" && filtered.length > 0 && <section aria-label="Lista de campañas" className="overflow-hidden rounded-card bg-surface-2/40 ring-1 ring-white/[0.07]">
       <div aria-hidden="true" className="hidden grid-cols-[minmax(0,1.4fr)_10rem_minmax(0,1fr)_11rem] gap-4 border-b border-white/10 px-5 py-3 text-xs text-ink-secondary md:grid">
         <span>Campaña</span><span>Entrega</span><span>Pendientes</span><span className="text-right">Próxima acción</span>
       </div>
@@ -121,7 +147,7 @@ export default function CampaignListPage() {
       <EmptyState title="Todavía no hay campañas" description="Creá una campaña, subí la carpeta de audios y seguí cada canción hasta el portal del cliente."
         action={<Button variant="primary" onClick={() => setCreating(true)}>Crear la primera campaña</Button>} />
     </div>}
-    {list.data && items.length > 0 && !filtered.length && <EmptyState title="No hay campañas con estos filtros"
+    {list.data && scope !== "changes" && items.length > 0 && !filtered.length && <EmptyState title="No hay campañas con estos filtros"
       action={<Button size="sm" onClick={() => setParams({})}>Limpiar filtros</Button>} />}
 
     <details className="rounded-card ring-1 ring-white/10"><summary className="cursor-pointer px-4 py-3 text-sm text-ink-secondary">Mi actividad de producción</summary><div className="p-4 pt-0"><OperatorActivity /></div></details>

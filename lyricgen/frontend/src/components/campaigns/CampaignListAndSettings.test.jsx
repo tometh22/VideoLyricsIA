@@ -63,7 +63,33 @@ describe("campaign list", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/a?view=changes&order=calendar");
   });
 
-  it("shows ongoing campaigns by default, finished ones in their view, and cancelled ones when searched", async () => {
+  it("opens actual songs with client requests despite stale list filters, oldest campaign first", async () => {
+    const campaigns = [
+      { id: "new", name: "Nuevos pedidos", status: "active", pipeline: { counts: { delivered: 1 }, flags: { change_requests_open: 1, oldest_change_request_at: "2026-11-05" } } },
+      { id: "old", name: "Religiosas finalizada", status: "completed", pipeline: { portal_status_available: true, counts: { delivered: 15 }, flags: { change_requests_open: 1, oldest_change_request_at: "2026-11-01" } } },
+    ];
+    const fetch = vi.fn(async input => {
+      const path = new URL(String(input), "http://test").pathname;
+      if (path === "/batch/campaigns") return json({ items: campaigns, can_view_accounts: true, features: { change_requests_inbox: true } });
+      if (path.endsWith("/change-requests")) return json({ available: true, counts: { open: 1, resolved: 0 }, items: [{ id: 7, song: path.includes("/old/") ? "Luces" : "Otra canción", artist: "Babasónicos", song_id: "song1", comment: "Corregir el segundo verso", submitted_at: "2026-11-01T12:00:00Z" }], next_cursor: null });
+      throw new Error(path);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<MemoryRouter initialEntries={["/campaigns?scope=done&product=art_track&status=paused&q=oculta"]}><Location /><Routes><Route path="/campaigns" element={<CampaignsPage />} /><Route path="/campaigns/:campaignId" element={<p>Detalle</p>} /></Routes></MemoryRouter>);
+    fireEvent.click(await screen.findByRole("button", { name: /Ver canciones con pedidos/ }));
+    expect(await screen.findByText("Luces")).toBeInTheDocument();
+    expect(screen.getByLabelText("Campaña con pedidos")).toHaveValue("old");
+    expect(screen.getByText("Corregir el segundo verso")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Abrir y resolver" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
+    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns?scope=changes");
+    fireEvent.change(screen.getByLabelText("Campaña con pedidos"), { target: { value: "new" } });
+    expect(await screen.findByText("Otra canción")).toBeInTheDocument();
+    expect(screen.queryByText("Luces")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Ver canción" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/new?view=all&song=song1");
+  });
+
+  it("shows finished campaigns by default and offers explicit ongoing and finished filters", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => json({ items: [
       { id: "oct", name: "Octubre", status: "active", pipeline: { portal_status_available: true, counts: { lyrics: 5, delivered: 23 } } },
       { id: "sep", name: "Septiembre", status: "completed", pipeline: { portal_status_available: true, counts: { delivered: 39 } } },
@@ -71,8 +97,8 @@ describe("campaign list", () => {
     ] })));
     render(<MemoryRouter initialEntries={["/campaigns"]}><Location /><Routes><Route path="/campaigns" element={<CampaignsPage />} /><Route path="/campaigns/:campaignId" element={<p>Detalle</p>} /></Routes></MemoryRouter>);
     await screen.findByText("Octubre");
-    expect(screen.queryByText("Septiembre")).not.toBeInTheDocument();
-    expect(screen.queryByText("QA cancelada")).not.toBeInTheDocument();
+    expect(screen.getByText("Septiembre")).toBeInTheDocument();
+    expect(screen.getByText("QA cancelada")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Finalizadas/ }));
     expect(screen.getByText("Septiembre")).toBeInTheDocument();
     expect(screen.queryByText("Octubre")).not.toBeInTheDocument();

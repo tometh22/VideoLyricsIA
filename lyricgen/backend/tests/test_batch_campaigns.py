@@ -408,7 +408,8 @@ def test_render_capacity_is_separate_and_bounded(db):
     assert exc.value.detail["code"] == "batch_render_window_full"
 
 
-def test_render_capacity_fails_closed_before_human_approval(db):
+@pytest.mark.parametrize("correction", [False, True])
+def test_render_capacity_fails_closed_before_human_approval(db, correction):
     campaign = _campaign(db, 1)
     item = db.query(BatchCampaignItem).filter(
         BatchCampaignItem.campaign_id == campaign.id,
@@ -424,7 +425,7 @@ def test_render_capacity_fails_closed_before_human_approval(db):
     db.add(job)
     db.commit()
     with pytest.raises(HTTPException) as exc:
-        batch.enforce_render_capacity(db, job)
+        batch.enforce_render_capacity(db, job, correction=correction)
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "reference_hypothesis_missing"
 
@@ -505,6 +506,38 @@ def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch, c
         batch.enforce_render_capacity(db, candidate)
     assert exc.value.status_code == 429
     assert exc.value.detail["code"] == "batch_final_review_full"
+
+    # A full (or overfull) backlog may stop new videos, never repairs to an
+    # existing video. Verify both an unapproved render and an already delivered
+    # one; the ordinary generation entry point above remains blocked.
+    for status in ("pending_review", "done", "rejected"):
+        candidate.status = status
+        db.commit()
+        batch.enforce_render_capacity(db, candidate, correction=True)
+
+    # Corrections still share the bounded render window.
+    other.status = "editing"
+    monkeypatch.setattr(batch, "RENDER_WINDOW", 1)
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, candidate, correction=True)
+    assert exc.value.detail["code"] == "batch_render_window_full"
+
+    other.status = "pending_review"
+    candidate.status = "lyrics_approved"
+    campaign.status = "active"
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, candidate, correction=True)
+    assert exc.value.detail["code"] == "batch_final_review_full"
+
+    candidate.status = "done"
+    for status in ("paused", "cancelled"):
+        campaign.status = status
+        db.commit()
+        with pytest.raises(HTTPException) as exc:
+            batch.enforce_render_capacity(db, candidate, correction=True)
+        assert exc.value.status_code == 409
 
 
 @pytest.mark.parametrize("reference_available", [True, False])
