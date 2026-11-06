@@ -49,7 +49,7 @@ test(`approves a saved UMG correction after reload (v2=${editorV2}, manual=${man
   if (await announcement.isVisible()) await announcement.click();
   await page.getByRole("button", { name: /4 Lyrics/ }).click();
   await expect(page.getByLabel("Letra de la línea 1")).toHaveValue(corrected[0].text);
-  await page.getByRole("button", { name: /Aprobar y re-renderizar/i }).click();
+  await page.getByRole("button", { name: /Aprobar cambios y generar video/i }).click();
   const override = page.getByRole("button", { name: "Aprobar igualmente" });
   if (await override.isVisible()) await override.click();
   await expect.poll(() => harness.approvals.length).toBe(1);
