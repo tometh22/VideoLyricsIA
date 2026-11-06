@@ -948,9 +948,7 @@ export default function LyricsEditor({
     if (hasEditorPreferenceOwner) setPersistedViewMode(next);
     else setAnonymousViewMode(next);
   }, [hasEditorPreferenceOwner, setPersistedViewMode]); // "basic" | "advanced"
-  // "Ajustar tiempos" opens on a focused, one-problem-at-a-time workflow.
-  // The full DAW-like surface is still available, but is an explicit expert
-  // choice instead of the first thing every operator has to understand.
+  // Advanced timing opens directly on the timeline; guided review is optional.
   const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("timeline"); // guided is an explicit, optional workspace
   const [previewDockOpen, setPreviewDockOpen] = useState(false);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que

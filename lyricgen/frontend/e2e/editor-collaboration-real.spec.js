@@ -6,6 +6,9 @@ const API = process.env.REAL_EDITOR_API || "http://127.0.0.1:8000";
 const JOB_ID = "e2ecollab001";
 const PASSWORD = "EditorE2E-test-123";
 
+// Both scenarios mutate the same disposable seeded document.
+test.describe.configure({ mode: "serial", retries: 0 });
+
 async function login(request, username) {
   const response = await request.post(`${API}/auth/login`, { data: { username, password: PASSWORD } });
   expect(response.ok()).toBeTruthy();
@@ -116,4 +119,36 @@ test.describe("Editor 2.0 real collaboration", () => {
     await a.context.close();
     await b.context.close();
   });
+});
+
+
+test("advanced edits and intentional duplicates survive real API reload", async ({ browser, request }) => {
+  test.skip(!ENABLED, "requires disposable real API/PostgreSQL");
+  const token = await login(request, "editor_e2e_a");
+  const { context, page } = await openEditor(browser, token);
+  try {
+    const before = await revision(request, token);
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+    await page.getByTestId("timeline-segment-body").first().dblclick();
+    const input = page.getByTestId("timeline-segment").first().locator("input");
+    await input.fill("Persistencia real con espacios");
+    await expect.poll(async () => (await revision(request, token)).segments[0].text).toBe("Persistencia real con espacios");
+    await expect(input).toBeFocused();
+    await input.press("Enter");
+    await page.getByTestId("timeline-label-row").first().click();
+    await page.getByRole("button", { name: "Duplicar línea", exact: true }).click();
+    await expect.poll(async () => (await revision(request, token)).segments.length).toBe(before.segments.length + 1);
+    const saved = await revision(request, token);
+    const copies = saved.segments.filter(row => row.text === "Persistencia real con espacios");
+    expect(copies).toHaveLength(2);
+    expect(copies[0].segment_id).not.toBe(copies[1].segment_id);
+    await page.reload();
+    await page.getByRole("button", { name: /4 Lyrics/ }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    await expect(page.locator('input[value="Persistencia real con espacios"]')).toHaveCount(2);
+    expect((await revision(request, token)).segments).toEqual(saved.segments);
+  } finally {
+    await context.close();
+  }
 });

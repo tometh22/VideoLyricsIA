@@ -421,6 +421,17 @@ describe("LyricsTimeline", () => {
     expect(props.onTimingChange).not.toHaveBeenCalled();
   });
 
+  it("keeps an open inline input in sync with a reconciled document", () => {
+    const props = { segments: SEGS, duration: 60, currentTime: 0, onTextChange: vi.fn() };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    fireEvent.doubleClick(screen.getAllByTestId("timeline-segment")[1].querySelector("span[title*='Doble-click']"));
+    const input = screen.getByDisplayValue("segunda línea");
+    rerender(<LyricsTimeline {...props} segments={SEGS.map(row => row._id === 1 ? { ...row, text: "texto conciliado" } : row)} />);
+    expect(input).toHaveValue("texto conciliado");
+    expect(input).toHaveFocus();
+    expect(props.onTextChange).not.toHaveBeenCalled();
+  });
+
   it("clicking the line column navigates to the exact start and enables duplication", () => {
     const props = setup({ onDuplicateLine: vi.fn() });
     const row = screen.getAllByTestId("timeline-label-row")[1];

@@ -149,7 +149,6 @@ export default function LyricsTimeline({
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
   const [moreActionsOpen, setMoreActionsOpen] = useState(false);
   const [editingTextId, setEditingTextId] = useState(null);
-  const [draftText, setDraftText] = useState("");
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [limitFeedback, setLimitFeedback] = useState("");
@@ -632,7 +631,6 @@ export default function LyricsTimeline({
 
   const startTextEdit = useCallback((segment) => {
     setEditingTextId(segment._id);
-    setDraftText(segment.text || "");
   }, []);
   const commitTextEdit = useCallback(() => {
     setEditingTextId(null);
@@ -1049,9 +1047,8 @@ export default function LyricsTimeline({
                         autoFocus
                         aria-label={`${t("review_workspace.text", "Letra de esta línea")} ${index + 1}`}
                         type="text"
-                        value={draftText}
+                        value={segment.text || ""}
                         onChange={(event) => {
-                          setDraftText(event.target.value);
                           onTextChange?.(segment._id, event.target.value);
                         }}
                         onPointerDown={(event) => event.stopPropagation()}
@@ -1059,7 +1056,7 @@ export default function LyricsTimeline({
                         onBlur={() => commitTextEdit(segment._id)}
                         onKeyDown={(event) => {
                           event.stopPropagation();
-                          if (event.key === "Enter") { event.preventDefault(); commitTextEdit(segment._id); }
+                          if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); commitTextEdit(); }
                           if (event.key === "Escape") { event.preventDefault(); setEditingTextId(null); }
                         }}
                         className="pointer-events-auto min-w-0 flex-1 bg-surface-1 border border-brand/50 rounded px-1 py-0.5 text-xs text-white outline-none"
