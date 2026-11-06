@@ -146,6 +146,7 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     await page.reload();
     await page.getByRole("button", { name: /4 Lyrics/ }).click();
     await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    await page.getByRole("tab", { name: "Revisar letra", exact: true }).click();
     await expect(page.locator('input[value="Persistencia real con espacios"]')).toHaveCount(2);
     expect((await revision(request, token)).segments).toEqual(saved.segments);
   } finally {
