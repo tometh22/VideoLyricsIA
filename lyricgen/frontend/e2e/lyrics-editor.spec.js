@@ -180,6 +180,9 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá para seleccionar varias líneas");
 
     const rows = page.getByTestId("timeline-label-row");
+    // Scroll the gesture target above the fixed approval footer before using
+    // raw pointer coordinates; the toolbar can wrap at this editor width.
+    await rows.nth(2).evaluate(row => row.scrollIntoView({ block: "center", behavior: "instant" }));
     const firstRow = await rows.first().boundingBox();
     // Use a visible lower row. The fixed approval bar may cover the final
     // row at short CI viewport heights even though it is reachable by scroll.
@@ -195,6 +198,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await page.getByRole("button", { name: "Limpiar selección" }).click();
     await page.waitForTimeout(100);
+    await rows.nth(2).evaluate(row => row.scrollIntoView({ block: "center", behavior: "instant" }));
     const firstRowAfterClear = await rows.first().boundingBox();
     const lastRowAfterClear = await rows.nth(2).boundingBox();
     expect(firstRowAfterClear).not.toBeNull();
