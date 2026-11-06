@@ -608,6 +608,52 @@ def title_card_lines(
     return lines
 
 
+def thumbnail_title_card_lines(
+    artist: str, song: str, first_lyric_start: float, *,
+    width: int, height: int,
+    lyric_font_family: str, artist_font_family: str,
+    lyric_font_path: str, artist_font_path: str,
+    template: str = "auto", size_multiplier: float = 1.0,
+    song_lines: list[str] | None = None,
+) -> list[AssLine]:
+    """Static intro card, 50% larger, fitted to the thumbnail's safe area.
+
+    Reuse the intro's fonts, opacity, wrapping and layout. After fitting each
+    title, fit the whole stack too: large sizes and manual line breaks must
+    not push a lower-third off screen or clip an unusually long word.
+    """
+    from dataclasses import replace
+    from PIL import ImageFont
+
+    lines = title_card_lines(
+        artist, song, first_lyric_start, width=width, height=height,
+        text_scale=height / 1080.0 * 1.5,
+        lyric_font_family=lyric_font_family, artist_font_family=artist_font_family,
+        lyric_font_path=lyric_font_path, artist_font_path=artist_font_path,
+        template=template, size_multiplier=size_multiplier, song_lines=song_lines,
+    )
+    layout = title_card_layout(template, first_lyric_start > 0.8)
+    anchor_y = {"center": 0.5, "lower_third": 0.74, "bottom": 0.92}[layout["anchor"]]
+    factor = 1.0
+    for line in lines:
+        font_path = (artist_font_path if line.bold else lyric_font_path)
+        ref = ImageFont.truetype(font_path, 100)
+        measured = max(ref.getlength(part) for part in line.text.split("\n")) * line.fontsize / 100
+        if measured:
+            factor = min(factor, width * layout["card_w_frac"] / measured)
+        half_h = 1.2 * line.fontsize * len(line.text.split("\n")) / height / 2
+        top, bottom = line.pos[1] - half_h, line.pos[1] + half_h
+        if top < 0.08 - 1e-6:
+            factor = min(factor, (anchor_y - 0.08) / (anchor_y - top))
+        if bottom > 0.92 + 1e-6:
+            factor = min(factor, (0.92 - anchor_y) / (bottom - anchor_y))
+    return [replace(
+        line, start_s=0.0, end_s=1.0, fade_in_ms=0, fade_out_ms=0,
+        fontsize=max(1, int(line.fontsize * factor)),
+        pos=(line.pos[0], anchor_y + (line.pos[1] - anchor_y) * factor),
+    ) for line in lines]
+
+
 def _clean_display_text(text: str, case_fn) -> str:
     """Apply the case transform + the same sanitisation _make_text_clip
     does before handing text to the renderer (NFC normalise, drop chars
