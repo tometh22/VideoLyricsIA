@@ -21,6 +21,7 @@ export const LYRIC_LOOK_CODES = [
   "", "cosmico", "cine", "pincel", "pop70", "pelicula",
   "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
   "duotono", "romantico", "degrade", "y2k",
+  "golpe", "recorte", "diptico", "diario", "nube", "puntada",
 ];
 
 /** Campos del wizard que un look define (y que el render ignora con look). */
@@ -357,6 +358,128 @@ const LOOKS = [
       thumbBg: "radial-gradient(120% 100% at 30% 20%,#e9fbff 0%,#8fd3f0 45%,#2a6fa8 100%)",
     },
   },
+  // Source-video editorial compositions; see editorialLookLayouts.jsx.
+{
+  "code": "golpe",
+  "font": {
+    "css": "'Bungee', sans-serif",
+    "weight": 400
+  },
+  "preview": {
+    "layout": "golpe",
+    "motion": "word_pop",
+    "color": "#F4F0E6",
+    "accent": "#FFD12F",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.82) saturate(.2) contrast(1.2)"
+  }
+},
+{
+  "code": "recorte",
+  "font": {
+    "css": "'Rubik Wet Paint', sans-serif",
+    "weight": 400
+  },
+  "preview": {
+    "layout": "recorte",
+    "motion": "word_pop",
+    "color": "#F0E6CF",
+    "accent": "#E64B37",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.82) saturate(.2) contrast(1.2)"
+  }
+},
+{
+  "code": "diptico",
+  "font": {
+    "css": "'UnifrakturCook', sans-serif",
+    "weight": 700
+  },
+  "preview": {
+    "layout": "diptico",
+    "motion": "word_pop",
+    "color": "#F0F3EF",
+    "accent": "#A0C9FF",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.82) saturate(.2) contrast(1.2)",
+    "lineColors": [
+      "#F0F3EF",
+      "#DEE5E8",
+      "#A0C9FF"
+    ]
+  }
+},
+{
+  "code": "diario",
+  "font": {
+    "css": "'Caveat', sans-serif",
+    "weight": 700
+  },
+  "preview": {
+    "layout": "diario",
+    "motion": "word_pop",
+    "color": "#725497",
+    "accent": "#B65276",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.92) contrast(1.05) saturate(.9)",
+    "lineColors": [
+      "#725497",
+      "#3E8A7E",
+      "#B65276"
+    ],
+    "forceCase": "lower"
+  }
+},
+{
+  "code": "nube",
+  "font": {
+    "css": "'Fredoka', sans-serif",
+    "weight": 600
+  },
+  "preview": {
+    "layout": "nube",
+    "motion": "word_pop",
+    "color": "#FFF4C9",
+    "accent": "#FFD7DC",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.92) contrast(1.05) saturate(.9)",
+    "forceCase": "lower"
+  }
+},
+{
+  "code": "puntada",
+  "font": {
+    "css": "'Quicksand', sans-serif",
+    "weight": 700
+  },
+  "preview": {
+    "layout": "puntada",
+    "motion": "word_pop",
+    "color": "#EDF4DD",
+    "accent": "#F4ADB9",
+    "fontScale": 1,
+    "stroke": "0px",
+    "textShadow": "none",
+    "thumbBg": "radial-gradient(120% 100% at 50% 30%,#5b5652 0%,#292726 60%,#151618 100%)",
+    "grade": "brightness(.92) contrast(1.05) saturate(.9)",
+    "forceCase": "lower"
+  }
+},
 ];
 
 const BY_CODE = Object.fromEntries(LOOKS.map((l) => [l.code, l]));
@@ -412,6 +535,12 @@ export const LYRIC_LOOK_LABELS = (t) => ({
   romantico: t("upload.look_romantico") || "Romántico",
   degrade: t("upload.look_degrade") || "Degradé",
   y2k: t("upload.look_y2k") || "Y2K",
+  golpe: t("upload.look_golpe") || "Golpe",
+  recorte: t("upload.look_recorte") || "Recorte",
+  diptico: t("upload.look_diptico") || "Díptico",
+  diario: t("upload.look_diario") || "Diario",
+  nube: t("upload.look_nube") || "Nube",
+  puntada: t("upload.look_puntada") || "Puntada",
 });
 
 const LYRIC_LOOK_DESCS = (t) => ({
@@ -432,6 +561,12 @@ const LYRIC_LOOK_DESCS = (t) => ({
   romantico: t("upload.look_romantico_desc") || "Cursiva que se escribe sola, luz cálida y franjas de cine.",
   degrade: t("upload.look_degrade_desc") || "No usa el fondo: atardecer violeta y rosa con montañas, letra limpia.",
   y2k: t("upload.look_y2k_desc") || "Letra techno ancha con ecos que se juntan, sobre un tono celeste helado.",
+  golpe: t("upload.look_golpe_desc") || "Una palabra gigante por entrada, con eco de contorno sobre el video.",
+  recorte: t("upload.look_recorte_desc") || "Papeles rasgados que arman un afiche al ritmo de la letra.",
+  diptico: t("upload.look_diptico_desc") || "Columna editorial y palabra gótica monumental sobre el video.",
+  diario: t("upload.look_diario_desc") || "Stickers manuscritos y corazones que aparecen con el canto.",
+  nube: t("upload.look_nube_desc") || "Letras de malvavisco con rebote y nubes suaves en los bordes.",
+  puntada: t("upload.look_puntada_desc") || "Letras bordadas con interlineado compacto y flores sobre el video.",
 });
 
 /** Opciones listas para pickers: [{ code, label, desc, font, preview }]. */
