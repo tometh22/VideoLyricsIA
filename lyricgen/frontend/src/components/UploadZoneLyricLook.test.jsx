@@ -101,7 +101,7 @@ afterEach(() => {
 });
 
 describe("paso 4: picker de looks", () => {
-  it("muestra los 16 looks arriba de la tipografía, con 'sin look' primero", () => {
+  it("muestra los 22 looks arriba de la tipografía, con 'sin look' primero", () => {
     render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "" }} />);
     goStep(4);
     const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')];
@@ -109,6 +109,7 @@ describe("paso 4: picker de looks", () => {
       "none", "cosmico", "cine", "pincel", "pop70", "pelicula",
       "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
       "duotono", "romantico", "degrade", "y2k",
+      "golpe", "recorte", "diptico", "diario", "nube", "puntada",
     ]);
     // Cada tarjeta trae su miniatura (fondo + demo) y su descripción.
     for (const card of cards) {
@@ -249,12 +250,12 @@ describe("paso 4: variante del look por género", () => {
     expect(resolveBodies.at(-1)).toMatchObject({ lyric_look: "cinetico", job_id: "job-1", artist: "Almafuerte", song_title: "Toro y Pampa" });
     // Familia heavy: recomendados primero (sin look siempre primero) con su marca.
     const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')].map((c) => c.dataset.lyricLook);
-    expect(cards.slice(0, 9)).toEqual(["none", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"]);
+    expect(cards.slice(0, 12)).toEqual(["none", "golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"]);
     const badges = screen.getAllByTestId("look-recommended");
-    expect(badges).toHaveLength(8);
+    expect(badges).toHaveLength(11);
     // (t mockeado devuelve la key; el texto real interpola {family}.)
     expect(badges[0].textContent).toBe("upload.variant_recommended_for");
-    expect(badges[0].closest("[data-lyric-look]").dataset.lyricLook).toBe("cinetico");
+    expect(badges[0].closest("[data-lyric-look]").dataset.lyricLook).toBe("golpe");
     // Lo resuelto viaja como pin con la review (para mandar el número al generar).
     await waitFor(() => expect(reviews.some((r) => r.lookResolved?.variant === 3)).toBe(true));
     // La tipografía queda bloqueada: se elige en «Variante».
