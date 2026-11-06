@@ -712,9 +712,10 @@ export default function WizardLivePreview({
     // force_case="original"); el resto respeta el textCase del operador.
     const keepCase = lp.forceCase === "original";
     const rawSample = t("upload.preview_sample") || "esta es tu letra";
-    const text = live
+    let text = live
       ? (keepCase ? String(live.activeLine).trim() : applyCase(live.activeLine, textCase))
       : (keepCase ? rawSample : sample);
+    if (lp.forceCase === "lower") text = text.toLowerCase();
     const tokens = text.split(/\s+/).filter(Boolean);
     const basePx = tierForLength(text.length).fontPx * (lp.fontScale || 1) * clampFontScale(fontScale);
     const toCqw = (px) => `${((px / REF_W) * 100).toFixed(3)}cqw`;
@@ -757,6 +758,7 @@ export default function WizardLivePreview({
       live,
       lineIdx,
       basePx,
+      fontScale: clampFontScale(fontScale),
       toCqw,
       textColor,
       operatorPickedColor,

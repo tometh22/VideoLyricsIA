@@ -169,18 +169,19 @@ def test_resolve_previews_a_legacy_job_as_designed(client):
     assert r["variant"] == 0 and r["genre"] == "" and r["background"] == "flat"
 
 
-def test_resolve_fresh_avoids_the_parent_variant(client):
+@pytest.mark.parametrize("look_id", ["neon", "golpe", "recorte", "diptico", "diario", "nube", "puntada"])
+def test_resolve_fresh_avoids_the_parent_variant(client, look_id):
     import lyric_recipes as R
     seed = R.seed_key_for("Almafuerte", "Niño Jefe")
-    v = R.choose_auto_variant("neon", "metal", seed, set())
+    v = R.choose_auto_variant(look_id, "metal", seed, set())
     sig = [list(x) if isinstance(x, tuple) else x
-           for x in R.recipe_for("neon", "metal", seed, v).signature]
-    token, job_id = _user_with_job(client, {"lyric_look": "neon", "lyric_genre": "metal",
+           for x in R.recipe_for(look_id, "metal", seed, v).signature]
+    token, job_id = _user_with_job(client, {"lyric_look": look_id, "lyric_genre": "metal",
                                             "lyric_variant": v, "lyric_variant_sig": sig})
-    same = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id,
+    same = client.post("/lyric-looks/resolve", json={"lyric_look": look_id, "job_id": job_id,
                                                       "lyric_genre": "metal"},
                        headers=auth(token)).json()
-    fresh = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id,
+    fresh = client.post("/lyric-looks/resolve", json={"lyric_look": look_id, "job_id": job_id,
                                                        "lyric_genre": "metal", "fresh": True},
                         headers=auth(token)).json()
     assert same["variant"] == v and fresh["variant"] != v
@@ -195,3 +196,18 @@ def test_detect_genre_does_not_charge_another_tenants_job(client, user_token, mo
     client.post("/lyric-looks/detect-genre", json={"artist": "A", "job_id": other_job},
                 headers=auth(user_token))
     assert seen == [None]
+
+
+def test_editorial_designs_resolve_as_original_over_source_video(client, user_token):
+    import lyric_looks
+    import main
+    for code in lyric_looks.EDITORIAL_LAYOUTS:
+        response = client.post('/lyric-looks/resolve', json={
+            'lyric_look': code, 'lyric_genre': 'rock',
+            'artist': 'Almafuerte', 'song_title': 'Niño jefe',
+        }, headers=auth(user_token))
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result['look'] == code and result['variant'] == 0
+        assert result['background'] == 'source'
+        assert main._lyric_look_kwargs(code, lyric_variant=0)['lyric_look'] == code

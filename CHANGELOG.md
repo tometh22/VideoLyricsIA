@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.163] - 2026-11-06
+
+### Added
+- Add Golpe, Recorte, Díptico, Diario, Nube and Puntada lyric looks with their real typography, synchronized word animation and source video backgrounds. Include selector previews and horizontal/vertical rendering; keep Puntada lines compact.
+
+### Fixed
+- Render larger thumbnail titles with the selected lyric look typography and readable title colors.
+
 ## [1.1.162] - 2026-11-04
 
 ### Fixed

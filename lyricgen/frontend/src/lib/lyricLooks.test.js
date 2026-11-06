@@ -28,6 +28,7 @@ describe("catálogo", () => {
       "", "cosmico", "cine", "pincel", "pop70", "pelicula",
       "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
       "duotono", "romantico", "degrade", "y2k",
+      "golpe", "recorte", "diptico", "diario", "nube", "puntada",
     ]);
     expect(lyricLookOptions(tNull).map((o) => o.code)).toEqual(LYRIC_LOOK_CODES);
   });
@@ -39,7 +40,7 @@ describe("catálogo", () => {
       if (!o.code) continue;
       expect(o.font.css, o.code).toMatch(/'/);
       expect(o.preview.color, o.code).toMatch(/^#[0-9A-F]{6}$/i);
-      expect(["line", "keyword", "build", "kinetic", "neon", "chat", "block", "arc", "floor"]).toContain(o.preview.layout);
+      expect(["line", "keyword", "build", "kinetic", "neon", "chat", "block", "arc", "floor", "golpe", "recorte", "diptico", "diario", "nube", "puntada"]).toContain(o.preview.layout);
       expect(o.preview.thumbBg, o.code).toBeTruthy();
     }
   });
