@@ -1224,7 +1224,7 @@ export default function LyricsEditor({
       || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
   const telemetryFailureReportedRef = useRef(false);
-  const trackEditorEvent = useCallback((name, properties = {}, { keepalive = false } = {}) => {
+  const trackEditorEvent = useCallback((name, properties = {}, { keepalive = false, sessionId = editorSessionIdRef.current } = {}) => {
     if (!editorRequest || !transcribeJobId) return;
     editorRequest("/analytics/events", {
       method: "POST",
@@ -1236,7 +1236,7 @@ export default function LyricsEditor({
         // Sin esto el backend guardaba occurred_at NULL en todos los eventos
         // del editor y sólo quedaba la hora de llegada (created_at).
         occurred_at: new Date().toISOString(),
-        properties: { ...properties, session_id: editorSessionIdRef.current },
+        properties: { ...properties, session_id: sessionId },
       }] }),
     }).then(async (response) => {
       const receipt = await response.json();
@@ -4357,6 +4357,14 @@ export default function LyricsEditor({
   // encima de un edit que en realidad sí había arrancado.
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
+  const approvalLifetimeRef = useRef(null);
+  useEffect(() => {
+    const lifetime = { active: true };
+    approvalLifetimeRef.current = lifetime;
+    approveInFlightRef.current = false;
+    setIsApproving(false);
+    return () => { lifetime.active = false; };
+  }, [transcribeJobId]);
   const approvalReturnFocusRef = useRef(null);
   useEffect(() => {
     if (isApproving || !approvalReturnFocusRef.current) return;
@@ -4400,6 +4408,12 @@ export default function LyricsEditor({
   };
 
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    // Capture the originating editor, not whichever route is current when a
+    // slow flush finishes. An abandoned save may be durable without granting
+    // permission to start approval/rendering from an unmounted screen.
+    const lifetime = approvalLifetimeRef.current;
+    const approvalIsCurrent = () => Boolean(lifetime?.active && approvalLifetimeRef.current === lifetime);
+    if (!approvalIsCurrent()) return;
     const conflict = approvalConflict(approvalSegments);
     if (conflict) {
       toast({ message: conflict, tone: "error" });
@@ -4482,11 +4496,25 @@ export default function LyricsEditor({
       active_edit_ms: readActiveEditMs(),
       quality_acknowledged: qualityAcknowledged,
     };
+    const approvalSessionId = editorSessionIdRef.current;
     const operatorMetrics = {
       ...approvalTelemetry,
-      session_id: editorSessionIdRef.current,
+      session_id: approvalSessionId,
+    };
+    const recordApprovalSuccess = (revision) => {
+      // These callbacks close over the originating job's clock key and event
+      // identity. A confirmed success can outlive its screen without touching
+      // the next editor's UI or resuming an abandoned retry chain.
+      clearActiveClock();
+      trackEditorEvent("editor_approved", { revision, ...approvalTelemetry }, { sessionId: approvalSessionId });
+    };
+    const stopAfterAbandonedApproval = (result, revision) => {
+      if (approvalIsCurrent() && !result?.abandoned) return false;
+      if (result?.ok === true && !result.abandoned) recordApprovalSuccess(revision);
+      return true;
     };
     const persistQualityAcknowledgement = async (revision) => {
+      if (!approvalIsCurrent()) return false;
       if (!qualityAcknowledged || !editorRequest || !transcribeJobId) return true;
       try {
         const response = await editorRequest(
@@ -4502,8 +4530,10 @@ export default function LyricsEditor({
             }),
           },
         );
+        if (!approvalIsCurrent()) return false;
         if (response.ok) return true;
       } catch { /* handled below */ }
+      if (!approvalIsCurrent()) return false;
       toast({
         message: "La letra cambió mientras la revisabas. Volvé a confirmar la versión actual antes de generar.",
         tone: "info",
@@ -4515,6 +4545,7 @@ export default function LyricsEditor({
       // The backend approves only the exact persisted revision.
       const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
+      if (!approvalIsCurrent() || saveResult?.abandoned) return;
       if (saveResult?.ok === false) {
         toast({
           message: "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.",
@@ -4546,7 +4577,7 @@ export default function LyricsEditor({
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (qualityAcknowledged
           && !await persistQualityAcknowledgement(currentSave.revision)) return;
-        if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
+        if (!approvalIsCurrent() || !approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
         approvalResult = await Promise.resolve(onApprove(approvalSegments, {
           baseRevision: currentSave.revision,
           editorRevision: currentSave.revision,
@@ -4554,6 +4585,7 @@ export default function LyricsEditor({
           operatorMetrics,
           confirmedLineIds: confirmedLineIdsForApproval,
         }));
+        if (stopAfterAbandonedApproval(approvalResult, currentSave.revision)) return;
         if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
 
         // Approval can race a renderer metadata write after the last autosave.
@@ -4562,6 +4594,7 @@ export default function LyricsEditor({
         // every retry still goes through the backend revision check.
         if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
         const reconciled = await durableEditor.reconcile(persistenceSnapshot);
+        if (!approvalIsCurrent()) return;
         // Reconciliation may itself take seconds; never replace text typed
         // during that wait with the older approval candidate.
         if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
@@ -4577,6 +4610,7 @@ export default function LyricsEditor({
           setEdited(reseedPreservingIds(editedRef.current, persistenceSnapshot));
         }
         currentSave = await flushDurableSave("manual", persistenceSnapshot);
+        if (!approvalIsCurrent() || currentSave?.abandoned) return;
         if (currentSave?.ok === false) break;
         savedScreenSnapshot = currentSave?.segments || persistenceSnapshot;
         if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
@@ -4591,29 +4625,25 @@ export default function LyricsEditor({
         return;
       }
       setIsDirty(false);
-      clearActiveClock();
-      trackEditorEvent("editor_approved", {
-        revision: currentSave.revision, ...approvalTelemetry,
-      });
+      recordApprovalSuccess(currentSave.revision);
       return;
     }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) {
       setIsDirty(false);
       const revision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
       if (qualityAcknowledged && !await persistQualityAcknowledgement(revision)) return;
-      await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+      if (!approvalIsCurrent()) return;
+      const approvalResult = await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
         baseRevision: revision,
         operatorMetrics,
         confirmedLineIds: confirmedLineIdsForApproval,
       }));
-      clearActiveClock();
-      trackEditorEvent("editor_approved", {
-        revision: Number.isInteger(segmentsRevision) ? segmentsRevision : 0,
-        ...approvalTelemetry,
-      });
+      if (stopAfterAbandonedApproval(approvalResult, revision)) return;
+      recordApprovalSuccess(revision);
       return;
     }
     let saveResult = await flushPendingSave();
+    if (!approvalIsCurrent() || saveResult?.abandoned) return;
     if (saveResult?.ok === false && saveResult.reason === "stale-revision") {
       toast({ message: "Tus cambios siguen en pantalla. Reintentá aprobar en un instante.", tone: "info" });
       return;
@@ -4624,20 +4654,19 @@ export default function LyricsEditor({
       : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     if (qualityAcknowledged
       && !await persistQualityAcknowledgement(approvedRevision)) return;
-    await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
+    if (!approvalIsCurrent()) return;
+    const approvalResult = await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: approvedRevision,
       operatorMetrics,
       confirmedLineIds: confirmedLineIdsForApproval,
     }));
-    clearActiveClock();
-    trackEditorEvent("editor_approved", {
-      revision: approvedRevision,
-      ...approvalTelemetry,
-    });
+    if (stopAfterAbandonedApproval(approvalResult, approvedRevision)) return;
+    recordApprovalSuccess(approvedRevision);
   };
 
   const handleApprove = async (options = {}) => {
-    if (approveInFlightRef.current) return;
+    const lifetime = approvalLifetimeRef.current;
+    if (approveInFlightRef.current || !lifetime?.active) return;
     // Lo escuchado hasta acá sale ANTES que la aprobación: el reporte de
     // cobertura sólo cuenta tramos registrados antes de la primera versión
     // aprobada.
@@ -4648,8 +4677,10 @@ export default function LyricsEditor({
     try {
       await runApprove({ skipWrapWarning: options?.skipWrapWarning === true });
     } finally {
-      approveInFlightRef.current = false;
-      setIsApproving(false);
+      if (lifetime.active && approvalLifetimeRef.current === lifetime) {
+        approveInFlightRef.current = false;
+        setIsApproving(false);
+      }
     }
   };
 

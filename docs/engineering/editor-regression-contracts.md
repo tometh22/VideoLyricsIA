@@ -55,3 +55,13 @@ Pruebas: `LyricsEditorPersistenceAudit3.test.jsx`, `rebaseEditorHistory.test.js`
 
 Pruebas nuevas: archivos `*Audit4.test.*`, `editor-navigation-races.spec.js` y `editor-approval-race.spec.js`. La prueba de flush conserva además el caso de dos guardados en cola y una corrección remota independiente.
 - Al terminar una validación, el foco del panel de observaciones o del diálogo de renglones largos tiene prioridad sobre devolverlo al botón Aprobar. Ambos recorridos están cubiertos por E2E de teclado.
+
+## Quinta auditoría: estados de canción y gestos reales
+
+- La aprobación pertenece al editor que la inició. Desmontarlo durante flush, acknowledgement o conciliación impide iniciar/reintentar una aprobación desde otra pantalla. Un éxito explícito ya confirmado conserva telemetría de su sesión; una respuesta abandonada no se atribuye a la siguiente canción.
+- Un arrastre no autoriza sobrescribir tiempos recibidos durante el gesto. Cambiar identidades o rangos invalida el preview y libera captura, incluyendo vecinos usados por ripple/colisiones. Cambios sólo de texto o metadata no cancelan el gesto.
+- Seleccionar con mouse deja los atajos de timeline disponibles sin un paso manual de foco. Los inputs inline conservan espacios, cursor y Delete como edición de texto.
+- La revisión dedicada corresponde a canciones en transcripción/revisión, con identidad no nula. Editar un video de campaña ya renderizado conserva el wizard previo; `null === null` nunca abre diseño implícitamente.
+- Una campaña sin asignación creativa puede guardar su primer diseño con revisión cero. Abrir/hidratar no escribe; editar persiste y una revisión obsoleta no pisa el diseño nuevo.
+
+Pruebas: `LyricsTimelineInteractionAudit5.test.jsx`, `LyricsEditorApprovalLifecycleAudit5.test.jsx`, `editor-approval-unmount-audit5.spec.js`, `editor-keyboard-audit-five.spec.js`, `campaign-postrender-audit-five.spec.js`, `campaign-workspace-audit-five.spec.js` y contrato backend de primer diseño en `test_campaign_creative.py`. La cobertura de teclado usa clics reales antes de los atajos; la lista de campaña se verifica también con lector automatizado de accesibilidad y viewport angosto.

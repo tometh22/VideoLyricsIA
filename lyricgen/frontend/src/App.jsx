@@ -1839,7 +1839,11 @@ export default function App() {
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
   const [campaignDesignJobId, setCampaignDesignJobId] = useState(null);
-  const campaignDesignOpen = Boolean(currentReview?.campaignId
+  // Rendered campaign jobs use the existing edit wizard and have no
+  // transcribeJobId. Only an explicit first-pass review owns this workspace.
+  const dedicatedCampaignReview = Boolean(currentReview?.campaignId && currentReview?.transcribeJobId
+    && !currentReview?.editingJobId && !currentReview?.editMode && !currentReview?.variantMode);
+  const campaignDesignOpen = Boolean(dedicatedCampaignReview
     && campaignDesignJobId === currentReview?.transcribeJobId);
   useEffect(() => { setCampaignDesignJobId(null); }, [currentReview?.transcribeJobId]);
   const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
@@ -2467,7 +2471,10 @@ export default function App() {
           referenceLyrics: job.reference_lyrics || "",
           referenceLinks: job.campaign?.review_reference_links || [],
           sourceReference: job.campaign?.source_reference || null,
-          campaignCreativeRevision: campaignPreset.creative_assignment?.revision ?? null,
+          // Individual creative edits can bootstrap an unassigned campaign
+          // item at revision 0; null disables its save hook entirely.
+          campaignCreativeRevision: campaignPreset.creative_assignment?.revision
+            ?? (job.campaign_id && job.campaign_item_id ? 0 : null),
           bgVerbatim: preset("bg_verbatim", "bgVerbatim", resumedCreativeFields.bgVerbatim),
           matchLyrics: preset("match_lyrics", "matchLyrics", true),
           titleTemplate: preset("title_template", "titleTemplate", "auto"),
@@ -6157,7 +6164,7 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
-          <div className={`w-full ${currentReview.campaignId ? "max-w-[1600px]" : "max-w-[980px]"}`}>
+          <div className={`w-full ${dedicatedCampaignReview ? "max-w-[1600px]" : "max-w-[980px]"}`}>
           {currentReview.transcribeJobId && (
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
               <div className="min-w-0">
@@ -6256,7 +6263,7 @@ export default function App() {
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
             // player bar se portalea ahí; null (modal/inline) → inline.
-            playerSlot={currentReview.campaignId ? null : playerSlotEl}
+            playerSlot={dedicatedCampaignReview ? null : playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
@@ -6506,7 +6513,7 @@ export default function App() {
   const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
   const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
     ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
-    : currentReview?.campaignId ? (campaignDesignOpen ? <>
+    : dedicatedCampaignReview ? (campaignDesignOpen ? <>
       <div className="mb-3 flex flex-wrap items-center gap-3">
         <button type="button" className="btn-secondary" onClick={async () => {
           const review = currentReview;
