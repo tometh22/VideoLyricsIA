@@ -249,6 +249,10 @@ test.describe("lyrics editor browser contract", () => {
 
     const before = await lines.nth(0).evaluate((element) => parseFloat(element.style.left));
     const driverBefore = await lines.nth(2).evaluate((element) => parseFloat(element.style.left));
+    // Locator clicks can leave native smooth scrolling in flight. Raw mouse
+    // coordinates must be measured only after centering the actual driver;
+    // otherwise the pointer can land on the empty lane and start a marquee.
+    await lines.nth(2).evaluate(element => element.scrollIntoView({ block: "center", behavior: "instant" }));
     const box = await lines.nth(2).boundingBox();
     expect(box).not.toBeNull();
     await drag(page, { x: box.x + box.width / 2, y: box.y + box.height / 2 }, { x: box.x + box.width / 2 + 36, y: box.y + box.height / 2 });
