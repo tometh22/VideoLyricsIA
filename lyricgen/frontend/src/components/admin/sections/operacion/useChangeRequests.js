@@ -62,11 +62,11 @@ function proposalMatchesSummary(proposal, item) {
     || revision === proposal.lyrics_context.revision;
 }
 
-// Pedidos que la publicación dejó abiertos porque el texto pedido no está
-// en la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+// Publication and request closure are separate results. A literal text check
+// cannot attest a timing instruction or decide a human-reviewed difference.
 function keptOpenText(kept) {
-  return (kept || []).map((entry) => ` El pedido #${entry.id} sigue abierto: la letra publicada no tiene ${
-    (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}.`).join("");
+  return (kept || []).map((entry) => ` El pedido #${entry.id} sigue abierto: no pudimos comprobar automáticamente ${
+    (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}. Revisá cada punto en el video publicado para darlo por resuelto.`).join("");
 }
 
 export const INTERPRETATION_POLL_MS = 4000;
@@ -723,7 +723,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         setCrPublishNotice({
           requestId: crId,
           tone: "ok",
-          text: `Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.${data.hidden_from_client ? ` OJO: el cliente no lo ve, está oculto.${HIDDEN_HINT}` : ""}`,
+          text: `La versión ${data.revision} ya está publicada. Reenviar el mismo corte no cambia la versión ni cierra pedidos pendientes: revisá el pedido publicado para darlo por resuelto.${data.hidden_from_client ? ` OJO: el cliente no lo ve, está oculto.${HIDDEN_HINT}` : ""}`,
         });
       }
       // A committed publication stays confirmed even if the follow-up list read
@@ -753,6 +753,17 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       if (item?.resolution_source === "publication" && item.resolved_at) {
         setCrPublishNotice({ requestId, tone: "ok",
           text: `Publicación confirmada. El pedido quedó resuelto en la versión ${item.resolved_by_revision || item.publication?.revision || "actual"}.` });
+        await loadChangeRequests({ silent: true });
+      } else if (item?.publication?.needs_publish === false
+          && item.publication.render_matches_editor === true
+          && item.publication.answers_request === true
+          && Number.isInteger(item.publication.revision) && item.publication.revision > 0) {
+        // Megagilda Mix: publication committed, but the literal-text guard
+        // kept the request open. Never ask the operator to publish again or
+        // claim resolution just because the corrected cut reached the portal.
+        setCrPublishNotice({ requestId, tone: "ok",
+          text: `Publicación confirmada: versión ${item.publication.revision}.${item.publication.hidden_from_client
+            ? ` El cliente todavía no la ve: está oculta.${HIDDEN_HINT}` : " El video corregido ya está en el portal."} El pedido sigue abierto; revisá cada punto en el video publicado para darlo por resuelto.` });
         await loadChangeRequests({ silent: true });
       } else {
         setCrPublishNotice({ requestId, outcomeUnknown: true, tone: "wait",

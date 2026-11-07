@@ -145,6 +145,26 @@ describe("publicationStatus", () => {
     expect(screen.getByRole("status", { name: "Resultado del pedido" })).toHaveTextContent("podría haberse publicado");
   });
 
+  it("checks publication from the selected request footer without throwing", () => {
+    const reconcile = vi.fn();
+    renderPanel({}, {
+      crPublishNotice: { requestId: REQUEST.id, tone: "wait", outcomeUnknown: true,
+        text: "Se perdió la respuesta del envío." },
+      reconcilePublication: reconcile,
+    });
+    const footer = screen.getByRole("status", { name: "Estado de la acción" });
+    fireEvent.click(within(footer).getByRole("button", { name: "Consultar estado" }));
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(REQUEST.id);
+  });
+
+  it("distinguishes a published correction from its still-open request", () => {
+    const resolve = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, revision: 2, render_matches_editor: true } },
+      { resolveChangeRequest: resolve });
+    expect(screen.getByText("Publicado · pedido abierto")).toBeInTheDocument();
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("warns that the broadcast master is still the previous cut", () => {
     // El caso de producción del 2026-09-15: el MP4 ya está corregido y el
     // .mov PRE-EDIT sigue descargable en la misma key.

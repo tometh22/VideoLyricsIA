@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.165] - 2026-11-06
+
+### Fixed
+- Recover the selected UMG request’s publication status without a client-side reference error. Confirm an already-published corrected video even when its change request stays open, keep manual review available, and label publication separately from request closure.
+
 ## [1.1.164] - 2026-11-06
 
 ### Fixed

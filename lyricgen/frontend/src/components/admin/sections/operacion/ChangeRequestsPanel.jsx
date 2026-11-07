@@ -413,6 +413,7 @@ export default function ChangeRequestsPanel({
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
               onRefresh={() => refreshChangeRequests()}
+              onReconcile={() => reconcilePublication?.(selectedItem.id)}
               visibilityBusy={visibilityBusyId != null && visibilityBusyId === selectedItem.delivery?.id}
               onChangeVisibility={setDeliveryVisibility}
               proposalEnabled={proposalEnabled}
@@ -474,11 +475,14 @@ function ChangeRequestCard({
   onResolve, onConfirmPublication, onReopen, onPublish, onPrepareOnly, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
-  onDismissProposal, onRegenerateBackground, onRefresh,
+  onDismissProposal, onRegenerateBackground, onRefresh, onReconcile,
   visibilityBusy = false, onChangeVisibility,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
+  const currentCutPublished = item.publication?.needs_publish === false
+    && item.publication?.render_matches_editor === true
+    && Number.isInteger(item.publication?.revision) && item.publication.revision > 0;
   const status = publicationStatus(item.publication);
   const workflow = requestWorkflow(item, proposal, proposalEnabled);
   const qcGate = item.delivery_qc_gate;
@@ -625,7 +629,7 @@ function ChangeRequestCard({
             isResolved ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300"
           }`}
         >
-          {isResolved ? "Resuelto" : "Pendiente"}
+          {isResolved ? "Resuelto" : currentCutPublished ? "Publicado · pedido abierto" : "Pendiente"}
         </span>
       </header>
 
@@ -826,7 +830,7 @@ function ChangeRequestCard({
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
           {actionNotice.text}
           {actionNotice.outcomeUnknown && (
-            <button type="button" onClick={() => reconcilePublication?.(item.id)}
+            <button type="button" onClick={onReconcile}
               className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15">
               Consultar estado
             </button>
