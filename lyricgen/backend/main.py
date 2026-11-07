@@ -14188,7 +14188,7 @@ async def restore_audio(
     except Exception:
         pass
 
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
 
     return {
         "job_id": job_id,
@@ -14546,6 +14546,14 @@ def _dispatch_editor_quality_outbox(event_id: str | None) -> None:
         )
 
 
+async def _dispatch_editor_quality_outbox_async(event_id: str | None) -> None:
+    # Publishing owns another DB session and may wait for the pool or Redis.
+    # Callers already committed their write; keep the loop free so competing
+    # requests can finish and return their connections while dispatch waits.
+    from starlette.concurrency import run_in_threadpool
+    await run_in_threadpool(_dispatch_editor_quality_outbox, event_id)
+
+
 class EditorRestoreRequest(BaseModel):
     version_id: str
     base_revision: int
@@ -14660,6 +14668,7 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
             db, job_id, job.tenant_id, job.segments_json or [],
         )
     except (LookupError, ValueError):
+        db.rollback()
         raise HTTPException(status_code=422, detail="Invalid editor segments.") from None
     # Opening/using an explicit editor ID wins over a soft-dedup race.  This
     # also refreshes the reaper activity anchor for long editing sessions.
@@ -14909,7 +14918,11 @@ async def patch_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
-    _enforce_segment_write_velocity(db, current_user, job_id)
+    try:
+        _enforce_segment_write_velocity(db, current_user, job_id)
+    except HTTPException:
+        db.rollback()
+        raise
     quality_outbox_id = None
     previous_editor_segments = [
         dict(item) for item in (document.current_segments or [])
@@ -14962,7 +14975,7 @@ async def patch_editor_document(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
     lyric_review = None
     if applied:
         # Sin cambios no hay nada nuevo que revisar: el editor conserva la
@@ -15109,7 +15122,7 @@ async def apply_editor_quality_proposal(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
     return {
         "job_id": job_id, "proposal_id": proposal_id,
         "revision": int(document.revision or 0),
@@ -15282,6 +15295,7 @@ async def editor_lock(
     try:
         assert_pilot_actor(db, job, current_user["id"])
     except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=403, detail=str(exc)) from None
     result = acquire_lock(
         db, document, current_user["id"], session_id=x_editor_session,
@@ -15332,6 +15346,7 @@ async def editor_activity_heartbeat(
         or lock_expires is None
         or lock_expires <= datetime.now(timezone.utc)
     ):
+        db.rollback()
         raise HTTPException(
             status_code=409, detail="editor_active_lock_required",
         )
@@ -15345,6 +15360,7 @@ async def editor_activity_heartbeat(
     expected_seq = int((previous.properties or {}).get("activity_seq") or 0) + 1 \
         if previous is not None else 1
     if body.activity_seq != expected_seq:
+        db.rollback()
         raise HTTPException(
             status_code=409, detail="editor_activity_sequence_conflict",
         )
@@ -15456,10 +15472,14 @@ async def restore_editor_version(
         )
         db.commit()
     except LookupError:
+        db.rollback()
         raise HTTPException(status_code=404, detail="editor_version_not_found") from None
     except RuntimeError:
         raise _editor_revision_conflict(db, job_id, current_user) from None
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
     return {
         "job_id": job_id,
         "revision": document.revision,
@@ -15517,14 +15537,11 @@ async def undo_editor_auto_repair(
         db.rollback()
         if str(exc) == "auto_repair_undo_unavailable":
             raise HTTPException(status_code=409, detail=str(exc)) from None
-        _, current = _editor_document_or_404(db, job_id, current_user)
-        raise HTTPException(
-            status_code=409, detail=_editor_conflict_payload(db, current),
-        ) from None
+        raise _editor_revision_conflict(db, job_id, current_user) from None
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
     return {
         "job_id": job_id,
         "revision": document.revision,
@@ -15571,7 +15588,7 @@ async def resolve_editor_conflict(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
     return {
         **serialize_document(db, document),
         "version_id": version.id if version else None,
@@ -16338,7 +16355,7 @@ async def save_segments(
             content={"code": "editor_state_conflict", "detail": str(exc)},
         )
 
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
 
     # Outcome metric (issue #934): éxito consultable por tenant — junto con
     # el warning del 409 de arriba permite medir la tasa real de fallas del
@@ -17461,7 +17478,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
     finally:
         _db2.close()
 
-    _dispatch_editor_quality_outbox(quality_outbox_id)
+    await _dispatch_editor_quality_outbox_async(quality_outbox_id)
 
     logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d pasted=%s replaced=%d",
                 job_id, len(merged), review_count, locked_kept, pasted_mode, lines_replaced)

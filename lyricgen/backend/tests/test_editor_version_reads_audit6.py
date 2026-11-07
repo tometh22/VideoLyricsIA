@@ -58,3 +58,28 @@ def test_version_list_commits_lazy_document_creation():
     with SessionLocal() as check:
         assert check.query(EditorDocument).filter_by(job_id=job_id).one()
         assert check.query(EditorVersion).filter_by(job_id=job_id).count() == 1
+
+
+@pytest.mark.parametrize("operation", ["missing_restore", "undo_conflict"])
+def test_restore_and_undo_errors_release_transactions(operation, monkeypatch):
+    import main
+
+    user, _, job_id = _users_and_job("version_errors_audit6")
+    actor = {"id": user.id, "role": "user", "tenant_id": user.tenant_id,
+             "features": {"editor_v2": True}}
+    with SessionLocal() as db:
+        if operation == "missing_restore":
+            call = main.restore_editor_version(job_id,
+                main.EditorRestoreRequest(version_id="missing", base_revision=0), current_user=actor, db=db)
+        else:
+            monkeypatch.setattr(main, "auto_repair_undo_segments", lambda *_: [
+                {"start": 0, "end": 1, "text": "source"}])
+            def concurrent_save(*args, **kwargs):
+                raise RuntimeError("editor_revision_conflict")
+            monkeypatch.setattr(main, "save_document", concurrent_save)
+            call = main.undo_editor_auto_repair(job_id,
+                main.EditorAutoRepairUndoRequest(base_revision=0), current_user=actor, db=db)
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(call)
+        assert caught.value.status_code == (404 if operation == "missing_restore" else 409)
+        assert not db.in_transaction()
