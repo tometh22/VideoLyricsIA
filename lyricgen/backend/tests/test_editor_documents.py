@@ -2016,3 +2016,42 @@ def test_campaign_review_needs_activity_for_same_actor_revision_and_save_time(db
     assert saved_review_history(db, [job_id]) == {}
     _review_activity(db, doc, human.id)
     assert saved_review_history(db, [job_id])[job_id]["user_id"] == human.id
+
+
+def test_explicit_duplicate_survives_autosave_database_and_reload(client):
+    """A deliberately duplicated final line must survive server canonicalization."""
+    actor, _, job_id = _users_and_job("ux_duplicate_roundtrip")
+    headers = auth(_token_for(actor))
+    loaded = client.get(f"/editor/{job_id}", headers=headers).json()
+    rows = [
+        {"segment_id": "original", "start": 0, "end": 1, "text": "con espacios"},
+        {"segment_id": "copy", "start": 0, "end": 1, "text": "con espacios", "review": True},
+    ]
+    saved = client.patch(f"/editor/{job_id}", headers=headers, json={
+        "base_revision": loaded["revision"], "segments": rows, "checkpoint": "autosave",
+    })
+    assert saved.status_code == 200, saved.text
+    with SessionLocal() as db:
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        assert len(document.current_segments) == 2
+        assert [r["segment_id"] for r in document.current_segments] == ["original", "copy"]
+        assert document.current_segments[1]["review"] is True
+        assert document.revision == saved.json()["revision"]
+        assert db.query(Job).filter_by(job_id=job_id).one().segments_json == document.current_segments
+    reloaded = client.get(f"/editor/{job_id}", headers=headers)
+    assert reloaded.status_code == 200
+    assert [r["segment_id"] for r in reloaded.json()["segments"]] == ["original", "copy"]
+    # Editing the copy and navigating away must retain both the text and timing.
+    rows = reloaded.json()["segments"]
+    rows[1].update(text="copia corregida con espacios", start=1.2, end=2.4)
+    changed = client.patch(f"/editor/{job_id}", headers=headers, json={
+        "base_revision": reloaded.json()["revision"], "segments": rows, "checkpoint": "manual",
+    })
+    assert changed.status_code == 200, changed.text
+    final = client.get(f"/editor/{job_id}", headers=headers).json()
+    assert final["segments"][1]["text"] == "copia corregida con espacios"
+    assert final["segments"][1]["start"] == 1.2
+    assert final["segments"][1]["end"] == 2.4
+    with SessionLocal() as db:
+        version = db.query(EditorVersion).filter_by(job_id=job_id, revision=final["revision"]).one()
+        assert version.segments == final["segments"]

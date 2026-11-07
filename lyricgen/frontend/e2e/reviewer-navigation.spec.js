@@ -46,7 +46,7 @@ for (const path of ["/admin/cola", "/campaigns/campaign-1?view=lyrics"]) {
     await page.getByRole("button", { name: "Detalle de Letra ya aprobada" }).click();
     await page.getByRole("dialog", { name: "Canción Letra ya aprobada" }).getByRole("button", { name: "Editar letra y tiempos" }).click();
     await expect(page).toHaveURL(/\/review\/j2\?return_to=/);
-    await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Texto aprobado sin video");
+    await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Texto aprobado sin video");
     await page.getByRole("button", { name: "Volver", exact: true }).click();
     await expect(page).toHaveURL(/view=ready/);
     await expect(page.getByRole("tab", { name: /^Lista/ })).toHaveAttribute("aria-selected", "true");

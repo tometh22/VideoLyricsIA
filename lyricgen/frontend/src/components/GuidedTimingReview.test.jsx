@@ -26,7 +26,7 @@ function props(overrides = {}) {
     currentTime: 10.5,
     confirmedIds: new Set(),
     onConfirm: vi.fn(),
-    onPlayWindow: vi.fn(),
+    onPlayWindow: vi.fn().mockResolvedValue(true),
     onSeek: vi.fn(),
     onMove: vi.fn(),
     onOpenAdvanced: vi.fn(),
@@ -105,6 +105,21 @@ describe("GuidedTimingReview", () => {
     expect(screen.getByRole("button", { name: /Escuchar fragmento/ })).toBeInTheDocument();
   });
 
+  it("no habilita confirmación si el audio rechaza la reproducción", async () => {
+    render(<GuidedTimingReview {...props({ onPlayWindow: vi.fn().mockRejectedValue(new Error("audio unavailable")) })} />);
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeDisabled();
+  });
+
+  it("abrir ayuda preserva la decisión de la revisora", async () => {
+    render(<GuidedTimingReview {...props()} />);
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
+    await userEvent.click(screen.getByRole("button", { name: /cómo funciona/i }));
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeEnabled();
+  });
+
   it("presenta una sola decisión con lenguaje humano y audio visible", () => {
     render(<GuidedTimingReview {...props()} />);
 
@@ -129,7 +144,7 @@ describe("GuidedTimingReview", () => {
   });
 
   it("reproduce el tramo, ajusta de a 100 ms y confirma antes de avanzar", async () => {
-    const onPlayWindow = vi.fn();
+    const onPlayWindow = vi.fn().mockResolvedValue(true);
     const onStopPlayback = vi.fn();
     const onMove = vi.fn();
     const onConfirm = vi.fn();
@@ -200,7 +215,7 @@ describe("GuidedTimingReview", () => {
   });
 
   it("no reproduce una ventana que quedó fuera de la duración real", async () => {
-    const onPlayWindow = vi.fn();
+    const onPlayWindow = vi.fn().mockResolvedValue(true);
     const onConfirm = vi.fn();
     render(<GuidedTimingReview {...props({
       windows: [{ id: "outside", start: 40, end: 45, reasons: ["timing"] }],

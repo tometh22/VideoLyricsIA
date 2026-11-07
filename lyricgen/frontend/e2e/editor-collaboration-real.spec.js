@@ -6,6 +6,9 @@ const API = process.env.REAL_EDITOR_API || "http://127.0.0.1:8000";
 const JOB_ID = "e2ecollab001";
 const PASSWORD = "EditorE2E-test-123";
 
+// These scenarios mutate the same disposable seeded document.
+test.describe.configure({ mode: "serial", retries: 0 });
+
 async function login(request, username) {
   const response = await request.post(`${API}/auth/login`, { data: { username, password: PASSWORD } });
   expect(response.ok()).toBeTruthy();
@@ -99,10 +102,18 @@ test.describe("Editor 2.0 real collaboration", () => {
     await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
+    // Undo remains local after reconciliation: it must never erase B's work.
+    await firstLyricsInput(a.page).blur();
+    await a.page.keyboard.press("Control+z");
+    await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
+    await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
+    await expect.poll(async () => (await revision(request, tokenA)).segments[0].text).toBe("A queda local");
+    expect((await revision(request, tokenA)).segments[1].text).toBe("B vuelve a guardar");
+
     await a.page.reload();
     await expect(a.page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
     await a.page.getByRole("button", { name: /4 Lyrics/ }).click();
-    await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
+    await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
     await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await a.page.getByRole("tab", { name: "Ajustar tiempos" }).click();
     await a.page.getByTestId("editor-overflow-btn").click();
@@ -116,4 +127,109 @@ test.describe("Editor 2.0 real collaboration", () => {
     await a.context.close();
     await b.context.close();
   });
+});
+
+
+test("advanced edits and intentional duplicates survive real API reload", async ({ browser, request }) => {
+  test.skip(!ENABLED, "requires disposable real API/PostgreSQL");
+  const token = await login(request, "editor_e2e_a");
+  const initial = await revision(request, token);
+  const overlapping = initial.segments.map((row, index) => index === 0 ? { ...row, end: 2 }
+    : index === 1 ? { ...row, end: 2.5 } : row);
+  const seeded = await request.patch(`${API}/editor/${JOB_ID}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { base_revision: initial.revision, segments: overlapping, checkpoint: "manual" },
+  });
+  expect(seeded.ok()).toBeTruthy();
+  const { context, page } = await openEditor(browser, token);
+  try {
+    const before = await revision(request, token);
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+    await page.getByTestId("timeline-segment-body").first().dblclick();
+    const input = page.getByTestId("timeline-segment").first().locator("input");
+    await input.fill("Persistencia real con espacios");
+    await expect.poll(async () => (await revision(request, token)).segments[0].text).toBe("Persistencia real con espacios");
+    await expect(input).toBeFocused();
+    await input.press("Enter");
+    await page.getByTestId("timeline-label-row").first().click();
+    await page.getByRole("button", { name: "Duplicar línea", exact: true }).click();
+    await expect.poll(async () => (await revision(request, token)).segments.length).toBe(before.segments.length + 1);
+    const saved = await revision(request, token);
+    const copies = saved.segments.filter(row => row.text === "Persistencia real con espacios");
+    expect(copies).toHaveLength(2);
+    expect(copies[0].segment_id).not.toBe(copies[1].segment_id);
+    for (const untouched of before.segments.slice(1)) {
+      // _id is a browser-local row handle and can change across hydration.
+      // Compare every durable field, including segment_id, text and timing.
+      const { _id: previousLocalId, ...expected } = untouched;
+      const { _id: savedLocalId, ...actual } = saved.segments.find(row => row.segment_id === untouched.segment_id);
+      expect(actual).toEqual(expected);
+    }
+    await page.reload();
+    await page.getByRole("button", { name: /4 Lyrics/ }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    await page.getByRole("tab", { name: "Revisar letra", exact: true }).click();
+    await expect(page.locator('input[value="Persistencia real con espacios"]')).toHaveCount(2);
+    expect((await revision(request, token)).segments).toEqual(saved.segments);
+  } finally {
+    await context.close();
+  }
+});
+
+// Restore replaces the document intentionally, while preserving current work
+// as an immutable checkpoint. Exercise a real in-flight PATCH, not a mock DB.
+test("restoring during autosave preserves a checkpoint and survives real API reload", async ({ browser, request }) => {
+  test.skip(!ENABLED, "requires disposable real API/PostgreSQL");
+  const token = await login(request, "editor_e2e_a");
+  const headers = { Authorization: `Bearer ${token}` };
+  const listed = await request.get(`${API}/editor/${JOB_ID}/versions`, { headers });
+  expect(listed.ok()).toBeTruthy();
+  const original = (await listed.json()).versions.find(version => version.revision === 0);
+  expect(original).toBeTruthy();
+  const oldResponse = await request.get(`${API}/editor/${JOB_ID}/versions/${original.id}`, { headers });
+  const oldSegments = (await oldResponse.json()).segments;
+  const content = rows => rows.map(({ segment_id, start, end, text }) => ({ segment_id, start, end, text }));
+  const { context, page } = await openEditor(browser, token);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let held = false;
+  await page.route(`**/editor/${JOB_ID}`, async route => {
+    if (route.request().method() === "PATCH" && !held) { held = true; await gate; }
+    await route.continue();
+  });
+  try {
+    await firstLyricsInput(page).fill("Borrador anterior en vuelo");
+    await expect.poll(() => held).toBe(true);
+    await firstLyricsInput(page).fill("Trabajo final antes de restaurar");
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await page.getByTestId("editor-overflow-btn").click();
+    await page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
+    const dialog = page.getByRole("dialog", { name: "Historial de versiones" });
+    const originalRow = dialog.getByText("Revisión 0", { exact: true }).locator("../..").locator("..");
+    await originalRow.getByRole("button", { name: "Restaurar", exact: true }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("inert", "");
+    await page.keyboard.press("ControlOrMeta+z");
+    release();
+    await expect(page.getByTestId("lyrics-editor")).not.toHaveAttribute("inert", "");
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(async () => content((await revision(request, token)).segments)).toEqual(content(oldSegments));
+    const historyResponse = await request.get(`${API}/editor/${JOB_ID}/versions`, { headers });
+    const history = (await historyResponse.json()).versions;
+    const manualSnapshots = await Promise.all(history.filter(version => version.reason === "manual").map(async version => {
+      const response = await request.get(`${API}/editor/${JOB_ID}/versions/${version.id}`, { headers });
+      return (await response.json()).segments;
+    }));
+    expect(manualSnapshots.some(rows => rows[0].text === "Trabajo final antes de restaurar")).toBe(true);
+    await page.reload();
+    await page.getByRole("button", { name: /4 Lyrics/ }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    // The advanced mode chosen before restore intentionally survives reload.
+    await page.getByRole("tab", { name: "Revisar letra", exact: true }).click();
+    await expect(firstLyricsInput(page)).toHaveValue(oldSegments[0].text);
+    expect(content((await revision(request, token)).segments)).toEqual(content(oldSegments));
+  } finally {
+    release();
+    await context.close();
+  }
 });

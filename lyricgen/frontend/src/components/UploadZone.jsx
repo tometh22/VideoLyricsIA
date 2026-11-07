@@ -299,6 +299,7 @@ export default function UploadZone({
   // backgroundHint, bgVerbatim, matchLyrics }. No toca r.* (el diff usa
   // initialFields), sólo el display.
   editSeed = null,
+  initialStep = null,
   // Cómo está RENDERIZADO el video hoy (currentReview.baseline). Alimenta el
   // chip "EN EL VIDEO" de las galerías: el anillo violeta dice "lo que elegí",
   // el chip ámbar dice "lo que el video tiene". Cuando coinciden, una tarjeta
@@ -922,6 +923,7 @@ export default function UploadZone({
   // El fallback a step 6 conserva el bootstrap defensivo histórico para
   // cualquier caller con lockedSteps que no declare editMode.
   const [wizardStep, setWizardStep] = useState(() => {
+    if (initialStep >= 1 && initialStep <= 6) return initialStep;
     if (_guidedExistingJobMode) return 2;
     if (Array.isArray(lockedSteps) && lockedSteps.length > 0) return 6;
     return 1;
@@ -975,13 +977,14 @@ export default function UploadZone({
   // editMode/variantMode usan el recorrido guiado y no auto-avanzan.
   const _editMode = Array.isArray(lockedSteps) && lockedSteps.length > 0;
   useEffect(() => {
+    if (initialStep != null) return; // Explicit entry into campaign design.
     if (!_guidedExistingJobMode && (hasReviewableContent || _editMode) && wizardStep !== 6) {
       setWizardStep(6);
     } else if (!_guidedExistingJobMode && !hasReviewableContent && !_editMode && wizardStep === 6) {
       setWizardStep(5);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasReviewableContent, _editMode, _guidedExistingJobMode]);
+  }, [hasReviewableContent, _editMode, _guidedExistingJobMode, initialStep]);
 
   // Hovering a movement option previews it in the big stage without committing.
   const [hoverMovement, setHoverMovement] = useState(null);

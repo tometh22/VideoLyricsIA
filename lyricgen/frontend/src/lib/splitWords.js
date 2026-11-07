@@ -271,6 +271,10 @@ export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = nul
 
   const segStart = Number(seg?.start) || 0;
   const segEnd = Math.max(segStart, Number(seg?.end) || 0);
+  // Persistence requires at least 10ms per line. Do not manufacture time
+  // outside the parent when it cannot accommodate two durable halves.
+  const duration = segEnd - segStart;
+  if (duration + 1e-9 < 0.02) return null;
   if (wordsA) {
     const aEnd = lastWordEnd(wordsA);
     const bStartRaw = firstWordStart(wordsB);
@@ -280,7 +284,7 @@ export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = nul
       && bStartRaw >= aEnd - OVERLAP_TOLERANCE_S
     ) {
       const bStart = bStartRaw > aEnd ? bStartRaw : aEnd + TOUCH_GAP_S;
-      if (bStart < segEnd) {
+      if (aEnd - segStart + 1e-9 >= 0.01 && segEnd - bStart + 1e-9 >= 0.01) {
         return {
           a: { text: textA, start: segStart, end: aEnd, words: wordsA },
           b: { text: textB, start: bStart, end: segEnd, words: wordsB },
@@ -295,9 +299,12 @@ export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = nul
   // even if this line's window was re-timed by hand since alignment.
   const ratio = textA.length / Math.max(1, textA.length + textB.length);
   const midTime = segStart + (segEnd - segStart) * ratio;
+  const minHalf = Math.min(MIN_HALF_S, duration / 2);
+  const gap = Math.min(FALLBACK_GAP_S, Math.max(0, duration - 2 * minHalf));
+  const boundary = Math.max(segStart + minHalf + gap, Math.min(segEnd - minHalf, midTime));
   return {
-    a: { text: textA, start: segStart, end: Math.max(segStart + MIN_HALF_S, midTime - FALLBACK_GAP_S), words: wordsA },
-    b: { text: textB, start: Math.min(segEnd - MIN_HALF_S, midTime), end: segEnd, words: wordsB },
+    a: { text: textA, start: segStart, end: boundary - gap, words: wordsA },
+    b: { text: textB, start: boundary, end: segEnd, words: wordsB },
     timing: "char_ratio",
   };
 }
