@@ -6,7 +6,7 @@ const API = process.env.REAL_EDITOR_API || "http://127.0.0.1:8000";
 const JOB_ID = "e2ecollab001";
 const PASSWORD = "EditorE2E-test-123";
 
-// Both scenarios mutate the same disposable seeded document.
+// These scenarios mutate the same disposable seeded document.
 test.describe.configure({ mode: "serial", retries: 0 });
 
 async function login(request, username) {
@@ -173,6 +173,63 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     await expect(page.locator('input[value="Persistencia real con espacios"]')).toHaveCount(2);
     expect((await revision(request, token)).segments).toEqual(saved.segments);
   } finally {
+    await context.close();
+  }
+});
+
+// Restore replaces the document intentionally, while preserving current work
+// as an immutable checkpoint. Exercise a real in-flight PATCH, not a mock DB.
+test("restoring during autosave preserves a checkpoint and survives real API reload", async ({ browser, request }) => {
+  test.skip(!ENABLED, "requires disposable real API/PostgreSQL");
+  const token = await login(request, "editor_e2e_a");
+  const headers = { Authorization: `Bearer ${token}` };
+  const listed = await request.get(`${API}/editor/${JOB_ID}/versions`, { headers });
+  expect(listed.ok()).toBeTruthy();
+  const original = (await listed.json()).versions.find(version => version.revision === 0);
+  expect(original).toBeTruthy();
+  const oldResponse = await request.get(`${API}/editor/${JOB_ID}/versions/${original.id}`, { headers });
+  const oldSegments = (await oldResponse.json()).segments;
+  const content = rows => rows.map(({ segment_id, start, end, text }) => ({ segment_id, start, end, text }));
+  const { context, page } = await openEditor(browser, token);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let held = false;
+  await page.route(`**/editor/${JOB_ID}`, async route => {
+    if (route.request().method() === "PATCH" && !held) { held = true; await gate; }
+    await route.continue();
+  });
+  try {
+    await firstLyricsInput(page).fill("Borrador anterior en vuelo");
+    await expect.poll(() => held).toBe(true);
+    await firstLyricsInput(page).fill("Trabajo final antes de restaurar");
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await page.getByTestId("editor-overflow-btn").click();
+    await page.getByRole("menuitem", { name: /Historial de versiones/ }).click();
+    const dialog = page.getByRole("dialog", { name: "Historial de versiones" });
+    const originalRow = dialog.getByText("Revisión 0", { exact: true }).locator("../..").locator("..");
+    await originalRow.getByRole("button", { name: "Restaurar", exact: true }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("inert", "");
+    await page.keyboard.press("ControlOrMeta+z");
+    release();
+    await expect(page.getByTestId("lyrics-editor")).not.toHaveAttribute("inert", "");
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(async () => content((await revision(request, token)).segments)).toEqual(content(oldSegments));
+    const historyResponse = await request.get(`${API}/editor/${JOB_ID}/versions`, { headers });
+    const history = (await historyResponse.json()).versions;
+    const manualSnapshots = await Promise.all(history.filter(version => version.reason === "manual").map(async version => {
+      const response = await request.get(`${API}/editor/${JOB_ID}/versions/${version.id}`, { headers });
+      return (await response.json()).segments;
+    }));
+    expect(manualSnapshots.some(rows => rows[0].text === "Trabajo final antes de restaurar")).toBe(true);
+    await page.reload();
+    await page.getByRole("button", { name: /4 Lyrics/ }).click();
+    await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    // The advanced mode chosen before restore intentionally survives reload.
+    await page.getByRole("tab", { name: "Revisar letra", exact: true }).click();
+    await expect(firstLyricsInput(page)).toHaveValue(oldSegments[0].text);
+    expect(content((await revision(request, token)).segments)).toEqual(content(oldSegments));
+  } finally {
+    release();
     await context.close();
   }
 });

@@ -3881,6 +3881,21 @@ export default function App() {
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
+    const submissionRouteKey = campaignRouteKeyRef.current;
+    const submissionIsCurrent = () => {
+      const active = creativeReviewRef.current;
+      return isMountedRef.current && campaignRouteKeyRef.current === submissionRouteKey
+        && active != null && active.editingJobId === r.editingJobId
+        && active.transcribeJobId === r.transcribeJobId
+        && active.parentJobId === r.parentJobId
+        && !!active.variantMode === !!r.variantMode;
+    };
+    // The server may finish an accepted request after navigation. Preserve
+    // that result, but never clear a newer review, prompt or submit a retry.
+    const abandonedSubmission = (res, data) => ({
+      ok: res?.ok === true, abandoned: true, reason: "abandoned",
+      approvedEditorVersionId: data?.approved_editor_version_id || null,
+    });
 
     // Variant-wizard mode (2026-07-24): "Crear variante" abre el mismo
     // wizard, pero el submit crea un JOB NUEVO en vez de parchear el
@@ -3942,6 +3957,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // Cap de versiones por canción: el plan incluye N renders del
         // mismo tema; a partir del siguiente se factura extra. El backend
@@ -3965,10 +3981,12 @@ export default function App() {
             + (t("variant.overage_confirm_question") || "¿Crear la variante igual?");
           track("variant.overage_prompted", { job_id: parentJobId });
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({
             ...payload,
             acknowledge_variant_overage: true,
           }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -3991,6 +4009,9 @@ export default function App() {
         // el modal viejo navegaba a /job/:id, que no existe).
         navigate(newJobId ? `/videos/${newJobId}` : `/videos/${parentJobId}`, { replace: true });
         return;
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
         setVariantSubmitting(false);
@@ -4142,6 +4163,7 @@ export default function App() {
             });
             let _upData = {};
             try { _upData = await _up.json(); } catch { /* empty body */ }
+            if (!submissionIsCurrent()) return abandonedSubmission();
             if (!_up.ok || !_upData?.bg_r2_key) {
               const _friendly = translateBackendError(_upData?.detail, t) || `Error ${_up.status}`;
               alert({
@@ -4154,6 +4176,7 @@ export default function App() {
             }
             payload.custom_background_r2_key = _upData.bg_r2_key;
           } catch (e) {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.custom_bg_upload_failed_title") || "No pudimos subir el fondo",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4203,6 +4226,7 @@ export default function App() {
               },
             );
           } catch {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4210,8 +4234,10 @@ export default function App() {
             });
             return { ok: false, reason: "campaign-approval-network" };
           }
+          if (!submissionIsCurrent()) return abandonedSubmission();
           if (!approvalResponse.ok) {
             const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
@@ -4249,6 +4275,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // YouTube already-published 409 retry.
         if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
@@ -4257,7 +4284,9 @@ export default function App() {
             "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
             + (url ? `\n\nYouTube: ${url}` : "");
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({ ...payload, allow_youtube_drift: true }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -4311,6 +4340,9 @@ export default function App() {
           { replace: true },
         );
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
       }

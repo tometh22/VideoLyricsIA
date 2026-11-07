@@ -15385,8 +15385,17 @@ async def get_editor_versions(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _, document = _editor_document_or_404(db, job_id, current_user)
-    return {"versions": list_versions(db, document, limit=limit, offset=offset)}
+    try:
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        payload = {"versions": list_versions(db, document, limit=limit, offset=offset)}
+        # The lazy bridge locks Job + EditorDocument. Release synchronously:
+        # another async request's sync SELECT FOR UPDATE can otherwise block
+        # the event loop before dependency teardown closes this transaction.
+        db.commit()
+        return payload
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.get("/editor/{job_id}/versions/{version_id}")
@@ -15396,18 +15405,26 @@ async def get_editor_version(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _, document = _editor_document_or_404(db, job_id, current_user)
-    version = get_version(db, document, version_id)
-    if not version:
-        raise HTTPException(status_code=404, detail="editor_version_not_found")
-    return {
-        "id": version.id,
-        "revision": version.revision,
-        "reason": version.reason,
-        "is_approved": bool(version.is_approved),
-        "segments": version.segments,
-        "created_at": version.created_at.isoformat() if version.created_at else None,
-    }
+    try:
+        _, document = _editor_document_or_404(db, job_id, current_user)
+        version = get_version(db, document, version_id)
+        if not version:
+            raise HTTPException(status_code=404, detail="editor_version_not_found")
+        payload = {
+            "id": version.id,
+            "revision": version.revision,
+            "reason": version.reason,
+            "is_approved": bool(version.is_approved),
+            "segments": version.segments,
+            "created_at": version.created_at.isoformat() if version.created_at else None,
+        }
+        # Materialize before commit; no ORM access may reacquire a transaction
+        # after releasing the bridge locks (including lazy migration/activity).
+        db.commit()
+        return payload
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/editor/{job_id}/restore")

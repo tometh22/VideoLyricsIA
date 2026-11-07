@@ -41,7 +41,11 @@ export function clampBlockShiftDelta(segments, requestedDelta, duration) {
   const upperBound = duration && Number.isFinite(Number(duration))
     ? Math.max(lowerBound, Number(duration) - maxEnd)
     : Infinity;
-  return Math.max(lowerBound, Math.min(delta, upperBound));
+  const bounded = Math.max(lowerBound, Math.min(delta, upperBound));
+  // Imported outliers may already violate a bound. A clamp may limit an
+  // intentional inward repair, but must never reverse the requested shift
+  // (or turn a zero-offset anchor into an unsolicited repair).
+  return Math.sign(bounded) === Math.sign(delta) ? bounded : 0;
 }
 
 /**

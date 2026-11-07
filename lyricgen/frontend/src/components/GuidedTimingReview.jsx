@@ -41,7 +41,9 @@ function segmentShiftBounds(segments, segment, duration) {
   const previous = index > 0 ? ordered[index - 1] : null;
   const next = index >= 0 && index < ordered.length - 1 ? ordered[index + 1] : null;
   const min = (previous ? previous.end + GAP_S : 0) - segment.start;
-  const max = (next ? next.start - GAP_S : Math.max(duration || segment.end, segment.end)) - segment.end;
+  const audioEnd = Number.isFinite(Number(duration)) && Number(duration) > 0 ? Number(duration) : null;
+  const nextBoundary = next ? next.start - GAP_S : (audioEnd ?? segment.end);
+  const max = (audioEnd == null ? nextBoundary : Math.min(audioEnd, nextBoundary)) - segment.end;
   // A guided nudge must never reverse the operator's requested direction.
   // Existing destructive overlaps need the full timeline because there may
   // be no safe single-line position without also moving a neighbour.

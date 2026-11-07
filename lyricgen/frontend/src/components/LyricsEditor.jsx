@@ -1068,6 +1068,8 @@ export default function LyricsEditor({
   // another write merely advanced the revision.
   saveConflictRef.current = false;
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyRestoreBusy, setHistoryRestoreBusy] = useState(false);
+  const historyRestoreFlightRef = useRef(false);
   const [autoRepairUndoBusy, setAutoRepairUndoBusy] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
@@ -1446,7 +1448,7 @@ export default function LyricsEditor({
     setIsDirty(true);
   }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
-    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery,
+    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery && !historyRestoreBusy,
     segments: durableSegments,
     dirty: isDirty,
     save: durableEditor.save,
@@ -3530,7 +3532,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (draftRecoveryRef.current || approveInFlightRef.current || e.defaultPrevented) return;
+      if (draftRecoveryRef.current || approveInFlightRef.current || historyRestoreFlightRef.current || e.defaultPrevented) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing || tag === "SELECT") return;
@@ -4560,6 +4562,14 @@ export default function LyricsEditor({
         return false;
       };
       let savedScreenSnapshot = saveResult?.segments || cleanedForPersistence;
+      // A conflict can introduce a remote correction during this flush.
+      // Saving it is safe; attesting to content never confirmed by this click
+      // is not. Renderer-only metadata remains semantically equivalent.
+      if (!segmentsEquivalent(cleanedForPersistence, savedScreenSnapshot)) {
+        setIsDirty(true);
+        toast({ message: t("editor.approval_changed_during_save", "La letra cambió mientras guardábamos. Revisá tus últimos cambios y volvé a aprobar."), tone: "info" });
+        return;
+      }
       if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
       // El guardado recién hecho es la verdad: si la letra que se va a
       // aprobar todavía tiene puntos obligatorios, se deciden antes.
@@ -4570,20 +4580,42 @@ export default function LyricsEditor({
         setReviewStatus("Para aprobar, resolvé los puntos de la revisión rápida.");
         return;
       }
+      // Derive both payload and attestation identities from the successful
+      // write, including equivalent identity/renderer metadata replacements.
+      // Non-campaign reviews retain only the originally reviewed occurrences.
+      const confirmedIdsForSnapshot = (snapshot) => {
+        const unmatched = new Set(cleaned.map((_, index) => index));
+        return snapshot.flatMap((segment, index) => {
+          let reviewed = requireLineReview;
+          if (!reviewed) {
+            const candidates = [...unmatched].filter(candidate =>
+              segmentsEquivalent(sanitizeSegmentsForPersistence([cleaned[candidate]]), [segment]));
+            const identity = String(segment.segment_id || segment.id || "");
+            const sourceIndex = candidates.find(candidate => identity
+              && String(cleaned[candidate].segment_id || cleaned[candidate].id || "") === identity)
+              ?? candidates[0];
+            if (sourceIndex !== undefined) {
+              unmatched.delete(sourceIndex);
+              reviewed = reviewedLineIds.includes(cleaned[sourceIndex]._id);
+            }
+          }
+          if (!reviewed) return [];
+          return [String(segment.segment_id || segment.id || "").trim() || `index:${index}`];
+        });
+      };
       let approvalResult = null;
       let currentSave = saveResult;
-      let approvalSegments = cleaned.map(({ _id, ...rest }) => rest);
-      let persistenceSnapshot = cleanedForPersistence;
+      let persistenceSnapshot = savedScreenSnapshot;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (qualityAcknowledged
           && !await persistQualityAcknowledgement(currentSave.revision)) return;
         if (!approvalIsCurrent() || !approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
-        approvalResult = await Promise.resolve(onApprove(approvalSegments, {
+        approvalResult = await Promise.resolve(onApprove(savedScreenSnapshot.map(({ _id, ...rest }) => rest), {
           baseRevision: currentSave.revision,
           editorRevision: currentSave.revision,
           editorVersionId: currentSave.versionId,
           operatorMetrics,
-          confirmedLineIds: confirmedLineIdsForApproval,
+          confirmedLineIds: confirmedIdsForSnapshot(savedScreenSnapshot),
         }));
         if (stopAfterAbandonedApproval(approvalResult, currentSave.revision)) return;
         if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
@@ -4602,8 +4634,13 @@ export default function LyricsEditor({
           break;
         }
         if (Array.isArray(reconciled.mergedSegments)) {
-          persistenceSnapshot = sanitizeSegmentsForPersistence(reconciled.mergedSegments);
-          approvalSegments = persistenceSnapshot.map(({ _id, ...rest }) => rest);
+          const reconciledSnapshot = sanitizeSegmentsForPersistence(reconciled.mergedSegments);
+          if (!segmentsEquivalent(cleanedForPersistence, reconciledSnapshot)) {
+            handleDurableMerge(reconciledSnapshot);
+            toast({ message: t("editor.approval_changed_during_save", "La letra cambió mientras guardábamos. Revisá tus últimos cambios y volvé a aprobar."), tone: "info" });
+            return;
+          }
+          persistenceSnapshot = reconciledSnapshot;
           // Keep the screen aligned with the exact snapshot that will be
           // approved. Remote-only edits survive the rebase; same-line edits
           // keep the current editor's value by merge policy.
@@ -4613,6 +4650,11 @@ export default function LyricsEditor({
         if (!approvalIsCurrent() || currentSave?.abandoned) return;
         if (currentSave?.ok === false) break;
         savedScreenSnapshot = currentSave?.segments || persistenceSnapshot;
+        if (!segmentsEquivalent(cleanedForPersistence, savedScreenSnapshot)) {
+          setIsDirty(true);
+          toast({ message: t("editor.approval_changed_during_save", "La letra cambió mientras guardábamos. Revisá tus últimos cambios y volvé a aprobar."), tone: "info" });
+          return;
+        }
         if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
       }
       if (approvalResult?.ok === false) {
@@ -4666,7 +4708,7 @@ export default function LyricsEditor({
 
   const handleApprove = async (options = {}) => {
     const lifetime = approvalLifetimeRef.current;
-    if (approveInFlightRef.current || !lifetime?.active) return;
+    if (approveInFlightRef.current || historyRestoreFlightRef.current || !lifetime?.active) return;
     // Lo escuchado hasta acá sale ANTES que la aprobación: el reporte de
     // cobertura sólo cuenta tramos registrados antes de la primera versión
     // aprobada.
@@ -4695,7 +4737,7 @@ export default function LyricsEditor({
 
   const handleBackSafely = useCallback(async (afterSave) => {
     const lifetime = safeExitLifetimeRef.current;
-    if (!lifetime?.active || safeExitInFlightRef.current || approveInFlightRef.current) return;
+    if (!lifetime?.active || safeExitInFlightRef.current || approveInFlightRef.current || historyRestoreFlightRef.current) return;
     const operation = {};
     safeExitInFlightRef.current = operation;
     try {
@@ -4872,7 +4914,8 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery || isApproving ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy || isApproving} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery || isApproving || historyRestoreBusy ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy || isApproving || historyRestoreBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {historyRestoreBusy && createPortal(<div role="status" aria-live="polite" className="fixed bottom-6 left-1/2 z-[100] -translate-x-1/2 rounded-xl bg-surface-1 px-4 py-3 text-sm text-white shadow-xl">{t("editor.restore_busy", "Restaurando versión…")}</div>, document.body)}
       {isApproving && createPortal(<div role="status" aria-live="polite"
         className="pointer-events-none fixed left-1/2 top-4 z-[95] -translate-x-1/2 rounded-xl bg-surface-1 px-5 py-3 text-sm text-white shadow-xl ring-1 ring-white/20">
         {t("editor.applying_changes") || "Aplicando cambios…"}
@@ -7300,21 +7343,42 @@ export default function LyricsEditor({
       />
       <VersionHistory
         open={historyOpen}
+        busy={historyRestoreBusy}
         loadVersions={durableEditor.listVersions}
         onClose={() => setHistoryOpen(false)}
         onRestore={async (versionId) => {
-          const result = await durableEditor.restoreVersion(versionId);
-          if (!result?.ok) return;
-          const next = sanitizeSegments(result.document.segments || []);
-          setEdited(reseedPreservingIds(editedRef.current, next));
-          setEditHistory([]);
-          setSyncHistory([]);
-          setPropagationPrompt(null);
-          setTextEditStart(null);
-          setIsDirty(false);
-          setSaveStatus("saved");
-          setHistoryOpen(false);
-          trackEditorEvent("editor_version_restored", { to_revision: result.document.revision });
+          if (historyRestoreFlightRef.current) return;
+          historyRestoreFlightRef.current = true;
+          setHistoryRestoreBusy(true);
+          const lifetime = safeExitLifetimeRef.current;
+          try {
+            // Preserve the current work as a checkpoint before replacing it.
+            const checkpoint = await flushDurableSave("manual", sanitizeSegmentsForPersistence(editedRef.current));
+            if (!lifetime?.active) return;
+            if (!checkpoint?.ok || checkpoint.abandoned) {
+              toast({ message: t("editor.restore_checkpoint_failed", "No pudimos guardar tus cambios antes de restaurar. Siguen en pantalla; reintentá."), tone: "error" });
+              return;
+            }
+            const result = await durableEditor.restoreVersion(versionId);
+            if (!lifetime?.active) return;
+            if (!result?.ok) {
+              toast({ message: t("editor.restore_failed", "No pudimos restaurar esa versión. Tus cambios siguen en pantalla; reintentá."), tone: "error" });
+              return;
+            }
+            const next = sanitizeSegments(result.document.segments || []);
+            setEdited(reseedPreservingIds(editedRef.current, next));
+            setEditHistory([]);
+            setSyncHistory([]);
+            setPropagationPrompt(null);
+            setTextEditStart(null);
+            setIsDirty(false);
+            setSaveStatus("saved");
+            setHistoryOpen(false);
+            trackEditorEvent("editor_version_restored", { to_revision: result.document.revision });
+          } finally {
+            historyRestoreFlightRef.current = false;
+            if (lifetime?.active) setHistoryRestoreBusy(false);
+          }
         }}
       />
       <EditorTour user={user} viewMode={viewMode} />

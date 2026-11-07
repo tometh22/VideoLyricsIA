@@ -65,3 +65,16 @@ Pruebas nuevas: archivos `*Audit4.test.*`, `editor-navigation-races.spec.js` y `
 - Una campaña sin asignación creativa puede guardar su primer diseño con revisión cero. Abrir/hidratar no escribe; editar persiste y una revisión obsoleta no pisa el diseño nuevo.
 
 Pruebas: `LyricsTimelineInteractionAudit5.test.jsx`, `LyricsEditorApprovalLifecycleAudit5.test.jsx`, `editor-approval-unmount-audit5.spec.js`, `editor-keyboard-audit-five.spec.js`, `campaign-postrender-audit-five.spec.js`, `campaign-workspace-audit-five.spec.js` y contrato backend de primer diseño en `test_campaign_creative.py`. La cobertura de teclado usa clics reales antes de los atajos; la lista de campaña se verifica también con lector automatizado de accesibilidad y viewport angosto.
+
+## Sexta auditoría y criterio de cierre
+
+- La aprobación usa el contenido y las identidades del snapshot que efectivamente se guardó. Si una conciliación incorpora texto o tiempos diferentes, requiere otra confirmación; los cambios equivalentes de metadata no bloquean el flujo.
+- Restaurar conserva primero el trabajo actual en un checkpoint, espera la escritura en vuelo e invalida los guardados viejos en cola. Un resultado superseded no reactiva autosave. El bloqueo incluye atajos, aprobación, salida y cierre del historial; un fallo devuelve la interacción sin borrar la letra.
+- Leer el historial materializa su respuesta y libera la transacción antes de retornar, también ante errores. Consultar versiones en paralelo no puede retener locks hasta el teardown y bloquear el event loop. La creación lazy sigue persistiendo.
+- Editar un video o crear una variante conserva la identidad de ruta y canción durante todos los awaits. Una respuesta tardía no navega, no limpia otra revisión ni abre confirmaciones en la pantalla siguiente.
+- Un gesto de diseño pertenece a su línea de origen: cambiar la línea activa durante reproducción cancela move/resize/rotate y libera captura. Cambios de texto que mantienen la identidad no cancelan el gesto.
+- Los límites del audio prevalecen aunque la siguiente línea esté fuera de rango. Un desplazamiento en bloque nunca invierte el sentido solicitado para corregir un outlier existente; permite volver hacia el rango válido.
+
+Pruebas: `*Audit6.test.*`, `editor-route-lifecycle-audit6.spec.js` y restauración durante autosave con API/PostgreSQL en `editor-collaboration-real.spec.js`.
+
+Cierre: revisión cruzada independiente sin nuevos defectos reproducibles en los contratos modificados, pruebas de regresión completas, persistencia con API/PostgreSQL y CI del commit exacto. Esto establece evidencia para integrar en staging; no demuestra ausencia absoluta de bugs ni reemplaza medir el uso real por línea/campaña.

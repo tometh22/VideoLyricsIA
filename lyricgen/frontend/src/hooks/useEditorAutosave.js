@@ -81,6 +81,7 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
     // A request already on the wire may settle after route navigation. Never
     // let that abandoned editor publish status or arm another retry timer.
     if (!mountedRef.current) return { ...result, abandoned: true };
+    if (result?.reason === "superseded") return result;
     if (result?.ok) {
       retryCountRef.current = 0;
       if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
