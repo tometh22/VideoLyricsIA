@@ -203,6 +203,7 @@ export default function LyricsTimeline({
 
   useEffect(() => {
     const valid = new Set(normalizedSegments.map((s) => s._id));
+    setEditingTextId(previous => valid.has(previous) ? previous : null);
     setSelectedIds((previous) => {
       const next = new Set([...previous].filter((id) => valid.has(id)));
       return next.size === previous.size ? previous : next;
@@ -1045,6 +1046,7 @@ export default function LyricsTimeline({
                     {editingTextId === segment._id ? (
                       <input
                         autoFocus
+                        data-editor-task="text"
                         aria-label={`${t("review_workspace.text", "Letra de esta línea")} ${index + 1}`}
                         type="text"
                         value={segment.text || ""}
@@ -1055,7 +1057,6 @@ export default function LyricsTimeline({
                         onClick={(event) => event.stopPropagation()}
                         onBlur={() => commitTextEdit(segment._id)}
                         onKeyDown={(event) => {
-                          event.stopPropagation();
                           if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); commitTextEdit(); }
                           if (event.key === "Escape") { event.preventDefault(); setEditingTextId(null); }
                         }}

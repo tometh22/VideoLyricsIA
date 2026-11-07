@@ -2,6 +2,7 @@ import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import LyricsTimeline from "./LyricsTimeline";
 import userEvent from "@testing-library/user-event";
+import { readTaskAttr, classifyTask } from "../editorTaskClock";
 
 afterEach(cleanup);
 
@@ -430,6 +431,29 @@ describe("LyricsTimeline", () => {
     expect(input).toHaveValue("texto conciliado");
     expect(input).toHaveFocus();
     expect(props.onTextChange).not.toHaveBeenCalled();
+  });
+
+  it("reports inline typing as text activity while letting spaces reach the input", () => {
+    setup();
+    fireEvent.doubleClick(screen.getAllByTestId("timeline-segment")[1].querySelector("span[title*='Doble-click']"));
+    const input = screen.getByDisplayValue("segunda línea");
+    const activity = vi.fn();
+    window.addEventListener("keydown", activity);
+    try {
+      expect(fireEvent.keyDown(input, { key: " ", code: "Space" })).toBe(true);
+      expect(activity).toHaveBeenCalledTimes(1);
+      expect(classifyTask({ taskAttr: readTaskAttr(input), editable: true })).toBe("text");
+    } finally { window.removeEventListener("keydown", activity); }
+  });
+
+  it("does not resurrect an inline edit when a remotely deleted identity returns on undo", () => {
+    const props = { segments: SEGS, duration: 60, currentTime: 0 };
+    const { rerender } = render(<LyricsTimeline {...props} />);
+    fireEvent.doubleClick(screen.getAllByTestId("timeline-segment")[1].querySelector("span[title*='Doble-click']"));
+    expect(screen.getByDisplayValue("segunda línea")).toBeInTheDocument();
+    rerender(<LyricsTimeline {...props} segments={SEGS.filter(row => row._id !== 1)} />);
+    rerender(<LyricsTimeline {...props} />);
+    expect(screen.queryByDisplayValue("segunda línea")).not.toBeInTheDocument();
   });
 
   it("clicking the line column navigates to the exact start and enables duplication", () => {

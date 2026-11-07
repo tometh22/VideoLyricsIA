@@ -2096,7 +2096,7 @@ export default function LyricsEditor({
   // last tap if the operator overshot.
   const [syncHistory, setSyncHistory] = useState([]);
 
-  // Manual-edit history. Each entry is the FULL `edited` snapshot taken
+  // Manual-edit history. Each entry contains the FULL `edited` snapshot and focus taken
   // BEFORE a mutation lands (single-line timestamp tweak, suggestion
   // application, intro trim, etc.). Capped at 50 entries — that's enough
   // to walk back through a normal review session without bloating React
@@ -2105,15 +2105,18 @@ export default function LyricsEditor({
   const pushEditHistory = useCallback(() => {
     setIsDirty(true);
     setEditHistory((prev) => {
-      const next = [...prev, edited];
+      const next = [...prev, { segments: edited, focusedId: focusedSegId }];
       return next.length > 50 ? next.slice(next.length - 50) : next;
     });
-  }, [edited]);
+  }, [edited, focusedSegId]);
   const undoEdit = useCallback(() => {
     setEditHistory((prev) => {
       if (!prev.length) return prev;
       const snapshot = prev[prev.length - 1];
-      setEdited(snapshot);
+      setEdited(snapshot.segments);
+      setFocusedSegId(snapshot.focusedId);
+      setPropagationPrompt(null);
+      setTextEditStart(null);
       trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
       return prev.slice(0, -1);
     });
@@ -3747,6 +3750,12 @@ export default function LyricsEditor({
     recordEditorAction("delete", { ids: existingIds, count: existingIds.length });
     pushEditHistory();
     const idSet = new Set(existingIds);
+    if (idSet.has(focusedSegId)) {
+      const index = edited.findIndex((segment) => segment._id === focusedSegId);
+      const next = edited.slice(index + 1).find(segment => !idSet.has(segment._id))
+        || edited.slice(0, index).reverse().find(segment => !idSet.has(segment._id));
+      setFocusedSegId(next?._id ?? null);
+    }
     setEdited((prev) => prev.filter((seg) => !idSet.has(seg._id)));
     setFlushCounter((c) => c + 1);
     trackEditorEvent("editor_timing_changed", {
@@ -3755,7 +3764,7 @@ export default function LyricsEditor({
       duration_ms: 0,
     });
     return true;
-  }, [edited, pushEditHistory, trackEditorEvent]);
+  }, [edited, focusedSegId, pushEditHistory, trackEditorEvent]);
 
   const deleteSeg = (id) => deleteSegments([id]);
 
@@ -3830,6 +3839,9 @@ export default function LyricsEditor({
     return { mode: splitTimingMode(seg, planSegmentSplit(seg, { charOffset })), start: seg.start, end: seg.end };
   };
   const splitSegAt = (id, charOffset, trigger = "caret") => {
+    const source = edited.find(segment => segment._id === id);
+    if (trigger === "caret" && (!source || !planSegmentSplit(source, { charOffset }))) return;
+    const nextFocus = trigger === "caret" ? edited.reduce((m, row) => Math.max(m, row._id), -1) + 2 : null;
     if (trigger) trackLineStructure("split", trigger, [splitTelemetryItem(id, charOffset)]);
     pushEditHistory();
     setEdited((prev) => {
@@ -3850,6 +3862,7 @@ export default function LyricsEditor({
         ...prev.slice(idx + 1),
       ];
     });
+    if (nextFocus != null) setFocusedSegId(nextFocus);
   };
   // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
   const splitSeg = (id) => splitSegAt(id, null, "button");
@@ -3863,15 +3876,17 @@ export default function LyricsEditor({
   // can't fabricate timing for the gap → drop words (karaoke falls back to
   // uniform distribution, consistent with the split fallback).
   const mergeSeg = (id, trigger = "button") => {
-    const mergeIdx = edited.findIndex((s) => s._id === id);
-    if (mergeIdx !== -1 && mergeIdx < edited.length - 1) {
-      const first = edited[mergeIdx];
-      const second = edited[mergeIdx + 1];
-      trackLineStructure("merge", trigger, [{ mode: mergeTimingMode(first, second), start: first.start, end: second.end }]);
+    const mergeIdx = sanitizedEdited.findIndex((s) => s._id === id);
+    if (mergeIdx !== -1 && mergeIdx < sanitizedEdited.length - 1) {
+      const first = sanitizedEdited[mergeIdx];
+      const second = sanitizedEdited[mergeIdx + 1];
+      trackLineStructure("merge", trigger, [{ mode: mergeTimingMode(first, second), start: first.start, end: Math.max(first.end, second.end) }]);
     }
     recordEditorAction("merge", { id });
     pushEditHistory();
-    setEdited((prev) => {
+    setFocusedSegId(id);
+    setEdited((previous) => {
+      const prev = sanitizeSegments(previous);
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1 || idx >= prev.length - 1) return prev;
       const a = prev[idx];
@@ -3882,7 +3897,7 @@ export default function LyricsEditor({
       const mergedWords = aw && bw ? [...aw, ...bw] : null;
       const { words: _awDrop, ...aNoWords } = a;
       const merged = {
-        ...aNoWords, text, start: a.start, end: b.end,
+        ...aNoWords, text, start: a.start, end: Math.max(a.end, b.end),
         ...(mergedWords ? { words: mergedWords } : {}),
       };
       return [...prev.slice(0, idx), merged, ...prev.slice(idx + 2)];
@@ -3913,7 +3928,8 @@ export default function LyricsEditor({
         ...copy, _id: nextId, segment_id: mintSegmentId(),
         start: newStart, end: newEnd, review: true,
       };
-      return [...prev.slice(0, idx), orig, dup, ...prev.slice(idx + 1)];
+      return [...prev.slice(0, idx), orig, dup, ...prev.slice(idx + 1)]
+        .sort((a, b) => a.start - b.start);
     });
     setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
@@ -3923,6 +3939,7 @@ export default function LyricsEditor({
   // Append a blank line at the end of the list. Operator types the
   // missing lyrics into the text input, then tap-syncs it.
   const addBlankLine = () => {
+    const nextId = edited.reduce((m, row) => Math.max(m, row._id), -1) + 1;
     recordEditorAction("addLine", { segments: Array.isArray(edited) ? edited.length : null });
     pushEditHistory();
     setEdited((prev) => {
@@ -3948,15 +3965,18 @@ export default function LyricsEditor({
       const playhead = currentTime > 0 ? Math.max(0, currentTime) : 0;
       const last = prev[prev.length - 1];
       const lastEnd = last ? last.end : 0;
-      const baseStart = playhead > 0
+      let baseStart = playhead > 0
         ? Math.min(playhead, duration ? duration - 0.5 : playhead)
         : Math.min(duration || lastEnd + 2, lastEnd + 0.5);
       const segDur = 3;
-      const baseEnd = Math.min(
+      let baseEnd = Math.min(
         duration || baseStart + segDur,
         baseStart + segDur,
       );
-      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      if (duration > 0) {
+        baseStart = Math.max(0, Math.min(baseStart, duration - 0.1));
+        baseEnd = Math.min(duration, Math.max(baseEnd, baseStart + 0.1));
+      }
       const inserted = {
         _id: nextId, segment_id: mintSegmentId(),
         start: baseStart, end: baseEnd, text: "",
@@ -3967,6 +3987,7 @@ export default function LyricsEditor({
       // immediate render consistent without waiting for a round-trip.
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
   };
 
@@ -3977,6 +3998,7 @@ export default function LyricsEditor({
   const insertLineAfter = (idx) => {
     recordEditorAction("insertLine", { idx });
     if (idx < 0 || idx >= edited.length) return;
+    const nextId = edited.reduce((m, row) => Math.max(m, row._id), -1) + 1;
     pushEditHistory();
     setEdited((prev) => {
       const cur = prev[idx];
@@ -3991,12 +4013,16 @@ export default function LyricsEditor({
         e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
         if (e <= s) e = s + 0.5;
       }
-      const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
+      if (duration > 0) {
+        s = Math.max(0, Math.min(s, duration - 0.1));
+        e = Math.min(duration, Math.max(e, s + 0.1));
+      }
       const inserted = {
         _id: nextId, segment_id: mintSegmentId(), start: s, end: e, text: "",
       };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
+    setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
   };
 
@@ -6610,6 +6636,12 @@ export default function LyricsEditor({
                 onUndo={undoEdit} canUndo={hasUndo} rowRefs={rowRefs}
                 onTextFocus={(line) => { setFocusedSegId(line._id); setTextEditStart({ id: line._id, text: line.text }); }}
                 onTextBlur={handleTextBlur}
+                onMergePrevious={(id) => {
+                  const index = sanitizedEdited.findIndex(line => line._id === id);
+                  if (index > 0) mergeSeg(sanitizedEdited[index - 1]._id, "backspace");
+                }}
+                suggestionsById={suggestionsById} onApplySuggestion={applySuggestion}
+                propagationPrompt={propagationPrompt} onApplyPropagation={applyPropagation} onDismissPropagation={dismissPropagation}
               />
             ) : (
               <>

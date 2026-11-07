@@ -125,6 +125,14 @@ test.describe("Editor 2.0 real collaboration", () => {
 test("advanced edits and intentional duplicates survive real API reload", async ({ browser, request }) => {
   test.skip(!ENABLED, "requires disposable real API/PostgreSQL");
   const token = await login(request, "editor_e2e_a");
+  const initial = await revision(request, token);
+  const overlapping = initial.segments.map((row, index) => index === 0 ? { ...row, end: 2 }
+    : index === 1 ? { ...row, end: 2.5 } : row);
+  const seeded = await request.patch(`${API}/editor/${JOB_ID}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { base_revision: initial.revision, segments: overlapping, checkpoint: "manual" },
+  });
+  expect(seeded.ok()).toBeTruthy();
   const { context, page } = await openEditor(browser, token);
   try {
     const before = await revision(request, token);
@@ -143,6 +151,9 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     const copies = saved.segments.filter(row => row.text === "Persistencia real con espacios");
     expect(copies).toHaveLength(2);
     expect(copies[0].segment_id).not.toBe(copies[1].segment_id);
+    for (const untouched of before.segments.slice(1)) {
+      expect(saved.segments.find(row => row.segment_id === untouched.segment_id)).toEqual(untouched);
+    }
     await page.reload();
     await page.getByRole("button", { name: /4 Lyrics/ }).click();
     await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
