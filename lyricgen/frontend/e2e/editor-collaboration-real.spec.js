@@ -102,10 +102,18 @@ test.describe("Editor 2.0 real collaboration", () => {
     await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await expect(a.page.getByRole("dialog", { name: /Hay una versión más nueva/ })).toHaveCount(0);
 
+    // Undo remains local after reconciliation: it must never erase B's work.
+    await firstLyricsInput(a.page).blur();
+    await a.page.keyboard.press("Control+z");
+    await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
+    await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
+    await expect.poll(async () => (await revision(request, tokenA)).segments[0].text).toBe("A queda local");
+    expect((await revision(request, tokenA)).segments[1].text).toBe("B vuelve a guardar");
+
     await a.page.reload();
     await expect(a.page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
     await a.page.getByRole("button", { name: /4 Lyrics/ }).click();
-    await expect(firstLyricsInput(a.page)).toHaveValue("A segunda versión local");
+    await expect(firstLyricsInput(a.page)).toHaveValue("A queda local");
     await expect(secondLyricsInput(a.page)).toHaveValue("B vuelve a guardar");
     await a.page.getByRole("tab", { name: "Ajustar tiempos" }).click();
     await a.page.getByTestId("editor-overflow-btn").click();
@@ -152,7 +160,11 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     expect(copies).toHaveLength(2);
     expect(copies[0].segment_id).not.toBe(copies[1].segment_id);
     for (const untouched of before.segments.slice(1)) {
-      expect(saved.segments.find(row => row.segment_id === untouched.segment_id)).toEqual(untouched);
+      // _id is a browser-local row handle and can change across hydration.
+      // Compare every durable field, including segment_id, text and timing.
+      const { _id: previousLocalId, ...expected } = untouched;
+      const { _id: savedLocalId, ...actual } = saved.segments.find(row => row.segment_id === untouched.segment_id);
+      expect(actual).toEqual(expected);
     }
     await page.reload();
     await page.getByRole("button", { name: /4 Lyrics/ }).click();

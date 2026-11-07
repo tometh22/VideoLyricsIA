@@ -84,7 +84,11 @@ function normalizeTimelineSegments(input) {
     const parsedStart = Number(rawStart);
     const parsedEnd = Number(rawEnd);
     const start = Number.isFinite(parsedStart) ? Math.max(0, parsedStart) : 0;
-    const end = Number.isFinite(parsedEnd) ? Math.max(start + MIN_DUR_S, parsedEnd) : start + 1;
+    // Minimum drag-resize distance is a UI constraint, not a normalization rule.
+    // Existing valid short vocals must retain their duration when moved.
+    const end = Number.isFinite(parsedEnd)
+      ? parsedEnd > start ? parsedEnd : start + MIN_DUR_S
+      : start + 1;
     return {
       ...segment,
       _id: segment?._id ?? index,
@@ -159,7 +163,9 @@ export default function LyricsTimeline({
   const [rippleEditing, setRippleEditing] = useState(false);
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
-  const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
+  const waveformDuration = Number(waveform?.duration);
+  const knownWaveformDuration = Number.isFinite(waveformDuration) && waveformDuration > 0 ? waveformDuration : 0;
+  const total = Math.max(Number(duration) || 0, knownWaveformDuration, ...normalizedSegments.map((s) => s.end), 1);
   const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - LABEL_W), total * pxPerSec + 24);
   const surfaceWidth = LABEL_W + trackWidth;
   const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
@@ -209,6 +215,37 @@ export default function LyricsTimeline({
       return next.size === previous.size ? previous : next;
     });
   }, [normalizedSegments]);
+
+  useEffect(() => {
+    if (!normalizedSegments.some(item => item._id === focusedSegId)) return;
+    // Keep a multiselection when focus enters one of its members. Zooming or
+    // resizing after "Clear" must not reselect an old focused line.
+    setSelectedIds(previous => previous.has(focusedSegId) ? previous : new Set([focusedSegId]));
+    selectionAnchorRef.current = focusedSegId;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedSegId]);
+
+  useEffect(() => {
+    const segment = normalizedSegments.find(item => item._id === focusedSegId);
+    const scroll = scrollRef.current;
+    if (!segment || !scroll) return;
+    // A deliberate line focus (including entering from campaign review) must
+    // reveal its horizontal time range. Playback activeId never triggers this.
+    const viewport = scroll.clientWidth || viewportWidth;
+    if (!viewport) return;
+    const startX = segment.start * pxPerSec;
+    const endX = segment.end * pxPerSec;
+    const visibleStart = scroll.scrollLeft + 12;
+    const visibleEnd = scroll.scrollLeft + viewport - LABEL_W - 12;
+    if (startX < visibleStart || endX > visibleEnd) {
+      const left = Math.max(0, startX - 24);
+      if (typeof scroll.scrollTo === "function") scroll.scrollTo({ left, behavior: "auto" });
+      else scroll.scrollLeft = left;
+    }
+  // Only explicit focus or viewport/zoom changes reveal a range; autosave,
+  // typing and playback must not reset the user's scroll or selection.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedSegId, viewportWidth, pxPerSec]);
 
   const xToTime = useCallback((clientX) => {
     const rect = trackRef.current?.getBoundingClientRect();
@@ -618,17 +655,21 @@ export default function LyricsTimeline({
     canvas.style.height = `${WAVE_H}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, trackWidth, WAVE_H);
-    const stride = Math.max(1, Math.ceil(peaks.length / Math.max(1, Math.floor(trackWidth / 4))));
+    // Peaks span the source audio, never viewport padding or lyric outliers.
+    // Keep their x coordinates on the same seconds scale as blocks/playhead.
+    const waveformSeconds = knownWaveformDuration || (Number(duration) > 0 ? Number(duration) : total);
+    const waveformWidth = waveformSeconds * pxPerSec;
+    const stride = Math.max(1, Math.ceil(peaks.length / Math.max(1, Math.floor(waveformWidth / 4))));
     ctx.fillStyle = "rgba(139,124,246,0.45)";
     for (let i = 0; i < peaks.length; i += stride) {
-      const x = (i / peaks.length) * trackWidth;
+      const x = (i / peaks.length) * waveformWidth;
       const magnitude = clamp(Math.abs(Number(peaks[i])) || 0, 0, 1);
       const height = Math.max(2, magnitude * (WAVE_H - 8));
-      const visualStep = (stride / peaks.length) * trackWidth;
+      const visualStep = (stride / peaks.length) * waveformWidth;
       const barWidth = Math.max(1, Math.min(3, visualStep - 1));
       ctx.fillRect(x, (WAVE_H - height) / 2, barWidth, height);
     }
-  }, [trackWidth, waveform]);
+  }, [duration, knownWaveformDuration, pxPerSec, total, trackWidth, waveform]);
 
   const startTextEdit = useCallback((segment) => {
     setEditingTextId(segment._id);
@@ -755,7 +796,16 @@ export default function LyricsTimeline({
             <div id="timeline-more-actions" role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl bg-surface-1 p-1.5 ring-1 ring-white/[0.1] shadow-2xl shadow-black/50">
               <button
                 type="button"
-                onClick={() => setFollowEnabled((value) => !value)}
+                onClick={() => {
+                  if (followEnabled && followSuppressed) {
+                    if (followTimerRef.current) clearTimeout(followTimerRef.current);
+                    followTimerRef.current = null;
+                    lastInteractionRef.current = 0;
+                    lastFollowTargetRef.current = null;
+                    setFollowSuppressed(false);
+                    scrollToPlayhead();
+                  } else setFollowEnabled(value => !value);
+                }}
                 aria-pressed={followEnabled}
                 title={t("timeline.follow_hint", "Mantener la línea activa visible")}
                 role="menuitem"

@@ -26,3 +26,19 @@ La interfaz nueva debe cambiar cómo se accede a las acciones, no perder los con
 - CI completo del commit exacto actualizado con staging. Si staging avanza, actualizar el PR y esperar de nuevo.
 
 No se escriben canciones de campaña para probar. No se cambian umbrales de calidad. La métrica de resultado sigue siendo minutos activos por línea y por campaña; mejorar la atribución de texto en el reloj no demuestra por sí solo ahorro de tiempo.
+
+## Tercera auditoría: concurrencia y límites
+
+- **Deshacer es local:** conciliar un documento remoto debe trasladar sus cambios independientes al historial; descartar snapshots ambiguos antes que sobrescribir otra sesión. Preservar metadatos vigentes de filas no modificadas. Restaurar una versión o aplicar un reemplazo autoritativo limpia el historial anterior.
+- **Identidad antes que índice:** una corrección remota puede renovar el `_id` visual; la selección debe seguir el `segment_id` y su ocurrencia legacy.
+- **Vacío también es un borrador:** eliminar todas las líneas sin conexión requiere recuperación explícita, no descarte silencioso del array vacío.
+- **No salir después de un guardado fallido:** cualquier `ok:false` bloquea la transición a diseño/salida, no sólo un conflicto de revisión. El texto permanece visible y se puede reintentar.
+- **Propuestas diferidas no son permiso permanente:** revalidar fuente y destinos al aplicar una corrección repetida. No pisar texto editado después de abrir la propuesta.
+- **Dividir conserva el padre y las vecinas:** ordenar antes de canonizar; cada mitad debe caber en el rango original y cumplir los 10 ms de persistencia. Si no hay lugar para dos mitades, no generar una operación ficticia.
+- **La onda usa segundos reales:** los picos ocupan duración de audio × zoom, nunca el ancho del viewport ni la extensión de una letra fuera del audio. La metadata de waveform permite dibujar mientras carga el audio.
+- **Mover no es redimensionar:** conservar duración de líneas cortas válidas. Mantener por separado las restricciones del gesto de resize.
+- **Entrar a avanzado conserva contexto:** seleccionar y revelar horizontalmente la línea elegida, sin romper multiselección ni volver a seleccionar después de limpiar.
+- **Reanudar significa reanudar:** quitar la suspensión temporal del seguimiento, no apagarlo.
+
+Pruebas: `LyricsEditorPersistenceAudit3.test.jsx`, `rebaseEditorHistory.test.js`, `LyricsEditorStructureAudit3.test.jsx`, `LyricsTimelineInteractionAudit3.test.jsx`, `editor-audit-three.spec.js` y el recorrido real de colaboración con undo después del merge.
+- **Una operación masiva, un paso de deshacer:** dividir varias líneas filtra IDs duplicados/no divisibles y registra una sola instantánea (`BulkSplitAudit3.test.jsx`).

@@ -42,6 +42,7 @@ import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
 import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 import { createSaveQueue } from "../lib/saveQueue";
+import { rebaseEditorHistory, rebaseFocusedSegmentId } from "../lib/rebaseEditorHistory";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
@@ -1434,7 +1435,14 @@ export default function LyricsEditor({
   );
   const handleDurableMerge = useCallback((mergedSegments) => {
     if (!Array.isArray(mergedSegments)) return;
-    setEdited(reseedPreservingIds(editedRef.current, mergedSegments));
+    const before = editedRef.current;
+    const merged = reseedPreservingIds(before, mergedSegments);
+    setEditHistory(history => rebaseEditorHistory(history, before, merged));
+    setFocusedSegId(id => rebaseFocusedSegmentId(before, merged, id));
+    // Tap undo entries contain local row ids and old timing ranges. They are
+    // not safe to replay after another document has changed those identities.
+    if (!segmentsEquivalent(before, merged)) setSyncHistory([]);
+    setEdited(merged);
     setIsDirty(true);
   }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
@@ -1491,7 +1499,7 @@ export default function LyricsEditor({
             phase = "compare";
             // Validate before normalization: clamps/defaults must not make an
             // unreadable copy look equivalent and eligible for deletion.
-            const valid = Array.isArray(draft?.segments) && draft.segments.length > 0
+            const valid = Array.isArray(draft?.segments)
               && draft.segments.every((row) => row && typeof row.text === "string"
                 && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
             if (!valid) throw new Error("invalid_segments");
@@ -2035,6 +2043,23 @@ export default function LyricsEditor({
   // "apply this change to the N other identical lines?".
   const [textEditStart, setTextEditStart] = useState(null);
   const [propagationPrompt, setPropagationPrompt] = useState(null);
+  useEffect(() => {
+    if (!propagationPrompt) return;
+    const source = edited.find((row) => row._id === propagationPrompt.id);
+    // A proposal belongs to this exact correction, not every future edit of
+    // the source or target lines. Remote edits and suggestions invalidate it
+    // just like typing does.
+    if (!source || normalizeLineForMatch(source.text) !== normalizeLineForMatch(propagationPrompt.newText)) {
+      setPropagationPrompt(null);
+      return;
+    }
+    const previousText = normalizeLineForMatch(propagationPrompt.prevText);
+    const matchIds = propagationPrompt.matchIds.filter((id) => edited.some((row) => (
+      row._id === id && normalizeLineForMatch(row.text) === previousText
+    )));
+    if (!matchIds.length) setPropagationPrompt(null);
+    else if (matchIds.length !== propagationPrompt.matchIds.length) setPropagationPrompt({ ...propagationPrompt, matchIds });
+  }, [edited, propagationPrompt]);
 
   // Tap-to-sync mode — operator hits Space (or button) while audio
   // plays to anchor each line at the current playback time. Solves
@@ -3223,6 +3248,10 @@ export default function LyricsEditor({
         editedRef.current,
         sanitizeSegments(nextDocument.segments),
       ));
+      setEditHistory([]);
+      setSyncHistory([]);
+      setPropagationPrompt(null);
+      setTextEditStart(null);
       setIsDirty(false);
     }
     return nextDocument;
@@ -3638,27 +3667,26 @@ export default function LyricsEditor({
           );
           continue;
         }
-        const ratio = lineA.length / totalChars;
-        const dur = Math.max(0.6, seg.end - seg.start);
-        const midTime = seg.start + dur * ratio;
-        const gap = 0.05;
+        const fallback = planSegmentSplit({ ...seg, text: `${lineA} ${lineB}`, words: undefined }, { splitTokenIndex: tokA });
+        if (!fallback) { result.push(seg); continue; }
         result.push({
           ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineA,
-          end: Math.max(seg.start + 0.3, midTime - gap),
+          start: fallback.a.start,
+          end: fallback.a.end,
         });
         result.push({
           ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineB,
-          start: Math.min(seg.end - 0.3, midTime),
-          end: seg.end,
+          start: fallback.b.start,
+          end: fallback.b.end,
         });
       }
-      return result;
+      return result.sort((a, b) => a.start - b.start);
     });
   };
 
@@ -3693,11 +3721,24 @@ export default function LyricsEditor({
 
   const applyPropagation = () => {
     if (!propagationPrompt) return;
-    const { newText, matchIds } = propagationPrompt;
+    const { newText, prevText } = propagationPrompt;
+    const current = editedRef.current;
+    const source = current.find((row) => row._id === propagationPrompt.id);
+    if (!source || normalizeLineForMatch(source.text) !== normalizeLineForMatch(newText)) {
+      setPropagationPrompt(null);
+      return;
+    }
+    const previousText = normalizeLineForMatch(prevText);
+    const matchIds = propagationPrompt.matchIds.filter((id) => current.some((row) => (
+      row._id === id && normalizeLineForMatch(row.text) === previousText
+    )));
+    if (!matchIds.length) { setPropagationPrompt(null); return; }
     pushEditHistory();
     markLinesReviewedByEdit(matchIds);
     const idset = new Set(matchIds);
-    setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
+    setEdited((prev) => prev.map((s) => (
+      idset.has(s._id) && normalizeLineForMatch(s.text) === previousText ? { ...s, text: newText } : s
+    )));
     setPropagationPrompt(null);
     // Flush-save immediately so the propagated lines persist without waiting
     // for the 3 s autosave debounce.
@@ -3838,12 +3879,14 @@ export default function LyricsEditor({
     if (!seg) return null;
     return { mode: splitTimingMode(seg, planSegmentSplit(seg, { charOffset })), start: seg.start, end: seg.end };
   };
-  const splitSegAt = (id, charOffset, trigger = "caret") => {
+  const splitSegAt = (id, charOffset, trigger = "caret", recordHistory = true) => {
     const source = edited.find(segment => segment._id === id);
-    if (trigger === "caret" && (!source || !planSegmentSplit(source, { charOffset }))) return;
-    const nextFocus = trigger === "caret" ? edited.reduce((m, row) => Math.max(m, row._id), -1) + 2 : null;
+    if (!source || !planSegmentSplit(source, { charOffset })) return;
+    const firstNewId = edited.reduce((m, row) => Math.max(m, row._id), -1) + 1;
+    const nextFocus = trigger === "caret" ? firstNewId + 1
+      : trigger === "button" && focusedSegId === id ? firstNewId : null;
     if (trigger) trackLineStructure("split", trigger, [splitTelemetryItem(id, charOffset)]);
-    pushEditHistory();
+    if (recordHistory) pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
@@ -3860,15 +3903,22 @@ export default function LyricsEditor({
       return [
         ...prev.slice(0, idx), half(nextId1, plan.a), half(nextId1 + 1, plan.b),
         ...prev.slice(idx + 1),
-      ];
+      ].sort((a, b) => a.start - b.start);
     });
     if (nextFocus != null) setFocusedSegId(nextFocus);
   };
   // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
   const splitSeg = (id) => splitSegAt(id, null, "button");
   const splitSegs = (ids, trigger) => {
-    trackLineStructure("split", trigger, (ids || []).map((id) => splitTelemetryItem(id, null)));
-    (ids || []).forEach((id) => splitSegAt(id, null, null));
+    const splittableIds = [...new Set(ids || [])].filter((id) => {
+      const segment = edited.find((row) => row._id === id);
+      return segment && planSegmentSplit(segment);
+    });
+    if (!splittableIds.length) return;
+    trackLineStructure("split", trigger, splittableIds.map((id) => splitTelemetryItem(id, null)));
+    // One operator action owns one snapshot, irrespective of line count.
+    pushEditHistory();
+    splittableIds.forEach((id) => splitSegAt(id, null, null, false));
   };
 
   // Merge a line with the NEXT line: concatenate text + per-word timing,
@@ -4577,13 +4627,18 @@ export default function LyricsEditor({
 
   const handleBackSafely = useCallback(async (afterSave) => {
     const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
-    if (result?.ok === false && result.reason === "stale-revision") return;
+    // Every failed flush must keep the editor mounted: network/auth/disabled
+    // failures are just as unsafe to leave as a stale revision.
+    if (result?.ok === false) {
+      toast({ message: t("editor.save_before_exit", "Tus cambios siguen en pantalla. Reintentá guardar antes de salir."), tone: "info" });
+      return;
+    }
     if (typeof afterSave === "function") {
       await afterSave();
       return;
     }
     await Promise.resolve(onBack?.());
-  }, [flushPendingSave, onBack]);
+  }, [flushPendingSave, onBack, toast, t]);
 
   // The campaign header lives in App, outside this component. Register the
   // same save-aware exit used by the editor's back arrow so its header action
@@ -5790,7 +5845,7 @@ export default function LyricsEditor({
                   </p>
                   <button
                     type="button"
-                    onClick={() => { pushEditHistory(); splitSegs(wrap2SegIds, "bulk"); }}
+                    onClick={() => splitSegs(wrap2SegIds, "bulk")}
                     className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.1] hover:text-white transition-colors"
                   >
                     {t("editor.wrap2_banner_split_all") || "Dividir todas"}
@@ -6272,6 +6327,10 @@ export default function LyricsEditor({
                   return;
                 }
                 setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(result.document.segments || [])));
+                setEditHistory([]);
+                setSyncHistory([]);
+                setPropagationPrompt(null);
+                setTextEditStart(null);
                 setIsDirty(false);
                 setSaveStatus("saved");
                 const nextQuality = qualityFromEditorPayload(result.document);
@@ -7171,6 +7230,10 @@ export default function LyricsEditor({
           if (!result?.ok) return;
           const next = sanitizeSegments(result.document.segments || []);
           setEdited(reseedPreservingIds(editedRef.current, next));
+          setEditHistory([]);
+          setSyncHistory([]);
+          setPropagationPrompt(null);
+          setTextEditStart(null);
           setIsDirty(false);
           setSaveStatus("saved");
           setHistoryOpen(false);
