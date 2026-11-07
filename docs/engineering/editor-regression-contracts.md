@@ -54,3 +54,4 @@ Pruebas: `LyricsEditorPersistenceAudit3.test.jsx`, `rebaseEditorHistory.test.js`
 - El preview karaoke sólo reutiliza alineación si los tokens actuales coinciden con los de la evidencia, con la misma normalización básica que el render. No altera los word-stamps originales ni cambia el fallback histórico.
 
 Pruebas nuevas: archivos `*Audit4.test.*`, `editor-navigation-races.spec.js` y `editor-approval-race.spec.js`. La prueba de flush conserva además el caso de dos guardados en cola y una corrección remota independiente.
+- Al terminar una validación, el foco del panel de observaciones o del diálogo de renglones largos tiene prioridad sobre devolverlo al botón Aprobar. Ambos recorridos están cubiertos por E2E de teclado.

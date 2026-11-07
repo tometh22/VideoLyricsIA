@@ -3096,6 +3096,9 @@ export default function LyricsEditor({
   const focusLyricReview = useCallback((scroll = true) => {
     const panel = reviewPanelRef.current;
     if (!panel) return;
+    // Validation owns the next focus target. Approval may still have the
+    // editor inert here; focus this panel after unlocking, not the submitter.
+    if (approveInFlightRef.current) approvalReturnFocusRef.current = panel;
     if (scroll) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
     panel.focus({ preventScroll: true });
   }, []);
@@ -4444,6 +4447,8 @@ export default function LyricsEditor({
       (seg) => (seg.text || "").trim() && linesForSeg(seg.text) >= 3
     );
     if (problematic.length > 0 && !skipWrapWarning) {
+      // The modal owns focus until dismissed; do not return behind it.
+      approvalReturnFocusRef.current = null;
       setWrapWarning({ ids: problematic.map((s) => s._id) });
       return;
     }

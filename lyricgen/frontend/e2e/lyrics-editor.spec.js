@@ -487,6 +487,7 @@ test.describe("lyrics editor browser contract", () => {
 
     const dialog = page.getByRole("dialog", { name: /Una línea puede ocupar 3 renglones/i });
     await expect(dialog).toBeVisible();
+    await expect(dialog).toBeFocused();
     const box = await dialog.boundingBox();
     expect(box).not.toBeNull();
     expect(box.y).toBeGreaterThanOrEqual(0);
