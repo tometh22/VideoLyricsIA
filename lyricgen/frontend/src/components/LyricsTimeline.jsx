@@ -38,6 +38,14 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function clampMoveDelta(segments, selectedIds, requestedDelta, duration, gap) {
+  const bounded = clampSelectionShiftDelta(segments, selectedIds, requestedDelta, duration, gap);
+  // Imported outliers can already violate the audio bound. Clamping an
+  // outward request must block it, never turn a right gesture into a left
+  // edit. An inward request may still recover the line into valid bounds.
+  return Math.sign(bounded) === Math.sign(requestedDelta) ? bounded : 0;
+}
+
 function fmt(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
   const m = Math.floor(sec / 60);
@@ -165,7 +173,13 @@ export default function LyricsTimeline({
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
   const waveformDuration = Number(waveform?.duration);
   const knownWaveformDuration = Number.isFinite(waveformDuration) && waveformDuration > 0 ? waveformDuration : 0;
-  const total = Math.max(Number(duration) || 0, knownWaveformDuration, ...normalizedSegments.map((s) => s.end), 1);
+  const audioDuration = Number(duration);
+  const knownAudioDuration = Number.isFinite(audioDuration) && audioDuration > 0 ? audioDuration : 0;
+  const total = Math.max(knownAudioDuration, knownWaveformDuration, ...normalizedSegments.map((s) => s.end), 1);
+  // The canvas can extend past the audio (padding, minimum width or legacy
+  // outliers). Those display bounds must never authorize edits past the file.
+  const editDuration = knownAudioDuration || knownWaveformDuration || total;
+  const focusedSegmentAvailable = normalizedSegments.some(item => item._id === focusedSegId);
   const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - LABEL_W), total * pxPerSec + 24);
   const surfaceWidth = LABEL_W + trackWidth;
   const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
@@ -217,13 +231,12 @@ export default function LyricsTimeline({
   }, [normalizedSegments]);
 
   useEffect(() => {
-    if (!normalizedSegments.some(item => item._id === focusedSegId)) return;
+    if (!focusedSegmentAvailable) return;
     // Keep a multiselection when focus enters one of its members. Zooming or
     // resizing after "Clear" must not reselect an old focused line.
     setSelectedIds(previous => previous.has(focusedSegId) ? previous : new Set([focusedSegId]));
     selectionAnchorRef.current = focusedSegId;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedSegId]);
+  }, [focusedSegId, focusedSegmentAvailable]);
 
   useEffect(() => {
     const segment = normalizedSegments.find(item => item._id === focusedSegId);
@@ -245,13 +258,13 @@ export default function LyricsTimeline({
   // Only explicit focus or viewport/zoom changes reveal a range; autosave,
   // typing and playback must not reset the user's scroll or selection.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedSegId, viewportWidth, pxPerSec]);
+  }, [focusedSegId, focusedSegmentAvailable, viewportWidth, pxPerSec]);
 
   const xToTime = useCallback((clientX) => {
     const rect = trackRef.current?.getBoundingClientRect();
     if (!rect) return 0;
-    return clamp((clientX - rect.left) / pxPerSec, 0, total);
-  }, [pxPerSec, total]);
+    return clamp((clientX - rect.left) / pxPerSec, 0, editDuration);
+  }, [editDuration, pxPerSec]);
 
   const seekAt = useCallback((clientX) => {
     markInteraction();
@@ -305,6 +318,8 @@ export default function LyricsTimeline({
     event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     marqueeRef.current = {
+      captureTarget: event.currentTarget,
+      pointerId: event.pointerId,
       originX: event.clientX,
       originY: event.clientY,
       currentX: event.clientX,
@@ -409,6 +424,8 @@ export default function LyricsTimeline({
       setSelectedIds(new Set([segment._id]));
     }
     dragRef.current = {
+      captureTarget: event.currentTarget,
+      pointerId: event.pointerId,
       id: segment._id,
       mode,
       originX: event.clientX,
@@ -441,11 +458,11 @@ export default function LyricsTimeline({
       drag.moved = true;
     }
     if (drag.movingGroup) {
-      const safeDelta = clampSelectionShiftDelta(
+      const safeDelta = clampMoveDelta(
         normalizedSegments,
         new Set(drag.snapshots.map((item) => item.id)),
         delta,
-        total,
+        editDuration,
         gapS,
       );
       setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
@@ -461,12 +478,12 @@ export default function LyricsTimeline({
       const requestedEnd = drag.mode === "end" ? drag.origEnd + delta : drag.origEnd;
       const resize = drag.ripple && drag.mode === "end"
         ? rippleResizeEnd(
-          normalizedSegments, drag.id, requestedEnd, total, gapS, MIN_DUR_S,
+          normalizedSegments, drag.id, requestedEnd, editDuration, gapS, MIN_DUR_S,
         )
         : (() => {
           const bounded = clampResizeTiming(
             normalizedSegments, drag.id, requestedStart, requestedEnd,
-            total, gapS, MIN_DUR_S, drag.mode,
+            editDuration, gapS, MIN_DUR_S, drag.mode,
           );
           return bounded ? {
             changes: [{ id: drag.id, start: bounded.start, end: bounded.end }],
@@ -490,7 +507,7 @@ export default function LyricsTimeline({
     } else {
       if (drag.ripple) {
         const move = shiftTimingWithAdjacent(
-          normalizedSegments, drag.id, delta, total, gapS,
+          normalizedSegments, drag.id, delta, editDuration, gapS,
         );
         const ownChange = move.changes.find((change) => change.id === drag.id);
         if (ownChange) ({ start, end } = ownChange);
@@ -500,8 +517,8 @@ export default function LyricsTimeline({
           return;
         }
       } else {
-        const safeDelta = clampSelectionShiftDelta(
-          normalizedSegments, new Set([drag.id]), delta, total, gapS,
+        const safeDelta = clampMoveDelta(
+          normalizedSegments, new Set([drag.id]), delta, editDuration, gapS,
         );
         start = drag.origStart + safeDelta;
         end = drag.origEnd + safeDelta;
@@ -511,7 +528,7 @@ export default function LyricsTimeline({
       }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
-  }, [gapS, normalizedSegments, t, total, updateMarquee]);
+  }, [editDuration, gapS, normalizedSegments, t, updateMarquee]);
 
   const finishDrag = useCallback((event, segment) => {
     if (marqueeRef.current) {
@@ -553,6 +570,12 @@ export default function LyricsTimeline({
   }, [finishMarquee, markInteraction, onDragStart, onFocus, onGroupMoved, onSeek, onTimingChange, onTimingChangeBatch, preview, xToTime]);
 
   const cancelPointerInteraction = useCallback((event) => {
+    for (const interaction of [dragRef.current, marqueeRef.current]) {
+      const target = interaction?.captureTarget;
+      if (target?.hasPointerCapture?.(interaction.pointerId)) {
+        target.releasePointerCapture?.(interaction.pointerId);
+      }
+    }
     dragRef.current = null;
     marqueeRef.current = null;
     setPreview(null);
@@ -560,6 +583,20 @@ export default function LyricsTimeline({
     setLimitFeedback("Edición cancelada; se restauraron los tiempos anteriores.");
     event?.stopPropagation?.();
   }, []);
+
+  const pointerInteractionActive = preview != null || marquee != null;
+  useEffect(() => {
+    if (!pointerInteractionActive) return undefined;
+    // Pointer-down prevents browser focus changes. Escape must still cancel
+    // when the previously focused control lives outside this workspace.
+    const onEscape = (event) => {
+      if (event.key !== "Escape" || event.isComposing || (!dragRef.current && !marqueeRef.current)) return;
+      event.preventDefault();
+      cancelPointerInteraction(event);
+    };
+    window.addEventListener("keydown", onEscape, true);
+    return () => window.removeEventListener("keydown", onEscape, true);
+  }, [cancelPointerInteraction, pointerInteractionActive]);
 
   const fitTimeline = useCallback(() => {
     setPxPerSec(fitZoom());
@@ -570,7 +607,7 @@ export default function LyricsTimeline({
     const snapshots = normalizedSegments.filter((segment) => selectedIds.has(segment._id));
     if (!snapshots.length) return;
     if (rippleEditing && snapshots.length === 1) {
-      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, total, gapS);
+      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, editDuration, gapS);
       if (!move.changes.length) {
         setLimitFeedback("La cadena llegó al límite disponible.");
         return;
@@ -580,7 +617,7 @@ export default function LyricsTimeline({
       markInteraction();
       return;
     }
-    const safeDelta = clampSelectionShiftDelta(normalizedSegments, selectedIds, delta, total, gapS);
+    const safeDelta = clampMoveDelta(normalizedSegments, selectedIds, delta, editDuration, gapS);
     if (Math.abs(safeDelta) < 1e-6) {
       setLimitFeedback(snapshots.length === 1
         ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
@@ -594,7 +631,7 @@ export default function LyricsTimeline({
       end: segment.end + safeDelta,
     })));
     markInteraction();
-  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds, total]);
+  }, [editDuration, gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds]);
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;

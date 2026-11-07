@@ -42,3 +42,15 @@ No se escriben canciones de campaña para probar. No se cambian umbrales de cali
 
 Pruebas: `LyricsEditorPersistenceAudit3.test.jsx`, `rebaseEditorHistory.test.js`, `LyricsEditorStructureAudit3.test.jsx`, `LyricsTimelineInteractionAudit3.test.jsx`, `editor-audit-three.spec.js` y el recorrido real de colaboración con undo después del merge.
 - **Una operación masiva, un paso de deshacer:** dividir varias líneas filtra IDs duplicados/no divisibles y registra una sola instantánea (`BulkSplitAudit3.test.jsx`).
+
+## Cuarta auditoría: operaciones en vuelo
+
+- Salir espera las ediciones que llegaron durante el guardado. Si siguen llegando cambios tras los intentos acotados, conserva el editor abierto. Una aprobación mantiene su snapshot explícito y exige nueva confirmación si cambia.
+- Una transición de salida sólo corre una vez. Una petición de un editor desmontado no puede navegar; las respuestas de siguiente/aprobación verifican identidad de canción y ruta antes de cambiar la pantalla.
+- Mientras se aprueba, el editor no acepta cambios ni atajos de edición; un fallo recupera la interacción y el foco, manteniendo un estado accesible fuera de la región bloqueada.
+- Escape descarta el gesto de arrastre o selección antes de soltar el puntero, sin persistir ni generar deshacer. El límite físico del audio es independiente del ancho visual mínimo; no puede invertir la dirección de un movimiento.
+- El foco recibido antes de los datos se aplica cuando llega la identidad, sin reactivar una selección limpiada ante cambios de texto.
+- La guía opcional invalida escucha/decisión cuando cambia el rango, aunque conserve ID. Sus picos se posicionan por tiempo absoluto, también en recortes fraccionarios y clips cortos.
+- El preview karaoke sólo reutiliza alineación si los tokens actuales coinciden con los de la evidencia, con la misma normalización básica que el render. No altera los word-stamps originales ni cambia el fallback histórico.
+
+Pruebas nuevas: archivos `*Audit4.test.*`, `editor-navigation-races.spec.js` y `editor-approval-race.spec.js`. La prueba de flush conserva además el caso de dos guardados en cola y una corrección remota independiente.

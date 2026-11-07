@@ -2167,6 +2167,12 @@ export default function App() {
   const [backgroundMode, setBackgroundMode] = useState("as_is");
   const creativeReviewRef = useRef(currentReview);
   creativeReviewRef.current = currentReview;
+  const campaignRouteKeyRef = useRef(location.key);
+  campaignRouteKeyRef.current = location.key;
+  const campaignReviewStillCurrent = useCallback((review, routeKey) => (
+    campaignRouteKeyRef.current === routeKey
+    && creativeReviewRef.current?.transcribeJobId === review?.transcribeJobId
+  ), []);
   const campaignCreativeSave = useCampaignCreativeSave({
     identity: currentReview?.campaignCreativeRevision != null && currentReview?.campaignId
       ? `${currentReview.campaignId}/${currentReview.campaignItemId}` : null,
@@ -4307,6 +4313,7 @@ export default function App() {
     // the generic wizard's approve→generate transition: backgrounds and
     // renders are a separate, later stage triggered outside this screen.
     if (r.campaignId && r.transcribeJobId) {
+      const approvalRouteKey = campaignRouteKeyRef.current;
       // Never infer review from mere presence in the submitted document.
       // LyricsEditor supplies only the identities explicitly confirmed (or
       // deliberately edited) by the operator; the backend then compares this
@@ -4316,6 +4323,7 @@ export default function App() {
         : [];
       try {
         if (r.campaignCreativeRevision != null) await campaignCreativeSave.save();
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) return { ok: false, reason: "abandoned" };
         const response = await authFetch(
           `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
           {
@@ -4337,6 +4345,9 @@ export default function App() {
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           return campaignApprovalFailure(response, body, t);
+        }
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) {
+          return { ok: true, abandoned: true, approvedEditorVersionId: body?.approved_version_id || null };
         }
         wizardPersistence.clear();
         segmentsStore.evict(reviewStoreKey(r));
@@ -5973,8 +5984,10 @@ export default function App() {
 
   const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     if (review?.transcribeJobId) {
       try {
         await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
@@ -5983,20 +5996,23 @@ export default function App() {
         });
       } catch { /* the lock expires safely even if release is unavailable */ }
     }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
     navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
-  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   const handleCampaignReviewNext = useCallback(async () => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     if (!review?.campaignId || !review?.transcribeJobId) {
       await handleCampaignReviewExit();
       return;
     }
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     let nextPath = campaignReturnPath || "/admin/cola";
     const returnParams = campaignReturnPath
       ? new URL(campaignReturnPath, window.location.origin).searchParams
@@ -6017,17 +6033,19 @@ export default function App() {
         nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
       }
     } catch { /* leave through the queue; the current draft is already saved */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     try {
       await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
         method: "DELETE",
         headers: editorSessionHeaders(),
       });
     } catch { /* the lock expires safely even if release is unavailable */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     segmentsStore.evict(reviewStoreKey(review));
     navigate(nextPath);
-  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -6491,8 +6509,11 @@ export default function App() {
     : currentReview?.campaignId ? (campaignDesignOpen ? <>
       <div className="mb-3 flex flex-wrap items-center gap-3">
         <button type="button" className="btn-secondary" onClick={async () => {
+          const review = currentReview;
+          const routeKey = campaignRouteKeyRef.current;
           try {
             await campaignCreativeSave.save();
+            if (!campaignReviewStillCurrent(review, routeKey)) return;
             const close = () => setCampaignDesignJobId(null);
             const safeExit = campaignReviewSafeExitRef.current;
             if (safeExit) await safeExit(close); else close();

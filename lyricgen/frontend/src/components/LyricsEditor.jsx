@@ -3527,7 +3527,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (draftRecoveryRef.current || e.defaultPrevented) return;
+      if (draftRecoveryRef.current || approveInFlightRef.current || e.defaultPrevented) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing || tag === "SELECT") return;
@@ -4354,6 +4354,13 @@ export default function LyricsEditor({
   // encima de un edit que en realidad sí había arrancado.
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
+  const approvalReturnFocusRef = useRef(null);
+  useEffect(() => {
+    if (isApproving || !approvalReturnFocusRef.current) return;
+    const target = approvalReturnFocusRef.current;
+    approvalReturnFocusRef.current = null;
+    if (target.isConnected) target.focus?.();
+  }, [isApproving]);
 
   const [languageResolutionOpen, setLanguageResolutionOpen] = useState(false);
   const [languageResolutionBusy, setLanguageResolutionBusy] = useState(false);
@@ -4510,6 +4517,14 @@ export default function LyricsEditor({
         });
         return;
       }
+      const approvalSnapshotStillCurrent = (expected) => {
+        if (segmentsEquivalent(expected, sanitizeSegmentsForPersistence(editedRef.current))) return true;
+        setIsDirty(true);
+        toast({ message: t("editor.approval_changed_during_save", "La letra cambió mientras guardábamos. Revisá tus últimos cambios y volvé a aprobar."), tone: "info" });
+        return false;
+      };
+      let savedScreenSnapshot = saveResult?.segments || cleanedForPersistence;
+      if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
       // El guardado recién hecho es la verdad: si la letra que se va a
       // aprobar todavía tiene puntos obligatorios, se deciden antes.
       if (saveResult?.lyricReview?.mode === "enforce"
@@ -4526,6 +4541,7 @@ export default function LyricsEditor({
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (qualityAcknowledged
           && !await persistQualityAcknowledgement(currentSave.revision)) return;
+        if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
         approvalResult = await Promise.resolve(onApprove(approvalSegments, {
           baseRevision: currentSave.revision,
           editorRevision: currentSave.revision,
@@ -4539,7 +4555,11 @@ export default function LyricsEditor({
         // Refresh the durable document, rebase the current screen snapshot,
         // and retry with the newly-created version. No modal is needed and
         // every retry still goes through the backend revision check.
+        if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
         const reconciled = await durableEditor.reconcile(persistenceSnapshot);
+        // Reconciliation may itself take seconds; never replace text typed
+        // during that wait with the older approval candidate.
+        if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
         if (!reconciled?.ok) {
           break;
         }
@@ -4553,6 +4573,8 @@ export default function LyricsEditor({
         }
         currentSave = await flushDurableSave("manual", persistenceSnapshot);
         if (currentSave?.ok === false) break;
+        savedScreenSnapshot = currentSave?.segments || persistenceSnapshot;
+        if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
       }
       if (approvalResult?.ok === false) {
         setIsDirty(true);
@@ -4615,6 +4637,7 @@ export default function LyricsEditor({
     // cobertura sólo cuenta tramos registrados antes de la primera versión
     // aprobada.
     flushPlaybackCoverage("approve");
+    approvalReturnFocusRef.current = document.activeElement;
     approveInFlightRef.current = true;
     setIsApproving(true);
     try {
@@ -4625,19 +4648,33 @@ export default function LyricsEditor({
     }
   };
 
+  const safeExitLifetimeRef = useRef(null);
+  const safeExitInFlightRef = useRef(null);
+  useEffect(() => {
+    const lifetime = { active: true };
+    safeExitLifetimeRef.current = lifetime;
+    safeExitInFlightRef.current = null;
+    return () => { lifetime.active = false; };
+  }, [transcribeJobId]);
+
   const handleBackSafely = useCallback(async (afterSave) => {
-    const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
-    // Every failed flush must keep the editor mounted: network/auth/disabled
-    // failures are just as unsafe to leave as a stale revision.
-    if (result?.ok === false) {
-      toast({ message: t("editor.save_before_exit", "Tus cambios siguen en pantalla. Reintentá guardar antes de salir."), tone: "info" });
-      return;
+    const lifetime = safeExitLifetimeRef.current;
+    if (!lifetime?.active || safeExitInFlightRef.current || approveInFlightRef.current) return;
+    const operation = {};
+    safeExitInFlightRef.current = operation;
+    try {
+      const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
+      if (!lifetime.active || result?.abandoned) return;
+      // Network/auth/disabled failures are just as unsafe as a stale revision.
+      if (result?.ok === false) {
+        toast({ message: t("editor.save_before_exit", "Tus cambios siguen en pantalla. Reintentá guardar antes de salir."), tone: "info" });
+        return;
+      }
+      if (typeof afterSave === "function") await afterSave();
+      else await Promise.resolve(onBack?.());
+    } finally {
+      if (safeExitInFlightRef.current === operation) safeExitInFlightRef.current = null;
     }
-    if (typeof afterSave === "function") {
-      await afterSave();
-      return;
-    }
-    await Promise.resolve(onBack?.());
   }, [flushPendingSave, onBack, toast, t]);
 
   // The campaign header lives in App, outside this component. Register the
@@ -4799,7 +4836,11 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery || isApproving ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy || isApproving} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {isApproving && createPortal(<div role="status" aria-live="polite"
+        className="pointer-events-none fixed left-1/2 top-4 z-[95] -translate-x-1/2 rounded-xl bg-surface-1 px-5 py-3 text-sm text-white shadow-xl ring-1 ring-white/20">
+        {t("editor.applying_changes") || "Aplicando cambios…"}
+      </div>, document.body)}
       {(reanchoring || pasteBusy) && <ReanchorProgressDialog
         waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}

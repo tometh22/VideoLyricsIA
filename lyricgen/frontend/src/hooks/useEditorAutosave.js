@@ -85,8 +85,9 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
       retryCountRef.current = 0;
       if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
-      runtimeRef.current.onStatus?.("saved", null, { durationMs: performance.now() - started, checkpoint, result });
-      return result;
+      const saved = { ...result, segments: Array.isArray(result.segments) ? result.segments : snapshot };
+      runtimeRef.current.onStatus?.("saved", null, { durationMs: performance.now() - started, checkpoint, result: saved });
+      return saved;
     }
     if ((result?.reason === "merged" || result?.reason === "conflict")
       && Array.isArray(result.mergedSegments)) {
@@ -163,10 +164,24 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
     };
   }, [dirty, enabled, onStatus, runSave]);
 
-  const flush = useCallback(
-    (checkpoint = "draft", overrideSegments = null) => runSave(checkpoint, false, overrideSegments),
-    [runSave],
-  );
+  const flush = useCallback(async (checkpoint = "draft", overrideSegments = null) => {
+    // Approval supplies an exact snapshot; never silently promote later edits
+    // into that attestation. Navigation/manual flushes instead drain typing
+    // that arrived while the previous request was on the wire.
+    if (Array.isArray(overrideSegments)) return runSave(checkpoint, false, overrideSegments);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      clearTimers();
+      const snapshot = segmentsRef.current;
+      const result = await runSave(checkpoint, false, snapshot);
+      if (!result?.ok || result.abandoned) return result;
+      const persisted = Array.isArray(result.segments) ? result.segments : snapshot;
+      if (segmentsEquivalent(persisted, segmentsRef.current)) return result;
+    }
+    // A continuously changing document is still editable, but is not safe to
+    // leave yet. The latest edit's normal autosave remains available.
+    runtimeRef.current.onStatus?.("local", null);
+    return { ok: false, reason: "pending-changes" };
+  }, [clearTimers, runSave]);
 
   const forceRecover = useCallback(
     (checkpoint = "manual") => runSave(checkpoint, true),

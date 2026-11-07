@@ -70,7 +70,7 @@ function FocusedWaveform({
   const dragRef = useRef(null);
   const [width, setWidth] = useState(720);
   const [dragPreview, setDragPreview] = useState(null);
-  const span = Math.max(0.5, rangeEnd - rangeStart);
+  const span = Math.max(0.001, rangeEnd - rangeStart);
 
   useEffect(() => {
     const node = surfaceRef.current;
@@ -100,7 +100,9 @@ function FocusedWaveform({
     canvas.style.height = `${height}px`;
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     context.clearRect(0, 0, width, height);
-    const audioDuration = Math.max(Number(waveform?.duration) || Number(duration) || rangeEnd, rangeEnd);
+    const waveformDuration = Number(waveform?.duration);
+    const audioDuration = Number.isFinite(waveformDuration) && waveformDuration > 0
+      ? waveformDuration : Number(duration) > 0 ? Number(duration) : rangeEnd;
     const first = clamp(Math.floor((rangeStart / audioDuration) * peaks.length), 0, peaks.length - 1);
     const last = clamp(Math.ceil((rangeEnd / audioDuration) * peaks.length), first + 1, peaks.length);
     const visibleCount = Math.max(1, last - first);
@@ -108,12 +110,15 @@ function FocusedWaveform({
     const stride = Math.max(1, Math.ceil(visibleCount / bars));
     context.fillStyle = "rgba(167, 139, 250, 0.82)";
     for (let index = first; index < last; index += stride) {
-      const x = ((index - first) / visibleCount) * width;
+      // Rounded source-bin indices choose what to draw, not its time scale.
+      // The first bin may begin before this fractional focused window.
+      const x = ((index * audioDuration / peaks.length - rangeStart) / span) * width;
       const magnitude = clamp(Number(peaks[index]) || 0, 0, 1);
       const barHeight = Math.max(2, magnitude * (height - 10));
-      context.fillRect(x, (height - barHeight) / 2, Math.max(1.5, Math.min(3, (width / visibleCount) * stride - 1)), barHeight);
+      const binWidth = (audioDuration / peaks.length / span) * width;
+      context.fillRect(x, (height - barHeight) / 2, Math.max(1.5, Math.min(3, binWidth * stride - 1)), barHeight);
     }
-  }, [duration, rangeEnd, rangeStart, waveform, width]);
+  }, [duration, rangeEnd, rangeStart, span, waveform, width]);
 
   const positionPct = useCallback((time) => clamp(((time - rangeStart) / span) * 100, 0, 100), [rangeStart, span]);
   const commitShift = useCallback((segment, requestedDelta, operation) => {
@@ -336,7 +341,7 @@ export default function GuidedTimingReview({
   useEffect(() => {
     setHasListened(false);
     setAlignmentDecision(null);
-  }, [activeWindowId]);
+  }, [activeWindowSignature]);
   const overlappingSegments = useMemo(() => {
     if (!activeWindow) return [];
     return segments.filter((segment) => Number(segment.end) >= activeWindow.start && Number(segment.start) <= activeWindow.end);
