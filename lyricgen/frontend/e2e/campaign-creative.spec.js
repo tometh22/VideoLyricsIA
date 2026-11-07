@@ -58,7 +58,7 @@ test("39-song contract assignment survives reload, generates only approved songs
 });
 
 test("individual campaign typography autosaves and reopens without approving or generating", async ({ page }) => {
-  await installEditorHarness(page, { jobId: "creative0001", role: "admin" });
+  const editor = await installEditorHarness(page, { jobId: "creative0001", role: "admin" });
   let settings = { font: "anton", effect: "rain", movement_style: "foto-parallax", font_scale: 1.2,
     title_template: "badge", title_artist_font: "anton", title_song_font: "poppins-bold", title_size: 1.3,
     background_hint: "Paisaje de Chile", bg_verbatim: true, match_lyrics: false };
@@ -86,7 +86,7 @@ test("individual campaign typography autosaves and reopens without approving or 
   await page.addLocatorHandler(announcement, async () => announcement.getByRole("button", { name: "Cancelar" }).click());
   await page.goto("/review/creative0001?return_to=%2Fcampaigns%2Fc1");
   await expect(page.getByText("Letra de prueba", { exact: true }).first()).toBeVisible();
-  await page.locator('[data-wizard-step="4"]').click();
+  await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
   const font = page.getByRole("button", { name: /^Tipografía:?$/ }).first();
   await expect(font).toContainText("Anton");
   await font.click();
@@ -98,8 +98,15 @@ test("individual campaign typography autosaves and reopens without approving or 
   expect(saves[0].settings.scene_source).toBe("prompt_literal");
   await page.reload();
   await expect(page.getByText("Letra de prueba", { exact: true }).first()).toBeVisible();
-  await page.locator('[data-wizard-step="4"]').click();
+  await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
   await expect(page.getByRole("button", { name: /^Tipografía:?$/ }).first()).toContainText("Poppins");
+  await page.getByRole("button", { name: "Volver a revisar letra", exact: true }).click();
+  await expect(page.getByTestId("campaign-line-workspace")).toBeVisible();
+  await page.getByLabel("Letra de esta línea", { exact: true }).fill("Letra editada antes de diseñar");
+  await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
+  await expect.poll(() => editor.saves.at(-1)?.segments[0]?.text).toBe("Letra editada antes de diseñar");
+  await page.getByRole("button", { name: "Volver a revisar letra", exact: true }).click();
+  await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Letra editada antes de diseñar");
   expect(paidCalls).toEqual([]);
 });
 

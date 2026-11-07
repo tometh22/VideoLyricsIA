@@ -1838,6 +1838,10 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  const [campaignDesignJobId, setCampaignDesignJobId] = useState(null);
+  const campaignDesignOpen = Boolean(currentReview?.campaignId
+    && campaignDesignJobId === currentReview?.transcribeJobId);
+  useEffect(() => { setCampaignDesignJobId(null); }, [currentReview?.transcribeJobId]);
   const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
   // First-pass reviews, resumed sessions and back-navigation all have a
   // transcription job but previously never requested its peak envelope.
@@ -5861,6 +5865,7 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
+        initialStep={campaignDesignOpen ? 4 : null}
         editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
@@ -6146,6 +6151,13 @@ export default function App() {
               <div className="flex flex-wrap gap-2">
                 {currentReview.campaignId && (
                   <>
+                    {!campaignDesignOpen && <button type="button" className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                      onClick={() => {
+                        const open = () => setCampaignDesignJobId(currentReview.transcribeJobId);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(open); else open();
+                      }}>{t("review_workspace.design")}</button>}
+
                     <button
                       type="button"
                       onClick={() => {
@@ -6470,19 +6482,26 @@ export default function App() {
     );
   })();
 
-  // Capa B 2026-05-24 + Phase 2 2026-05-25 — wizardScreen siempre es
-  // newBatchScreen (UploadZone). El layout de 3 columnas del wizard
-  // (stepper + WizardLivePreview + contenido) abarca ahora también la
-  // review (paso 6): el contenido de reviewScreen se inyecta como render
-  // prop en UploadZone y aparece en la columna derecha del wizard. El
-  // operador NUNCA cambia de layout durante el flow — el preview central
-  // y el stepper persisten desde el drop del audio hasta "Crear videos".
-  // wizardStage queda como flag de back-compat (sessionStorage, /review
-  // como ruta legacy) pero NO controla qué pantalla se renderiza.
+  // Campaigns open in the dedicated review workspace. Visual design remains
+  // an explicit entry into the existing wizard, with saves flushed on exit.
+  // Creation and post-render editing retain their existing wizard flow.
   const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
   const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
     ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
-    : currentReview?.campaignId ? reviewScreen : newBatchScreen;
+    : currentReview?.campaignId ? (campaignDesignOpen ? <>
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <button type="button" className="btn-secondary" onClick={async () => {
+          try {
+            await campaignCreativeSave.save();
+            const close = () => setCampaignDesignJobId(null);
+            const safeExit = campaignReviewSafeExitRef.current;
+            if (safeExit) await safeExit(close); else close();
+          } catch { /* The save hook exposes the error below and retains edits. */ }
+        }}>{t("review_workspace.back_to_lyrics")}</button>
+        {campaignCreativeSave.error && <p role="alert" className="text-red-300">{campaignCreativeSave.error}</p>}
+      </div>
+      {newBatchScreen}
+    </> : reviewScreen) : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
