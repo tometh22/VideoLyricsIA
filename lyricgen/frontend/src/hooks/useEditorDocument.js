@@ -64,6 +64,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
   const documentRef = useRef(null);
   const mountedRef = useRef(true);
   const saveChainRef = useRef(Promise.resolve());
+  const saveGenerationRef = useRef(0);
   const hasDocument = Boolean(document);
 
   const applyDocument = useCallback((value) => {
@@ -246,10 +247,13 @@ export function useEditorDocument({ jobId, enabled, request }) {
   // own subsequent edit; each queued request reads revisionRef only when it
   // actually starts.
   const save = useCallback((segments, checkpoint = "draft") => {
-    const operation = saveChainRef.current.then(
-      () => performSave(segments, checkpoint),
-      () => performSave(segments, checkpoint),
-    );
+    const generation = saveGenerationRef.current;
+    const run = async () => {
+      if (generation !== saveGenerationRef.current) return { ok: false, reason: "superseded" };
+      const result = await performSave(segments, checkpoint);
+      return generation === saveGenerationRef.current ? result : { ok: false, reason: "superseded" };
+    };
+    const operation = saveChainRef.current.then(run, run);
     saveChainRef.current = operation.then(() => undefined, () => undefined);
     return operation;
   }, [performSave]);
@@ -305,20 +309,30 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return response.ok ? body.versions || [] : [];
   }, [jobId, request]);
 
-  const restoreVersion = useCallback(async (versionId) => {
-    const response = await request(`/editor/${jobId}/restore`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version_id: versionId, base_revision: revisionRef.current }),
-    });
-    const body = await responseBody(response);
-    if (response.status === 409) {
-      return { ok: false, reason: "stale-revision", currentRevision: body?.current_revision };
-    }
-    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
-    applyDocument({ ...document, ...body });
-    return { ok: true, document: body };
-  }, [applyDocument, document, jobId, request]);
+  const restoreVersion = useCallback((versionId) => {
+    // A restore is an authoritative replacement. Cancel old queued snapshots
+    // and wait for the write already on the wire before reading its CAS base.
+    saveGenerationRef.current += 1;
+    const run = async () => {
+      try {
+        const response = await request(`/editor/${jobId}/restore`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version_id: versionId, base_revision: revisionRef.current }),
+        });
+        const body = await responseBody(response);
+        if (response.status === 409) return { ok: false, reason: "stale-revision", currentRevision: body?.current_revision };
+        if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+        applyDocument({ ...documentRef.current, ...body });
+        return { ok: true, document: body };
+      } catch (error) {
+        return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(error) };
+      }
+    };
+    const operation = saveChainRef.current.then(run, run);
+    saveChainRef.current = operation.then(() => undefined, () => undefined);
+    return operation;
+  }, [applyDocument, jobId, request]);
 
   const undoAutoRepair = useCallback(async () => {
     const response = await request(`/editor/${jobId}/auto-repair/undo`, {

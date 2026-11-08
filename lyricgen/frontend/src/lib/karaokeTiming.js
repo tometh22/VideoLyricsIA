@@ -8,7 +8,7 @@
 //
 // Contrato (espejo del guard de ass_render._word_timings):
 // - `words` se usa sólo si es un array con EXACTAMENTE una entrada por
-//   token visible del texto y starts numéricos — protege contra words
+//   token visible del texto, tokens equivalentes y starts numéricos — protege contra words
 //   viejos tras una edición manual del texto.
 // - Devuelve -1 mientras nadie cantó todavía (el lead-in: línea visible,
 //   ninguna palabra iluminada) — igual que el render, donde la primera
@@ -19,21 +19,30 @@ export function countTokens(text) {
   return (text || "").split(/\s+/).filter(Boolean).length;
 }
 
-function wordsUsable(words, nTokens) {
+// Same matching contract as ass_render._strip_for_match: NFC, lowercase,
+// alphanumerics only. Case and punctuation do not invalidate alignment;
+// replacing a word does, even when the total number of tokens is unchanged.
+function normalizedToken(value) {
+  return String(value ?? "").normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function wordsUsable(words, tokens) {
   return (
     Array.isArray(words) &&
-    words.length === nTokens &&
-    nTokens > 0 &&
-    words.every((w) => w && Number.isFinite(Number(w.start)))
+    words.length === tokens.length &&
+    tokens.length > 0 &&
+    words.every((w, index) => w && Number.isFinite(Number(w.start))
+      && normalizedToken(w.word) === normalizedToken(tokens[index]))
   );
 }
 
 export function activeWordIndex(text, words, segStart, segEnd, currentTime) {
-  const n = countTokens(text);
+  const tokens = (text || "").split(/\s+/).filter(Boolean);
+  const n = tokens.length;
   if (n === 0) return -1;
   const ct = Number(currentTime);
 
-  if (wordsUsable(words, n)) {
+  if (wordsUsable(words, tokens)) {
     // Última palabra cuyo start real ya pasó. Antes de la primera: -1
     // (lead-in en pantalla, nada cantado aún).
     let idx = -1;

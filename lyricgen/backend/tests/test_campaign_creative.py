@@ -144,6 +144,31 @@ def test_individual_pin_and_partial_bulk_keep_contract_group(db, setup):
     assert item.render_overrides["font_scale"] == 1.3
 
 
+
+def test_individual_design_starts_at_zero_without_assignment_and_rejects_stale_retry(db, setup):
+    campaign, items, actor = setup
+    item = items[0]
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              artist="Artista", filename="unassigned.wav", status="transcribed_pending")
+    db.add(job); db.commit()
+    assert creative.ASSIGNMENT not in item.render_overrides
+    result = creative.save_individual(campaign.id, item.id,
+        creative.IndividualRequest(revision=0, settings={"font": "poppins-bold"}), actor, db)
+    db.expire_all()
+    persisted = db.get(BatchCampaignItem, item.id)
+    assert result["revision"] == 1
+    assert persisted.render_overrides["font"] == "poppins-bold"
+    assert persisted.render_overrides[creative.ASSIGNMENT]["revision"] == 1
+    assert persisted.render_overrides["source_reference"] == {"status": "absent"}
+    with pytest.raises(HTTPException) as stale:
+        creative.save_individual(campaign.id, item.id,
+            creative.IndividualRequest(revision=0, settings={"font": "anton"}), actor, db)
+    assert stale.value.status_code == 409
+    db.rollback(); db.refresh(persisted)
+    assert persisted.render_overrides["font"] == "poppins-bold"
+
+
 def test_lock_and_render_progress_block_bulk(db, setup):
     campaign, items, actor = setup
     job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id, campaign_id=campaign.id,

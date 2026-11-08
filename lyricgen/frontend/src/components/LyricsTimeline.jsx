@@ -38,6 +38,24 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function clampMoveDelta(segments, selectedIds, requestedDelta, duration, gap) {
+  const bounded = clampSelectionShiftDelta(segments, selectedIds, requestedDelta, duration, gap);
+  // Imported outliers can already violate the audio bound. Clamping an
+  // outward request must block it, never turn a right gesture into a left
+  // edit. An inward request may still recover the line into valid bounds.
+  return Math.sign(bounded) === Math.sign(requestedDelta) ? bounded : 0;
+}
+
+function sameTimingDocument(snapshot, segments) {
+  if (!snapshot || snapshot.length !== segments.length) return false;
+  const currentById = new Map(segments.map(segment => [segment._id, segment]));
+  return snapshot.every(previous => {
+    const current = currentById.get(previous._id);
+    return current && current.segment_id === previous.segment_id
+      && current.start === previous.start && current.end === previous.end;
+  });
+}
+
 function fmt(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
   const m = Math.floor(sec / 60);
@@ -84,7 +102,11 @@ function normalizeTimelineSegments(input) {
     const parsedStart = Number(rawStart);
     const parsedEnd = Number(rawEnd);
     const start = Number.isFinite(parsedStart) ? Math.max(0, parsedStart) : 0;
-    const end = Number.isFinite(parsedEnd) ? Math.max(start + MIN_DUR_S, parsedEnd) : start + 1;
+    // Minimum drag-resize distance is a UI constraint, not a normalization rule.
+    // Existing valid short vocals must retain their duration when moved.
+    const end = Number.isFinite(parsedEnd)
+      ? parsedEnd > start ? parsedEnd : start + MIN_DUR_S
+      : start + 1;
     return {
       ...segment,
       _id: segment?._id ?? index,
@@ -118,6 +140,7 @@ export default function LyricsTimeline({
   onTimingChange,
   onTimingChangeBatch,
   onTextChange,
+  onDuplicateLine,
   onFocus,
   onReset,
   onDeleteSelection,
@@ -127,6 +150,7 @@ export default function LyricsTimeline({
 }) {
   const i18n = useI18n?.() || {};
   const t = (key, fallback) => i18n.t?.(key) || fallback || key;
+  const workspaceRef = useRef(null);
   const scrollRef = useRef(null);
   const trackRef = useRef(null);
   const canvasRef = useRef(null);
@@ -148,7 +172,6 @@ export default function LyricsTimeline({
   const [pxPerSec, setPxPerSec] = useState(ZOOM_DEFAULT);
   const [moreActionsOpen, setMoreActionsOpen] = useState(false);
   const [editingTextId, setEditingTextId] = useState(null);
-  const [draftText, setDraftText] = useState("");
   const [followEnabled, setFollowEnabled] = useState(true);
   const [followSuppressed, setFollowSuppressed] = useState(false);
   const [limitFeedback, setLimitFeedback] = useState("");
@@ -159,7 +182,15 @@ export default function LyricsTimeline({
   const [rippleEditing, setRippleEditing] = useState(false);
 
   const normalizedSegments = useMemo(() => normalizeTimelineSegments(segments), [segments]);
-  const total = Math.max(Number(duration) || 0, ...normalizedSegments.map((s) => s.end), 1);
+  const waveformDuration = Number(waveform?.duration);
+  const knownWaveformDuration = Number.isFinite(waveformDuration) && waveformDuration > 0 ? waveformDuration : 0;
+  const audioDuration = Number(duration);
+  const knownAudioDuration = Number.isFinite(audioDuration) && audioDuration > 0 ? audioDuration : 0;
+  const total = Math.max(knownAudioDuration, knownWaveformDuration, ...normalizedSegments.map((s) => s.end), 1);
+  // The canvas can extend past the audio (padding, minimum width or legacy
+  // outliers). Those display bounds must never authorize edits past the file.
+  const editDuration = knownAudioDuration || knownWaveformDuration || total;
+  const focusedSegmentAvailable = normalizedSegments.some(item => item._id === focusedSegId);
   const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - LABEL_W), total * pxPerSec + 24);
   const surfaceWidth = LABEL_W + trackWidth;
   const trackHeight = Math.max(ROW_H, normalizedSegments.length * ROW_H);
@@ -203,17 +234,48 @@ export default function LyricsTimeline({
 
   useEffect(() => {
     const valid = new Set(normalizedSegments.map((s) => s._id));
+    setEditingTextId(previous => valid.has(previous) ? previous : null);
     setSelectedIds((previous) => {
       const next = new Set([...previous].filter((id) => valid.has(id)));
       return next.size === previous.size ? previous : next;
     });
   }, [normalizedSegments]);
 
+  useEffect(() => {
+    if (!focusedSegmentAvailable) return;
+    // Keep a multiselection when focus enters one of its members. Zooming or
+    // resizing after "Clear" must not reselect an old focused line.
+    setSelectedIds(previous => previous.has(focusedSegId) ? previous : new Set([focusedSegId]));
+    selectionAnchorRef.current = focusedSegId;
+  }, [focusedSegId, focusedSegmentAvailable]);
+
+  useEffect(() => {
+    const segment = normalizedSegments.find(item => item._id === focusedSegId);
+    const scroll = scrollRef.current;
+    if (!segment || !scroll) return;
+    // A deliberate line focus (including entering from campaign review) must
+    // reveal its horizontal time range. Playback activeId never triggers this.
+    const viewport = scroll.clientWidth || viewportWidth;
+    if (!viewport) return;
+    const startX = segment.start * pxPerSec;
+    const endX = segment.end * pxPerSec;
+    const visibleStart = scroll.scrollLeft + 12;
+    const visibleEnd = scroll.scrollLeft + viewport - LABEL_W - 12;
+    if (startX < visibleStart || endX > visibleEnd) {
+      const left = Math.max(0, startX - 24);
+      if (typeof scroll.scrollTo === "function") scroll.scrollTo({ left, behavior: "auto" });
+      else scroll.scrollLeft = left;
+    }
+  // Only explicit focus or viewport/zoom changes reveal a range; autosave,
+  // typing and playback must not reset the user's scroll or selection.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedSegId, focusedSegmentAvailable, viewportWidth, pxPerSec]);
+
   const xToTime = useCallback((clientX) => {
     const rect = trackRef.current?.getBoundingClientRect();
     if (!rect) return 0;
-    return clamp((clientX - rect.left) / pxPerSec, 0, total);
-  }, [pxPerSec, total]);
+    return clamp((clientX - rect.left) / pxPerSec, 0, editDuration);
+  }, [editDuration, pxPerSec]);
 
   const seekAt = useCallback((clientX) => {
     markInteraction();
@@ -251,17 +313,32 @@ export default function LyricsTimeline({
     onSelectionCreated?.({ count: next.size, method: "range" });
   }, [normalizedSegments, onSelectionCreated, rowOfId]);
 
+  const navigateToLine = useCallback((id) => {
+    const segment = normalizedSegments.find((item) => item._id === id);
+    if (!segment) return;
+    selectionAnchorRef.current = id;
+    setSelectedIds(new Set([id]));
+    onFocus?.(id);
+    onSeek?.(segment.start, segment);
+    markInteraction();
+  }, [markInteraction, normalizedSegments, onFocus, onSeek]);
+
   const beginMarquee = useCallback((event, anchorId = null) => {
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
+    workspaceRef.current?.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture?.(event.pointerId);
     marqueeRef.current = {
+      captureTarget: event.currentTarget,
+      pointerId: event.pointerId,
       originX: event.clientX,
       originY: event.clientY,
       currentX: event.clientX,
       currentY: event.clientY,
       anchorId,
+      shiftKey: event.shiftKey,
+      additive: event.metaKey || event.ctrlKey,
       moved: false,
       startedAt: performance.now(),
     };
@@ -287,7 +364,11 @@ export default function LyricsTimeline({
     event.stopPropagation();
     if (!current.moved) {
       suppressNextClick();
-      if (current.anchorId != null) toggleSelection(current.anchorId);
+      if (current.anchorId != null) {
+        if (current.shiftKey) selectRangeTo(current.anchorId);
+        else if (current.additive) toggleSelection(current.anchorId);
+        else navigateToLine(current.anchorId);
+      }
       else seekAt(event.clientX);
       return;
     }
@@ -318,11 +399,16 @@ export default function LyricsTimeline({
     });
     if (ids.length) selectionAnchorRef.current = ids[0];
     markInteraction();
-  }, [markInteraction, normalizedSegments, onSelectionCreated, pxPerSec, rowOfId, seekAt, toggleSelection, total]);
+  }, [markInteraction, navigateToLine, normalizedSegments, onSelectionCreated, pxPerSec, rowOfId, seekAt, selectRangeTo, suppressNextClick, toggleSelection, total]);
 
   const startDrag = useCallback((event, segment, mode) => {
+    if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
+    // Preventing native pointer focus must not strand Delete/arrow shortcuts
+    // on the toolbar button that opened the timeline. Inline inputs stop
+    // pointer propagation before reaching this handler and keep their caret.
+    workspaceRef.current?.focus({ preventScroll: true });
     if ((event.metaKey || event.ctrlKey) && !event.shiftKey) {
       toggleSelection(segment._id);
       return;
@@ -355,10 +441,16 @@ export default function LyricsTimeline({
       setSelectedIds(new Set([segment._id]));
     }
     dragRef.current = {
+      captureTarget: event.currentTarget,
+      pointerId: event.pointerId,
       id: segment._id,
       mode,
       originX: event.clientX,
       snapshots,
+      // Every neighbour participates in collision/ripple bounds. Text-only
+      // updates remain safe, but a changed timing document invalidates this
+      // gesture rather than letting its stale preview overwrite newer data.
+      timingDocument: normalizedSegments.map(({ _id, segment_id, start, end }) => ({ _id, segment_id, start, end })),
       origStart: segment.start,
       origEnd: segment.end,
       movingGroup,
@@ -387,11 +479,11 @@ export default function LyricsTimeline({
       drag.moved = true;
     }
     if (drag.movingGroup) {
-      const safeDelta = clampSelectionShiftDelta(
+      const safeDelta = clampMoveDelta(
         normalizedSegments,
         new Set(drag.snapshots.map((item) => item.id)),
         delta,
-        total,
+        editDuration,
         gapS,
       );
       setLimitFeedback(Math.abs(delta) > 1e-4 && Math.abs(safeDelta) < 1e-4
@@ -407,12 +499,12 @@ export default function LyricsTimeline({
       const requestedEnd = drag.mode === "end" ? drag.origEnd + delta : drag.origEnd;
       const resize = drag.ripple && drag.mode === "end"
         ? rippleResizeEnd(
-          normalizedSegments, drag.id, requestedEnd, total, gapS, MIN_DUR_S,
+          normalizedSegments, drag.id, requestedEnd, editDuration, gapS, MIN_DUR_S,
         )
         : (() => {
           const bounded = clampResizeTiming(
             normalizedSegments, drag.id, requestedStart, requestedEnd,
-            total, gapS, MIN_DUR_S, drag.mode,
+            editDuration, gapS, MIN_DUR_S, drag.mode,
           );
           return bounded ? {
             changes: [{ id: drag.id, start: bounded.start, end: bounded.end }],
@@ -436,7 +528,7 @@ export default function LyricsTimeline({
     } else {
       if (drag.ripple) {
         const move = shiftTimingWithAdjacent(
-          normalizedSegments, drag.id, delta, total, gapS,
+          normalizedSegments, drag.id, delta, editDuration, gapS,
         );
         const ownChange = move.changes.find((change) => change.id === drag.id);
         if (ownChange) ({ start, end } = ownChange);
@@ -446,8 +538,8 @@ export default function LyricsTimeline({
           return;
         }
       } else {
-        const safeDelta = clampSelectionShiftDelta(
-          normalizedSegments, new Set([drag.id]), delta, total, gapS,
+        const safeDelta = clampMoveDelta(
+          normalizedSegments, new Set([drag.id]), delta, editDuration, gapS,
         );
         start = drag.origStart + safeDelta;
         end = drag.origEnd + safeDelta;
@@ -457,14 +549,34 @@ export default function LyricsTimeline({
       }
     }
     setPreview({ id: drag.id, start, end, mode: drag.mode });
-  }, [gapS, normalizedSegments, t, total, updateMarquee]);
+  }, [editDuration, gapS, normalizedSegments, t, updateMarquee]);
 
+  const cancelPointerInteraction = useCallback((event, message = "Edición cancelada; se restauraron los tiempos anteriores.") => {
+    for (const interaction of [dragRef.current, marqueeRef.current]) {
+      const target = interaction?.captureTarget;
+      if (target?.hasPointerCapture?.(interaction.pointerId)) {
+        target.releasePointerCapture?.(interaction.pointerId);
+      }
+    }
+    dragRef.current = null;
+    marqueeRef.current = null;
+    setPreview(null);
+    setMarquee(null);
+    setLimitFeedback(message);
+    event?.stopPropagation?.();
+  }, []);
+
+  const documentChangedMessage = t("timeline.document_changed", "El documento cambió durante el ajuste. Volvé a arrastrar la línea.");
   const finishDrag = useCallback((event, segment) => {
     if (marqueeRef.current) {
       finishMarquee(event);
       return;
     }
     const drag = dragRef.current;
+    if (drag && !sameTimingDocument(drag.timingDocument, normalizedSegments)) {
+      cancelPointerInteraction(event, documentChangedMessage);
+      return;
+    }
     dragRef.current = null;
     const current = preview;
     setPreview(null);
@@ -472,7 +584,8 @@ export default function LyricsTimeline({
     event.stopPropagation();
     if (!drag.moved) {
       onFocus?.(segment._id);
-      seekAt(event.clientX);
+      onSeek?.(xToTime(event.clientX), segment);
+      markInteraction();
       return;
     }
     if (current.changes?.length > 1) {
@@ -495,16 +608,28 @@ export default function LyricsTimeline({
         operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
       });
     }
-  }, [finishMarquee, onDragStart, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+  }, [cancelPointerInteraction, documentChangedMessage, finishMarquee, markInteraction, normalizedSegments, onDragStart, onFocus, onGroupMoved, onSeek, onTimingChange, onTimingChangeBatch, preview, xToTime]);
 
-  const cancelPointerInteraction = useCallback((event) => {
-    dragRef.current = null;
-    marqueeRef.current = null;
-    setPreview(null);
-    setMarquee(null);
-    setLimitFeedback("Edición cancelada; se restauraron los tiempos anteriores.");
-    event?.stopPropagation?.();
-  }, []);
+  useEffect(() => {
+    const drag = dragRef.current;
+    if (drag && !sameTimingDocument(drag.timingDocument, normalizedSegments)) {
+      cancelPointerInteraction(undefined, documentChangedMessage);
+    }
+  }, [cancelPointerInteraction, documentChangedMessage, normalizedSegments]);
+
+  const pointerInteractionActive = preview != null || marquee != null;
+  useEffect(() => {
+    if (!pointerInteractionActive) return undefined;
+    // Pointer-down prevents browser focus changes. Escape must still cancel
+    // when the previously focused control lives outside this workspace.
+    const onEscape = (event) => {
+      if (event.key !== "Escape" || event.isComposing || (!dragRef.current && !marqueeRef.current)) return;
+      event.preventDefault();
+      cancelPointerInteraction(event);
+    };
+    window.addEventListener("keydown", onEscape, true);
+    return () => window.removeEventListener("keydown", onEscape, true);
+  }, [cancelPointerInteraction, pointerInteractionActive]);
 
   const fitTimeline = useCallback(() => {
     setPxPerSec(fitZoom());
@@ -515,7 +640,7 @@ export default function LyricsTimeline({
     const snapshots = normalizedSegments.filter((segment) => selectedIds.has(segment._id));
     if (!snapshots.length) return;
     if (rippleEditing && snapshots.length === 1) {
-      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, total, gapS);
+      const move = shiftTimingWithAdjacent(normalizedSegments, snapshots[0]._id, delta, editDuration, gapS);
       if (!move.changes.length) {
         setLimitFeedback("La cadena llegó al límite disponible.");
         return;
@@ -525,7 +650,7 @@ export default function LyricsTimeline({
       markInteraction();
       return;
     }
-    const safeDelta = clampSelectionShiftDelta(normalizedSegments, selectedIds, delta, total, gapS);
+    const safeDelta = clampMoveDelta(normalizedSegments, selectedIds, delta, editDuration, gapS);
     if (Math.abs(safeDelta) < 1e-6) {
       setLimitFeedback(snapshots.length === 1
         ? "No hay espacio para mover sólo esta línea. Ajustá uno de sus bordes o elegí En cadena."
@@ -539,7 +664,7 @@ export default function LyricsTimeline({
       end: segment.end + safeDelta,
     })));
     markInteraction();
-  }, [gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds, total]);
+  }, [editDuration, gapS, markInteraction, normalizedSegments, onDragStart, onTimingChangeBatch, rippleEditing, selectedIds]);
 
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
@@ -600,26 +725,28 @@ export default function LyricsTimeline({
     canvas.style.height = `${WAVE_H}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, trackWidth, WAVE_H);
-    const stride = Math.max(1, Math.ceil(peaks.length / Math.max(1, Math.floor(trackWidth / 4))));
+    // Peaks span the source audio, never viewport padding or lyric outliers.
+    // Keep their x coordinates on the same seconds scale as blocks/playhead.
+    const waveformSeconds = knownWaveformDuration || (Number(duration) > 0 ? Number(duration) : total);
+    const waveformWidth = waveformSeconds * pxPerSec;
+    const stride = Math.max(1, Math.ceil(peaks.length / Math.max(1, Math.floor(waveformWidth / 4))));
     ctx.fillStyle = "rgba(139,124,246,0.45)";
     for (let i = 0; i < peaks.length; i += stride) {
-      const x = (i / peaks.length) * trackWidth;
+      const x = (i / peaks.length) * waveformWidth;
       const magnitude = clamp(Math.abs(Number(peaks[i])) || 0, 0, 1);
       const height = Math.max(2, magnitude * (WAVE_H - 8));
-      const visualStep = (stride / peaks.length) * trackWidth;
+      const visualStep = (stride / peaks.length) * waveformWidth;
       const barWidth = Math.max(1, Math.min(3, visualStep - 1));
       ctx.fillRect(x, (WAVE_H - height) / 2, barWidth, height);
     }
-  }, [trackWidth, waveform]);
+  }, [duration, knownWaveformDuration, pxPerSec, total, trackWidth, waveform]);
 
   const startTextEdit = useCallback((segment) => {
     setEditingTextId(segment._id);
-    setDraftText(segment.text || "");
   }, []);
-  const commitTextEdit = useCallback((id) => {
+  const commitTextEdit = useCallback(() => {
     setEditingTextId(null);
-    onTextChange?.(id, draftText);
-  }, [draftText, onTextChange]);
+  }, []);
 
   const clearSelection = useCallback(() => {
     selectionAnchorRef.current = null;
@@ -674,6 +801,7 @@ export default function LyricsTimeline({
 
   return (
     <div
+      ref={workspaceRef}
       data-editor-task="timing"
       className="rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.07] overflow-hidden animate-fade-in outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
       tabIndex={0}
@@ -739,7 +867,16 @@ export default function LyricsTimeline({
             <div id="timeline-more-actions" role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl bg-surface-1 p-1.5 ring-1 ring-white/[0.1] shadow-2xl shadow-black/50">
               <button
                 type="button"
-                onClick={() => setFollowEnabled((value) => !value)}
+                onClick={() => {
+                  if (followEnabled && followSuppressed) {
+                    if (followTimerRef.current) clearTimeout(followTimerRef.current);
+                    followTimerRef.current = null;
+                    lastInteractionRef.current = 0;
+                    lastFollowTargetRef.current = null;
+                    setFollowSuppressed(false);
+                    scrollToPlayhead();
+                  } else setFollowEnabled(value => !value);
+                }}
                 aria-pressed={followEnabled}
                 title={t("timeline.follow_hint", "Mantener la línea activa visible")}
                 role="menuitem"
@@ -788,19 +925,36 @@ export default function LyricsTimeline({
         </div>
       )}
 
-      {selectedIds.size > 0 ? (
+      {(
         <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2.5 border-b border-brand/20 bg-gradient-to-r from-brand/20 via-brand/10 to-transparent px-4 sm:px-5 py-2.5 flex-wrap">
           <span className="inline-flex h-7 items-center rounded-lg bg-brand px-2.5 text-[11px] font-semibold text-white shadow-lg shadow-brand/20">{selectedIds.size} {selectedIds.size === 1 ? "línea" : "líneas"}</span>
           <span className="text-[11px] text-ink-secondary">{t("timeline.move_selection", "Mover selección")}</span>
           <div className="inline-flex overflow-hidden rounded-lg ring-1 ring-white/[0.12]">
-            <button type="button" onClick={() => nudgeSelection(-0.1)} className="h-7 px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_back", "−100 ms")}</button>
-            <button type="button" onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
+            <button type="button" disabled={!selectedIds.size} onClick={() => nudgeSelection(-0.1)} className="h-7 px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_back", "−100 ms")}</button>
+            <button type="button" disabled={!selectedIds.size} onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
           </div>
-          <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.move_selection_hint", "o arrastrá cualquier bloque seleccionado")}</span>
+          <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}</span>
           <div className="ml-auto flex items-center gap-1.5">
+            {onDuplicateLine && (
+              <button
+                type="button"
+                disabled={selectedIds.size !== 1}
+                onClick={() => {
+                  const copiedId = onDuplicateLine([...selectedIds][0]);
+                  if (copiedId != null) {
+                    setSelectedIds(new Set([copiedId]));
+                    selectionAnchorRef.current = copiedId;
+                  }
+                }}
+                className="h-8 rounded-lg bg-white/[0.08] px-3 text-[11px] font-medium text-white ring-1 ring-white/[0.15] hover:bg-white/[0.14] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t("timeline.duplicate_line", "Duplicar línea")}
+              </button>
+            )}
             <button
               type="button"
               onClick={deleteSelection}
+              disabled={!selectedIds.size}
               aria-keyshortcuts="Delete Backspace"
               className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-400/10 px-3 text-[10px] font-semibold text-red-200 ring-1 ring-red-300/20 transition-colors hover:bg-red-400/20 hover:ring-red-300/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
             >
@@ -812,13 +966,8 @@ export default function LyricsTimeline({
                 : t("timeline.delete_selected_many", "Eliminar {n} líneas")
               ).replace("{n}", selectedIds.size)}
             </button>
-            <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
+            <button type="button" onClick={clearSelection} disabled={!selectedIds.size} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
           </div>
-        </div>
-      ) : (
-        <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">
-          <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand-light shadow-glow" aria-hidden="true" />
-          <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
       <div
@@ -913,11 +1062,17 @@ export default function LyricsTimeline({
                     onPointerUp={finishMarquee}
                     onPointerCancel={cancelPointerInteraction}
                   >
+                    <button type="button" className="flex min-w-0 flex-1 items-center gap-2 self-stretch text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+                      aria-label={`${t("timeline.go_to_line", "Ir a la línea")} ${index + 1}: ${segment.text}`}
+                      onClick={(event) => {
+                        if (event.detail === 0) { event.stopPropagation(); navigateToLine(segment._id); }
+                      }}>
                     {isActive && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" aria-hidden="true" />}
                     <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isActive ? "bg-cyan-300 text-slate-950" : isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{isActive ? (isPlaying ? "▶" : "•") : index + 1}</span>
                     <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
                     {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
+                    </button>
                     <button
                       type="button"
                       data-testid="timeline-delete-line"
@@ -969,14 +1124,15 @@ export default function LyricsTimeline({
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
                   data-testid="timeline-segment"
-                  tabIndex={0}
-                  role="button"
-                  aria-pressed={isSelected}
+                  tabIndex={editingTextId === segment._id ? -1 : 0}
+                  role={editingTextId === segment._id ? undefined : "button"}
+                  aria-pressed={editingTextId === segment._id ? undefined : isSelected}
                   aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
                   className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget) return;
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       toggleSelection(segment._id);
@@ -1011,14 +1167,18 @@ export default function LyricsTimeline({
                     {editingTextId === segment._id ? (
                       <input
                         autoFocus
+                        data-editor-task="text"
+                        aria-label={`${t("review_workspace.text", "Letra de esta línea")} ${index + 1}`}
                         type="text"
-                        value={draftText}
-                        onChange={(event) => setDraftText(event.target.value)}
+                        value={segment.text || ""}
+                        onChange={(event) => {
+                          onTextChange?.(segment._id, event.target.value);
+                        }}
                         onPointerDown={(event) => event.stopPropagation()}
                         onClick={(event) => event.stopPropagation()}
                         onBlur={() => commitTextEdit(segment._id)}
                         onKeyDown={(event) => {
-                          if (event.key === "Enter") { event.preventDefault(); commitTextEdit(segment._id); }
+                          if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); commitTextEdit(); }
                           if (event.key === "Escape") { event.preventDefault(); setEditingTextId(null); }
                         }}
                         className="pointer-events-auto min-w-0 flex-1 bg-surface-1 border border-brand/50 rounded px-1 py-0.5 text-xs text-white outline-none"

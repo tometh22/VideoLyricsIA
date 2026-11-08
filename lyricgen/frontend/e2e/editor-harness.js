@@ -297,6 +297,9 @@ export async function installEditorHarness(page, options = {}) {
 export async function openAdvanced(page, { expectTimeline = true } = {}) {
   await page.getByRole("tab", { name: "Ajustar tiempos" }).click();
   await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
+  if (!expectTimeline && await page.getByRole("tab", { name: /Revisión guiada/ }).isVisible()) {
+    await page.getByRole("tab", { name: /Revisión guiada/ }).click();
+  }
   if (expectTimeline) {
     await page.getByRole("tab", { name: "Timeline avanzada" }).click();
     await expect(page.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");

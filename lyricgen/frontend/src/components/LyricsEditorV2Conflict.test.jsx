@@ -334,7 +334,7 @@ describe("Editor 2.0 stale draft recovery", () => {
     expect(screen.queryByText(/revisión del equipo es la 7/i)).not.toBeInTheDocument();
   });
 
-  it("preserva cambios remotos independientes al reintentar aprobación", async () => {
+  it("preserva cambios remotos independientes y exige nueva confirmación antes de aprobarlos", async () => {
     localStorage.clear();
     const request = makeRequest({ approvalRemote: true });
     const onApprove = vi.fn()
@@ -344,6 +344,13 @@ describe("Editor 2.0 stale draft recovery", () => {
     await screen.findByDisplayValue("versión equipo");
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
 
+    fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+    await screen.findByDisplayValue("cambio remoto independiente");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
+    // The remote correction survives reconciliation, but the first click
+    // cannot attest to content that arrived after the operator confirmed.
+    expect(onApprove).toHaveBeenCalledTimes(1);
+    expect(screen.getByDisplayValue("versión equipo")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
     await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(2));
     expect(onApprove.mock.calls[1][0]).toEqual(expect.arrayContaining([
