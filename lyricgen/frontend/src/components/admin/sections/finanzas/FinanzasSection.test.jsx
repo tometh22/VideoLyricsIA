@@ -39,7 +39,8 @@ describe("FinanzasSection", () => {
     // 10 lyric videos × US$ 10 en septiembre.
     expect(screen.getAllByText("100,00").length).toBeGreaterThan(0);
     expect(screen.getByText("Railway")).toBeTruthy();
-    expect(calls.some((c) => c.url.includes("operations?since=2026-08"))).toBe(true);
+    // The contract fetch changes the initial rolling range in a later effect.
+    await waitFor(() => expect(calls.some((c) => c.url.includes("operations?since=2026-08"))).toBe(true));
   });
 
   it("una celda vacía se carga con un clic y crea el renglón", async () => {
