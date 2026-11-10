@@ -4109,7 +4109,7 @@ export default function UploadZone({
         // El preview baja a 360-500 px (≈40 px menos) lo cual sigue
         // bien usable para el operador.
         const gridCols = isStep6
-          ? "lg:grid-cols-[170px_minmax(280px,360px)_minmax(0,1fr)]"
+          ? "lg:grid-cols-[170px_minmax(200px,260px)_minmax(0,1fr)]"
           : "lg:grid-cols-[190px_minmax(0,1fr)_minmax(400px,460px)]";
         const gridGap = isStep6 ? "gap-4" : "gap-6";
         // Studio focus: when LyricsEditor emits `editor-focus-mode`, collapse
