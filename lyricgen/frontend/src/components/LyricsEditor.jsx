@@ -922,6 +922,14 @@ export default function LyricsEditor({
     _storeKey,
     () => reseedPreservingIds([], sanitizeSegments(segments)),
   );
+  // App releases this entry on approval/exit before React necessarily finishes
+  // unmounting us. The store's absent-entry snapshot is [], but that is not an
+  // operator deleting every line. Never persist that lifecycle sentinel.
+  // Read the store live so pagehide/unmount also work before another render.
+  const hasLiveEditorStore = useCallback(
+    () => !_storeKey || segmentsStore.get(_storeKey) !== undefined,
+    [_storeKey],
+  );
   const sanitizedEdited = useMemo(() => sanitizeSegments(edited), [edited]);
 
   // A module-level store can outlive a remount. If it was seeded before the
@@ -1436,7 +1444,7 @@ export default function LyricsEditor({
     [edited],
   );
   const handleDurableMerge = useCallback((mergedSegments) => {
-    if (!Array.isArray(mergedSegments)) return;
+    if (!Array.isArray(mergedSegments) || !hasLiveEditorStore()) return;
     const before = editedRef.current;
     const merged = reseedPreservingIds(before, mergedSegments);
     setEditHistory(history => rebaseEditorHistory(history, before, merged));
@@ -1446,9 +1454,9 @@ export default function LyricsEditor({
     if (!segmentsEquivalent(before, merged)) setSyncHistory([]);
     setEdited(merged);
     setIsDirty(true);
-  }, []);
+  }, [hasLiveEditorStore]);
   const { flush: flushDurableSave } = useEditorAutosave({
-    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery && !historyRestoreBusy,
+    enabled: editorV2Enabled && durableHydrated && hasLiveEditorStore() && !durableEditor.loading && !draftRecovery && !historyRestoreBusy,
     segments: durableSegments,
     dirty: isDirty,
     save: durableEditor.save,
@@ -1502,6 +1510,10 @@ export default function LyricsEditor({
             // Validate before normalization: clamps/defaults must not make an
             // unreadable copy look equivalent and eligible for deletion.
             const valid = Array.isArray(draft?.segments)
+              && (draft.segments.length > 0 || (Array.isArray(draft.base_segments)
+                && draft.base_segments.length > 0
+                && draft.base_segments.every(row => row && typeof row.text === "string"
+                  && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start)))
               && draft.segments.every((row) => row && typeof row.text === "string"
                 && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
             if (!valid) throw new Error("invalid_segments");
@@ -1630,7 +1642,7 @@ export default function LyricsEditor({
   }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
 
   useEffect(() => {
-    if (!draftKey || !isDirty || draftRecoveryRef.current) return;
+    if (!draftKey || !isDirty || draftRecoveryRef.current || !hasLiveEditorStore()) return;
     try {
       const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
@@ -1644,21 +1656,21 @@ export default function LyricsEditor({
         updated_at: new Date().toISOString(),
       }));
     } catch { /* quota/storage blocked; network autosave still runs */ }
-  }, [draftKey, edited, editorV2Enabled, isDirty, transcribeJobId, durableEditor.revisionRef]);
+  }, [draftKey, edited, editorV2Enabled, isDirty, transcribeJobId, durableEditor.revisionRef, hasLiveEditorStore]);
 
   // SPA navigation unmounts React before pagehide. Flush only when a
   // debounce/trailing snapshot is actually pending; a completed save must not
   // be duplicated merely because isDirty remains true until approval.
   useEffect(() => () => {
     if (disableAutosave || editorV2Enabled || !onPersistSegments || !transcribeJobId) return;
-    if (saveConflictRef.current) return;
+    if (saveConflictRef.current || !hasLiveEditorStore()) return;
     const queue = saveQueueRef.current;
     const state = queue._peek(transcribeJobId);
     if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
     queue.flush(transcribeJobId, {
       provider: () => sanitizeSegmentsForPersistence(editedRef.current),
     });
-  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId]);
+  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, hasLiveEditorStore]);
 
   // Flush sincrónico del borrador en editor V2 (refresh / cierre de pestaña /
   // reload forzado por un 401). El efecto que escribe el draft es asíncrono y
@@ -1671,7 +1683,7 @@ export default function LyricsEditor({
   useEffect(() => {
     if (!editorV2Enabled || !draftKey) return undefined;
     const persistDraftNow = () => {
-      if (!dirtyRef.current) return;
+      if (!dirtyRef.current || draftRecoveryRef.current || !hasLiveEditorStore()) return;
       const doc = durableDocRef.current;
       const current = sanitizeSegmentsForPersistence(editedRef.current);
       // Rescatamos SÓLO si hay trabajo que el servidor todavía no tiene. Sin
@@ -1702,7 +1714,7 @@ export default function LyricsEditor({
       // cleanup corría en CADA cambio del documento, no sólo al desmontar.
       persistDraftNow();
     };
-  }, [draftKey, durableEditor.revisionRef, editorV2Enabled]);
+  }, [draftKey, durableEditor.revisionRef, editorV2Enabled, hasLiveEditorStore]);
 
   // Durable flush on page unload (refresh / tab close). The beforeunload
   // handler above only WARNS via a native dialog — it does not persist. And
@@ -1720,7 +1732,7 @@ export default function LyricsEditor({
     const flushOnUnload = () => {
       // A conflict draft belongs to a different server revision. Keep the raw
       // recovery payload intact and never replace or POST it during reload.
-      if (!dirtyRef.current || saveConflictRef.current) return;
+      if (!dirtyRef.current || saveConflictRef.current || !hasLiveEditorStore()) return;
       try {
         const cleaned = sanitizeSegmentsForPersistence(editedRef.current);
         // useEffect puede no alcanzar a correr entre el último keystroke y
@@ -1755,7 +1767,7 @@ export default function LyricsEditor({
       window.removeEventListener("pagehide", flushOnUnload);
       window.removeEventListener("beforeunload", flushOnUnload);
     };
-  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, draftKey]);
+  }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, draftKey, hasLiveEditorStore]);
 
   // Flush-save on a timeline drag (no 3 s wait) + drive the "Guardado ✓"
   // chip. Runs only when flushCounter bumps. By the time this effect fires,
@@ -4899,6 +4911,7 @@ export default function LyricsEditor({
         setIsDirty(true);
         setSaveStatus("local");
       } else {
+        localStorage.setItem(`${draftKey}:discarded`, draftRecovery.raw);
         localStorage.removeItem(draftKey);
         setIsDirty(false);
       }

@@ -42,7 +42,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
         <h2 className="text-sm font-semibold">{t("review_workspace.lines") || "Líneas"} ({segments.length})</h2>
         <button className={button} aria-pressed={markedOnly} onClick={() => setMarkedOnly((value) => !value)}>{t("review_workspace.marked_only") || "Solo marcadas"}</button>
       </div>
-      <div ref={listRef} className="relative max-h-[55vh] overflow-y-auto p-2" aria-label={t("review_workspace.lines") || "Líneas"}>
+      <div ref={listRef} className="relative max-h-[55vh] overflow-y-auto p-2 lg:max-h-none lg:overflow-visible" aria-label={t("review_workspace.lines") || "Líneas"}>
         {visible.map((line) => <button type="button" key={line._id} ref={(node) => { rowRefs.current[line._id] = node; }}
           data-testid={`review-line-${segments.indexOf(line) + 1}`} aria-current={selected?._id === line._id ? "true" : undefined}
           onClick={() => navigate(line)} onKeyDown={(event) => {
@@ -52,7 +52,11 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
             if (next) { navigate(next); rowRefs.current[next._id]?.focus(); }
           }}
           className={`mb-1 flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${selected?._id === line._id ? "bg-brand/20 ring-1 ring-brand/50" : "hover:bg-white/5"}`}>
-          <span className="mt-0.5 text-xs tabular-nums text-ink-secondary">{segments.indexOf(line) + 1}</span>
+          <span className="shrink-0 text-xs tabular-nums text-ink-secondary">
+            <span className="block">{segments.indexOf(line) + 1}</span>
+            <span className="mt-1 block whitespace-nowrap font-mono text-ink-primary">{timestamp(line.start)}</span>
+            <span className="block whitespace-nowrap font-mono">{timestamp(line.end)}</span>
+          </span>
           <span className="min-w-0 flex-1 break-words text-sm">{line.text || (t("review_workspace.empty_line") || "Línea sin texto")}</span>
           {marked(line) && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-amber-300" aria-label={t("review_workspace.marked") || "Marcada para revisar"} />}
         </button>)}

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.166] - 2026-11-10
+
+### Fixed
+- Stop editor cleanup after approval or navigation from creating empty local drafts. Preserve genuine unsaved edits and intentional deletions.
+- Make draft recovery compact and readable, keep actions visible, archive the local copy before opening the saved version, and require explicit confirmation before restoring an empty draft.
+- Show line start/end times in review and give lyric editing more space alongside the preview.
+
 ## [1.1.165] - 2026-11-06
 
 ### Fixed

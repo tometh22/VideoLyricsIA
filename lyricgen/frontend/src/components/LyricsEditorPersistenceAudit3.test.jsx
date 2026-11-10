@@ -65,9 +65,67 @@ describe("third audit: recoverable intentional empty draft", () => {
     render(<LyricsEditor segments={rows} transcribeJobId={job} filename="song.wav" requireLineReview
       disableBeforeUnload user={{ id: 42, tenant_id: "audit-team", features: { editor_v2: true } }}
       editorRequest={request} onApprove={vi.fn()} onBack={vi.fn()} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recuperar cambios", exact: true }));
+    const useDraft = await screen.findByRole("button", { name: "Usar borrador local", exact: true });
+    expect(useDraft).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Quiero usar la copia vacía/ }));
+    fireEvent.click(useDraft);
     expect(segmentsStore.get(job)).toEqual([]);
     expect(localStorage.getItem(`${key}:incompatible`)).toBeNull();
+  });
+});
+
+describe("closing a reviewed job", () => {
+  it.each(["evict", "evictAll"])("does not manufacture an empty draft when %s releases the editor store", async (method) => {
+    const key = `genly_editor_draft:audit-team:42:${job}`;
+    const request = vi.fn(async path => {
+      const body = path.endsWith("/lock/heartbeat") ? { acquired: true }
+        : { job_id: job, revision: 273, segments: rows, original_segments: rows, lock: { active: false } };
+      return { ok: true, status: 200, clone: () => ({ json: async () => body }) };
+    });
+    const view = render(<LyricsEditor segments={rows} transcribeJobId={job} filename="song.wav" requireLineReview
+      disableBeforeUnload user={{ id: 42, tenant_id: "audit-team", features: { editor_v2: true } }}
+      editorRequest={request} onApprove={vi.fn()} onBack={vi.fn()} />);
+    await screen.findByLabelText("Letra de esta línea");
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText("Letra de esta línea"), { target: { value: "Corrección guardada" } });
+    expect(JSON.parse(localStorage.getItem(key)).segments).toHaveLength(2);
+    // Approval clears the saved draft and App releases the store while the
+    // child can still render/unmount with its previous dirty flag.
+    localStorage.removeItem(key);
+    act(() => segmentsStore[method](job));
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(runtime.autosave.enabled).toBe(false);
+    act(() => runtime.autosave.onMerged(rows));
+    expect(segmentsStore.get(job)).toBeUndefined();
+    fireEvent(window, new Event("pagehide"));
+    fireEvent(window, new Event("beforeunload"));
+    view.unmount();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  it.each([false, true])("still backs up unsaved edits on ordinary unmount (intentional empty: %s)", async empty => {
+    const key = `genly_editor_draft:audit-team:42:${job}`;
+    const request = vi.fn(async path => {
+      const body = path.endsWith("/lock/heartbeat") ? { acquired: true }
+        : { job_id: job, revision: 273, segments: rows, original_segments: rows, lock: { active: false } };
+      return { ok: true, status: 200, clone: () => ({ json: async () => body }) };
+    });
+    const view = render(<LyricsEditor segments={rows} transcribeJobId={job} filename="song.wav" requireLineReview
+      disableBeforeUnload user={{ id: 42, tenant_id: "audit-team", features: { editor_v2: true } }}
+      editorRequest={request} onApprove={vi.fn()} onBack={vi.fn()} />);
+    await screen.findByLabelText("Letra de esta línea");
+    await act(async () => {});
+    if (empty) act(() => runtime.autosave.onMerged([]));
+    else fireEvent.change(screen.getByLabelText("Letra de esta línea"), { target: { value: "Cambio sin guardar" } });
+    expect(runtime.autosave.enabled).toBe(true);
+    // Exercise the synchronous rescue independently of the normal draft effect.
+    localStorage.removeItem(key);
+    view.unmount();
+    const rescued = JSON.parse(localStorage.getItem(key));
+    expect(rescued.segments).toHaveLength(empty ? 0 : 2);
+    if (!empty) expect(rescued.segments[0].text).toBe("Cambio sin guardar");
+    expect(rescued.base_segments).toHaveLength(2);
+    expect(rescued.base_revision).toBe(273);
   });
 });
 
