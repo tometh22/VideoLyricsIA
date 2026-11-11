@@ -400,3 +400,20 @@ def test_kinetic_key_word_and_bubble_stay_inside_the_frame():
         m = re.search(r"\\(?:pos|move)\((-?\d+),(-?\d+)", d)
         if m and "\\p1" not in d:
             assert 0 <= int(m.group(1)) <= 1920, d[:90]
+
+
+@pytest.mark.parametrize("width,height", [(1920, 1080), (1080, 1920)])
+def test_perspectiva_floor_stays_readable_and_inside_the_frame(width, height):
+    # At \frx48 the far rows collapsed into unreadable slivers and long
+    # lines slid off the bottom (Rosa de Fogo demo, Nov 2026).
+    long_line = [{"text": "Já tomou conta do meu peito aqui é o seu lugar",
+                  "start": 0.0, "end": 4.6}]
+    doc = L.build_look_ass(long_line, L.LOOKS["perspectiva"], width=width,
+                           height=height, duration=5.0)
+    floor = [d for d in _dialogues(doc) if "\\frx" in d]
+    assert floor
+    for d in floor:
+        tilt = int(re.search(r"\\frx(\d+)", d).group(1))
+        assert tilt <= 32
+        y_end = int(re.search(r"\\move\(\d+,\d+,\d+,(\d+)", d).group(1))
+        assert y_end <= height * 0.5

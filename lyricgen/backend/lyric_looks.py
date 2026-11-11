@@ -1156,11 +1156,18 @@ def _floor_events(look: Look, n: int, tokens: list[str], start: float, end: floa
     for i, part in enumerate(parts):
         text += ("\\N" if i in cuts else (" " if i else "")) + part
     yaw = 6 if n % 2 == 0 else -7
-    y0, y1 = height * 0.50, height * 0.74
+    # A 30 degree tilt still reads as words lying on the road; at 48 the far
+    # rows collapsed into slivers nobody could read. The slab starts close to
+    # full size and grows a little, centred high enough that a five or six
+    # row line never runs off the bottom (portrait breaks into more rows).
+    if height > width:
+        y0, y1, grow = height * 0.36, height * 0.40, 96
+    else:
+        y0, y1, grow = height * 0.40, height * 0.47, 104
     return [_dialogue(2, start, end,
                       "{" + f"\\an5\\move({width // 2},{_n(y0)},{width // 2},{_n(y1)},0,{dur})"
-                      f"\\q2\\fs{base_fs}\\frx48\\frz{yaw}"
-                      f"\\fscx70\\fscy70\\t(0,{dur},1.4,\\fscx125\\fscy125)"
+                      f"\\q2\\fs{base_fs}\\frx30\\frz{yaw}"
+                      f"\\fscx90\\fscy90\\t(0,{dur},1.4,\\fscx{grow}\\fscy{grow})"
                       f"\\fad(220,260)" + "}" + text)]
 
 
