@@ -23,108 +23,86 @@
 
 <main>
 
-<section class="hero shell">
+<section class="intro shell">
   <p class="eyebrow"><span class="live" aria-hidden="true"></span>Prévia de 30 segundos · Diego Faria</p>
   <h1>Rosa de Fogo, <span class="accent">em todos os formatos.</span></h1>
-  <p class="lead">Cinco versões do lyric video, cada uma com uma direção de arte tirada da letra, uma tipografia animada diferente e o seu corte vertical para Reels, TikTok e Shorts. Mais o art track com a capa oficial. Letra sincronizada palavra por palavra e revisada por pessoas.</p>
-  <nav class="jump" aria-label="Versões">
-    <a href="#v2">Estrada · Perspectiva 3D</a>
-    <a href="#v4">Várias cenas · Arco</a>
-    <a href="#v5">Brasas · Bloco</a>
-    <a href="#v3">Jardim · Romântico</a>
-    <a href="#v1">Rosa de fogo · Cine</a>
-    <a href="#art-track">Art track</a>
-  </nav>
+  <p class="lead">Quatro direções de arte para o lyric video, cada uma com a sua tipografia animada, o corte vertical e a thumbnail. Mais o art track com a capa oficial. Escolham à direita.</p>
 </section>
 
-<section class="versions shell" aria-label="Versões do lyric video">
+<section class="studio shell" aria-label="Prévia" data-studio data-media="/muestra/the-home-music-rf7k2q/media/">
+  <div class="stage">
+    <div class="formats" role="tablist" aria-label="Formato">
+      <button type="button" role="tab" data-format="wide" aria-selected="true">16:9 · YouTube</button>
+      <button type="button" role="tab" data-format="tall" aria-selected="false">9:16 · Reels, TikTok, Shorts</button>
+      <button type="button" role="tab" data-format="thumb" aria-selected="false">Thumbnail</button>
+    </div>
+    <div class="screen" data-screen="wide">
+      <video data-player controls playsinline preload="metadata"
+        src="/muestra/the-home-music-rf7k2q/media/v4-lyric.mp4"
+        poster="/muestra/the-home-music-rf7k2q/media/v4-poster.jpg"></video>
+      <img data-still alt="" hidden>
+    </div>
+    <div class="now">
+      <div>
+        <h2 data-title>Várias cenas</h2>
+        <p class="meta" data-meta>A rosa de fogo, o jardim iluminado e a estrada no fim de tarde se alternam ao longo da música · Tipografia <strong>Arco</strong>: cada frase gira em volta da rosa</p>
+      </div>
+      <a class="download" data-download href="/muestra/the-home-music-rf7k2q/media/v4-lyric.mp4" download>Baixar</a>
+    </div>
+  </div>
 
-  <article class="version" id="v2">
-    <header class="version-head">
-      <p class="num">01</p>
-      <div>
-        <h2>Estrada no fim de tarde</h2>
-        <p class="meta">Estrada de terra no interior, o calor tremulando e a luz dourada · Tipografia <strong>Perspectiva 3D</strong>: as palavras deitadas na estrada e a câmera avançando sobre elas</p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/v2-lyric.mp4" poster="/muestra/the-home-music-rf7k2q/media/v2-poster.jpg" controls playsinline preload="none"></video><figcaption>Lyric video · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/v2-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/v2-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/v2-lyric.mp4" download>Baixar lyric video</a><a href="/muestra/the-home-music-rf7k2q/media/v2-short.mp4" download>Baixar vertical</a></p>
-  </article>
-  <article class="version" id="v4">
-    <header class="version-head">
-      <p class="num">02</p>
-      <div>
-        <h2>Várias cenas</h2>
-        <p class="meta">A rosa de fogo, o jardim iluminado e a estrada no fim de tarde se alternam ao longo da música · Tipografia <strong>Arco</strong>: cada frase gira em volta da rosa</p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/v4-lyric.mp4" poster="/muestra/the-home-music-rf7k2q/media/v4-poster.jpg" controls playsinline preload="none"></video><figcaption>Lyric video · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/v4-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/v4-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/v4-lyric.mp4" download>Baixar lyric video</a><a href="/muestra/the-home-music-rf7k2q/media/v4-short.mp4" download>Baixar vertical</a></p>
-  </article>
-  <article class="version" id="v5">
-    <header class="version-head">
-      <p class="num">03</p>
-      <div>
-        <h2>Brasas e pétala</h2>
-        <p class="meta">Uma pétala de rosa sobre brasas incandescentes · Tipografia <strong>Bloco</strong>: linhas do mesmo largo, finas e grossas, a frase-chave em destaque</p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/v5-lyric.mp4" poster="/muestra/the-home-music-rf7k2q/media/v5-poster.jpg" controls playsinline preload="none"></video><figcaption>Lyric video · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/v5-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/v5-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/v5-lyric.mp4" download>Baixar lyric video</a><a href="/muestra/the-home-music-rf7k2q/media/v5-short.mp4" download>Baixar vertical</a></p>
-  </article>
-  <article class="version" id="v3">
-    <header class="version-head">
-      <p class="num">04</p>
-      <div>
-        <h2>O jardim iluminado</h2>
-        <p class="meta">“Só você que ilumina o meu jardim”: um jardim à noite com vaga-lumes e lanternas · Tipografia <strong>Romântico</strong></p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/v3-lyric.mp4" poster="/muestra/the-home-music-rf7k2q/media/v3-poster.jpg" controls playsinline preload="none"></video><figcaption>Lyric video · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/v3-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/v3-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/v3-lyric.mp4" download>Baixar lyric video</a><a href="/muestra/the-home-music-rf7k2q/media/v3-short.mp4" download>Baixar vertical</a></p>
-  </article>
-  <article class="version" id="v1">
-    <header class="version-head">
-      <p class="num">05</p>
-      <div>
-        <h2>A rosa de fogo</h2>
-        <p class="meta">Uma rosa feita de fogo se abre devagar sobre o preto, entre brasas e fumaça · Tipografia <strong>Cine</strong>: serifa elegante e a palavra-chave em destaque</p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/v1-lyric.mp4" poster="/muestra/the-home-music-rf7k2q/media/v1-poster.jpg" controls playsinline preload="none"></video><figcaption>Lyric video · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/v1-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/v1-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/v1-lyric.mp4" download>Baixar lyric video</a><a href="/muestra/the-home-music-rf7k2q/media/v1-short.mp4" download>Baixar vertical</a></p>
-  </article>
-
-  <article class="version" id="art-track">
-    <header class="version-head">
-      <p class="num">06</p>
-      <div>
-        <h2>Art track</h2>
-        <p class="meta">Capa oficial, onda do áudio, título e faíscas em movimento</p>
-      </div>
-    </header>
-    <div class="players">
-      <figure class="player wide"><video src="/muestra/the-home-music-rf7k2q/media/art-track.mp4" poster="/muestra/the-home-music-rf7k2q/media/art-track-poster.jpg" controls playsinline preload="none"></video><figcaption>Art track · 16:9 · 1080p</figcaption></figure>
-      <figure class="player tall"><video src="/muestra/the-home-music-rf7k2q/media/art-track-short.mp4" poster="/muestra/the-home-music-rf7k2q/media/art-track-short-poster.jpg" controls playsinline preload="metadata"></video><figcaption>Vertical · 9:16</figcaption></figure>
-    </div>
-    <p class="downloads"><a href="/muestra/the-home-music-rf7k2q/media/art-track.mp4" download>Baixar art track</a><a href="/muestra/the-home-music-rf7k2q/media/art-track-short.mp4" download>Baixar vertical</a></p>
-  </article>
-
+  <aside class="picker" aria-label="Versões">
+    <p class="picker-label">Lyric video</p>
+    <ul>
+      <li><button type="button" class="pick" aria-pressed="true"
+        data-title="Várias cenas"
+        data-meta="A rosa de fogo, o jardim iluminado e a estrada no fim de tarde se alternam ao longo da música · Tipografia &lt;strong&gt;Arco&lt;/strong&gt;: cada frase gira em volta da rosa"
+        data-wide="v4-lyric.mp4" data-wide-poster="v4-poster.jpg"
+        data-tall="v4-short.mp4" data-tall-poster="v4-short-poster.jpg"
+        data-thumb="v4-thumbnail.jpg">
+        <img src="/muestra/the-home-music-rf7k2q/media/v4-tile.jpg" alt="" width="112" height="63">
+        <span><strong>Várias cenas</strong><small>Tipografia Arco</small></span>
+      </button></li>
+      <li><button type="button" class="pick" aria-pressed="false"
+        data-title="Brasas e pétala"
+        data-meta="Uma pétala de rosa sobre brasas incandescentes · Tipografia &lt;strong&gt;Bloco&lt;/strong&gt;: linhas do mesmo largo, finas e grossas, a frase-chave em destaque"
+        data-wide="v5-lyric.mp4" data-wide-poster="v5-poster.jpg"
+        data-tall="v5-short.mp4" data-tall-poster="v5-short-poster.jpg"
+        data-thumb="v5-thumbnail.jpg">
+        <img src="/muestra/the-home-music-rf7k2q/media/v5-tile.jpg" alt="" width="112" height="63">
+        <span><strong>Brasas e pétala</strong><small>Tipografia Bloco</small></span>
+      </button></li>
+      <li><button type="button" class="pick" aria-pressed="false"
+        data-title="O jardim iluminado"
+        data-meta="Um jardim à noite com vaga-lumes e lanternas, tirado da letra · Tipografia &lt;strong&gt;Romântico&lt;/strong&gt;: letra manuscrita em violeta, com bokeh suave"
+        data-wide="v3-lyric.mp4" data-wide-poster="v3-poster.jpg"
+        data-tall="v3-short.mp4" data-tall-poster="v3-short-poster.jpg"
+        data-thumb="v3-thumbnail.jpg">
+        <img src="/muestra/the-home-music-rf7k2q/media/v3-tile.jpg" alt="" width="112" height="63">
+        <span><strong>O jardim iluminado</strong><small>Tipografia Romântico</small></span>
+      </button></li>
+      <li><button type="button" class="pick" aria-pressed="false"
+        data-title="A rosa de fogo"
+        data-meta="Uma rosa feita de fogo se abre devagar sobre o preto, entre brasas e fumaça · Tipografia &lt;strong&gt;Cine&lt;/strong&gt;: serifa elegante e a palavra-chave em destaque"
+        data-wide="v1-lyric.mp4" data-wide-poster="v1-poster.jpg"
+        data-tall="v1-short.mp4" data-tall-poster="v1-short-poster.jpg"
+        data-thumb="v1-thumbnail.jpg">
+        <img src="/muestra/the-home-music-rf7k2q/media/v1-tile.jpg" alt="" width="112" height="63">
+        <span><strong>A rosa de fogo</strong><small>Tipografia Cine</small></span>
+      </button></li>
+    </ul>
+    <p class="picker-label">Art track</p>
+    <ul>
+      <li><button type="button" class="pick" aria-pressed="false"
+        data-title="Art track"
+        data-meta="Capa oficial, onda do áudio, título e faíscas em movimento"
+        data-wide="art-track.mp4" data-wide-poster="art-track-poster.jpg"
+        data-tall="art-track-short.mp4" data-tall-poster="art-track-short-poster.jpg">
+        <img src="/muestra/the-home-music-rf7k2q/media/art-track-tile.jpg" alt="" width="112" height="63">
+        <span><strong>Art track</strong><small>Capa oficial animada</small></span>
+      </button></li>
+    </ul>
+  </aside>
 </section>
 
 <section class="offer">
