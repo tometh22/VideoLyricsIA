@@ -4,5 +4,6 @@ Disallow: /admin
 Disallow: /settings
 Disallow: /history
 Disallow: /new
+Disallow: /muestra/
 
 Sitemap: https://app.genly.pro/sitemap.xml
