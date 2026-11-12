@@ -159,7 +159,7 @@ h1 { max-width: 26ch; font-family: var(--display); font-size: clamp(2rem, 3.6vw,
   .picker ul { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
   .pick { grid-template-columns: 1fr; gap: 8px; }
   .pick img { width: 100%; height: auto; aspect-ratio: 16 / 9; }
-  .screen[data-screen="tall"] { aspect-ratio: 9 / 16; max-height: 78vh; margin-inline: auto; }
+  .screen[data-screen="tall"], .screen[data-screen="canvas"] { aspect-ratio: 9 / 16; max-height: 78vh; margin-inline: auto; }
 }
 
 @media (max-width: 820px) {
