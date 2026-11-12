@@ -20930,6 +20930,79 @@ def generate_art_track_thumbnail(
     return out_path
 
 
+def _thumbnail_poster_enabled() -> bool:
+    """Poster thumbnails for lyric looks are ON unless THUMBNAIL_LOOK_POSTER
+    is set to a falsy value (kill switch back to the enlarged title card)."""
+    return os.environ.get("THUMBNAIL_LOOK_POSTER", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _render_look_poster_thumbnail(
+    look, *, artist: str, song: str, song_lines: list[str] | None,
+    song_font_path: str | None, artist_font_path: str | None,
+    primary_override: str, bg_source: str | None, mp3_path: str, job_dir: str,
+    effect: str, style: str, custom_colors: str,
+) -> str:
+    """Thumbnail for a lyric-look job: the video's opening background (same
+    grade, overlay effect and look-painted surfaces as the master) with the
+    title set as a poster in the look's typography (thumbnail_poster)."""
+    import shutil
+    import ass_render as _ass
+    import fx_compositor as _fx
+    import lyric_looks as _looks
+    import thumbnail_poster as _tp
+    from PIL import Image
+
+    width, height = _tp.W, _tp.H
+    out_path = os.path.abspath(os.path.join(job_dir, "thumbnail.jpg"))
+    font_dir = _ass.multi_font_dir(_looks.font_paths(look))
+    try:
+        with tempfile.TemporaryDirectory(prefix="thumbnail-", dir=job_dir) as tmp:
+            if not bg_source or not os.path.isfile(bg_source):
+                raise FileNotFoundError("Thumbnail requires the video's background")
+            with open(os.path.join(tmp, "thumbnail.ass"), "w", encoding="utf-8") as f:
+                f.write(_tp.background_ass(look, width, height))
+            bg_frame = os.path.abspath(os.path.join(tmp, "background.png"))
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.abspath(bg_source),
+                 "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1",
+                 "-frames:v", "1", bg_frame],
+                label="thumbnail-background", timeout=60, output_path=bg_frame,
+            )
+            vf, complex_filter, extra_inputs = _fx.build_video_filter(
+                ass_basename="thumbnail.ass", font_dir=font_dir,
+                width=width, height=height, effect=effect, style=style,
+                custom_colors=custom_colors, fx_input_index=1,
+                grade_override=look.grade,
+                rhythm=_fx.detect_effect_rhythm(effect, mp3_path),
+            )
+            filters = (["-filter_complex", vf, "-map", "[out]"] if complex_filter
+                       else ["-vf", vf])
+            graded = os.path.abspath(os.path.join(tmp, "graded.png"))
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", bg_frame,
+                 *extra_inputs, *filters, "-frames:v", "1", graded],
+                label="thumbnail-poster-background", timeout=90,
+                output_path=graded, cwd=tmp,
+            )
+            with Image.open(graded) as bg:
+                poster = _tp.compose(
+                    bg, look, artist=artist, title=song, song_lines=song_lines,
+                    song_font_path=song_font_path, artist_font_path=artist_font_path,
+                    primary_override=primary_override,
+                )
+            # Write next to the target and rename: a failed save must not
+            # leave a half-written thumbnail.jpg behind for the fallback.
+            tmp_out = os.path.join(tmp, "thumbnail.jpg")
+            poster.save(tmp_out, "JPEG", quality=92, optimize=True)
+            os.replace(tmp_out, out_path)
+    finally:
+        shutil.rmtree(font_dir, ignore_errors=True)
+    logger.info("[THUMB] poster thumbnail look=%s layout=%s", look.id,
+                _tp.layout_for(look, os.path.basename(song_font_path or look.font_file)))
+    return out_path
+
+
 def generate_thumbnail(
     artist: str,
     mp3_path: str,
@@ -20982,6 +21055,26 @@ def generate_thumbnail(
         look_artist_path = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
     artist_path = _resolve_font(title_artist_font) or look_artist_path or extrabold
     song_path = _resolve_font(title_song_font) or font_path
+    if look is not None and _thumbnail_poster_enabled():
+        # Looks get a poster composition in the look's own typography (see
+        # thumbnail_poster). Any failure keeps the libass title card below:
+        # the thumbnail is an accessory and must never go missing for it.
+        try:
+            return _render_look_poster_thumbnail(
+                look, artist=artist,
+                song=_resolve_title_song(song_title, mp3_path, artist),
+                song_lines=(title_song_break.split("\n") if title_song_break else None),
+                song_font_path=_resolve_font(title_song_font),
+                artist_font_path=_resolve_font(title_artist_font),
+                primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
+                bg_source=bg_source, mp3_path=mp3_path, job_dir=job_dir,
+                effect=effect, style=style, custom_colors=custom_colors,
+            )
+        except FileNotFoundError:
+            raise
+        except Exception as poster_err:
+            logger.warning("[THUMB] poster thumbnail failed (look=%s), using the "
+                           "title card: %s", lyric_look, poster_err)
     artist_family, _ = _ass.font_family(artist_path)
     song_family, bold = _ass.font_family(song_path)
     lines = _ass.thumbnail_title_card_lines(

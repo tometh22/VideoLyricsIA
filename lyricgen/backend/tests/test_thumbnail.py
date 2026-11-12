@@ -169,6 +169,9 @@ def test_actual_thumbnail_render_has_colored_title(tmp_path, effect):
 
 @pytest.mark.parametrize('look_id', __import__('lyric_looks').LOOKS)
 def test_new_looks_keep_their_real_title_fonts_and_palette(tmp_path, monkeypatch, look_id):
+    # The libass title card stays the fallback (and kill switch) of the look
+    # poster: it must keep the look's fonts and palette on its own.
+    monkeypatch.setenv('THUMBNAIL_LOOK_POSTER', '0')
     import lyric_look_runtime as runtime
     import lyric_looks as looks
     import fx_compositor
@@ -215,7 +218,8 @@ def test_new_looks_keep_their_real_title_fonts_and_palette(tmp_path, monkeypatch
 
 
 @pytest.mark.skipif(not _has_libass(), reason='requires ffmpeg with libass')
-def test_black_ops_artist_green_and_oswald_song_light(tmp_path):
+def test_black_ops_artist_green_and_oswald_song_light(tmp_path, monkeypatch):
+    monkeypatch.setenv('THUMBNAIL_LOOK_POSTER', '0')
     bg = tmp_path / 'bg.png'
     Image.new('RGB', (1280, 720), (20, 20, 20)).save(bg)
     result = pipeline.generate_thumbnail(
@@ -234,7 +238,8 @@ def test_black_ops_artist_green_and_oswald_song_light(tmp_path):
 
 
 @pytest.mark.skipif(not _has_libass(), reason='requires ffmpeg with libass')
-def test_chat_title_stays_visible_on_dark_background(tmp_path):
+def test_chat_title_stays_visible_on_dark_background(tmp_path, monkeypatch):
+    monkeypatch.setenv('THUMBNAIL_LOOK_POSTER', '0')
     bg = tmp_path / 'bg.png'
     Image.new('RGB', (1280, 720), (20, 20, 20)).save(bg)
     result = pipeline.generate_thumbnail(
