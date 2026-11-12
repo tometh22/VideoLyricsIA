@@ -40,6 +40,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [issueReasons, setIssueReasons] = useState({});
   const firstActionRef = useRef(null);
   const latestJob = useRef(job);
   latestJob.current = job;
@@ -150,9 +151,14 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       </section>
     );
   }
-  const updateDecision = async (issue, decision) => {
+  const updateDecision = async (issue, decision, reasonOverride) => {
     if (!reportReviewable) {
       setError("Actualizá el preflight antes de firmar: hace falta un informe completo con identidad verificable.");
+      return;
+    }
+    const reason = String(reasonOverride ?? "reviewer_qc_panel").trim();
+    if (issue.requires_recorded_review && !reason) {
+      setError("Contá qué revisaste y qué encontraste antes de guardar esta decisión.");
       return;
     }
     const request = beginRequest(issue.issue_id);
@@ -163,7 +169,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({ decision, reason: "reviewer_qc_panel", expected_report_id: reportToken }),
+          body: JSON.stringify({ decision, reason, expected_report_id: reportToken }),
         },
       );
       const data = await response.json().catch(() => ({}));
@@ -301,6 +307,22 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         <div className="col-span-2 sm:col-span-1 rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.notRun}</div><div className="text-[10px] text-ink-secondary">sin verificación automática</div></div>
       </div>
 
+      {report.acoustic?.required && (
+        <div data-testid="acoustic-coverage" className="mb-4 rounded-xl bg-white/[0.03] p-3 ring-1 ring-white/[0.06]">
+          <h4 className="text-xs font-semibold">Cobertura de escucha automática</h4>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            {Object.entries(report.acoustic.coverage || {}).map(([provider, result]) => {
+              const fraction = Math.max(0, Math.min(1, Number(result?.fraction) || 0));
+              const missing = result?.missing || [];
+              return <p key={provider} className="text-[11px] text-ink-secondary">
+                <span className="font-medium text-ink-primary">{provider}</span>: {Math.round(fraction * 100)}% analizado
+                {missing.length > 0 && <span> · {missing.length} tramo{missing.length === 1 ? "" : "s"} pendiente{missing.length === 1 ? "" : "s"}</span>}
+              </p>;
+            })}
+          </div>
+        </div>
+      )}
+
       {checks.length > 0 && (
         <details data-testid="delivery-qc-checks" open={visibleCheckSummary.fail > 0} className="mb-4 rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06] p-3">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-semibold">
@@ -373,6 +395,14 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                   <p className="text-xs font-medium">{issue.summary}</p>
                 </div>
                 {issue.description && <p className="text-[11px] text-ink-secondary mt-1">{issue.description}</p>}
+                {issue.requires_recorded_review && (
+                  <label className="mt-2 block text-[11px] text-ink-secondary">
+                    Motivo de revisión: {issue.summary}
+                    <textarea aria-label={`Motivo de revisión: ${issue.summary}`} value={issueReasons[issue.issue_id] || ""}
+                      onChange={event => setIssueReasons(current => ({ ...current, [issue.issue_id]: event.target.value }))}
+                      rows={2} className="mt-1 w-full rounded-lg bg-black/20 p-2 text-xs text-ink-primary ring-1 ring-white/10" />
+                  </label>
+                )}
                 <div className="flex flex-wrap gap-1.5 mt-2">
                   {(issue.seconds || []).slice(0, 8).map((seconds, index) => (
                     <button key={`${seconds}-${index}`} aria-label={`Ir a ${issue.summary}, ${issue.timecodes?.[index] || `${Number(seconds).toFixed(2)} segundos`}`} onClick={() => onSeek?.(Number(seconds))} className="text-[10px] px-2 py-1 rounded-lg bg-brand/10 text-brand-light hover:bg-brand/20">
@@ -384,7 +414,9 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
               {issue.status === "OPEN" && (issue.result_status === "FAIL" || issue.severity === "FAIL") ? (
                 <button type="button" onClick={onOpenEditor} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-red-500/10 text-red-200 hover:bg-red-500/20">Corregir video</button>
               ) : issue.status === "OPEN" ? (
-                <button disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
+                <button disabled={Boolean(busy) || !reportReviewable || (issue.requires_recorded_review && !String(issueReasons[issue.issue_id] || "").trim())}
+                  onClick={() => updateDecision(issue, "acknowledged", issueReasons[issue.issue_id])}
+                  className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
               ) : <span className="text-[10px] text-emerald-300">{issue.status}</span>}
             </div>
           </div>

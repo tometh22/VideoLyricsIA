@@ -693,6 +693,7 @@ class Job(Base):
     # Final-render label-style preflight.  Kept separate from transcription
     # quality because it is bound to an encoded render, not only to segments.
     delivery_qc = Column(JSONB, nullable=True)
+    acoustic_review = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     # Monotonic invalidation fence for asynchronous correction learning. Every
@@ -1166,7 +1167,8 @@ class ChangeRequestProposal(Base):
     status = Column(String(24), nullable=False)
     operations = Column(JSONB, nullable=False)
     decision_history = Column(JSONB, nullable=False, default=list)
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    actor_kind = Column(String(16), nullable=False, default="user", server_default="user")
     applied_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)

@@ -158,12 +158,20 @@ class BlindAudioTools:
         identity = {"clip_sha256": file_sha(clip), "provider": provider, "model": model,
                     "prompt_version": PROMPT_VERSION if provider == "google" else "no-prompt-v1",
                     "source": source, "window": window, "view": view, "policy": asdict(self.policy)}
+        if self.policy.version == "full-audio-review-v1":
+            identity["request_config"] = ({"temperature": 0, "response_format": "verbose_json", "timestamps": "word"}
+                if provider == "openai" else {"temperature": 0, "max_output_tokens": 4096, "thinking_budget": 0,
+                    "response_schema_sha256": digest(BLIND_RESPONSE_SCHEMA),
+                    "location": os.environ.get("VERTEX_LOCATION", "us-central1")})
         task_id = digest(identity)
         target, attempt = self.cache / (task_id + ".json"), self.cache / (task_id + ".attempt.json")
         if target.exists():
             result = json.loads(target.read_text())
+            if not all(result.get(k) == v for k, v in identity.items()):
+                return {**identity, "tool_status": "incompatible_cache", "received_audio": False,
+                        "reason": "cached_identity_mismatch_do_not_repurchase", "calls_this_run": 0}
             return {**result, "cache_hit": True, "calls_this_run": 0}
-        if provider == "google":
+        if provider == "google" and self.policy.version != "full-audio-review-v1":
             old_identity = {**identity, "prompt_version": LEGACY_PROMPT_VERSION}
             old_id = digest(old_identity)
             old_target = self.cache / (old_id + ".json")
