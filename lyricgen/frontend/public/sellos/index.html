@@ -8,8 +8,8 @@
 <title>Genly para sellos — Lyric videos para tu catálogo y lanzamientos</title>
 <link rel="icon" href="/sellos/assets/brand-icon.png" type="image/png">
 <link rel="preload" href="/sellos/assets/montserrat-extrabold.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="/sellos/style.css">
-<script src="/sellos/app.js" defer></script>
+<link rel="stylesheet" href="/sellos/style.css?v=20261112b">
+<script src="/sellos/app.js?v=20261112b" defer></script>
 </head>
 <body>
 <a class="skip" href="#main" data-i18n="skip">Saltar al contenido</a>
@@ -62,12 +62,12 @@
 
     <figure class="feature">
       <div class="feature-media">
-        <img src="/sellos/assets/work/enanitos-verdes-salpicandonos.jpg" alt="Enanitos Verdes — Salpicandonos" width="1280" height="720" fetchpriority="high">
+        <video id="feature-video" src="/sellos/assets/hero/estilos-genly.mp4" poster="/sellos/assets/hero/estilos-genly.jpg" aria-label="Fragmentos de lyric videos con ocho estilos de letra distintos." width="1280" height="720" autoplay muted loop playsinline preload="auto"></video>
       </div>
       <figcaption class="feature-caption">
         <span class="feature-tag"><span class="live" aria-hidden="true"></span><span data-i18n="featureTag">Hecho con Genly</span></span>
-        <span class="feature-title"><strong>Enanitos Verdes</strong> Salpicandonos</span>
-        <span class="feature-meta"><span data-i18n="featureMeta">Lyric video · 5:12</span></span>
+        <span class="feature-title" data-i18n="featureTitle"><strong>Estilos nuevos</strong> Arco, Recorte, Perspectiva y más</span>
+        <span class="feature-meta"><span data-i18n="featureMeta">Lyric videos · Fragmentos</span></span>
       </figcaption>
     </figure>
   </div>
@@ -108,30 +108,44 @@
       </ul>
     </div>
   </div>
+  <div class="art-strip shell">
+    <h3 class="art-title" data-i18n="artTitle">Y también art tracks</h3>
+    <ul class="art-grid">
+      <li><figure class="reel-item"><img src="/sellos/assets/art/mon-laferte-nina-800.jpg" alt="" width="800" height="450" loading="lazy" decoding="async"><figcaption class="reel-meta"><b>Mon Laferte</b><span>Niña</span></figcaption></figure></li>
+      <li><figure class="reel-item"><img src="/sellos/assets/art/los-bunkers-coma-800.jpg" alt="" width="800" height="450" loading="lazy" decoding="async"><figcaption class="reel-meta"><b>Los Bunkers</b><span>Coma</span></figcaption></figure></li>
+      <li><figure class="reel-item"><img src="/sellos/assets/art/kudai-dejame-gritar-800.jpg" alt="" width="800" height="450" loading="lazy" decoding="async"><figcaption class="reel-meta"><b>Kudai</b><span>Déjame Gritar</span></figcaption></figure></li>
+      <li><figure class="reel-item"><img src="/sellos/assets/art/tiro-de-gracia-melaza-800.jpg" alt="" width="800" height="450" loading="lazy" decoding="async"><figcaption class="reel-meta"><b>Tiro de Gracia</b><span>Melaza</span></figcaption></figure></li>
+    </ul>
+  </div>
 </section>
 
 <section id="looks" class="looks shell" aria-labelledby="looks-title">
   <div class="looks-head">
     <div>
       <p class="kicker"><span class="num">02</span><span data-i18n="looksEyebrow">Estilos de letra</span></p>
-      <h2 id="looks-title" data-i18n="looksTitle">Una misma imagen con cinco estilos de letra.</h2>
+      <h2 id="looks-title" data-i18n="looksTitle">Diez estilos de letra, cada uno con su animación.</h2>
     </div>
-    <p class="section-body" data-i18n="looksBody">Son estilos que sumamos hace poco. Cambian la tipografía, el color y la forma en que entra cada palabra. Tocá uno para comparar. El de cada canción lo elegimos con vos antes de arrancar.</p>
+    <p class="section-body" data-i18n="looksBody">Cambian la tipografía, el color y la forma en que entra cada palabra. Tocá uno para verlo. El de cada canción lo elegimos con vos según el género y la estética del artista.</p>
   </div>
   <figure class="look-stage">
     <div class="look-frame">
-      <img id="look-image" src="/sellos/assets/looks/cosmico.jpg" alt="Look Cósmico: la letra «Lavará sus heridas» sobre un callejón bajo la lluvia" width="1280" height="720" loading="lazy" decoding="async">
-      <span class="look-name" id="look-name" aria-hidden="true">Cósmico</span>
+      <img id="look-image" src="/sellos/assets/looks/arco.jpg" alt="Estilo Arco" width="1280" height="720" loading="lazy" decoding="async">
+      <span class="look-name" id="look-name" aria-hidden="true">Arco</span>
     </div>
     <figcaption class="look-bar">
       <div class="look-chips" role="group" aria-label="Estilos de letra">
-        <button type="button" class="look-chip" data-look="cosmico" data-src="/sellos/assets/looks/cosmico.jpg" aria-pressed="true"><img src="/sellos/assets/looks/cosmico-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Cósmico</span></button>
+        <button type="button" class="look-chip" data-look="arco" data-src="/sellos/assets/looks/arco.jpg" aria-pressed="true"><img src="/sellos/assets/looks/arco-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Arco</span></button>
+        <button type="button" class="look-chip" data-look="recorte" data-src="/sellos/assets/looks/recorte.jpg" aria-pressed="false"><img src="/sellos/assets/looks/recorte-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Recorte</span></button>
+        <button type="button" class="look-chip" data-look="perspectiva" data-src="/sellos/assets/looks/perspectiva.jpg" aria-pressed="false"><img src="/sellos/assets/looks/perspectiva-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Perspectiva 3D</span></button>
+        <button type="button" class="look-chip" data-look="bloque" data-src="/sellos/assets/looks/bloque.jpg" aria-pressed="false"><img src="/sellos/assets/looks/bloque-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Bloque</span></button>
+        <button type="button" class="look-chip" data-look="romantico" data-src="/sellos/assets/looks/romantico.jpg" aria-pressed="false"><img src="/sellos/assets/looks/romantico-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Romántico</span></button>
+        <button type="button" class="look-chip" data-look="diptico" data-src="/sellos/assets/looks/diptico.jpg" aria-pressed="false"><img src="/sellos/assets/looks/diptico-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Díptico</span></button>
+        <button type="button" class="look-chip" data-look="duotono" data-src="/sellos/assets/looks/duotono.jpg" aria-pressed="false"><img src="/sellos/assets/looks/duotono-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Duotono</span></button>
+        <button type="button" class="look-chip" data-look="golpe" data-src="/sellos/assets/looks/golpe.jpg" aria-pressed="false"><img src="/sellos/assets/looks/golpe-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Golpe</span></button>
+        <button type="button" class="look-chip" data-look="cosmico" data-src="/sellos/assets/looks/cosmico.jpg" aria-pressed="false"><img src="/sellos/assets/looks/cosmico-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Cósmico</span></button>
         <button type="button" class="look-chip" data-look="cine" data-src="/sellos/assets/looks/cine.jpg" aria-pressed="false"><img src="/sellos/assets/looks/cine-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Cine</span></button>
-        <button type="button" class="look-chip" data-look="pincel" data-src="/sellos/assets/looks/pincel.jpg" aria-pressed="false"><img src="/sellos/assets/looks/pincel-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Pincel</span></button>
-        <button type="button" class="look-chip" data-look="pop" data-src="/sellos/assets/looks/pop.jpg" aria-pressed="false"><img src="/sellos/assets/looks/pop-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Pop 70s</span></button>
-        <button type="button" class="look-chip" data-look="pelicula" data-src="/sellos/assets/looks/pelicula.jpg" aria-pressed="false"><img src="/sellos/assets/looks/pelicula-thumb.jpg" alt="" width="96" height="54" decoding="async"><span>Película</span></button>
       </div>
-      <span class="look-note" data-i18n="looksNote">Capturas de nuestro reel de estilos.</span>
+      <span class="look-note" data-i18n="looksNote">Capturas de videos recientes.</span>
     </figcaption>
   </figure>
 </section>
@@ -156,36 +170,41 @@
     <div class="delivery-copy">
       <p class="kicker"><span class="num">04</span><span data-i18n="deliveryEyebrow">Qué recibís</span></p>
       <h2 id="delivery-title" data-i18n="deliveryTitle">Lo que te mandamos por cada canción</h2>
-      <p class="section-body" data-i18n="deliveryBody">Tres archivos listos para subir. En el piloto son cinco canciones, o sea quince archivos.</p>
+      <p class="section-body" data-i18n="deliveryBody">Cuatro archivos listos para subir. En el piloto son cinco canciones, o sea veinte archivos.</p>
       <ul class="formats">
         <li class="format f-lyric"><span class="ratio r-169" aria-hidden="true"></span><div><h3><span data-i18n="fLyric">Lyric video</span> <span class="spec">16:9 · MP4 Full HD</span></h3><p data-i18n="fLyricBody">La canción entera con la letra sincronizada. Es el video principal para YouTube.</p></div></li>
         <li class="format f-vertical"><span class="ratio r-916" aria-hidden="true"></span><div><h3><span data-i18n="fVertical">Corte vertical</span> <span class="spec">9:16 · MP4 · 30 s</span></h3><p data-i18n="fVerticalBody">Un fragmento de 30 segundos que elegís vos, para Reels, Shorts o TikTok.</p></div></li>
         <li class="format f-thumb"><span class="ratio r-thumb" aria-hidden="true"></span><div><h3><span data-i18n="fThumb">Miniatura</span> <span class="spec">16:9 · JPG 1280×720</span></h3><p data-i18n="fThumbBody">La portada del video, con la misma estética.</p></div></li>
+        <li class="format f-canvas"><span class="ratio r-916" aria-hidden="true"></span><div><h3><span data-i18n="fCanvas">Canvas de Spotify</span> <span class="spec">9:16 · MP4 · 8 s en loop</span></h3><p data-i18n="fCanvasBody">El loop que se ve en Spotify mientras suena la canción, hecho con el mismo fondo.</p></div></li>
+        <li class="format f-art"><span class="ratio r-169" aria-hidden="true"></span><div><h3><span data-i18n="fArt">Art track (opcional)</span> <span class="spec">16:9 · MP4 Full HD</span></h3><p data-i18n="fArtBody">La portada oficial con la onda del audio y el título, para los temas que no llevan lyric video.</p></div></li>
       </ul>
     </div>
 
     <div class="folder" role="img" aria-labelledby="folder-label">
-      <p id="folder-label" class="visually-hidden" data-i18n="folderLabel">Esquema de la carpeta de entrega del piloto: cinco canciones, cada una con un lyric video, un corte vertical y una miniatura.</p>
-      <div class="folder-bar" aria-hidden="true"><span class="dots"><i></i><i></i><i></i></span><span class="folder-path">piloto_genly / <b data-i18n="folderPath">entrega_final</b></span><span class="folder-count" data-i18n="folderCount">15 archivos</span></div>
+      <p id="folder-label" class="visually-hidden" data-i18n="folderLabel">Esquema de la carpeta de entrega del piloto: cinco canciones, cada una con un lyric video, un corte vertical, un Canvas de Spotify y una miniatura.</p>
+      <div class="folder-bar" aria-hidden="true"><span class="dots"><i></i><i></i><i></i></span><span class="folder-path">piloto_genly / <b data-i18n="folderPath">entrega_final</b></span><span class="folder-count" data-i18n="folderCount">20 archivos</span></div>
       <div class="folder-body" aria-hidden="true">
         <div class="song"><p class="song-name"><span class="caret">▾</span><span data-i18n="song1">01_tu_cancion</span></p>
           <p class="file k-lyric"><span class="ico">▶</span><span class="fname">lyric_video_1920x1080.mp4</span><span class="ftag">16:9</span></p>
           <p class="file k-vertical"><span class="ico">▯</span><span class="fname">vertical_1080x1920_30s.mp4</span><span class="ftag">9:16</span></p>
+          <p class="file k-vertical"><span class="ico">▯</span><span class="fname">canvas_spotify_8s.mp4</span><span class="ftag">9:16</span></p>
           <p class="file k-thumb"><span class="ico">▣</span><span class="fname">miniatura_1280x720.jpg</span><span class="ftag">JPG</span></p>
         </div>
         <div class="song"><p class="song-name"><span class="caret">▾</span><span data-i18n="song2">02_tu_cancion</span></p>
           <p class="file k-lyric"><span class="ico">▶</span><span class="fname">lyric_video_1920x1080.mp4</span><span class="ftag">16:9</span></p>
           <p class="file k-vertical"><span class="ico">▯</span><span class="fname">vertical_1080x1920_30s.mp4</span><span class="ftag">9:16</span></p>
+          <p class="file k-vertical"><span class="ico">▯</span><span class="fname">canvas_spotify_8s.mp4</span><span class="ftag">9:16</span></p>
           <p class="file k-thumb"><span class="ico">▣</span><span class="fname">miniatura_1280x720.jpg</span><span class="ftag">JPG</span></p>
         </div>
         <div class="song"><p class="song-name"><span class="caret">▾</span><span data-i18n="song3">03_tu_cancion</span></p>
           <p class="file k-lyric"><span class="ico">▶</span><span class="fname">lyric_video_1920x1080.mp4</span><span class="ftag">16:9</span></p>
           <p class="file k-vertical"><span class="ico">▯</span><span class="fname">vertical_1080x1920_30s.mp4</span><span class="ftag">9:16</span></p>
+          <p class="file k-vertical"><span class="ico">▯</span><span class="fname">canvas_spotify_8s.mp4</span><span class="ftag">9:16</span></p>
           <p class="file k-thumb"><span class="ico">▣</span><span class="fname">miniatura_1280x720.jpg</span><span class="ftag">JPG</span></p>
         </div>
-        <div class="song"><p class="song-name"><span class="caret">▸</span><span data-i18n="songMore">04 y 05, con los mismos tres archivos</span></p></div>
+        <div class="song"><p class="song-name"><span class="caret">▸</span><span data-i18n="songMore">04 y 05, con los mismos cuatro archivos</span></p></div>
       </div>
-      <p class="folder-note" data-i18n="folderNote">Así queda la carpeta. Si necesitás ProRes, 4K, Canvas u otro formato, lo cotizamos aparte.</p>
+      <p class="folder-note" data-i18n="folderNote">Así queda la carpeta. También entregamos en ProRes; si necesitás 4K u otro formato, lo cotizamos aparte.</p>
     </div>
   </div>
 </section>
