@@ -93,14 +93,49 @@ def _sig_json(sig: tuple) -> list:
     return [list(x) if isinstance(x, tuple) else x for x in sig]
 
 
+def _sig_is_original(sig) -> bool:
+    """Whether a persisted ``lyric_variant_sig`` is the look's original design
+    (Recipe.signature = (look, fonts, palette); the original's palette is
+    "original")."""
+    try:
+        return str(list(sig)[2]) == "original"
+    except (TypeError, IndexError):
+        return False
+
+
+def wants_original(*, operator_genre="", variant=None, persisted_sig=None) -> bool:
+    """The default of a look is its ORIGINAL design.
+
+    An operator who picks a look and leaves genre AND variant on "automatic"
+    (or asks for variant 0 without a genre) gets the look exactly as designed:
+    variant 0 in the look's native family (lyric_recipes.NATIVE), never a
+    recipe drawn from the detected genre's pools — those mixed in cheap
+    overlays (shapes / prism) and off-brand fonts (incident 11-nov-2026). The
+    detected genre still drives "Otra variante" (variant ≥ 1).
+
+    ``persisted_sig`` is the signature already rendered for THIS variant: a
+    job that rendered a non-original recipe for variant 0 before this rule
+    keeps it, so a retry or an edit never restyles a delivered video.
+    """
+    if R.normalize_genre(operator_genre):
+        return False
+    if normalize_variant(variant) not in (None, 0):
+        return False
+    if persisted_sig:
+        return _sig_is_original(persisted_sig)
+    return True
+
+
 def prepare_opts(*, job_id: str, lyric_look: str, artist: str = "", song_title: str = "",
                  lyrics_text: str = "", render_params: dict | None = None,
                  detect_genre: bool = True) -> tuple[dict, dict]:
     """(opts, render_params_update) for a job about to render with a look.
 
-    - operator genre wins; else a previously detected one; else detect now.
-    - operator variant wins; else a previously chosen one; else choose the
-      first variant not used by sibling songs.
+    - automatic genre + automatic (or 0) variant = the look's original design
+      (`wants_original`): variant 0, no genre.
+    - otherwise: operator genre wins; else a previously detected one; else
+      detect now. Operator variant wins; else a previously chosen one; else
+      choose the first variant not used by sibling songs.
     """
     rp = dict(render_params or {})
     if not L.get_look(lyric_look):
@@ -123,9 +158,15 @@ def prepare_opts(*, job_id: str, lyric_look: str, artist: str = "", song_title: 
                 update["lyric_genre_detected"] = detected
         except Exception as exc:  # pragma: no cover
             logger.warning("[LOOK] genre detection failed for %s: %s", job_id, exc)
-    eff_genre = genre or detected
     seed_key = R.seed_key_for(artist, song_title) if (artist or song_title) else job_id
     variant = normalize_variant(rp.get("lyric_variant"))
+    if wants_original(operator_genre=genre, variant=variant,
+                      persisted_sig=rp.get("lyric_variant_sig")):
+        # The detected genre stays persisted (it feeds "Otra variante"), but
+        # the default render is the look as designed.
+        eff_genre, variant = "", 0
+    else:
+        eff_genre = genre or detected
     if variant is None:
         variant = R.choose_auto_variant(lyric_look, eff_genre, seed_key,
                                         sibling_signatures(job_id, lyric_look))

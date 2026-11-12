@@ -14358,6 +14358,28 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
                                             overrides={"ink": _ov["ink"]})
         info["genre_source"] = "none"
         return info
+    # The default of a look is its ORIGINAL design (lyric_look_runtime.
+    # wants_original — the same rule the render applies): automatic genre +
+    # automatic/0 variant → variant 0, no genre. For a job, "automatic"
+    # variant means the stored one when the stored genre is automatic too
+    # (what the edit pipeline renders), and the stored signature protects a
+    # job that already rendered a non-original recipe for that variant. A
+    # fresh preview (/variant wizard) only follows it for an explicit variant:
+    # its automatic one is a new recipe, distinct from the parent.
+    if not body.fresh or variant is not None:
+        _req_variant, _stored_sig = variant, None
+        if same_look and not lyric_recipes.normalize_genre(rp.get("lyric_genre")):
+            _stored_variant = _llr.normalize_variant(rp.get("lyric_variant"))
+            if _req_variant is None:
+                _req_variant = _stored_variant
+            if _stored_variant is not None and _stored_variant == _req_variant:
+                _stored_sig = rp.get("lyric_variant_sig")
+        if _llr.wants_original(operator_genre=body.lyric_genre, variant=_req_variant,
+                               persisted_sig=_stored_sig):
+            _look, info = lyric_recipes.resolve(look_id, genre="", variant=0,
+                                                seed_key=seed_key, overrides=overrides)
+            info["genre_source"] = "none"
+            return info
     # The genre the operator chose travels in the body ("" = automatic); the
     # stored operator genre is NOT a fallback, or "Automático" could never
     # clear it. Automatic = the detection the render uses, read from cache
@@ -14383,7 +14405,12 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
             if body.fresh and rp.get("lyric_look") == look_id and rp.get("lyric_variant_sig"):
                 sibs = set(sibs) | {tuple(tuple(x) if isinstance(x, list) else x
                                           for x in rp["lyric_variant_sig"])}
-            variant = lyric_recipes.choose_auto_variant(look_id, genre, seed_key, sibs, fresh=body.fresh)
+            # A fresh preview (the /variant wizard) with an automatic genre
+            # must not land on variant 0: the render treats that as the
+            # original design, which is not what this preview would show.
+            variant = lyric_recipes.choose_auto_variant(
+                look_id, genre, seed_key, sibs, fresh=body.fresh,
+                min_variant=1 if (body.fresh and genre_src != "operator") else 0)
     _look, info = lyric_recipes.resolve(
         look_id, genre=genre, variant=variant, seed_key=seed_key, overrides=overrides)
     info["genre_source"] = genre_src

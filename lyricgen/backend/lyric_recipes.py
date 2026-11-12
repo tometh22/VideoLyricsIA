@@ -318,19 +318,28 @@ def recipe_for(look_id: str, genre: str, seed_key: str, variant: int) -> Recipe:
 
 
 def choose_auto_variant(look_id: str, genre: str, seed_key: str,
-                        used_signatures: set | None = None, limit: int = 40, *, fresh: bool = False) -> int:
-    """Smallest variant whose look isn't already used by a sibling song."""
+                        used_signatures: set | None = None, limit: int = 40, *, fresh: bool = False,
+                        min_variant: int = 0) -> int:
+    """Smallest variant whose look isn't already used by a sibling song.
+
+    ``min_variant=1`` skips variant 0: with an automatic genre, variant 0 IS
+    the original design (lyric_look_runtime.wants_original), so a caller that
+    needs a recipe different from the original (the /variant wizard) asks
+    for ≥ 1."""
     # These explicitly selected designs keep their approved appearance.
     # Manual "another variant" remains available through recipe_for.
     if look_id in L.EDITORIAL_LAYOUTS and not fresh:
         return 0
     used = used_signatures or set()
+    min_variant = max(0, min(int(min_variant or 0), limit - 1))
     # Start each song at its own offset so a batch resolved before any sibling
     # has rendered (a campaign, a wizard batch) still spreads across variants
     # instead of all landing on variant 0.
     start = 0 if look_id in L.EDITORIAL_LAYOUTS else job_seed(seed_key) % 6
-    for i in range(limit):
-        v = (start + i) % limit
+    span = limit - min_variant
+    start = min_variant + (max(start - min_variant, 0) % span)
+    for i in range(span):
+        v = min_variant + ((start - min_variant + i) % span)
         if recipe_for(look_id, genre, seed_key, v).signature not in used:
             return v
     return start

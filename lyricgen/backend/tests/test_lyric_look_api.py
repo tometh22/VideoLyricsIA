@@ -98,10 +98,16 @@ def test_variant_overridable_fields_include_the_look_controls():
 def test_resolve_without_genre_uses_the_same_detection_as_the_render(client, user_token, monkeypatch):
     import genre_detect
     monkeypatch.setattr(genre_detect, "detect", lambda a, t, l="", job_id=None, **_kw: ("metal", "cache"))
+    # "Otra variante" (variant ≥ 1) with an automatic genre uses the detection.
+    r = client.post("/lyric-looks/resolve", json={"lyric_look": "cinetico", "artist": "Almafuerte",
+                                                   "song_title": "Niño Jefe", "lyric_variant": 1},
+                    headers=auth(user_token)).json()
+    assert r["genre"] == "metal" and r["family"] == "heavy" and r["genre_source"] == "detected"
+    # Automatic variant = the look's original design, whatever was detected.
     r = client.post("/lyric-looks/resolve", json={"lyric_look": "cinetico", "artist": "Almafuerte",
                                                    "song_title": "Niño Jefe"},
                     headers=auth(user_token)).json()
-    assert r["genre"] == "metal" and r["family"] == "heavy" and r["genre_source"] == "detected"
+    assert r["variant"] == 0 and r["genre"] == "" and r["description"] == "Diseño original"
 
 
 # --- Regressions of the 12-oct review ------------------------------------------------
@@ -144,6 +150,10 @@ def test_resolve_never_pays_for_detection(client, user_token, monkeypatch):
                         lambda a, t, l="", job_id=None, **kw: calls.append(kw) or ("", "none"))
     client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "artist": "X", "song_title": "Y"},
                 headers=auth(user_token))
+    assert calls == []              # the original design needs no genre at all
+    client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "artist": "X", "song_title": "Y",
+                                              "lyric_variant": 2},
+                headers=auth(user_token))
     assert calls and all(kw.get("cached_only") for kw in calls)
 
 
@@ -151,10 +161,17 @@ def test_resolve_automatic_genre_ignores_the_stored_operator_genre(client):
     token, job_id = _user_with_job(client, {
         "lyric_look": "neon", "lyric_genre": "metal", "lyric_genre_detected": "pop",
         "lyric_variant": 3, "lyric_variant_sig": ["x"]})
-    r = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id},
+    r = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id,
+                                                   "lyric_variant": 1},
                     headers=auth(token)).json()
     # "Automático" = the detected genre, not the metal the operator had set.
     assert r["genre"] == "pop" and r["genre_source"] == "detected"
+    # Automatic genre + automatic variant: the stored variant belonged to the
+    # operator's metal (the edit drops it with the genre) → original design,
+    # which is what the edit pipeline renders.
+    r = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id},
+                    headers=auth(token)).json()
+    assert r["variant"] == 0 and r["genre"] == "" and r["description"] == "Diseño original"
     r = client.post("/lyric-looks/resolve", json={"lyric_look": "neon", "job_id": job_id,
                                                    "lyric_genre": "metal"},
                     headers=auth(token)).json()
@@ -211,3 +228,66 @@ def test_editorial_designs_resolve_as_original_over_source_video(client, user_to
         assert result['look'] == code and result['variant'] == 0
         assert result['background'] == 'source'
         assert main._lyric_look_kwargs(code, lyric_variant=0)['lyric_look'] == code
+
+
+# --- 11-nov-2026: the wizard's look reaches the first render ------------------------
+
+def test_resolve_previews_the_original_for_an_automatic_variant(client, user_token):
+    # Wizard (no job yet): look picked, genre/variant automatic → the look as
+    # designed, so the pinned variant the wizard submits is 0 = original.
+    for look_id in ("cine", "romantico", "neon", "perspectiva", "arco", "bloque"):
+        r = client.post("/lyric-looks/resolve", json={
+            "lyric_look": look_id, "artist": "Diego Faria", "song_title": "Rosa de Fogo",
+            "lyric_variant": ""}, headers=auth(user_token)).json()
+        assert r["variant"] == 0 and r["genre"] == "", (look_id, r)
+        assert r["description"] == "Diseño original", (look_id, r)
+
+
+def test_resolve_fresh_automatic_variant_is_never_the_original(client):
+    # /variant wizard: an automatic variant must be a NEW recipe (≥ 1), since
+    # the render reads a pinned variant 0 + automatic genre as the original.
+    import lyric_recipes as R
+    seed = R.seed_key_for("Almafuerte", "Niño Jefe")
+    sig = [list(x) if isinstance(x, tuple) else x for x in R.recipe_for("neon", "", seed, 0).signature]
+    # Detected genre outside Neón's native family: variant 0 there is a
+    # recipe the old code could pick (and the render would then draw the
+    # original instead).
+    token, job_id = _user_with_job(client, {"lyric_look": "neon", "lyric_variant": 0,
+                                            "lyric_variant_sig": sig,
+                                            "lyric_genre_detected": "metal"})
+    for i in range(12):
+        fresh = client.post("/lyric-looks/resolve", json={
+            "lyric_look": "neon", "job_id": job_id, "fresh": True,
+            "artist": "Almafuerte", "song_title": f"Tema {i}"},
+            headers=auth(token)).json()
+        assert fresh["variant"] >= 1 and fresh["description"] != "Diseño original", (i, fresh)
+
+
+@pytest.mark.parametrize("segments", ["[]", '[{"start": 0, "end": 1, "text": "rosa de fogo"}]'])
+@pytest.mark.parametrize("variant", ["", "0"])
+def test_generate_forwards_the_wizard_look_to_the_render(client, monkeypatch, segments, variant):
+    # "Generar sin revisar" (segments []) and "Revisar letra" → approve
+    # (edited segments) share POST /generate: the look must reach the worker.
+    from tests.test_main_generate_with_job_id import _make_user, _seed_transcribed_pending
+    from database import SessionLocal, User
+    username, token = _make_user(client)
+    s = SessionLocal()
+    try:
+        u = s.query(User).filter(User.username == username).first()
+        user_id, tenant_id = u.id, u.tenant_id
+    finally:
+        s.close()
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+    captured = {}
+    monkeypatch.setattr("main.enqueue_pipeline", lambda **kw: captured.update(kw) or "thread:fake")
+    monkeypatch.setattr("main._enforce_memory_pressure", lambda: None)
+    data = {"job_id": job_id, "artist": "Intoxicados", "song_title": "No Tengo Ganas",
+            "style": "oscuro", "segments_json": segments, "delivery_profile": "youtube",
+            "lyric_look": "cine", "lyric_color": ""}
+    if variant:
+        data["lyric_variant"] = variant
+    res = client.post("/generate", data=data, headers=auth(token))
+    assert res.status_code == 200, res.text
+    assert captured["lyric_look"] == "cine"
+    assert captured.get("lyric_variant") == (int(variant) if variant else None)
+    assert "lyric_genre" not in captured
