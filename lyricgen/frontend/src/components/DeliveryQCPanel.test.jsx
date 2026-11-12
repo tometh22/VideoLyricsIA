@@ -332,3 +332,20 @@ describe("DeliveryQCPanel", () => {
     expect(onJobUpdate).not.toHaveBeenCalled();
   });
 });
+
+it('requires an acoustic explanation and never offers generic acceptance of objective failures', async () => {
+  const onJobUpdate = vi.fn();
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ok:true,json:async()=>({delivery_qc:job.delivery_qc})}));
+  const pilot = {...job, delivery_qc:{...job.delivery_qc, acoustic:{required:true,coverage:{google:{fraction:.5,missing:[[20,40]]}}},
+    issues:[{issue_id:'audio',summary:'Tramo sin analizar',status:'OPEN',result_status:'REVIEW',requires_recorded_review:true,seconds:[20]},
+      {issue_id:'objective',summary:'Falta pista de audio',status:'OPEN',result_status:'FAIL',seconds:[0]}]}};
+  render(<DeliveryQCPanel job={pilot} onJobUpdate={onJobUpdate}/>);
+  expect(screen.getByTestId('acoustic-coverage')).toHaveTextContent('50% analizado');
+  expect(screen.getAllByRole('button',{name:'Revisado'})).toHaveLength(1);
+  fireEvent.click(screen.getByRole('button',{name:'Revisado'}));
+  expect(fetch).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByRole('textbox',{name:'Motivo de revisión: Tramo sin analizar'}),{target:{value:'Escuché de 20 a 40 segundos: solo instrumental'}});
+  fireEvent.click(screen.getByRole('button',{name:'Revisado'}));
+  await waitFor(()=>expect(onJobUpdate).toHaveBeenCalled());
+  expect(JSON.parse(fetch.mock.calls[0][1].body).reason).toContain('solo instrumental');
+});

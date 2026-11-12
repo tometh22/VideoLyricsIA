@@ -13350,6 +13350,12 @@ async def approve_job(
             detail="Una copia de piloto no se aprueba ni se entrega.",
         )
 
+    from delivery_acoustic_qc import require_delivery_review
+    try:
+        require_delivery_review(job)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
     from delivery_qc_runtime import delivery_readiness_gate
     _delivery_gate = delivery_readiness_gate(job, job.delivery_qc)
     override_requested = bool(body.admin_override)
@@ -13565,6 +13571,17 @@ def decide_delivery_qc_issue(
     from delivery_qc_runtime import qc_input_fingerprint
     if report.get("job_input_fingerprint") != qc_input_fingerprint(job):
         raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    # Reviewer decisions belong to the exact rendered file inspected by QC.
+    # An object can be replaced in storage without changing the job row, so
+    # bind each decision to the render asset ETag as well as the report token.
+    render_asset = report.get("render_asset") or {}
+    if (report.get("acoustic") or {}).get("required") and render_asset.get("key"):
+        try:
+            current_etag = storage.object_etag(render_asset["key"])
+        except Exception:
+            current_etag = None
+        if not current_etag or current_etag != render_asset.get("etag"):
+            raise HTTPException(status_code=409, detail="delivery_qc_render_asset_changed")
     _validate_qc_report_preview(report, body.expected_report_id)
     found = None
     issues = []
@@ -13578,6 +13595,8 @@ def decide_delivery_qc_issue(
         row = dict(raw)
         if str(row.get("issue_id")) == issue_id:
             found = row
+            if row.get("requires_recorded_review") and not body.reason.strip():
+                raise HTTPException(status_code=422, detail="delivery_qc_decision_reason_required")
             if row.get("manual_verification_required") and body.decision != "resolved_manual":
                 raise HTTPException(
                     status_code=422,
@@ -21235,6 +21254,11 @@ def admin_create_delivery_from_job(
             job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
             validate_reviewed_cut()
     job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+    from delivery_acoustic_qc import require_delivery_review
+    try:
+        require_delivery_review(job)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     if body and body.change_request_id:
         validate_reviewed_cut()
     if job.status != "done" or job.approved_at is None:
@@ -23374,7 +23398,7 @@ def admin_generate_change_request_proposal(
     ddb: Session = Depends(get_deliveries_db),
 ):
     """Generate or reuse a deterministic proposal for the current editor revision."""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") != "admin" and not current_user.get("_system_actor"):
         raise HTTPException(status_code=403, detail="Admin only")
     _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
     cr, delivery = _read_change_request_context(db, ddb, cr_id)
@@ -23431,6 +23455,8 @@ def admin_generate_change_request_proposal(
             base_revision=int(document.revision or 0),
             audio_revision=int(job.audio_revision or 0),
             audio_sha256=str(job.input_audio_sha256 or ""),
+            metadata={"artist": job.artist, "song_title": job.song_title},
+            duration_seconds=((job.transcription_quality or {}).get("metrics") or {}).get("audio_duration_s"),
             background_context={
                 "background_hint": (job.render_params or {}).get("background_hint"),
                 "background_mode": (job.render_params or {}).get("background_mode"),
@@ -23467,6 +23493,8 @@ def admin_generate_change_request_proposal(
         ][-99:]
         history.append({
             "decision": "recalculated", "decided_at": now.isoformat(),
+            "actor_kind": "system" if current_user.get("_system_actor") else "user",
+            "user_id": current_user.get("id"),
         })
         row.delivery_id = delivery.id
         row.job_id = job.job_id
@@ -23484,6 +23512,7 @@ def admin_generate_change_request_proposal(
         row.applied_revision = None
         row.idempotency_hash = None
         row.updated_at = now
+        row.actor_kind = "system" if current_user.get("_system_actor") else "user"
     else:
         import uuid as _uuid
         row = ChangeRequestProposal(
@@ -23498,11 +23527,13 @@ def admin_generate_change_request_proposal(
             parser_version=built["parser_version"],
             schema_version=built["schema_version"], status=built["status"],
             operations=built["operations"], decision_history=[],
-            created_by=current_user["id"], created_at=now, updated_at=now,
+            created_by=current_user.get("id"),
+            actor_kind="system" if current_user.get("_system_actor") else "user",
+            created_at=now, updated_at=now,
         )
         db.add(row)
     db.add(ProductEvent(
-        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job.job_id,
+        tenant_id=str(job.tenant_id), user_id=current_user.get("id"), job_id=job.job_id,
         name="change_request_proposal_generated",
         properties={
             "status": row.status,
@@ -23514,7 +23545,7 @@ def admin_generate_change_request_proposal(
         },
     ))
     db.add(AuditLog(
-        user_id=current_user["id"], action="delivery.change_request.proposal_generated",
+        user_id=current_user.get("id"), action="delivery.change_request.proposal_generated",
         detail={
             "change_request_id": cr_id, "delivery_id": delivery.id,
             "job_id": job.job_id, "proposal_id": row.id,
@@ -23673,7 +23704,7 @@ def admin_apply_change_request_proposal(
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
-    if current_user.get("role") != "admin":
+    if current_user.get("role") != "admin" and not current_user.get("_system_actor"):
         raise HTTPException(status_code=403, detail="Admin only")
     _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
     _require_change_request_flag("CHANGE_REQUEST_APPLY_ENABLED")
@@ -23761,7 +23792,7 @@ def admin_apply_change_request_proposal(
             body.operation_ids,
         )
         document, version, applied = save_document(
-            db, job, document, current_user["id"], body.base_revision,
+            db, job, document, current_user.get("id"), body.base_revision,
             next_segments, "change_request",
         )
     except RuntimeError as exc:
@@ -23771,6 +23802,15 @@ def admin_apply_change_request_proposal(
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
+    metadata_changed = False
+    for operation in selected:
+        if operation.get("kind") == "set_metadata" and operation.get("field") in {"artist", "song_title"}:
+            field = operation["field"]
+            value = operation.get("proposed_value")
+            if value and getattr(job, field) != value:
+                setattr(job, field, value)
+                metadata_changed = True
+    operation_applied = bool(applied or metadata_changed)
     quality_outbox_id = None
     if applied:
         from correction_learning import invalidate_job_observations
@@ -23812,13 +23852,13 @@ def admin_apply_change_request_proposal(
     row.operations = operations
     row.decision_history = history
     row.status = "partially_applied" if pending_applicable or pending_manual else "applied"
-    row.applied_by = current_user["id"]
+    row.applied_by = current_user.get("id")
     row.applied_at = now
     row.updated_at = now
     row.applied_revision = int(document.revision or 0)
     row.idempotency_hash = idem_hash
     db.add(ProductEvent(
-        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job.job_id,
+        tenant_id=str(job.tenant_id), user_id=current_user.get("id"), job_id=job.job_id,
         name="change_request_proposal_applied",
         properties={
             "operation_count": len(selected_ids), "status": row.status,
@@ -23827,7 +23867,7 @@ def admin_apply_change_request_proposal(
         },
     ))
     db.add(AuditLog(
-        user_id=current_user["id"], action="delivery.change_request.proposal_applied",
+        user_id=current_user.get("id"), action="delivery.change_request.proposal_applied",
         detail={
             "change_request_id": cr_id, "delivery_id": row.delivery_id,
             "job_id": row.job_id, "proposal_id": row.id,
@@ -23839,7 +23879,7 @@ def admin_apply_change_request_proposal(
     _dispatch_editor_quality_outbox(quality_outbox_id)
     db.refresh(row)
     return {
-        "ok": True, "applied": applied, "idempotent": not applied,
+        "ok": True, "applied": operation_applied, "idempotent": not operation_applied,
         "revision": int(document.revision or 0),
         "version_id": version.id if version else None,
         "editor_url": f"/videos/{job.job_id}/edit-lyrics?change_request_id={cr_id}&proposal_id={row.id}",

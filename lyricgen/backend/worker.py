@@ -353,6 +353,8 @@ def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
         try:
             from queue_jobs import ensure_job_outbox_reconciler_scheduled
             ensure_job_outbox_reconciler_scheduled()
+            from queue_jobs import ensure_change_request_reconciler_scheduled
+            ensure_change_request_reconciler_scheduled()
             scheduled["job_outbox"] = True
         except Exception as exc:
             scheduled["job_outbox"] = False

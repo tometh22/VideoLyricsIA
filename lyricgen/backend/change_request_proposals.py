@@ -15,7 +15,7 @@ from editor import normalize_segments, segments_content_hash
 from transcription_quality import segments_hash
 
 
-SCHEMA_VERSION = "change-request-proposal-v2"
+SCHEMA_VERSION = "change-request-proposal-v3"
 MANUAL_KINDS = {
     "manual_review", "timing_review", "structure_review",
     "background_review", "audio_review",
@@ -226,6 +226,8 @@ def _text_operation(
     proposed = {**deepcopy(current), "text": proposed_text}
     for key in ("words", "word_timestamps", "tokens"):
         proposed.pop(key, None)
+    if any(key in current for key in ("words", "word_timestamps", "tokens")):
+        proposed["alignment_stale"] = True
     current_rows = [deepcopy(current)]
     proposed_rows = [proposed]
     group_key = instruction.get("id")
@@ -238,7 +240,13 @@ def _text_operation(
         "kind": "replace_text",
         "status": "pending",
         "applicable": True,
-        "automatic_apply_allowed": False,
+        # A client supplied both sides of the correction. _text_targets only
+        # returns an exact source-text match (or explicit repeat scope), so the
+        # operation is safe to auto-apply unless later conflict/lock checks
+        # abstain. New text attached only to a timestamp remains review-only.
+        "automatic_apply_allowed": bool(instruction.get("current_text")) and not bool(
+            current.get("locked") or current.get("operator_locked")
+        ),
         "confidence": instruction.get("confidence") or "medium",
         "scope": instruction.get("scope") or "single",
         "source_excerpt": instruction.get("source_excerpt"),
@@ -251,7 +259,8 @@ def _text_operation(
         "proposed_segments": proposed_rows,
         "current_segments_hash": segments_content_hash(current_rows),
         "proposed_segments_hash": segments_content_hash(proposed_rows),
-        "warnings": [],
+        "warnings": ["locked_segment_requires_confirmation"]
+        if current.get("locked") or current.get("operator_locked") else [],
         "word_alignment_invalidated": any(key in current for key in ("words", "word_timestamps", "tokens")),
     }
 
@@ -384,6 +393,69 @@ def _manual_operation(instruction: dict) -> dict:
     }
 
 
+def _explicit_timing_operation(segments, instruction, metadata, duration):
+    op = _manual_operation(instruction)
+    kind = instruction.get("kind")
+    before, after = [], []
+    if kind == "set_metadata":
+        field = instruction.get("field")
+        op.update(field=field, current_value=metadata.get(field),
+                  proposed_value=instruction.get("requested_text"))
+        if field not in {"artist", "song_title"} or not instruction.get("requested_text"):
+            op["reason"] = "unsupported_metadata_field"
+            return op
+        if metadata.get(field) == instruction.get("requested_text"):
+            op.update(status="already_satisfied", reason="already_satisfied", warnings=[])
+            return op
+    elif kind == "delete_from":
+        at = instruction.get("timecode_seconds")
+        if at is None or any(r["start"] < at < r["end"] for r in segments):
+            op["reason"] = "deletion_crosses_segment_or_time_missing"
+            return op
+        before = [r for r in segments if r["start"] >= at]
+        if not before:
+            op.update(status="already_satisfied", reason="already_satisfied", warnings=[])
+            return op
+        if len(before) == len(segments):
+            op["reason"] = "whole_document_deletion_requires_review"
+            return op
+    else:
+        at = instruction.get("requested_start")
+        text = instruction.get("requested_text")
+        if at is None or not text:
+            op["reason"] = "explicit_phrase_and_start_required"
+            return op
+        matches = [r for r in segments if _identity(r.get("text")) == _identity(text)]
+        if len(matches) != 1:
+            op["reason"] = "phrase_target_ambiguous_or_missing"
+            return op
+        row = matches[0]
+        end = instruction.get("requested_end") if kind == "set_interval" else row["end"]
+        if end is None or end <= at or duration is None or end > duration:
+            op["reason"] = "invalid_interval_or_unknown_duration"
+            return op
+        if any(r is not row and r["start"] < end and r["end"] > at for r in segments):
+            op["reason"] = "interval_overlaps_neighbor"
+            return op
+        if row["start"] == at and row["end"] == end:
+            op.update(status="already_satisfied", reason="already_satisfied", warnings=[])
+            return op
+        before = [row]
+        after = [{**deepcopy(row), "start": at, "end": end, "alignment_stale": True}]
+        for key in ("words", "word_timestamps", "tokens"):
+            after[0].pop(key, None)
+    op.update(current_segments=deepcopy(before), proposed_segments=after,
+              current_segments_hash=segments_content_hash(before),
+              proposed_segments_hash=segments_content_hash(after), applicable=True,
+              automatic_apply_allowed=True, reason="explicit_client_instruction",
+              warnings=list(instruction.get("warnings") or []))
+    if any(row.get("locked") is True or row.get("operator_locked") is True for row in before):
+        op.update(automatic_apply_allowed=False, reason="locked_segment_requires_confirmation")
+        op["warnings"].append("locked_segment_requires_confirmation")
+    if before: op.update(start=before[0]["start"], end=before[-1]["end"])
+    return op
+
+
 def _background_prompt_operation(
     instruction: dict, *, comment: str, background_context: dict | None,
 ) -> dict:
@@ -514,6 +586,7 @@ def build_proposal(
     audio_revision: int = 0, audio_sha256: str = "",
     background_context: dict | None = None,
     interpretation: dict | None = None,
+    metadata: dict | None = None, duration_seconds: float | None = None,
 ) -> dict:
     current = normalize_segments([dict(row) for row in segments])
     parsed = parse_change_request(comment)
@@ -526,7 +599,19 @@ def build_proposal(
     visual_constraints = [row for row in parsed["instructions"] if row.get("reason") == "unresolved_visual_constraint"]
     for instruction in parsed["instructions"]:
         kind = instruction.get("kind")
-        if kind == "replace_text":
+        if kind in {"set_interval", "set_start", "delete_from", "set_metadata"}:
+            resolved_metadata = metadata or {
+                key: (background_context or {}).get(key)
+                for key in ("artist", "song_title")
+            }
+            operation = _explicit_timing_operation(current, instruction, resolved_metadata, duration_seconds)
+            if operation.get("applicable"):
+                operations.append(operation)
+            elif operation.get("status") == "already_satisfied":
+                satisfied.append(operation)
+            else:
+                unresolved.append(operation)
+        elif kind == "replace_text":
             targets = _text_targets(current, instruction)
             if targets:
                 operations.extend(
@@ -604,10 +689,19 @@ def build_proposal(
     # Detect competing claims before presenting a jointly applicable selection.
     claims: dict[str, list[dict]] = {}
     for operation in operations:
+        if operation.get("kind") == "set_metadata":
+            claims.setdefault("metadata:" + str(operation.get("field")), []).append(operation)
         for row in operation["current_segments"]:
             claims.setdefault(segments_content_hash([row]), []).append(operation)
     conflicts = {item["id"] for values in claims.values() if len(values) > 1 for item in values}
-    unresolved.extend({**item, "applicable": False, "automatic_apply_allowed": False,
+    candidates = [item for item in operations if item.get("kind") in {"set_interval", "set_start"}]
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1:]:
+            if any(a["start"] < b["end"] and a["end"] > b["start"]
+                   for a in left.get("proposed_segments", [])
+                   for b in right.get("proposed_segments", [])):
+                conflicts.update((left["id"], right["id"]))
+    unresolved.extend({**item, "status": "conflict", "applicable": False, "automatic_apply_allowed": False,
                        "reason": "conflicting_operations", "warnings": ["conflicting_operations"]}
                       for item in operations if item["id"] in conflicts)
     operations = [item for item in operations if item["id"] not in conflicts]
@@ -710,7 +804,14 @@ def apply_operations(
         before = operation.get("current_segments") or []
         after = operation.get("proposed_segments") or []
         kind = operation.get("kind")
-        if not before or not after or (len(after) != 1 and kind != "relayout"):
+        if kind == "set_metadata":
+            if operation.get("field") not in {"artist", "song_title"} or not operation.get("proposed_value"):
+                raise ValueError("invalid metadata operation")
+            continue
+        if kind == "delete_from":
+            if not before or after:
+                raise ValueError("invalid deletion operation")
+        elif not before or not after or (len(after) != 1 and kind != "relayout"):
             raise ValueError("change request operations need source segments and one result")
         if kind not in {"merge_phrase", "relayout"} and len(before) != 1:
             raise ValueError("text change request operations must replace one segment")
@@ -748,7 +849,7 @@ def apply_operations(
                     or any(a[1] > b[0] + 1e-6 or a[0] >= a[1] for a, b in zip(spans, spans[1:]))
                     or spans[-1][0] >= spans[-1][1]):
                 raise ValueError("structural relayout left the phrase span")
-        if kind == "timing":
+        if kind in {"timing", "set_interval", "set_start"}:
             old, new = before[0], after[0]
             if _identity(old.get("text")) != _identity(new.get("text")):
                 raise ValueError("timing change request changed text")
@@ -764,7 +865,7 @@ def apply_operations(
     result = normalize_segments(result)
     # Plain text operations must never move the timeline. Structural merges
     # deliberately replace adjacent fragments by their exact outer span.
-    if not any(row.get("kind") in {"merge_phrase", "relayout", "timing"} for row in selected):
+    if not any(row.get("kind") in {"merge_phrase", "relayout", "timing", "set_interval", "set_start", "delete_from"} for row in selected):
         before_timing = [(row["start"], row["end"]) for row in current]
         after_timing = [(row["start"], row["end"]) for row in result]
         if before_timing != after_timing:

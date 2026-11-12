@@ -437,6 +437,9 @@ def approval_gate(
     actual_mode = mode or effective_delivery_qc_mode()
     if require_manual_review:
         actual_mode = "enforce"
+    acoustic_required = bool(isinstance(report, Mapping) and (report.get("acoustic") or {}).get("required"))
+    if acoustic_required:
+        actual_mode = "enforce"
     if actual_mode != "enforce":
         return {"blocked": False, "can_approve": True, "reason": "observe_only"}
     if not report or report.get("status") != "COMPLETE":
@@ -452,6 +455,12 @@ def approval_gate(
             "reason": "open_fail", "issue_ids": [row["issue_id"] for row in blocking_fail if row.get("issue_id")],
         }
     review = [row for row in open_rows if _issue_result_status(row) == "REVIEW" and row.get("blocking")]
+    acoustic_pending = [row for row in open_rows if acoustic_required
+                        and str(row.get("code") or "").startswith("ACOUSTIC_")
+                        and row.get("requires_recorded_review")]
+    if acoustic_pending:
+        return {"blocked": True, "can_approve": False, "reason": "acoustic_review_required",
+                "issue_ids": [row["issue_id"] for row in acoustic_pending if row.get("issue_id")]}
     if require_manual_review:
         manual = [row for row in report.get("issues") or [] if row.get("manual_verification_required") or str(row.get("code") or "") in LEGACY_MANUAL_CHECK_CODES]
         missing = sorted(LEGACY_MANUAL_CHECK_CODES - {str(row.get("code") or "") for row in manual})
@@ -753,7 +762,7 @@ def build_runtime_report(
         "job_input_fingerprint": job_input_fingerprint,
         "source_fingerprint": source_fingerprint,
         "visual_fingerprint": visual_fingerprint,
-        "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
+        "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0), "sha256": artifact_sha256},
         "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
         "summary": summary, "check_summary": check_summary,
         "checks": checks, "issues": issues,
@@ -823,6 +832,19 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
             'job_id', 'previous_versions', 'completed_at')})
         db.rollback()
         report = build_runtime_report(job=snapshot, video_path=video_path, segments=rows, previous=previous, mode_override=mode_override)
+        from delivery_acoustic_qc import build_acoustic_checks
+        acoustic, acoustic_issues = build_acoustic_checks(snapshot, rows, video_path)
+        if acoustic:
+            report["acoustic"] = acoustic
+            report["issues"].extend(_normalise_issue(item, fps=30.0) for item in acoustic_issues)
+            report["summary"]["issue_count"] = len(report["issues"])
+            report["summary"]["open_count"] = sum(item.get("status") == "OPEN" for item in report["issues"])
+            report["summary"]["fail_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "FAIL" for item in report["issues"])
+            report["summary"]["warn_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "REVIEW" for item in report["issues"])
+            report["approval"] = delivery_readiness_gate(
+                snapshot, report,
+                for_umg_delivery=(mode_override == "enforce" or is_umg_delivery_job(snapshot)),
+            )
         job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
         if job is None or expected != qc_input_identity(job):
             raise RuntimeError('delivery_qc_input_changed')
