@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.167] - 2026-11-11
+
+### Changed
+- Compose YouTube thumbnails of lyric-look jobs as a poster in the video's effective look typography (font, palette and accent from the resolved variant): keyword layout for Cine, stacked equal-width rows for Bloque, title on a ring for Arco, glowing script for Romántico/handwritten looks, and a big title with an accented key word and tracked artist for the rest. Long titles wrap and shrink, qualifiers such as "(En Vivo)" become a subtitle, and the text block always stays inside the frame. Jobs without a look keep the current title card; text no poster font can draw (e.g. CJK) and any poster failure fall back to it too. `THUMBNAIL_LOOK_POSTER=0` restores the previous thumbnail for every job.
+
 ## [1.1.166] - 2026-11-10
 
 ### Fixed
