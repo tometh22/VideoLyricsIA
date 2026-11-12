@@ -192,8 +192,16 @@ def test_prepare_opts_respects_operator_then_persisted_then_detects(monkeypatch)
                         lambda a, t, l="", job_id=None: calls.append(1) or ("metal", "ai"))
     opts, upd = RT.prepare_opts(job_id="j1", lyric_look="cinetico", artist="Almafuerte",
                                 song_title="Niño Jefe", render_params={})
-    assert opts["genre"] == "metal" and upd["lyric_genre_detected"] == "metal"
-    assert isinstance(upd["lyric_variant"], int) and "lyric_variant_sig" in upd
+    # Automatic genre + automatic variant = the look's original design; the
+    # detected genre is still persisted for "Otra variante".
+    assert opts["genre"] == "" and opts["variant"] == 0
+    assert upd["lyric_genre_detected"] == "metal"
+    assert upd["lyric_variant"] == 0 and "lyric_variant_sig" in upd
+    # An explicit variant ≥ 1 with an automatic genre uses the detection.
+    opts1, _ = RT.prepare_opts(job_id="j1", lyric_look="cinetico", artist="Almafuerte",
+                               song_title="Niño Jefe",
+                               render_params={"lyric_genre_detected": "metal", "lyric_variant": 1})
+    assert opts1["genre"] == "metal" and opts1["variant"] == 1
     opts2, upd2 = RT.prepare_opts(job_id="j1", lyric_look="cinetico",
                                   render_params={"lyric_genre": "pop", "lyric_variant": 4})
     assert opts2["genre"] == "pop" and opts2["variant"] == 4 and upd2["lyric_variant"] == 4
@@ -396,3 +404,78 @@ def test_cascade_key_word_lands_whole_and_inside_the_frame():
             xs = [float(re.search(r"\\move\([^,]+,[^,]+,([-\d.]+)", e).group(1)) for e in evs]
             assert min(xs) >= 0 and max(xs) < 1080
     assert hit
+
+
+# --- 11-nov-2026: a look picked without a variant = its ORIGINAL design -------------
+# Founder's demos (tenant genly): a look with lyric_variant "" drew a recipe
+# from the detected genre's pools (Cine came out in yellow Michroma, cheap
+# "shapes"/"prism" overlays) and variant 0 only meant "original" when the
+# genre happened to be the look's native one.
+
+def _other_family_genre(look_id):
+    return next(g for g, (fam, _label) in sorted(R.GENRES.items()) if fam != R.NATIVE[look_id])
+
+
+@pytest.mark.parametrize("look_id", sorted(L.LOOKS))
+@pytest.mark.parametrize("variant", [None, "", 0, "0"])
+def test_look_without_variant_renders_its_original_design(monkeypatch, look_id, variant):
+    import genre_detect
+    monkeypatch.setattr(RT, "sibling_signatures", lambda *a: set())
+    # Detected genre deliberately OUTSIDE the look's native family.
+    other = _other_family_genre(look_id)
+    monkeypatch.setattr(genre_detect, "detect", lambda *a, **k: (other, "ai"))
+    rp = {} if variant is None else {"lyric_variant": variant}
+    opts, upd = RT.prepare_opts(job_id="j", lyric_look=look_id, artist="Diego Faria",
+                                song_title="Rosa de Fogo", render_params=rp)
+    assert opts["variant"] == 0 and opts["genre"] == ""
+    assert upd["lyric_variant"] == 0 and RT._sig_is_original(upd["lyric_variant_sig"])
+    assert upd["lyric_genre_detected"] == other          # kept for "Otra variante"
+    assert R.recipe_for(look_id, opts["genre"], opts["seed_key"], opts["variant"]).original
+    # Exactly the look as designed: its font, its effect (no recipe overlay).
+    assert RT.resolve_for_render(look_id, opts) == L.LOOKS[look_id]
+
+
+def test_wants_original_rules():
+    assert RT.wants_original()
+    assert RT.wants_original(operator_genre="", variant="")
+    assert RT.wants_original(operator_genre="nope", variant=0)       # unknown genre = automatic
+    assert not RT.wants_original(operator_genre="metal", variant=None)
+    assert not RT.wants_original(variant=1)
+    original_sig = [list(x) if isinstance(x, tuple) else x
+                    for x in R.recipe_for("cine", "", "s", 0).signature]
+    recipe_sig = [list(x) if isinstance(x, tuple) else x
+                  for x in R.recipe_for("cine", "metal", "s", 0).signature]
+    assert RT.wants_original(variant=0, persisted_sig=original_sig)
+    assert not RT.wants_original(variant=0, persisted_sig=recipe_sig)
+
+
+def test_operator_genre_still_picks_that_familys_design(monkeypatch):
+    monkeypatch.setattr(RT, "sibling_signatures", lambda *a: set())
+    opts, _ = RT.prepare_opts(job_id="j", lyric_look="cine", artist="A", song_title="B",
+                              render_params={"lyric_genre": "metal", "lyric_variant": 0})
+    assert opts["genre"] == "metal" and opts["variant"] == 0
+    assert not R.recipe_for("cine", "metal", opts["seed_key"], 0).original
+
+
+def test_a_job_that_rendered_a_recipe_for_variant_0_keeps_it_on_edits(monkeypatch):
+    # Rendered before this rule: variant 0 + detected metal = a heavy recipe.
+    # Its persisted signature keeps every later edit/retry identical.
+    monkeypatch.setattr(RT, "sibling_signatures", lambda *a: set())
+    seed = R.seed_key_for("A", "B")
+    sig = [list(x) if isinstance(x, tuple) else x
+           for x in R.recipe_for("cine", "metal", seed, 0).signature]
+    opts, upd = RT.prepare_opts(job_id="j", lyric_look="cine", artist="A", song_title="B",
+                                render_params={"lyric_genre_detected": "metal", "lyric_variant": 0,
+                                               "lyric_variant_sig": sig})
+    assert opts["genre"] == "metal" and opts["variant"] == 0
+    assert upd["lyric_variant_sig"] == sig
+
+
+@pytest.mark.parametrize("look_id", sorted(L.LOOKS))
+def test_choose_auto_variant_min_variant_skips_the_original(look_id):
+    for i in range(8):
+        seed = R.seed_key_for("Artista", f"Canción {i}")
+        assert R.choose_auto_variant(look_id, "metal", seed, set(), fresh=True, min_variant=1) >= 1
+        # min_variant=0 is the historical behaviour.
+        assert (R.choose_auto_variant(look_id, "metal", seed, set(), fresh=True, min_variant=0)
+                == R.choose_auto_variant(look_id, "metal", seed, set(), fresh=True))

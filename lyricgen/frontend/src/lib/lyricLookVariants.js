@@ -109,10 +109,10 @@ export const STATIC_LOOK_CATALOG = {
     font("unifraktur-cook", "UnifrakturCook", 700, ["heavy"]),
   ],
   recommended: {
-    heavy: ["cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"],
-    pop: ["cinetico", "pop70", "chat", "cuaderno", "y2k", "degrade", "duotono", "neon"],
+    heavy: ["golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"],
+    pop: ["diario", "nube", "cinetico", "pop70", "chat", "cuaderno", "y2k", "degrade", "duotono", "neon"],
     urban: ["bloque", "neon", "cinetico", "y2k", "perspectiva", "cosmico", "arco", "duotono"],
-    soft: ["cine", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"],
+    soft: ["puntada", "diario", "cine", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"],
   },
 };
 

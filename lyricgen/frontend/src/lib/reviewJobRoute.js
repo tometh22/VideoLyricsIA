@@ -17,6 +17,27 @@ export function beginReviewResume(attemptRef, jobId) {
   return attempt;
 }
 
+// The wizard already holds the review of this job in memory: it just
+// transcribed it and only gave it its durable /review/<id> URL. Re-reading
+// /status there would REPLACE the operator's picks (lyric look, variant,
+// typography, colours, background tab, multi-scene) with the job's
+// render_params — which are still empty, because they are written by
+// /generate. That is how "Revisar letra" lost the chosen look and rendered
+// plain white text (incident 11-nov-2026).
+//
+// Only a review that the wizard built in THIS session from the operator's
+// own audio (a live File/Blob) counts. A server-backed review (history link,
+// campaign queue, reload — `file: null`) or a rehydrated snapshot (stub
+// file) still resumes from the server, exactly as before.
+export function reviewAlreadyOpen(currentReview, jobId) {
+  if (!currentReview || !jobId) return false;
+  if (currentReview.variantMode) return false;
+  const file = currentReview.file;
+  if (!file || typeof file.slice !== "function" || file._restoredStub) return false;
+  const loaded = String(currentReview.transcribeJobId || "").trim();
+  return !!loaded && loaded === String(jobId).trim();
+}
+
 export function reviewJobIdFromLocation(pathname, search = "") {
   const match = String(pathname || "").match(/^\/review\/([^/]+)\/?$/);
   if (match) {

@@ -60,14 +60,16 @@ NATIVE = {
     "pelicula": "soft", "cinetico": "pop", "neon": "urban", "chat": "pop",
     "cuaderno": "pop", "bloque": "urban", "arco": "urban", "perspectiva": "urban",
     "duotono": "pop", "romantico": "soft", "degrade": "pop", "y2k": "pop",
+    "golpe": "heavy", "recorte": "heavy", "diptico": "heavy",
+    "diario": "pop", "nube": "pop", "puntada": "soft",
 }
 
 # Looks shown first in the wizard for each family.
 RECOMMENDED = {
-    "heavy": ("cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"),
-    "pop": ("cinetico", "pop70", "chat", "cuaderno", "y2k", "degrade", "duotono", "neon"),
+    "heavy": ("golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"),
+    "pop": ("diario", "nube", "cinetico", "pop70", "chat", "cuaderno", "y2k", "degrade", "duotono", "neon"),
     "urban": ("bloque", "neon", "cinetico", "y2k", "perspectiva", "cosmico", "arco", "duotono"),
-    "soft": ("cine", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"),
+    "soft": ("puntada", "diario", "cine", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"),
 }
 
 # --- Font catalogue ------------------------------------------------------------------
@@ -112,7 +114,7 @@ FONTS = {
 _FONT_BY_FILE = {v[0]: k for k, v in FONTS.items()}
 
 # What each look's lyric font must be able to do.
-LOOK_TEXT_ROLE = {"cuaderno": "hand", "romantico": "script", "chat": "ui"}
+LOOK_TEXT_ROLE = {"cuaderno": "hand", "romantico": "script", "chat": "ui", "diario": "hand"}
 
 # Looks that paint their own surfaces (cards, bubbles, gradient): recipes swap
 # only their fonts; operator colours still apply.
@@ -258,7 +260,7 @@ def recipe_for(look_id: str, genre: str, seed_key: str, variant: int) -> Recipe:
     look = L.LOOKS[look_id]
     family = family_of(genre) or NATIVE.get(look_id, "pop")
     variant = max(0, int(variant or 0))
-    if variant == 0 and family == NATIVE.get(look_id):
+    if variant == 0 and (family == NATIVE.get(look_id) or look_id in L.EDITORIAL_LAYOUTS):
         main = _FONT_BY_FILE.get(look.font_file, "montserrat")
         key = _FONT_BY_FILE.get(look.key_font or look.font_file, main)
         return Recipe(family, look_id, 0, (main, key), "original",
@@ -316,15 +318,28 @@ def recipe_for(look_id: str, genre: str, seed_key: str, variant: int) -> Recipe:
 
 
 def choose_auto_variant(look_id: str, genre: str, seed_key: str,
-                        used_signatures: set | None = None, limit: int = 40) -> int:
-    """Smallest variant whose look isn't already used by a sibling song."""
+                        used_signatures: set | None = None, limit: int = 40, *, fresh: bool = False,
+                        min_variant: int = 0) -> int:
+    """Smallest variant whose look isn't already used by a sibling song.
+
+    ``min_variant=1`` skips variant 0: with an automatic genre, variant 0 IS
+    the original design (lyric_look_runtime.wants_original), so a caller that
+    needs a recipe different from the original (the /variant wizard) asks
+    for ≥ 1."""
+    # These explicitly selected designs keep their approved appearance.
+    # Manual "another variant" remains available through recipe_for.
+    if look_id in L.EDITORIAL_LAYOUTS and not fresh:
+        return 0
     used = used_signatures or set()
+    min_variant = max(0, min(int(min_variant or 0), limit - 1))
     # Start each song at its own offset so a batch resolved before any sibling
     # has rendered (a campaign, a wizard batch) still spreads across variants
     # instead of all landing on variant 0.
-    start = job_seed(seed_key) % 6
-    for i in range(limit):
-        v = (start + i) % limit
+    start = 0 if look_id in L.EDITORIAL_LAYOUTS else job_seed(seed_key) % 6
+    span = limit - min_variant
+    start = min_variant + (max(start - min_variant, 0) % span)
+    for i in range(span):
+        v = min_variant + ((start - min_variant + i) % span)
         if recipe_for(look_id, genre, seed_key, v).signature not in used:
             return v
     return start
@@ -364,6 +379,8 @@ def apply_colors(look: L.Look, ink: str, alt: str, accent: str,
                  *, explicit: bool = False) -> L.Look:
     """Paint the look with (ink, alt, accent) in the way each look uses colour."""
     upd = {"primary": ink, "accent": accent}
+    if look.layout in L.EDITORIAL_LAYOUTS:
+        upd["line_colors"] = (ink, alt, accent)
     if look.layout == "kinetic":
         upd["line_colors"] = (ink, alt, accent)
         if explicit or look.background != "flat":
@@ -547,7 +564,7 @@ def effective_colors(look: L.Look, rec: Recipe) -> tuple[str, str, str]:
     if look.layout == "chat":
         incoming, outgoing = (tuple(look.flat_colors) + ("#E9E9EB", "#1F8BFF"))[:2]
         return (look.primary, incoming, outgoing)
-    if look.line_colors and look.layout == "kinetic":
+    if look.line_colors and (look.layout == "kinetic" or look.layout in L.EDITORIAL_LAYOUTS):
         return tuple(look.line_colors[:3])  # type: ignore[return-value]
     if look.card_palettes:
         return tuple(look.card_palettes[0][:3])  # type: ignore[return-value]

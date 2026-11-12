@@ -1668,6 +1668,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             and _prev.get("lyric_variant") not in (None, "") \
                             and str(_prev_genre).strip().lower() == str(_cur_genre).strip().lower():
                         _look_rp["lyric_variant"] = _prev.get("lyric_variant")
+                    # The signature already rendered for that same variant
+                    # (same look, same operator genre) travels with it:
+                    # lyric_look_runtime.wants_original keeps a job that
+                    # rendered a non-original recipe for variant 0 as it was,
+                    # so a retry never restyles a delivered video.
+                    _cur_variant = _look_rp.get("lyric_variant")
+                    if _prev.get("lyric_look") == lyric_look and _prev.get("lyric_variant_sig") \
+                            and _cur_variant not in (None, "") \
+                            and str(_prev.get("lyric_variant")) == str(_cur_variant) \
+                            and str(_prev.get("lyric_genre") or "").strip().lower() \
+                            == str(lyric_genre or "").strip().lower():
+                        _look_rp["lyric_variant_sig"] = _prev.get("lyric_variant_sig")
                 except Exception:
                     pass
                 _look_opts, _look_update = _llr.prepare_opts(
@@ -1830,6 +1842,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         match_lyrics=match_lyrics,
                         allow_people=_compute_allow_people(job_id, background_hint),
                         job_id=job_id,
+                        # Same composition/lighting guidance the single
+                        # background gets for the chosen look (Arco's empty
+                        # centre, Neón's low-key light, …).
+                        lyric_look=lyric_look,
                     )
                     bg_image_path = _scene_timeline
                     _scenes_active = True
@@ -2564,8 +2580,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             else:
                 logger.info("[CANVAS] job=%s no es de un admin — no se genera", job_id)
 
-            # Step 4 — Thumbnail (art tracks reuse the composite look so the
-            # thumbnail matches what plays; lyric videos keep the raw bg).
+            # Step 4 — Thumbnail: reuse the video's visual settings, with a
+            # larger static title card for readability at thumbnail sizes.
             update_job(job_id, current_step="thumbnail", progress=90)
             try:
                 if art_track:
@@ -2577,7 +2593,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 else:
                     generate_thumbnail(
                         artist, mp3_path, job_dir, bg_source=bg_source,
-                        song_title=song_title,
+                        song_title=song_title, font=chosen_font,
+                        style=style, effect=effect, custom_colors=custom_colors,
+                        text_contrast=text_contrast,
+                        lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                        lyrics_animation=lyrics_animation,
+                        lyric_look=lyric_look, lyric_look_opts=_look_opts,
+                        title_template=title_template, title_size=title_size,
+                        title_artist_font=title_artist_font, title_song_font=title_song_font,
+                        title_song_break=title_song_break,
+                        first_lyric_start=next((s["start"] for s in segments if s.get("text", "").strip()), 10.0),
                     )
                 files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
             except Exception as _thumb_err:
@@ -14484,8 +14509,12 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           *, match_lyrics=True, operator_prompt=None,
                           bg_verbatim=False, creative_mode=None,
                           atmospherics_policy=None, anchors=None,
-                          shared_light=None):
+                          shared_light=None, lyric_look=""):
     """Fabrica la callable que scenes.build_scene_plan usa por escena.
+
+    ``lyric_look``: cada escena recibe la misma guía de composición/luz del
+    look que recibe el fondo único (``_steer_prompt_for_look``), salvo un
+    prompt del operador "tal cual" (verbatim), que nunca se toca.
 
     ``operator_prompt`` is the only user-authored value. The callable argument
     named ``background_hint`` is legacy scenes.py API and is INTERNAL context
@@ -14515,7 +14544,7 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
         # `palette`, pero una paleta no fija una hora: dos escenas pueden
         # compartir colores y estar una al mediodía y otra de noche.
         _ctx = f"{_light_line} {background_hint}".strip() if _light_line else background_hint
-        return _get_unique_prompt(
+        result = _get_unique_prompt(
             lyrics_text=lyrics_text, artist=artist, job_id=job_id,
             song_title=song_title, genre=genre, concept=concept,
             movement_style=movement_style, match_lyrics=_scene_match_lyrics,
@@ -14530,6 +14559,10 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
             # del lado visual. Se extraen una vez en _generate_scene_background.
             anchors=anchors,
         )
+        _verbatim = bool(bg_verbatim and operator_prompt and str(operator_prompt).strip())
+        if lyric_look and not _verbatim and isinstance(result, dict) and result.get("prompt"):
+            result = {**result, "prompt": _steer_prompt_for_look(result["prompt"], lyric_look)}
+        return result
     return prompt_fn
 
 
@@ -15005,7 +15038,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                               allow_people: bool = False,
                               atmospherics_policy: dict | None = None,
                               job_id: str = None, target_w: int = 1920,
-                              target_h: int = 1080) -> tuple[str, dict]:
+                              target_h: int = 1080,
+                              lyric_look: str = "") -> tuple[str, dict]:
     """Orquesta el fondo multi-escena. Devuelve (timeline_path, scene_plan).
 
     detect → biblia → scene plan → N clips Veo (con recurrencia de coro) →
@@ -15049,7 +15083,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       creative_mode=creative_mode,
                                       atmospherics_policy=atmospherics_policy,
                                       anchors=_scene_anchors,
-                                      shared_light=(bible or {}).get("light"))
+                                      shared_light=(bible or {}).get("light"),
+                                      lyric_look=lyric_look)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style))
@@ -20865,16 +20900,6 @@ def generate_short(
 # Step 4 — Thumbnail
 # ---------------------------------------------------------------------------
 
-def _draw_text_with_outline(draw, xy, text, font, fill="white", outline="black", width=3):
-    """Draw text with a thick outline for readability."""
-    x, y = xy
-    for ox in range(-width, width + 1):
-        for oy in range(-width, width + 1):
-            if ox != 0 or oy != 0:
-                draw.text((x + ox, y + oy), text, font=font, fill=outline)
-    draw.text((x, y), text, font=font, fill=fill)
-
-
 def generate_art_track_thumbnail(
     cover_path: str,
     mp3_path: str,
@@ -20931,107 +20956,218 @@ def generate_art_track_thumbnail(
     return out_path
 
 
+def _thumbnail_poster_enabled() -> bool:
+    """Poster thumbnails for lyric looks are ON unless THUMBNAIL_LOOK_POSTER
+    is set to a falsy value (kill switch back to the enlarged title card)."""
+    return os.environ.get("THUMBNAIL_LOOK_POSTER", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _render_look_poster_thumbnail(
+    look, *, artist: str, song: str, song_lines: list[str] | None,
+    song_font_path: str | None, artist_font_path: str | None,
+    primary_override: str, bg_source: str | None, mp3_path: str, job_dir: str,
+    effect: str, style: str, custom_colors: str,
+) -> str:
+    """Thumbnail for a lyric-look job: the video's opening background (same
+    grade, overlay effect and look-painted surfaces as the master) with the
+    title set as a poster in the look's typography (thumbnail_poster)."""
+    import shutil
+    import ass_render as _ass
+    import fx_compositor as _fx
+    import lyric_looks as _looks
+    import thumbnail_poster as _tp
+    from PIL import Image
+
+    width, height = _tp.W, _tp.H
+    out_path = os.path.abspath(os.path.join(job_dir, "thumbnail.jpg"))
+    font_dir = _ass.multi_font_dir(_looks.font_paths(look))
+    try:
+        with tempfile.TemporaryDirectory(prefix="thumbnail-", dir=job_dir) as tmp:
+            if not bg_source or not os.path.isfile(bg_source):
+                raise FileNotFoundError("Thumbnail requires the video's background")
+            with open(os.path.join(tmp, "thumbnail.ass"), "w", encoding="utf-8") as f:
+                f.write(_tp.background_ass(look, width, height))
+            bg_frame = os.path.abspath(os.path.join(tmp, "background.png"))
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.abspath(bg_source),
+                 "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1",
+                 "-frames:v", "1", bg_frame],
+                label="thumbnail-background", timeout=60, output_path=bg_frame,
+            )
+            vf, complex_filter, extra_inputs = _fx.build_video_filter(
+                ass_basename="thumbnail.ass", font_dir=font_dir,
+                width=width, height=height, effect=effect, style=style,
+                custom_colors=custom_colors, fx_input_index=1,
+                grade_override=look.grade,
+                rhythm=_fx.detect_effect_rhythm(effect, mp3_path),
+            )
+            filters = (["-filter_complex", vf, "-map", "[out]"] if complex_filter
+                       else ["-vf", vf])
+            graded = os.path.abspath(os.path.join(tmp, "graded.png"))
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", bg_frame,
+                 *extra_inputs, *filters, "-frames:v", "1", graded],
+                label="thumbnail-poster-background", timeout=90,
+                output_path=graded, cwd=tmp,
+            )
+            with Image.open(graded) as bg:
+                poster = _tp.compose(
+                    bg, look, artist=artist, title=song, song_lines=song_lines,
+                    song_font_path=song_font_path, artist_font_path=artist_font_path,
+                    primary_override=primary_override,
+                )
+            # Write next to the target and rename: a failed save must not
+            # leave a half-written thumbnail.jpg behind for the fallback.
+            tmp_out = os.path.join(tmp, "thumbnail.jpg")
+            poster.save(tmp_out, "JPEG", quality=92, optimize=True)
+            os.replace(tmp_out, out_path)
+    finally:
+        shutil.rmtree(font_dir, ignore_errors=True)
+    logger.info("[THUMB] poster thumbnail look=%s layout=%s", look.id,
+                _tp.layout_for(look, os.path.basename(song_font_path or look.font_file)))
+    return out_path
+
+
 def generate_thumbnail(
     artist: str,
     mp3_path: str,
     job_dir: str,
     bg_source: str | None = None,
     song_title: str = "",
+    *,
+    font: str | None = None,
+    style: str = "",
+    effect: str = "",
+    custom_colors: str = "",
+    text_contrast: str = "medium",
+    lyric_color: str = "",
+    lyric_sung_color: str = "",
+    lyrics_animation: str = "none",
+    lyric_look: str = "",
+    lyric_look_opts: dict | None = None,
+    title_template: str = "auto",
+    title_size: float = 1.0,
+    title_artist_font: str = "",
+    title_song_font: str = "",
+    title_song_break: str = "",
+    first_lyric_start: float = 10.0,
 ) -> str:
-    """Generate a thumbnail from the RAW background with artist and song name."""
-    from PIL import ImageFilter, ImageEnhance
+    """Render the intro's look as a 1280×720 still, with 50% larger text.
 
-    # Grab a frame from the raw background (no burned-in lyrics)
-    if bg_source and bg_source.lower().endswith((".jpg", ".jpeg", ".png")):
-        img = Image.open(bg_source)
-    elif bg_source and os.path.exists(bg_source):
+    Use the same title layout, libass fonts/colors and background compositor
+    as the master. Only the title card is burned in: no lyric can overlap it,
+    even for songs whose vocals start immediately. Its fades are disabled.
+    """
+    import shutil
+    import ass_render as _ass
+    import fx_compositor as _fx
+    import lyric_looks as _looks
+    import lyric_look_runtime as _llr
+
+    width, height = 1280, 720
+    scale = height / 1080.0
+    look = _llr.resolve_for_render(lyric_look, lyric_look_opts, bg_path=bg_source) if lyric_look else None
+    font_path = _looks.font_path(look) if look is not None else (font or _resolve_font("montserrat-bold"))
+    if look is not None:
+        effect = effect or look.effect
+    if not font_path:
+        raise RuntimeError("Thumbnail requires the video's font")
+    extrabold = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
+    if not os.path.isfile(extrabold):
+        extrabold = font_path
+    look_artist_path = ""
+    if look is not None and not (lyric_look_opts or {}).get("legacy"):
+        look_artist_path = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
+    artist_path = _resolve_font(title_artist_font) or look_artist_path or extrabold
+    song_path = _resolve_font(title_song_font) or font_path
+    if look is not None and _thumbnail_poster_enabled():
+        # Looks get a poster composition in the look's own typography (see
+        # thumbnail_poster). Any failure keeps the libass title card below:
+        # the thumbnail is an accessory and must never go missing for it.
         try:
-            clip = VideoFileClip(bg_source)
-            t = min(clip.duration * 0.4, clip.duration - 0.1)
-            frame = clip.get_frame(t)
-            clip.close()
-            img = Image.fromarray(frame)
-        except Exception:
-            img = Image.new("RGB", (1280, 720), (30, 15, 60))
-    else:
-        img = Image.new("RGB", (1280, 720), (30, 15, 60))
-
-    img = img.resize((1280, 720), Image.LANCZOS)
-
-    # Slight darken so text is readable, but background is clearly visible
-    enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(0.6)
-
-    draw = ImageDraw.Draw(img)
-    # Prefer the structured title from the job; fall back to the filename
-    # only when it's missing. The filename heuristic handles both
-    # "Artist - Title" and Suno-style "Title_Artist" so the thumbnail
-    # never shows a literal underscore-joined basename.
-    if song_title:
-        song_name = song_title
-    else:
-        raw_name = os.path.splitext(os.path.basename(mp3_path))[0]
-        song_name = raw_name
-        if " - " in raw_name:
-            song_name = raw_name.split(" - ", 1)[1]
-        elif "_" in raw_name:
-            song_name = raw_name.split("_", 1)[0]
-    for suffix in ["(Official Video)", "(Official Audio)", "(Lyric Video)",
-                   "(Official Music Video)", "(Audio)", "(Video)", "(En Vivo)",
-                   "(Live)", "(Lyrics)"]:
-        song_name = song_name.replace(suffix, "").strip()
-    # Defensive scrub for legacy / manually-typed values that still carry
-    # the artist concatenated to the title.
-    if song_name:
-        if " - " in song_name and artist and song_name.startswith(artist):
-            song_name = song_name.split(" - ", 1)[1].strip()
-        if artist and song_name.endswith(f"_{artist}"):
-            song_name = song_name[: -(len(artist) + 1)].strip()
-
-    # Use Montserrat ExtraBold for thumbnails (Google Font, OFL licensed)
-    thumb_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
-    if not os.path.exists(thumb_font) and _FONT_POOL:
-        thumb_font = _FONT_POOL[0]
-
-    # Auto-shrink font until the text fits within max_width with a 60px
-    # margin on each side. Without this, long artist names ("El Plan de la
-    # Mariposa") or songs with explanatory subtitles overflow 1280px and
-    # get cropped by the thumbnail frame.
-    def _fit_font(text: str, start_size: int, max_width: int, min_size: int = 28):
-        size = start_size
-        while size > min_size:
-            try:
-                f = ImageFont.truetype(thumb_font, size)
-            except (OSError, IOError):
-                return ImageFont.load_default()
-            bbox = draw.textbbox((0, 0), text, font=f)
-            tw = bbox[2] - bbox[0]
-            if tw <= max_width:
-                return f
-            size -= 4
-        try:
-            return ImageFont.truetype(thumb_font, min_size)
-        except (OSError, IOError):
-            return ImageFont.load_default()
-
-    max_w = 1280 - 120  # 60px margin each side
-    font_artist = _fit_font(artist.upper(), 100, max_w)
-    font_song = _fit_font(song_name, 55, max_w)
-
-    # Artist name centered
-    bbox = draw.textbbox((0, 0), artist.upper(), font=font_artist)
-    tw = bbox[2] - bbox[0]
-    x = (1280 - tw) // 2
-    _draw_text_with_outline(draw, (x, 240), artist.upper(), font_artist, fill="white", width=5)
-
-    # Song name centered below
-    bbox = draw.textbbox((0, 0), song_name, font=font_song)
-    tw = bbox[2] - bbox[0]
-    x = (1280 - tw) // 2
-    _draw_text_with_outline(draw, (x, 380), song_name, font_song, fill=(230, 230, 240), width=3)
-
-    out_path = os.path.join(job_dir, "thumbnail.jpg")
-    img.save(out_path, "JPEG", quality=92)
+            return _render_look_poster_thumbnail(
+                look, artist=artist,
+                song=_resolve_title_song(song_title, mp3_path, artist),
+                song_lines=(title_song_break.split("\n") if title_song_break else None),
+                song_font_path=_resolve_font(title_song_font),
+                artist_font_path=_resolve_font(title_artist_font),
+                primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
+                bg_source=bg_source, mp3_path=mp3_path, job_dir=job_dir,
+                effect=effect, style=style, custom_colors=custom_colors,
+            )
+        except FileNotFoundError:
+            raise
+        except Exception as poster_err:
+            logger.warning("[THUMB] poster thumbnail failed (look=%s), using the "
+                           "title card: %s", lyric_look, poster_err)
+    artist_family, _ = _ass.font_family(artist_path)
+    song_family, bold = _ass.font_family(song_path)
+    lines = _ass.thumbnail_title_card_lines(
+        artist, _resolve_title_song(song_title, mp3_path, artist),
+        first_lyric_start,
+        width=width, height=height,
+        lyric_font_family=song_family, artist_font_family=artist_family,
+        lyric_font_path=song_path, artist_font_path=artist_path,
+        template=title_template, size_multiplier=title_size,
+        song_lines=(title_song_break.split("\n") if title_song_break else None),
+    )
+    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
+    # Title lines inherit the master's primary color, including karaoke's
+    # sung-color mapping; they don't animate with the words themselves.
+    primary = lyric_sung_color if lyrics_animation == "karaoke" else lyric_color
+    ass_doc = _ass.build_ass(
+        width=width, height=height, font_name=song_family,
+        base_fontsize=85 * scale, bold=bold, lines=lines,
+        outline=max(1.0, contrast["stroke_mult"] * scale),
+        shadow=max(1, int(round(3 * scale))), primary_color=primary,
+    )
+    if look is not None:
+        # The same renderer as the intro owns decorative fonts, independent
+        # artist accent, song ink, faux-bold removal and title readability.
+        ass_doc = _looks.build_look_ass(
+            [], look, width=width, height=height, duration=1.0,
+            title_lines=lines,
+            primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
+        )
+    out_path = os.path.abspath(os.path.join(job_dir, "thumbnail.jpg"))
+    font_dir = _ass.multi_font_dir(
+        [artist_path, song_path] + (_looks.font_paths(look) if look is not None else [])
+    )
+    try:
+        # Isolate the ASS file and intermediate background frame; using a
+        # basename in the filter avoids escaping user/workspace paths.
+        with tempfile.TemporaryDirectory(prefix="thumbnail-", dir=job_dir) as tmp:
+            with open(os.path.join(tmp, "thumbnail.ass"), "w", encoding="utf-8") as f:
+                f.write(ass_doc)
+            if not bg_source or not os.path.isfile(bg_source):
+                raise FileNotFoundError("Thumbnail requires the video's background")
+            # The opening frame belongs to the intro (also on multi-scene
+            # timelines). Crop to fill without distorting non-16:9 sources.
+            bg_frame = os.path.abspath(os.path.join(tmp, "background.png"))
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.abspath(bg_source),
+                 "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1",
+                 "-frames:v", "1", bg_frame],
+                label="thumbnail-background", timeout=60, output_path=bg_frame,
+            )
+            vf, complex_filter, extra_inputs = _fx.build_video_filter(
+                ass_basename="thumbnail.ass", font_dir=font_dir,
+                width=width, height=height, effect=effect, style=style,
+                custom_colors=custom_colors, fx_input_index=1,
+                grade_override=(look.grade if look is not None else None),
+                rhythm=_fx.detect_effect_rhythm(effect, mp3_path),
+            )
+            filters = (["-filter_complex", vf, "-map", "[out]"] if complex_filter
+                       else ["-vf", vf])
+            run_checked(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", bg_frame,
+                 *extra_inputs, *filters, "-frames:v", "1", "-q:v", "2", out_path],
+                label="thumbnail-title-card", timeout=90,
+                output_path=out_path, cwd=tmp,
+            )
+    finally:
+        shutil.rmtree(font_dir, ignore_errors=True)
     return out_path
 
 
@@ -22310,7 +22446,19 @@ def run_edit_pipeline(
 
             update_job(job_id, current_step="thumbnail", progress=90)
             try:
-                generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
+                generate_thumbnail(
+                    artist, mp3_path, job_dir, bg_source=bg_source,
+                    song_title=song_title, font=chosen_font,
+                    style=style, effect=effect, custom_colors=custom_colors,
+                    text_contrast=text_contrast,
+                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                    lyrics_animation=lyrics_animation,
+                    lyric_look=lyric_look, lyric_look_opts=_look_opts,
+                    title_template=title_template, title_size=title_size,
+                    title_artist_font=title_artist_font, title_song_font=title_song_font,
+                    title_song_break=title_song_break,
+                    first_lyric_start=next((s["start"] for s in segments if s.get("text", "").strip()), 10.0),
+                )
                 files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
             except Exception as _thumb_err:
                 _accessory_failed("thumbnail", job_id, job_dir, _thumb_err)
