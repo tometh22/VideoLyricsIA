@@ -26,11 +26,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const render = (autoplay) => {
     const d = current.dataset;
-    // The art track has no thumbnail: fall back to 16:9.
-    if (format === "thumb" && !d.thumb) format = "wide";
+    // Not every item has every format (the art track has no thumbnail or
+    // Canvas): fall back to 16:9 and disable what is missing.
+    if (!d[format]) format = "wide";
     formats.forEach((b) => {
       b.setAttribute("aria-selected", String(b.dataset.format === format));
-      b.disabled = b.dataset.format === "thumb" && !d.thumb;
+      b.disabled = !d[b.dataset.format];
     });
     picks.forEach((p) => p.setAttribute("aria-pressed", String(p === current)));
     screen.dataset.screen = format;
@@ -48,15 +49,19 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     still.hidden = true;
     player.hidden = false;
+    // Spotify Canvas: an 8-second silent loop, shown the way Spotify plays it.
+    const canvas = format === "canvas";
+    player.loop = canvas;
+    player.muted = canvas;
     const src = base + d[format];
     if (!player.src.endsWith(src)) {
       player.pause();
       player.poster = base + d[format + "Poster"];
       player.src = src;
-      if (autoplay) player.play().catch(() => {});
+      if (autoplay || canvas) player.play().catch(() => {});
     }
     download.href = src;
-    download.textContent = format === "tall" ? "Baixar vertical" : "Baixar 16:9";
+    download.textContent = { tall: "Baixar vertical", canvas: "Baixar Canvas" }[format] || "Baixar 16:9";
   };
 
   formats.forEach((b) => b.addEventListener("click", () => {
