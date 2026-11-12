@@ -108,7 +108,8 @@ h1 { max-width: 26ch; font-family: var(--display); font-size: clamp(2rem, 3.6vw,
 .qty { margin-top: 12px; color: var(--text); font-weight: 600; }
 .save { margin-top: 4px; color: var(--cyan); font-size: 14px; font-weight: 600; }
 .note-sm { margin-top: 4px; font-size: 14px; }
-.partner { margin-top: 12px; padding: 22px 24px; border: 1px solid rgba(117, 87, 255, .45); border-radius: var(--radius); background: linear-gradient(135deg, rgba(117, 87, 255, .16), rgba(32, 212, 232, .06)); color: var(--text); }
+.ladder-note { margin-top: 14px; color: var(--dim); font-size: 14px; }
+.partner { margin-top: 18px; padding: 22px 24px; border: 1px solid rgba(117, 87, 255, .45); border-radius: var(--radius); background: linear-gradient(135deg, rgba(117, 87, 255, .16), rgba(32, 212, 232, .06)); color: var(--text); }
 .partner .card-label { margin-bottom: 6px; }
 
 /* CTA */
