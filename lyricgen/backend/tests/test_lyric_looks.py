@@ -417,3 +417,55 @@ def test_perspectiva_floor_stays_readable_and_inside_the_frame(width, height):
         assert tilt <= 32
         y_end = int(re.search(r"\\move\(\d+,\d+,\d+,(\d+)", d).group(1))
         assert y_end <= height * 0.5
+
+
+# Incidente 11-nov-2026: una línea SIN `words` (interjección corta de una letra
+# oficial, o línea que el anclado repuso por interpolación) tiene que verse en
+# todos los looks palabra por palabra: el renderer sintetiza el timing por
+# palabra dentro de la ventana de la línea. (Las `words` que caen FUERA de la
+# ventana se ocultan a propósito — ver test_late_alignment_does_not_show_a_
+# word_at_the_line_start en test_editorial_looks.py.)
+_WORDLESS = [
+    {"text": "Frase sintetica de apertura", "start": 1.0, "end": 3.0,
+     "words": [{"word": "Frase", "start": 1.0, "end": 1.4},
+               {"word": "sintetica", "start": 1.4, "end": 2.0},
+               {"word": "de", "start": 2.0, "end": 2.2},
+               {"word": "apertura", "start": 2.2, "end": 2.9}]},
+    {"text": "Uh oh uh oh", "start": 3.2, "end": 4.4},
+    {"text": "Cierre inventado del fragmento", "start": 4.6, "end": 6.5},
+]
+
+
+def _events_in(doc, lo, hi):
+    out = []
+    for d in _dialogues(doc):
+        if "\\p1" in d:
+            continue
+        _, start, end = d.split(",")[:3]
+        if lo - 0.05 <= _secs(start) and _secs(end) <= hi + 0.01:
+            out.append(d)
+    return out
+
+
+@pytest.mark.parametrize("variant", ["absent", "empty"])
+@pytest.mark.parametrize(
+    "look_id",
+    sorted(k for k, v in L.LOOKS.items() if v.layout in L.WORD_TIMED_LAYOUTS),
+)
+def test_word_timed_looks_show_a_line_without_words(look_id, variant):
+    segs = [dict(s) for s in _WORDLESS]
+    if variant == "empty":
+        segs[1]["words"] = []
+    doc = L.build_look_ass(segs, L.LOOKS[look_id], width=1920, height=1080,
+                           duration=8.0)
+    inside = _events_in(doc, segs[1]["start"], segs[1]["end"])
+    assert inside, f"{look_id}/{variant}: la línea sin words no se dibuja"
+
+
+def test_word_timings_synthesize_inside_the_window_for_a_line_without_words():
+    import ass_render as A
+    out = A._word_timings("Uh oh uh oh", 3.2, 4.4, None)
+    assert [w["word"] for w in out] == ["Uh", "oh", "uh", "oh"]
+    assert out[0]["start"] == pytest.approx(3.2)
+    assert out[-1]["end"] == pytest.approx(4.4)
+    assert all(a["end"] <= b["start"] + 1e-9 for a, b in zip(out, out[1:]))

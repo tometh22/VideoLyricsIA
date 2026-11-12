@@ -520,6 +520,35 @@ class User(Base):
         }
 
 
+# Canvas de Spotify: canvas, canvas_v2, canvas_v3. Espejo de
+# pipeline.CANVAS_FILE_TYPES (no se importa pipeline acá: database es la base
+# del grafo de imports). tests/test_canvas.py fija que las dos listas coincidan.
+CANVAS_FILE_TYPES = ("canvas", "canvas_v2", "canvas_v3")
+
+
+def canvas_files_from_s3_keys(job_id: str, s3_keys) -> dict:
+    """`{canvas_url: ...}` para cada variante de Canvas que existe en R2.
+
+    El Canvas NO tiene columna `*_url` (a diferencia de video/short/thumbnail)
+    y `update_job(files=...)` sólo persiste esas tres, así que el
+    `files["canvas_url"]` que arma el worker se perdía siempre al guardar: el
+    archivo quedaba en R2 y en `s3_keys`, pero `/media-token/{id}/canvas`
+    respondía 404 y el front no montaba el tab. La fuente de verdad del Canvas
+    es `s3_keys`, que es exactamente lo que `/download` y `/preview` usan para
+    servirlo — derivarlo de ahí hace imposible que la URL anunciada y el
+    archivo servible diverjan. El worker se encarga de que `s3_keys` no
+    retenga un Canvas que el último render ya no produjo
+    (pipeline._drop_stale_canvas_keys).
+    """
+    if not isinstance(s3_keys, dict):
+        return {}
+    return {
+        f"{ft}_url": f"/download/{job_id}/{ft}"
+        for ft in CANVAS_FILE_TYPES
+        if s3_keys.get(ft)
+    }
+
+
 class Job(Base):
     __tablename__ = "jobs"
     # __table_args__ uses the deferred-string form for the DESC column
@@ -786,6 +815,8 @@ class Job(Base):
                 "thumbnail_url": self.thumbnail_url,
                 "umg_master_url": self.umg_master_url,
                 "umg_short_url": self.umg_short_url,
+                # canvas_url / canvas_v2_url / canvas_v3_url, sólo si existen.
+                **canvas_files_from_s3_keys(self.job_id, s3),
             },
             "s3_keys": self.s3_keys,
             "prores_ready": (
