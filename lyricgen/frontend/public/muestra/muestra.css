@@ -88,20 +88,25 @@ h1 { max-width: 26ch; font-family: var(--display); font-size: clamp(2rem, 3.6vw,
 
 /* Offer */
 .offer { padding: clamp(72px, 10vw, 120px) 0; background: var(--ink-2); border-block: 1px solid var(--line); }
-.offer-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: clamp(32px, 6vw, 80px); align-items: start; }
+.offer-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: clamp(28px, 5vw, 72px); align-items: end; }
 .kicker { margin-bottom: 20px; color: var(--muted); font-size: 13px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase; }
 .offer h2, .cta h2 { font-family: var(--display); font-size: clamp(2rem, 4.2vw, 3.4rem); line-height: 1.03; letter-spacing: -.035em; text-wrap: balance; }
 .soft { color: var(--dim); }
-.included { display: grid; gap: 14px; margin-top: 30px; }
+.included { display: grid; gap: 12px; }
 .included li { position: relative; padding-left: 28px; color: var(--muted); }
 .included li::before { content: ""; position: absolute; left: 0; top: .62em; width: 12px; height: 12px; border-radius: 50%; background: var(--gradient-brand); }
 .included strong { color: var(--text); font-weight: 650; }
-.cards { display: grid; gap: 14px; }
-.card { padding: 24px 26px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-3); color: var(--muted); font-size: 15.5px; }
-.card-label { margin-bottom: 8px; color: var(--violet-soft); font-size: 12.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-.price { margin-bottom: 8px; color: var(--text); font: 800 clamp(1.6rem, 2.6vw, 2.1rem)/1.1 var(--display); letter-spacing: -.02em; }
-.price span { color: var(--dim); font: 500 15px/1 var(--body); letter-spacing: 0; }
-.accent-card { border-color: rgba(117, 87, 255, .45); background: linear-gradient(135deg, rgba(117, 87, 255, .16), rgba(32, 212, 232, .06)); color: var(--text); }
+.ladder { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: clamp(36px, 5vw, 56px); }
+.tier { padding: 24px 22px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-3); color: var(--muted); font-size: 15px; }
+.tier-top { border-color: rgba(117, 87, 255, .55); background: linear-gradient(160deg, rgba(117, 87, 255, .2), rgba(32, 212, 232, .06)); }
+.card-label { margin-bottom: 10px; color: var(--violet-soft); font-size: 12.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.price { color: var(--text); font: 800 clamp(1.7rem, 2.6vw, 2.2rem)/1.1 var(--display); letter-spacing: -.02em; }
+.price span { color: var(--dim); font: 500 14.5px/1 var(--body); letter-spacing: 0; }
+.qty { margin-top: 12px; color: var(--text); font-weight: 600; }
+.save { margin-top: 4px; color: var(--cyan); font-size: 14px; font-weight: 600; }
+.note-sm { margin-top: 4px; font-size: 14px; }
+.partner { margin-top: 12px; padding: 22px 24px; border: 1px solid rgba(117, 87, 255, .45); border-radius: var(--radius); background: linear-gradient(135deg, rgba(117, 87, 255, .16), rgba(32, 212, 232, .06)); color: var(--text); }
+.partner .card-label { margin-bottom: 6px; }
 
 /* CTA */
 .cta { padding: clamp(80px, 11vw, 136px) 0; text-align: center; }
@@ -129,6 +134,7 @@ h1 { max-width: 26ch; font-family: var(--display); font-size: clamp(2rem, 3.6vw,
   .for { display: none; }
   .header-cta { margin-left: auto; }
   .offer-grid { grid-template-columns: 1fr; }
+  .ladder { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .now { flex-direction: column; gap: 12px; }
 }
 
