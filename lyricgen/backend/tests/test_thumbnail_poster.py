@@ -223,3 +223,28 @@ def test_actual_poster_render(tmp_path, look_id):
         assert img.format == 'JPEG' and img.size == (1280, 720)
         bright = sum(1 for p in img.convert('L').getdata() if p > 215)
         assert bright > 2000
+
+
+def test_block_layout_honours_the_artist_font_override(monkeypatch):
+    # Bloque draws the artist in the look's light weight by default, but an
+    # operator-picked artist font (title_artist_font) must win, as it did in
+    # the title card.
+    look = runtime.resolve_for_render('bloque', OPTS)
+    assert tp.layout_for(look) == 'block'
+    override = tp._path('BlackOpsOne-Regular.ttf')
+    used = []
+    real_font = tp._font
+
+    def spy(path, size):
+        used.append(os.path.basename(path))
+        return real_font(path, size)
+
+    monkeypatch.setattr(tp, '_font', spy)
+    plain, _st, _ = tp.text_layer(look, artist='Diego Faria', title='Rosa de Fogo')
+    assert 'BlackOpsOne-Regular.ttf' not in used
+    used.clear()
+    custom, st, _ = tp.text_layer(look, artist='Diego Faria', title='Rosa de Fogo',
+                                  artist_font_path=override)
+    assert os.path.basename(st.artist_font) == 'BlackOpsOne-Regular.ttf'
+    assert 'BlackOpsOne-Regular.ttf' in used
+    assert plain.tobytes() != custom.tobytes()

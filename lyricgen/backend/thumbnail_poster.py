@@ -605,16 +605,20 @@ def _layout_block(layer, artist, title, st: Style, song_lines):
     for _ in range(4):
         rows = []
         if artist:
-            asz = _fit_size(st.light_font, artist, width, cap_light, track)
+            # st.artist_font is the look's light weight unless the operator
+            # picked an artist font (title_artist_font) — honour that override.
+            afont = st.artist_font
+            cap_artist = 0.10 * H / _cap_em(afont)
+            asz = _fit_size(afont, artist, width, cap_artist, track)
             if asz < 48 and len(artist.split()) > 1:
-                _sz, alines = wrap_fit(artist, st.light_font, max_w=width, max_h=H,
-                                       max_size=cap_light, max_lines=2, track=track)
+                _sz, alines = wrap_fit(artist, afont, max_w=width, max_h=H,
+                                       max_size=cap_artist, max_lines=2, track=track)
                 for ln in alines:
-                    rows.append(Row([(ln, st.ink)], st.light_font,
-                                    _fit_size(st.light_font, ln, width, cap_light, track),
+                    rows.append(Row([(ln, st.ink)], afont,
+                                    _fit_size(afont, ln, width, cap_artist, track),
                                     track=track, gap_after=gap, alpha=235))
             else:
-                rows.append(Row([(artist, st.ink)], st.light_font, asz,
+                rows.append(Row([(artist, st.ink)], afont, asz,
                                 track=track, gap_after=gap, alpha=235))
         for i, tr in enumerate(trows):
             color = st.accent if (st.accent is not None and i == len(trows) - 1
