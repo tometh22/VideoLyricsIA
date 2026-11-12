@@ -219,6 +219,33 @@ def test_background_prompt_is_steered_by_the_look():
     assert "night" not in pipeline._steer_prompt_for_look(base, "neon")
 
 
+def test_multi_scene_prompts_are_steered_by_the_look_too(monkeypatch):
+    # 11-nov-2026: the single background followed the look's composition
+    # guidance, every multi-scene clip ignored it.
+    import inspect
+    import pipeline
+    base = "A quiet harbour at dusk."
+    monkeypatch.setattr(pipeline, "_get_unique_prompt",
+                        lambda **kw: {"style": "video", "prompt": base})
+
+    def scene_prompt(**kw):
+        fn = pipeline._make_scene_prompt_fn("letra", "Artista", "Tema", "rock", "", "auto",
+                                            "", "job", False, creative_mode="auto", **kw)
+        return fn(background_hint="bible")["prompt"]
+
+    assert scene_prompt() == base
+    assert scene_prompt(lyric_look="arco") == pipeline._steer_prompt_for_look(base, "arco")
+    # A verbatim operator prompt is never rewritten.
+    assert scene_prompt(lyric_look="arco", operator_prompt="mi prompt", bg_verbatim=True) == base
+    # And the look actually travels run_pipeline → scenes → prompt factory.
+    run_src = inspect.getsource(pipeline.run_pipeline)
+    call = run_src[run_src.index("_generate_scene_background("):]
+    assert "lyric_look=lyric_look" in call[:call.index("bg_image_path = _scene_timeline")]
+    scene_src = inspect.getsource(pipeline._generate_scene_background)
+    factory = scene_src[scene_src.index("_make_scene_prompt_fn("):]
+    assert "lyric_look=lyric_look" in factory[:factory.index("plan = ")]
+
+
 def test_look_beats_are_rebased_to_the_short_window(monkeypatch):
     import pipeline, beat_snap
     monkeypatch.setattr(beat_snap, "detect_beats", lambda p: (120.0, [1.0, 30.5, 31.0]))

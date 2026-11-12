@@ -96,7 +96,7 @@ import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
 import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
-import { buildGenerationJob } from "./lib/buildGenerationJob";
+import { buildGenerationJob, buildDirectGenerationJob } from "./lib/buildGenerationJob";
 import { normalizeLyricLook, lyricColorForSubmit, lookOwnsBackground } from "./lib/lyricLooks";
 import {
   LOOK_VARIANT_FIELDS, appendLookVariantFields, lookVariantFieldsFromParams, pickLookVariantFields,
@@ -113,8 +113,8 @@ import {
   PROACTIVE_URL_RETRY_MS,
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
-import { beginReviewResume, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
-import { creativeFieldsForReviewResume } from "./lib/reviewResume";
+import { beginReviewResume, reviewAlreadyOpen, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { creativeFieldsForReviewResume, mergeWizardPicksIntoResumedReview } from "./lib/reviewResume";
 import { editorSessionHeaders } from "./lib/editorSession";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -2387,6 +2387,14 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
+    // El wizard le acaba de dar a SU review la URL durable /review/<id>
+    // (effect "stable URL" de arriba): ya está en memoria con los picks del
+    // operador. /status sigue mandando en la transcripción y en los gates de
+    // idioma/referencia, pero su render_params está vacío hasta /generate:
+    // sin esto pisaba look, variante, tipografía, fondo y multi-escena
+    // (incidente 11-nov-2026) — ver reviewAlreadyOpen / mergeWizardPicks….
+    const wizardOwnReview = reviewAlreadyOpen(creativeReviewRef.current, resumeJobId)
+      ? creativeReviewRef.current : null;
     const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
     if (!attempt) return;
     (async () => {
@@ -2407,7 +2415,7 @@ export default function App() {
         };
         const preset = (snake, camel, fallback = "") =>
           campaignPreset[snake] ?? campaignPreset[camel] ?? fallback;
-        setCurrentReview({
+        const serverReview = {
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
           audioUrl: null,
@@ -2477,7 +2485,13 @@ export default function App() {
           campaignItemId: job.campaign_item_id || null,
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
-        });
+        };
+        // Funcional: si el operador tocó un pick mientras /status volaba,
+        // gana su último valor, no el de cuando arrancó el resume.
+        setCurrentReview((cur) => mergeWizardPicksIntoResumedReview(
+          serverReview,
+          wizardOwnReview && reviewAlreadyOpen(cur, resumeJobId) ? cur : null,
+        ));
         // Open the editor immediately and recover audio in the background.
         // Identity guards in the callback discard a late result if the
         // operator has already moved to another song.
@@ -2488,6 +2502,14 @@ export default function App() {
         // silencio (la variante "resume" del bug de Ana M.). El job
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
+        //
+        // Salvo que sea la review que el wizard acaba de crear: ahí el
+        // fondo, la multi-escena y el art track son lo que el operador
+        // eligió para ESTE batch y no se tocan.
+        if (wizardOwnReview) {
+          setWizardStage("review");
+          return;
+        }
         setBackgroundFile(null);
         const presetBackgroundId = preset("background_id", "backgroundId", null);
         setBackgroundId(job.campaign_id ? presetBackgroundId : null);
@@ -2522,6 +2544,9 @@ export default function App() {
         if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
         attempt.cancel(); // liberar sólo este intento, nunca el de otra canción
+        // La review del propio wizard ya está abierta y completa: un fallo
+        // del refresco no puede sacar al operador del editor.
+        if (wizardOwnReview) return;
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
@@ -3367,15 +3392,11 @@ export default function App() {
       return;
     }
 
-    const jobList = files.map((f) => ({
-      filename: f.file.name, _file: f.file, artist: f.artist.trim(),
-      songTitle: (f.songTitle || "").trim(),
-      language: f.language, genre: f.genre || "", font: f.font || "",
-      concept: f.concept || "", movementStyle: f.movementStyle || "", effect: f.effect || "",
-      backgroundHint: f.backgroundHint || "", bgVerbatim: !!f.bgVerbatim,
-      status: "queued", current_step: null,
-      progress: 0, job_id: null, error: null,
-    }));
+    // Mismo contrato visual que el camino revisado (lib/buildGenerationJob):
+    // antes este map copiaba sólo fondo/fuente y dejaba afuera look, variante,
+    // tipografía, colores y portada → /generate recibía lyric_look="" y el
+    // video salía con la letra blanca plana (incidente 11-nov-2026).
+    const jobList = files.map((f) => buildDirectGenerationJob(f));
     setJobs(jobList);
     navigate("/generating");
     // Mismo cleanup que startGenerationWithSegments: el batch ya está en
