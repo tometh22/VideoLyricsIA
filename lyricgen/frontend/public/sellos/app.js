@@ -45,15 +45,16 @@ const english = {
   "mobileCta": "Get a free sample",
   "heroProof": "We produce for a multinational label in Chile and Argentina. We’ve made lyric videos for <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> and many more artists.",
   "featureTag": "Made with Genly",
-  "featureTitle": "<strong>New styles</strong> Brush and Cosmic",
-  "featureMeta": "Lyric video · Excerpt",
+  "featureTitle": "<strong>New styles</strong> Arc, Cut-out, Perspective and more",
+  "featureMeta": "Lyric videos · Excerpts",
   "workEyebrow": "Our work",
   "workTitle": "A few lyric videos we’ve made.",
   "workBody": "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
   "looksEyebrow": "Lyric styles",
-  "looksTitle": "One image with five lyric styles.",
-  "looksBody": "These are styles we added recently. They change the typeface, the color and how each word comes in. Tap one to compare. We pick the style for each song with you before we start.",
-  "looksNote": "Stills from our styles reel.",
+  "looksTitle": "Ten lyric styles, each with its own motion.",
+  "looksBody": "They change the typeface, the color and how each word comes in. Tap one to see it. We pick the style for each song with you, based on the genre and the artist’s look.",
+  "looksNote": "Stills from recent videos.",
+  "artTitle": "And art tracks too",
   "whyEyebrow": "Why Genly",
   "whyTitle": "Built for when there are a lot of songs.",
   "whyBody": "If you work with several artists, at some point you have twenty or thirty songs waiting for a video, and someone has to make sure no lyric mistakes slip through. That’s the part we take care of.",
@@ -68,21 +69,25 @@ const english = {
   "whyKicker": "With Genly Studio there’s nothing to learn. You send us the material and we send back the videos.",
   "deliveryEyebrow": "What you get",
   "deliveryTitle": "What we send you for each song",
-  "deliveryBody": "Three files, ready to upload. The pilot is five songs, so fifteen files.",
+  "deliveryBody": "Four files, ready to upload. The pilot is five songs, so twenty files.",
   "fLyric": "Lyric video",
   "fLyricBody": "The full song with synced lyrics. Your main video for YouTube.",
   "fVertical": "Vertical edit",
   "fVerticalBody": "A 30-second excerpt you choose, for Reels, Shorts or TikTok.",
   "fThumb": "Thumbnail",
   "fThumbBody": "The video’s cover image, in the same style.",
-  "folderLabel": "Diagram of the pilot delivery folder: five songs, each with a lyric video, a vertical edit and a thumbnail.",
+  "fCanvas": "Spotify Canvas",
+  "fCanvasBody": "The loop Spotify shows while the song plays, made from the same background.",
+  "fArt": "Art track (optional)",
+  "fArtBody": "The official cover with the audio waveform and the title, for songs that don’t get a lyric video.",
+  "folderLabel": "Diagram of the pilot delivery folder: five songs, each with a lyric video, a vertical edit, a Spotify Canvas and a thumbnail.",
   "folderPath": "final_delivery",
-  "folderCount": "15 files",
+  "folderCount": "20 files",
   "song1": "01_your_song",
   "song2": "02_your_song",
   "song3": "03_your_song",
-  "songMore": "04 and 05, with the same three files",
-  "folderNote": "This is how the folder looks. If you need ProRes, 4K, Canvas or another format, we quote it separately.",
+  "songMore": "04 and 05, with the same four files",
+  "folderNote": "This is how the folder looks. We also deliver in ProRes; if you need 4K or another format, we quote it separately.",
   "processEyebrow": "Process",
   "processTitle": "How we work, step by step",
   "laneYou": "Your team",
@@ -208,15 +213,16 @@ const portuguese = {
   "mobileCta": "Pedir uma amostra grátis",
   "heroProof": "Produzimos para uma gravadora multinacional no Chile e na Argentina. Fizemos lyric videos de <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> e muitos outros artistas.",
   "featureTag": "Feito com Genly",
-  "featureTitle": "<strong>Estilos novos</strong> Pincel e Cósmico",
-  "featureMeta": "Lyric video · Trecho",
+  "featureTitle": "<strong>Estilos novos</strong> Arco, Recorte, Perspectiva e mais",
+  "featureMeta": "Lyric videos · Trechos",
   "workEyebrow": "Nosso trabalho",
   "workTitle": "Alguns lyric videos que fizemos.",
   "workBody": "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com o seu visual e a letra revisada linha por linha.",
   "looksEyebrow": "Estilos de letra",
-  "looksTitle": "Uma imagem com cinco estilos de letra.",
-  "looksBody": "São estilos que adicionamos há pouco. Mudam a tipografia, a cor e a forma como cada palavra entra. Toque em um para comparar. Escolhemos o estilo de cada música com você antes de começar.",
-  "looksNote": "Quadros do nosso reel de estilos.",
+  "looksTitle": "Dez estilos de letra, cada um com a sua animação.",
+  "looksBody": "Mudam a tipografia, a cor e a forma como cada palavra entra. Toque em um para ver. Escolhemos o estilo de cada música com você, de acordo com o gênero e a estética do artista.",
+  "looksNote": "Quadros de vídeos recentes.",
+  "artTitle": "E também art tracks",
   "whyEyebrow": "Por que Genly",
   "whyTitle": "Pensado para quando há muitas músicas.",
   "whyBody": "Se você trabalha com vários artistas, em algum momento tem vinte ou trinta músicas esperando vídeo, e alguém precisa garantir que nenhum erro de letra passe. Essa é a parte que fica com a gente.",
@@ -231,21 +237,25 @@ const portuguese = {
   "whyKicker": "Com o Genly Studio não há nada para aprender. Você manda o material e nós devolvemos os vídeos.",
   "deliveryEyebrow": "O que você recebe",
   "deliveryTitle": "O que mandamos para cada música",
-  "deliveryBody": "Três arquivos, prontos para subir. O piloto é de cinco músicas, então são quinze arquivos.",
+  "deliveryBody": "Quatro arquivos, prontos para subir. O piloto é de cinco músicas, então são vinte arquivos.",
   "fLyric": "Lyric video",
   "fLyricBody": "A música inteira com a letra sincronizada. O seu vídeo principal para o YouTube.",
   "fVertical": "Corte vertical",
   "fVerticalBody": "Um trecho de 30 segundos escolhido por você, para Reels, Shorts ou TikTok.",
   "fThumb": "Miniatura",
   "fThumbBody": "A imagem de capa do vídeo, no mesmo estilo.",
-  "folderLabel": "Esquema da pasta de entrega do piloto: cinco músicas, cada uma com lyric video, corte vertical e miniatura.",
+  "fCanvas": "Canvas do Spotify",
+  "fCanvasBody": "O loop que aparece no Spotify enquanto a música toca, feito com o mesmo fundo.",
+  "fArt": "Art track (opcional)",
+  "fArtBody": "A capa oficial com a onda do áudio e o título, para as músicas que não levam lyric video.",
+  "folderLabel": "Esquema da pasta de entrega do piloto: cinco músicas, cada uma com lyric video, corte vertical, Canvas do Spotify e miniatura.",
   "folderPath": "entrega_final",
-  "folderCount": "15 arquivos",
+  "folderCount": "20 arquivos",
   "song1": "01_sua_musica",
   "song2": "02_sua_musica",
   "song3": "03_sua_musica",
-  "songMore": "04 e 05, com os mesmos três arquivos",
-  "folderNote": "A pasta fica assim. Se precisar de ProRes, 4K, Canvas ou outro formato, orçamos à parte.",
+  "songMore": "04 e 05, com os mesmos quatro arquivos",
+  "folderNote": "A pasta fica assim. Também entregamos em ProRes; se precisar de 4K ou outro formato, orçamos à parte.",
   "processEyebrow": "Processo",
   "processTitle": "Como trabalhamos, passo a passo",
   "laneYou": "Sua equipe",
@@ -414,20 +424,21 @@ reelToggle.addEventListener('click',() => {
 
 // Lyric looks: same scene, switchable lyric styles.
 const looks = {
+  arco: {es:'Arco', en:'Arc', pt:'Arco'},
+  recorte: {es:'Recorte', en:'Cut-out', pt:'Recorte'},
+  perspectiva: {es:'Perspectiva 3D', en:'3D Perspective', pt:'Perspectiva 3D'},
+  bloque: {es:'Bloque', en:'Block', pt:'Bloco'},
+  romantico: {es:'Romántico', en:'Romantic', pt:'Romântico'},
+  diptico: {es:'Díptico', en:'Diptych', pt:'Díptico'},
+  duotono: {es:'Duotono', en:'Duotone', pt:'Duotom'},
+  golpe: {es:'Golpe', en:'Punch', pt:'Golpe'},
   cosmico: {es:'Cósmico', en:'Cosmic', pt:'Cósmico'},
-  cine: {es:'Cine', en:'Cinema', pt:'Cinema'},
-  pincel: {es:'Pincel', en:'Brush', pt:'Pincel'},
-  pop: {es:'Pop 70s', en:'70s Pop', pt:'Pop anos 70'},
-  pelicula: {es:'Película', en:'Film', pt:'Película'}
+  cine: {es:'Cine', en:'Cinema', pt:'Cinema'}
 };
 const lookImage = document.querySelector('#look-image');
-let selectedLook = 'cosmico';
+let selectedLook = 'arco';
 function lookAlt(key) {
-  const lyric = key === 'pop' ? 'Lluvia espacial' : 'Lavará sus heridas';
-  return tr(
-    'Estilo '+looks[key].es+': la letra «'+lyric+'»'+(key === 'pop' ? ' sobre un fondo de color plano' : ' sobre un callejón bajo la lluvia'),
-    looks[key].en+' style: the lyric “'+lyric+'”'+(key === 'pop' ? ' on a flat color background' : ' over a rainy alley'),
-    'Estilo '+looks[key].pt+': a letra «'+lyric+'»'+(key === 'pop' ? ' sobre um fundo de cor chapada' : ' sobre um beco na chuva'));
+  return tr('Estilo de letra '+looks[key].es, looks[key].en+' lyric style', 'Estilo de letra '+looks[key].pt);
 }
 function setLook(key) {
   selectedLook = key;
@@ -571,7 +582,7 @@ function setLanguage(lang) {
   syncHeadline();
   updateReelToggle();
   setLook(selectedLook);
-  featureVideo.setAttribute('aria-label',tr('Fragmento de un lyric video con los estilos de letra Pincel y Cósmico, sobre un callejón bajo la lluvia.','Excerpt from a lyric video with the Brush and Cosmic lyric styles, over a rainy alley.','Trecho de um lyric video com os estilos de letra Pincel e Cósmico, sobre um beco na chuva.'));
+  featureVideo.setAttribute('aria-label',tr('Fragmentos de lyric videos con ocho estilos de letra distintos.','Excerpts from lyric videos in eight different lyric styles.','Trechos de lyric videos com oito estilos de letra diferentes.'));
   document.querySelector('.look-chips').setAttribute('aria-label',tr('Estilos de letra','Lyric styles','Estilos de letra'));
   if (!briefPreview.hidden) updatePreparedInquiry();
   closeMenu();
