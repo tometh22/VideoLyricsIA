@@ -495,3 +495,28 @@ def test_word_timings_synthesize_inside_the_window_for_a_line_without_words():
     assert out[0]["start"] == pytest.approx(3.2)
     assert out[-1]["end"] == pytest.approx(4.4)
     assert all(a["end"] <= b["start"] + 1e-9 for a, b in zip(out, out[1:]))
+
+
+def test_perspectiva_long_line_fits_five_rows_in_portrait():
+    # 9:16 broke "Que um sentimento assim tão forte vinha pra ficar" into 7
+    # rows and the last word ran off the bottom; long lines now shrink to
+    # five rows, short lines and 16:9 keep the base size.
+    long_line = [{"text": "Que um sentimento assim tão forte vinha pra ficar",
+                  "start": 0.0, "end": 4.0}]
+    short_line = [{"text": "Minha rosa de fogo", "start": 0.0, "end": 3.0}]
+
+    def floor(segs, width, height):
+        doc = L.build_look_ass(segs, L.LOOKS["perspectiva"], width=width,
+                               height=height, duration=5.0)
+        d = [x for x in _dialogues(doc) if "\\frx" in x][0]
+        fs = int(re.search(r"\\fs(\d+)\\frx", d).group(1))
+        rows = d.split("}", 1)[1].count("\\N") + 1
+        return fs, rows
+
+    fs_long, rows_long = floor(long_line, 1080, 1920)
+    fs_short, _ = floor(short_line, 1080, 1920)
+    fs_wide, _ = floor(long_line, 1920, 1080)
+    assert rows_long <= 5
+    assert fs_long < fs_short
+    assert fs_long >= int(fs_short * 0.6)
+    assert fs_wide == fs_short
