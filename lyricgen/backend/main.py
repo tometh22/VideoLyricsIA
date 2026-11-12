@@ -6371,6 +6371,45 @@ def _maybe_chorus_snap(result, job_id: str):
         return result
 
 
+def _enforce_reference_line_contract(result, job_id: str):
+    """Restore one row per operator-pasted line after the quality post-passes.
+
+    Ad-lib filtering, repetition reconciliation, gap rescue, word vote, chorus
+    snap, phrase segmentation, formatting and the late credit filter were
+    written for ASR or doubtful catalogue text. On lyrics the operator pasted
+    as official none of their merges, splits, rewrites or drops is legitimate
+    (incident 11-nov-2026: lines merged and the last two lost). Results
+    without a contract are returned untouched. Never raises."""
+    if not isinstance(result, dict):
+        return result
+    try:
+        import reference_lines as _reflines
+        contract = result.get(_reflines.CONTRACT_KEY)
+        if not contract:
+            return result
+        restored, stats = _reflines.enforce_contract(
+            result.get("segments") or [], contract,
+        )
+        if stats is None:
+            return result
+        result = dict(result)
+        result["segments"] = restored
+        result.setdefault("postpass_stats", {})["reference_line_contract"] = stats
+        logger.warning(
+            "[REF-LINES] post-passes changed the official lyric rows: "
+            "%d → %d rows, %d restored from the anchor, %d texts restored job=%s",
+            stats["final_rows_before"], stats["reference_rows"],
+            stats["restored"], stats["text_restored"], job_id,
+        )
+        return result
+    except Exception as exc:  # never break a transcription over this
+        logger.warning(
+            "[REF-LINES] contract enforcement declined error_type=%s job=%s",
+            type(exc).__name__, job_id,
+        )
+        return result
+
+
 def _maybe_timing_consistency(result, job_id: str):
     """Post-pass FINAL (TIMING_CONSISTENCY_ENABLED, default ON): la ventana de
     cada cartel tiene que coincidir con las palabras que ese cartel muestra.
@@ -6393,6 +6432,11 @@ def _maybe_timing_consistency(result, job_id: str):
     de result-dict, igual que los demás post-pases. Never raises."""
     if not isinstance(result, dict):
         return result
+    # Official lyrics pasted by the operator: one row per pasted line, in
+    # order, before the final timing invariant. Living here keeps the three
+    # transcription paths (worker + two HTTP handlers) and the quality-gate
+    # retry in lockstep without a fourth call site to forget.
+    result = _enforce_reference_line_contract(result, job_id)
     try:
         import karaoke_align as _ka
         segs = result.get("segments") or []
@@ -7088,10 +7132,50 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         raise ValueError("invalid alignment content source")
     _stem = None
     anchor_text = (anchor_lyrics or "").strip()
+    import reference_lines as _reflines
+    # Stripped per line: a paste from the web keeps trailing spaces, and the
+    # exact comparison in _safe_alignment then rejected every fallback.
     psegs = [
         {"text": line, "start": 0.0, "end": 0.0}
-        for line in anchor_text.splitlines() if line.strip()
+        for line in _reflines.split_reference_lines(anchor_text)
     ]
+    # Operator-pasted lyrics are authoritative line by line: an aligner that
+    # loses the tail (or leaves it outside the audio) gets those lines put
+    # back inside the audio, interpolated and flagged for review, instead of
+    # the whole reference being declined or silently truncated (incident
+    # 11-nov-2026). Catalogue references keep the strict historical contract.
+    _complete_missing = content_source == "operator_reference"
+    _audio_duration_s: list = [None]
+
+    async def _measure_audio_duration():
+        if not _complete_missing or not audio_path or not os.path.exists(audio_path):
+            return
+        try:
+            from pipeline import _audio_duration
+            _audio_duration_s[0] = await asyncio.wait_for(
+                asyncio.to_thread(_audio_duration, audio_path), timeout=60,
+            )
+        except Exception as duration_exc:
+            logger.warning(
+                "[ANCHOR] audio duration unavailable error_type=%s job=%s",
+                type(duration_exc).__name__, job_id,
+            )
+
+    def _complete(aligned):
+        if not _complete_missing or not isinstance(aligned, list):
+            return aligned
+        completed, _stats = _reflines.complete_alignment(
+            [segment["text"] for segment in psegs], aligned,
+            audio_duration=_audio_duration_s[0],
+        )
+        if completed is not aligned:
+            logger.info(
+                "[ANCHOR] reference lines completed missing=%d invalid=%d "
+                "interpolated=%d job=%s",
+                _stats["missing"], _stats["invalid_timing"],
+                _stats["interpolated"], job_id,
+            )
+        return completed
 
     def _declined(base, reason: str, *, error_type: str = ""):
         out = dict(base) if isinstance(base, dict) else base
@@ -7165,6 +7249,9 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
             if timing_source == "whisper_align" and not scores:
                 # This line was interpolated between acoustic word anchors.
                 needs_review = True
+            if _reflines.REVIEW_REASON in (segment.get("review_reasons") or []):
+                # Pasted line the aligner lost; placed by interpolation.
+                needs_review = True
             if needs_review:
                 segment["review"] = True
                 flagged += 1
@@ -7177,6 +7264,13 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         ]
         out["segments"] = anchored
         out["reference_lyrics"] = anchor_text
+        if content_source == "operator_reference":
+            # One row per pasted line, in order: the final post-pass boundary
+            # (_maybe_timing_consistency) restores this shape if any quality
+            # post-pass merged, split, rewrote or dropped a row.
+            out[_reflines.CONTRACT_KEY] = _reflines.build_contract(anchored)
+        else:
+            out.pop(_reflines.CONTRACT_KEY, None)
         # Historical internal marker used by worker + reanchor to skip a
         # second CTC pass. The actual timing engine is recorded below.
         out["timing_source"] = "anchor_ctc"
@@ -7279,6 +7373,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         align_src = _stem or audio_path
         if not _stem:
             logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
+        await _measure_audio_duration()
         if len(psegs) >= 3:
             try:
                 retimed = await asyncio.wait_for(
@@ -7305,6 +7400,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
             # lyric is still authoritative and Whisper-DP can align it.
             retimed = None
             decline_reason = "too_few_lines_for_ctc"
+        retimed = _complete(retimed)
         if retimed is not None and (content_source != "catalog_reference" or _safe_alignment(retimed)):
             result = _apply(
                 result, retimed, timing_source="ctc_timing_only",
@@ -7334,6 +7430,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                     type(forced_exc).__name__, job_id,
                 )
                 retimed = None
+            retimed = _complete(retimed)
             if _safe_alignment(retimed):
                 result = _apply(
                     result,
@@ -7374,6 +7471,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                         ),
                         timeout=240,
                     )
+                    retimed = _complete(retimed)
                     if _safe_alignment(retimed):
                         break
                     logger.info(
@@ -7433,6 +7531,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                             ),
                             timeout=600,
                         )
+                        retimed = _complete(retimed)
                         if _safe_alignment(retimed):
                             break
                         logger.info(
