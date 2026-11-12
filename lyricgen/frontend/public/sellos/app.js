@@ -45,12 +45,13 @@ const english = {
   "mobileCta": "Get a free sample",
   "heroProof": "We produce for a multinational label in Chile and Argentina. We’ve made lyric videos for <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> and many more artists.",
   "featureTag": "Made with Genly",
-  "featureMeta": "Lyric video · 5:12",
+  "featureTitle": "<strong>New styles</strong> Arc, Cut-out, Perspective and more",
+  "featureMeta": "Lyric videos · Excerpts",
   "workEyebrow": "Our work",
   "workTitle": "A few lyric videos we’ve made.",
   "workBody": "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
   "looksEyebrow": "Lyric styles",
-  "looksTitle": "Nine lyric styles, each with its own motion.",
+  "looksTitle": "Ten lyric styles, each with its own motion.",
   "looksBody": "They change the typeface, the color and how each word comes in. Tap one to see it. We pick the style for each song with you, based on the genre and the artist’s look.",
   "looksNote": "Stills from recent videos.",
   "artTitle": "And art tracks too",
@@ -212,12 +213,13 @@ const portuguese = {
   "mobileCta": "Pedir uma amostra grátis",
   "heroProof": "Produzimos para uma gravadora multinacional no Chile e na Argentina. Fizemos lyric videos de <strong>Charly García, Mercedes Sosa, Enanitos Verdes</strong> e muitos outros artistas.",
   "featureTag": "Feito com Genly",
-  "featureMeta": "Lyric video · 5:12",
+  "featureTitle": "<strong>Estilos novos</strong> Arco, Recorte, Perspectiva e mais",
+  "featureMeta": "Lyric videos · Trechos",
   "workEyebrow": "Nosso trabalho",
   "workTitle": "Alguns lyric videos que fizemos.",
   "workBody": "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com o seu visual e a letra revisada linha por linha.",
   "looksEyebrow": "Estilos de letra",
-  "looksTitle": "Nove estilos de letra, cada um com a sua animação.",
+  "looksTitle": "Dez estilos de letra, cada um com a sua animação.",
   "looksBody": "Mudam a tipografia, a cor e a forma como cada palavra entra. Toque em um para ver. Escolhemos o estilo de cada música com você, de acordo com o gênero e a estética do artista.",
   "looksNote": "Quadros de vídeos recentes.",
   "artTitle": "E também art tracks",
@@ -387,6 +389,14 @@ function syncHeadline() {
   requestAnimationFrame(tick);
 }
 
+// Hero clip: with reduced motion it stays on its poster frame.
+const featureVideo = document.querySelector('#feature-video');
+if (reducedMotion) {
+  featureVideo.removeAttribute('autoplay');
+  featureVideo.preload = 'none';
+  featureVideo.pause();
+}
+
 // Published work reel: duplicated rows loop unless motion is reduced.
 const reel = document.querySelector('[data-reel]');
 const reelToggle = document.querySelector('#reel-toggle');
@@ -414,18 +424,19 @@ reelToggle.addEventListener('click',() => {
 
 // Lyric looks: same scene, switchable lyric styles.
 const looks = {
+  arco: {es:'Arco', en:'Arc', pt:'Arco'},
   recorte: {es:'Recorte', en:'Cut-out', pt:'Recorte'},
+  perspectiva: {es:'Perspectiva 3D', en:'3D Perspective', pt:'Perspectiva 3D'},
+  bloque: {es:'Bloque', en:'Block', pt:'Bloco'},
+  romantico: {es:'Romántico', en:'Romantic', pt:'Romântico'},
   diptico: {es:'Díptico', en:'Diptych', pt:'Díptico'},
   duotono: {es:'Duotono', en:'Duotone', pt:'Duotom'},
   golpe: {es:'Golpe', en:'Punch', pt:'Golpe'},
-  arco: {es:'Arco', en:'Arc', pt:'Arco'},
   cosmico: {es:'Cósmico', en:'Cosmic', pt:'Cósmico'},
-  perspectiva: {es:'Perspectiva 3D', en:'3D Perspective', pt:'Perspectiva 3D'},
-  cine: {es:'Cine', en:'Cinema', pt:'Cinema'},
-  pincel: {es:'Pincel', en:'Brush', pt:'Pincel'}
+  cine: {es:'Cine', en:'Cinema', pt:'Cinema'}
 };
 const lookImage = document.querySelector('#look-image');
-let selectedLook = 'recorte';
+let selectedLook = 'arco';
 function lookAlt(key) {
   return tr('Estilo de letra '+looks[key].es, looks[key].en+' lyric style', 'Estilo de letra '+looks[key].pt);
 }
@@ -571,6 +582,7 @@ function setLanguage(lang) {
   syncHeadline();
   updateReelToggle();
   setLook(selectedLook);
+  featureVideo.setAttribute('aria-label',tr('Fragmentos de lyric videos con ocho estilos de letra distintos.','Excerpts from lyric videos in eight different lyric styles.','Trechos de lyric videos com oito estilos de letra diferentes.'));
   document.querySelector('.look-chips').setAttribute('aria-label',tr('Estilos de letra','Lyric styles','Estilos de letra'));
   if (!briefPreview.hidden) updatePreparedInquiry();
   closeMenu();
