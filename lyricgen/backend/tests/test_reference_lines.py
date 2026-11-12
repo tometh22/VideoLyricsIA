@@ -284,3 +284,75 @@ def test_worker_strips_the_contract_before_persisting():
     src = (pathlib.Path(__file__).resolve().parent.parent
            / "transcription_worker.py").read_text()
     assert src.count('r.pop("_reference_line_contract", None)') >= 2
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (PR #1582)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_tail_survives_the_final_timing_consistency_pass():
+    """Two lost lines after a word-aligned line that ends at 30 s reserve
+    29–30 s. The neighbour's word stamps must be clipped too, or the final
+    timing pass re-extends it to its last word (30 s) over the restored tail."""
+    lines = LINES[:4]
+    rows = [_row(lines[0], 1.0, 9.0), _row(lines[1], 10.0, AUDIO_S)]
+    rows[1]["words"][-1]["end"] = AUDIO_S
+    out, _stats = RL.complete_alignment(lines, rows, audio_duration=AUDIO_S)
+    assert out[1]["end"] == pytest.approx(29.0)
+    assert all(w["end"] <= 29.0 + 1e-6 for w in out[1]["words"])
+
+    result = {"segments": out, RL.CONTRACT_KEY: RL.build_contract(out)}
+    final = _maybe_timing_consistency(result, "j-ref-lines")["segments"]
+
+    assert [s["text"] for s in final] == lines
+    assert final[1]["end"] <= final[2]["start"] + 1e-6, final[1]
+    assert final[2]["end"] <= final[3]["start"] + 1e-6
+    assert final[3]["end"] <= AUDIO_S + 1e-6
+
+
+def test_next_neighbour_words_are_clipped_out_of_a_restored_middle_line():
+    rows = [r for i, r in enumerate(_hosted_tail_cut()) if i != 2]
+    # The line after the hole carries a word stamped before its start.
+    first_word = {"word": LINES[3].split()[0], "start": 7.0, "end": 10.4, "score": 0.9}
+    rows[2] = dict(rows[2], words=[first_word] + rows[2]["words"][1:])
+    rows += [_row(LINES[6], 22.0, 25.0), _row(LINES[7], 25.5, 29.0)]
+    out, _stats = RL.complete_alignment(LINES, rows, audio_duration=AUDIO_S)
+    final = _maybe_timing_consistency(
+        {"segments": out, RL.CONTRACT_KEY: RL.build_contract(out)}, "j",
+    )["segments"]
+    assert [s["text"] for s in final] == LINES
+    assert final[2]["end"] <= final[3]["start"] + 1e-6
+    assert final[3]["start"] == pytest.approx(10.0)
+
+
+_CHORUS = ["refrao sintetico um", "refrao sintetico dois",
+           "refrao sintetico um", "refrao sintetico dois", "ponte final"]
+
+
+def _chorus_anchor():
+    return [_row(t, s, s + 5.0)
+            for t, s in zip(_CHORUS, [0.0, 10.0, 20.0, 30.0, 40.0])]
+
+
+def test_deleted_repeated_chorus_rows_are_restored_at_their_own_occurrence():
+    """Anchor A B A B C at 0/10/20/30/40; post-passes keep the first A B and C.
+    Text-only block matching paired the survivors with the SECOND A B and
+    restored 0, 10, 10.05, 10.1, 40."""
+    anchored = _chorus_anchor()
+    survivors = [dict(anchored[0]), dict(anchored[1]), dict(anchored[4])]
+    out, stats = RL.enforce_contract(survivors, RL.build_contract(anchored))
+    assert [s["text"] for s in out] == _CHORUS
+    assert [s["start"] for s in out] == [0.0, 10.0, 20.0, 30.0, 40.0]
+    assert [bool(s.get("reference_line_restored")) for s in out] == [
+        False, False, True, True, False,
+    ]
+    assert stats["restored"] == 2
+
+
+def test_survivor_of_the_second_chorus_keeps_its_own_occurrence():
+    anchored = _chorus_anchor()
+    refined = dict(anchored[2], start=20.3)
+    out, _stats = RL.enforce_contract([refined, dict(anchored[4])],
+                                      RL.build_contract(anchored))
+    assert [s["start"] for s in out] == [0.0, 10.0, 20.3, 30.0, 40.0]

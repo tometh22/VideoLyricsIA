@@ -32,7 +32,6 @@ Puro: sin I/O, sin red. Nunca levanta.
 """
 from __future__ import annotations
 
-import difflib
 import logging
 import math
 import re
@@ -84,6 +83,42 @@ def _valid_timing(segment, audio_duration):
     if audio_duration and end > audio_duration:
         end = audio_duration
     return end > start
+
+
+def _clip_words(segment: dict, *, lo: float | None = None,
+                hi: float | None = None) -> None:
+    """Keep ``segment["words"]`` inside ``[lo, hi]`` (in place).
+
+    Words wholly outside the bound are dropped, words straddling it are
+    clipped. With no word left the key is removed, so the renderer and the
+    timing pass fall back to the line window."""
+    words = segment.get("words")
+    if not isinstance(words, list) or not words:
+        return
+    kept = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        start, end = _num(word.get("start")), _num(word.get("end"))
+        if start is None or end is None:
+            kept.append(word)
+            continue
+        if hi is not None and start >= hi:
+            continue
+        if lo is not None and end <= lo:
+            continue
+        if (hi is not None and end > hi) or (lo is not None and start < lo):
+            word = dict(word)
+            if hi is not None and end > hi:
+                word["end"] = round(hi, 3)
+            if lo is not None and start < lo:
+                word["start"] = round(lo, 3)
+        kept.append(word)
+    if kept != words:
+        if kept:
+            segment["words"] = kept
+        else:
+            segment.pop("words", None)
 
 
 def _map_rows(lines: list[str], rows: list, window: int = 8):
@@ -195,6 +230,14 @@ def complete_alignment(lines: list[str], aligned, *,
                     k, lo, hi,
                 )
                 return aligned, stats
+            # The neighbours' word stamps must stay out of the reserved window:
+            # the final timing pass re-frames every line to its own words, so a
+            # stamp left inside [lo, hi] would stretch the neighbour back over
+            # the restored lines and undo the reservation.
+            if prev is not None:
+                _clip_words(prev, hi=lo)
+            if nxt is not None:
+                _clip_words(nxt, lo=hi)
             gap = _GAP_S if step > 3 * _GAP_S else 0.0
             for offset, pos in enumerate(range(first, last + 1)):
                 start = lo + step * offset
@@ -227,6 +270,59 @@ def build_contract(segments: list[dict]) -> dict:
     }
 
 
+def _match_rows(final: list[dict], expected: list[dict]) -> list[tuple[int, int]]:
+    """Order-preserving pairs ``(final_index, expected_index)`` of equal text.
+
+    Text alone cannot tell two occurrences of a chorus apart: with the anchor
+    ``A B A B C`` and survivors ``A B C``, a longest-block match pairs the
+    survivors with the SECOND ``A B`` and the deleted rows get restored at the
+    wrong place. This DP keeps the maximum number of equal-text pairs and,
+    among those, the assignment whose starts lie closest to the anchored
+    occurrence — the survivors' own timing identifies which occurrence they
+    are."""
+    final_keys = [line_key(row.get("text") or "") for row in final]
+    expected_keys = [line_key(row.get("text") or "") for row in expected]
+
+    def _start(row):
+        value = _num(row.get("start"))
+        return value if value is not None else 0.0
+
+    final_starts = [_start(row) for row in final]
+    expected_starts = [_start(row) for row in expected]
+    n, m = len(final), len(expected)
+    # best[i][j] = (matches, -distance) over final[i:] and expected[j:].
+    best = [[(0, 0.0)] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        row_next = best[i + 1]
+        row_here = best[i]
+        for j in range(m - 1, -1, -1):
+            candidate = max(row_next[j], row_here[j + 1])
+            if final_keys[i] and final_keys[i] == expected_keys[j]:
+                matches, neg_distance = row_next[j + 1]
+                paired = (matches + 1, neg_distance
+                          - abs(final_starts[i] - expected_starts[j]))
+                if paired > candidate:
+                    candidate = paired
+            row_here[j] = candidate
+    pairs: list[tuple[int, int]] = []
+    i = j = 0
+    while i < n and j < m:
+        if final_keys[i] and final_keys[i] == expected_keys[j]:
+            matches, neg_distance = best[i + 1][j + 1]
+            paired = (matches + 1, neg_distance
+                      - abs(final_starts[i] - expected_starts[j]))
+            if paired == best[i][j]:
+                pairs.append((i, j))
+                i += 1
+                j += 1
+                continue
+        if best[i + 1][j] == best[i][j]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
 def enforce_contract(segments, contract):
     """Restituye una fila por línea pegada, en orden. ``(segmentos, stats|None)``.
 
@@ -246,15 +342,7 @@ def enforce_contract(segments, contract):
     ]:
         return segments, None
 
-    final_keys = [line_key(row.get("text") or "") for row in final]
-    expected_keys = [line_key(row.get("text") or "") for row in expected]
-    matcher = difflib.SequenceMatcher(a=final_keys, b=expected_keys, autojunk=False)
-    taken: dict[int, dict] = {}
-    for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
-        if tag != "equal":
-            continue
-        for offset in range(i2 - i1):
-            taken[j1 + offset] = final[i1 + offset]
+    taken = {j: final[i] for i, j in _match_rows(final, expected)}
 
     out: list[dict] = []
     restored = text_restored = 0
