@@ -9,7 +9,7 @@ const SALES_EMAIL = "tomas@genly.pro";
 
 // Lyric videos hechos con Genly. Las imágenes son fotogramas reales (con la
 // letra en pantalla). No se enlaza ni se nombra dónde están publicados.
-const FEATURED = { id: "enanitos-verdes-salpicandonos", artist: "Enanitos Verdes", title: "Salpicandonos", duration: "5:12" };
+const HERO_CLIP = { src: "/landing/hero/estilos-genly.mp4", poster: "/landing/hero/estilos-genly.jpg" };
 const WORK = [
   [
     { id: "illya-kuryaki-jugo", artist: "Illya Kuryaki and the Valderramas", title: "Jugo" },
@@ -28,7 +28,15 @@ const WORK = [
     { id: "diego-torres-el-mundo-sigue-igual", artist: "Diego Torres", title: "El Mundo Sigue Igual" },
   ],
 ];
-const LOOK_KEYS = ["cosmico", "cine", "pincel", "pop", "pelicula"];
+// Art tracks: la imagen ya trae su propio título, así que el pie va debajo.
+const ART_TRACKS = [
+  { id: "mon-laferte-nina", artist: "Mon Laferte", title: "Niña" },
+  { id: "los-bunkers-coma", artist: "Los Bunkers", title: "Coma" },
+  { id: "kudai-dejame-gritar", artist: "Kudai", title: "Déjame Gritar" },
+  { id: "tiro-de-gracia-melaza", artist: "Tiro de Gracia", title: "Melaza" },
+];
+// Mismo orden y capturas que /sellos. Las capturas no muestran artistas.
+const LOOK_KEYS = ["arco", "recorte", "perspectiva", "bloque", "romantico", "diptico", "duotono", "golpe", "cosmico", "cine"];
 
 const COPY = {
   es: {
@@ -58,24 +66,34 @@ const COPY = {
     pathsTitle: "Lo hacés vos o lo hacemos nosotros",
     paths: [
       { name: "Genly Platform", tag: "Para artistas y sellos", title: "Lo hacés vos", body: "Subís las canciones, corregís la letra y elegís la estética. Genly arma los videos.", points: ["Video, vertical y miniatura de cada canción", "Hasta cinco canciones por vez", "Para sellos: un workspace con todo tu equipo"], cta: "Empezar gratis", labelsLink: "¿Sos un sello? Te armamos el workspace del equipo" },
-      { name: "Genly Studio", tag: "Para sellos", title: "Lo hacemos nosotros", body: "Nos mandás las canciones y te devolvemos los videos listos para subir, con la letra revisada palabra por palabra.", points: ["Muestra gratis de 30 segundos", "Una sola persona para todo el lote", "Precio según volumen"], cta: "Pedir mi muestra gratis", footNote: "Sin compromiso de seguir." },
+      { name: "Genly Studio", tag: "Para sellos", title: "Lo hacemos nosotros", body: "Nos mandás las canciones y te devolvemos los videos listos para subir, con la letra revisada palabra por palabra.", points: ["Muestra gratis de 30 segundos", "Una sola persona para todo el lote", "También Canvas de Spotify, art tracks y entrega en ProRes", "Precio según volumen"], cta: "Pedir mi muestra gratis", footNote: "Sin compromiso de seguir.", pricingLink: "Ver precios para sellos" },
     ],
     pathsNote: "Se pueden combinar: usás Platform para el día a día y nos pasás los lotes grandes a Studio.",
     proof: ["Producimos para un sello multinacional en Chile y Argentina. Hicimos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " y muchos artistas más."],
     featureTag: "Hecho con Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["Estilos nuevos", "Arco, Recorte, Perspectiva y más"],
+    featureMeta: "Lyric videos · Fragmentos",
+    featureAlt: "Fragmentos de lyric videos con ocho estilos de letra distintos.",
     workEyebrow: "Nuestro trabajo",
     workTitle: "Algunos lyric videos que hicimos.",
     workBody: "Para catálogos de rock nacional, folklore, pop y cuarteto. Cada canción con su estética y la letra revisada línea por línea.",
     pause: "Pausar",
     resume: "Reanudar",
+    artTitle: "Y también art tracks",
+    whyEyebrow: "Para qué sirve",
+    whyTitle: "Por qué un lyric video",
+    why: [
+      { title: "Más ingresos en YouTube", body: "Cada lyric video oficial monetiza con anuncios y Content ID." },
+      { title: "Te encuentran por la letra", body: "Mucha gente busca canciones por un pedazo de la letra. Con el video, tu canción aparece." },
+      { title: "Contenido para redes", body: "El vertical sale del mismo video, listo para Reels, TikTok y Shorts." },
+    ],
     looksEyebrow: "Estilos de letra",
-    looksTitle: "Una misma imagen con cinco estilos de letra.",
-    looksBody: "La tipografía, el color y la forma en que entra cada palabra cambian mucho cómo se siente una canción. Tocá uno para comparar.",
-    looksNote: "Capturas de nuestro reel de estilos.",
+    looksTitle: "Un estilo de letra para cada canción.",
+    looksBody: "Cambian la tipografía, el color y la forma en que entra cada palabra. Tocá uno para verlo.",
+    looksNote: "Capturas de videos recientes.",
     looksGroup: "Estilos de letra",
-    looks: { cosmico: "Cósmico", cine: "Cine", pincel: "Pincel", pop: "Pop 70s", pelicula: "Película" },
-    lookAlt: "Estilo {name} sobre la misma escena",
+    looks: { arco: "Arco", recorte: "Recorte", perspectiva: "Perspectiva 3D", bloque: "Bloque", romantico: "Romántico", diptico: "Díptico", duotono: "Duotono", golpe: "Golpe", cosmico: "Cósmico", cine: "Cine" },
+    lookAlt: "Estilo de letra {name}",
     directionEyebrow: "Dirección visual",
     directionTitle: "El fondo también lo elegís vos.",
     directionBody: "Hay tres formas de arrancar y 15 conceptos visuales para combinar con movimiento, paleta y efectos. No son plantillas cerradas, así que cada combinación da una imagen distinta.",
@@ -125,7 +143,7 @@ const COPY = {
       { q: "¿Son plantillas de lyric video?", a: "No. El fondo sale de lo que elegís: concepto, movimiento, paleta y efectos. Si preferís, también podés subir un fondo propio." },
       { q: "¿Puedo corregir la letra y los tiempos?", a: "Sí. Antes de generar editás el texto, movés los tiempos en la línea de tiempo, dividís o unís líneas y lo ves sincronizado en el preview." },
       { q: "¿Qué puedo cambiar del estilo?", a: "El modo, el género, el concepto visual, el movimiento, la paleta y tus propios colores, los efectos, y la tipografía, el tamaño, el contraste y la animación de la letra." },
-      { q: "¿Qué me llevo por cada canción?", a: "Un lyric video Full HD 16:9, un vertical de 30 segundos y una miniatura JPG. Algunas cuentas tienen además entregas ProRes." },
+      { q: "¿Qué me llevo por cada canción?", a: "Un lyric video Full HD 16:9, un vertical de 30 segundos y una miniatura JPG. Si producimos para tu sello con Genly Studio, también el Canvas de Spotify y, si lo necesitás, el art track y la entrega en ProRes." },
       { q: "¿Puedo hacer un video con varias escenas?", a: "Sí. El modo multiescena divide la canción en partes con una estética en común, y podés rehacer una escena sin tocar las demás. Usa créditos extra." },
       { q: "¿Puedo trabajar varias canciones juntas?", a: "Sí. Podés subir hasta cinco archivos MP3 o WAV en un mismo lote y ajustar cada canción por separado." },
     ],
@@ -164,24 +182,34 @@ const COPY = {
     pathsTitle: "You make it, or we make it for you",
     paths: [
       { name: "Genly Platform", tag: "For artists and labels", title: "You make it", body: "Upload the songs, fix the lyrics and pick the look. Genly puts the videos together.", points: ["Video, vertical edit and thumbnail for every song", "Up to five songs at a time", "For labels: one workspace for your whole team"], cta: "Start free", labelsLink: "Run a label? We’ll set up your team workspace" },
-      { name: "Genly Studio", tag: "For labels", title: "We make it for you", body: "Send us the songs and we send back the videos ready to upload, with the lyrics checked word by word.", points: ["Free 30-second sample", "One person handles the whole batch", "Pricing based on volume"], cta: "Get my free sample", footNote: "No commitment to continue." },
+      { name: "Genly Studio", tag: "For labels", title: "We make it for you", body: "Send us the songs and we send back the videos ready to upload, with the lyrics checked word by word.", points: ["Free 30-second sample", "One person handles the whole batch", "Also Spotify Canvas, art tracks and ProRes delivery", "Pricing based on volume"], cta: "Get my free sample", footNote: "No commitment to continue.", pricingLink: "See label pricing" },
     ],
     pathsNote: "You can combine them: use Platform day to day and send the big batches to Studio.",
     proof: ["We produce for a multinational label in Chile and Argentina. We’ve made lyric videos for ", "Charly García, Mercedes Sosa, Enanitos Verdes", " and many more artists."],
     featureTag: "Made with Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["New styles:", "Arc, Cut-out, Perspective and more"],
+    featureMeta: "Lyric videos · Excerpts",
+    featureAlt: "Excerpts from lyric videos in eight different lyric styles.",
     workEyebrow: "Our work",
     workTitle: "A few lyric videos we’ve made.",
     workBody: "For catalogs of Argentine rock, folk, pop and cuarteto. Each song with its own look and the lyrics checked line by line.",
     pause: "Pause",
     resume: "Resume",
+    artTitle: "And art tracks too",
+    whyEyebrow: "What it’s for",
+    whyTitle: "Why a lyric video",
+    why: [
+      { title: "More revenue on YouTube", body: "Every official lyric video earns from ads and Content ID." },
+      { title: "People find you by the lyrics", body: "Lots of people search for songs by a line of the lyrics. With the video, your song shows up." },
+      { title: "Content for social", body: "The vertical edit comes from the same video, ready for Reels, TikTok and Shorts." },
+    ],
     looksEyebrow: "Lyric styles",
-    looksTitle: "One image with five lyric styles.",
-    looksBody: "The typeface, the color and how each word comes in change how a song feels. Tap one to compare.",
-    looksNote: "Stills from our styles reel.",
+    looksTitle: "A lyric style for every song.",
+    looksBody: "They change the typeface, the color and how each word comes in. Tap one to see it.",
+    looksNote: "Stills from recent videos.",
     looksGroup: "Lyric styles",
-    looks: { cosmico: "Cosmic", cine: "Cinema", pincel: "Brush", pop: "70s Pop", pelicula: "Film" },
-    lookAlt: "{name} style over the same scene",
+    looks: { arco: "Arc", recorte: "Cut-out", perspectiva: "3D Perspective", bloque: "Block", romantico: "Romantic", diptico: "Diptych", duotono: "Duotone", golpe: "Punch", cosmico: "Cosmic", cine: "Cinema" },
+    lookAlt: "{name} lyric style",
     directionEyebrow: "Visual direction",
     directionTitle: "You pick the background too.",
     directionBody: "There are three ways to start and 15 visual concepts to combine with motion, palette and effects. They aren’t closed templates, so every combination gives you a different image.",
@@ -231,7 +259,7 @@ const COPY = {
       { q: "Are these lyric video templates?", a: "No. The background comes from what you pick: concept, motion, palette and effects. You can also upload your own background." },
       { q: "Can I fix the lyrics and timing?", a: "Yes. Before generating you edit the text, move timing on the timeline, split or merge lines and watch it synced in the preview." },
       { q: "What can I change about the style?", a: "The mode, genre, visual concept, motion, palette and your own colors, effects, and the lyrics’ typeface, size, contrast and animation." },
-      { q: "What do I get for each song?", a: "A Full HD 16:9 lyric video, a 30-second vertical edit and a JPG thumbnail. Some accounts also have ProRes delivery." },
+      { q: "What do I get for each song?", a: "A Full HD 16:9 lyric video, a 30-second vertical edit and a JPG thumbnail. If we produce for your label with Genly Studio, also the Spotify Canvas and, if you need them, the art track and ProRes delivery." },
       { q: "Can I make a video with several scenes?", a: "Yes. Multi-scene splits the song into parts that share a look, and you can redo one scene without touching the rest. It uses extra credits." },
       { q: "Can I work on several songs at once?", a: "Yes. You can upload up to five MP3 or WAV files in one batch and adjust each song separately." },
     ],
@@ -270,24 +298,34 @@ const COPY = {
     pathsTitle: "Você faz ou a gente faz",
     paths: [
       { name: "Genly Platform", tag: "Para artistas e gravadoras", title: "Você faz", body: "Você envia as músicas, corrige a letra e escolhe a estética. A Genly monta os vídeos.", points: ["Vídeo, vertical e thumbnail de cada música", "Até cinco músicas por vez", "Para gravadoras: um workspace com toda a sua equipe"], cta: "Começar grátis", labelsLink: "Tem uma gravadora? A gente monta o workspace da equipe" },
-      { name: "Genly Studio", tag: "Para gravadoras", title: "A gente faz", body: "Você nos manda as músicas e devolvemos os vídeos prontos para subir, com a letra revisada palavra por palavra.", points: ["Amostra grátis de 30 segundos", "Uma só pessoa cuida do lote inteiro", "Preço conforme o volume"], cta: "Pedir minha amostra grátis", footNote: "Sem compromisso de continuar." },
+      { name: "Genly Studio", tag: "Para gravadoras", title: "A gente faz", body: "Você nos manda as músicas e devolvemos os vídeos prontos para subir, com a letra revisada palavra por palavra.", points: ["Amostra grátis de 30 segundos", "Uma só pessoa cuida do lote inteiro", "Também Canvas do Spotify, art tracks e entrega em ProRes", "Preço conforme o volume"], cta: "Pedir minha amostra grátis", footNote: "Sem compromisso de continuar.", pricingLink: "Ver preços para gravadoras" },
     ],
     pathsNote: "Dá para combinar: você usa a Platform no dia a dia e manda os lotes grandes para o Studio.",
     proof: ["Produzimos para uma gravadora multinacional no Chile e na Argentina. Fizemos lyric videos de ", "Charly García, Mercedes Sosa, Enanitos Verdes", " e muitos outros artistas."],
     featureTag: "Feito com Genly",
-    featureMeta: "Lyric video",
+    featureTitle: ["Estilos novos:", "Arco, Recorte, Perspectiva e mais"],
+    featureMeta: "Lyric videos · Trechos",
+    featureAlt: "Trechos de lyric videos com oito estilos de letra diferentes.",
     workEyebrow: "Nosso trabalho",
     workTitle: "Alguns lyric videos que fizemos.",
     workBody: "Para catálogos de rock argentino, folclore, pop e cuarteto. Cada música com sua estética e a letra revisada linha por linha.",
     pause: "Pausar",
     resume: "Retomar",
+    artTitle: "E também art tracks",
+    whyEyebrow: "Para que serve",
+    whyTitle: "Por que um lyric video",
+    why: [
+      { title: "Mais receita no YouTube", body: "Cada lyric video oficial monetiza com anúncios e Content ID." },
+      { title: "Te encontram pela letra", body: "Muita gente procura músicas por um trecho da letra. Com o vídeo, a sua música aparece." },
+      { title: "Conteúdo para redes", body: "O vertical sai do mesmo vídeo, pronto para Reels, TikTok e Shorts." },
+    ],
     looksEyebrow: "Estilos de letra",
-    looksTitle: "Uma mesma imagem com cinco estilos de letra.",
-    looksBody: "A fonte, a cor e o jeito como cada palavra entra mudam muito como uma música é sentida. Toque em um para comparar.",
-    looksNote: "Capturas do nosso reel de estilos.",
+    looksTitle: "Um estilo de letra para cada música.",
+    looksBody: "Mudam a tipografia, a cor e a forma como cada palavra entra. Toque em um para ver.",
+    looksNote: "Quadros de vídeos recentes.",
     looksGroup: "Estilos de letra",
-    looks: { cosmico: "Cósmico", cine: "Cinema", pincel: "Pincel", pop: "Pop 70s", pelicula: "Filme" },
-    lookAlt: "Estilo {name} sobre a mesma cena",
+    looks: { arco: "Arco", recorte: "Recorte", perspectiva: "Perspectiva 3D", bloque: "Bloco", romantico: "Romântico", diptico: "Díptico", duotono: "Duotom", golpe: "Golpe", cosmico: "Cósmico", cine: "Cinema" },
+    lookAlt: "Estilo de letra {name}",
     directionEyebrow: "Direção visual",
     directionTitle: "O fundo você também escolhe.",
     directionBody: "São três jeitos de começar e 15 conceitos visuais para combinar com movimento, paleta e efeitos. Não são templates fechados, então cada combinação gera uma imagem diferente.",
@@ -337,7 +375,7 @@ const COPY = {
       { q: "São templates de lyric video?", a: "Não. O fundo sai do que você escolhe: conceito, movimento, paleta e efeitos. Você também pode enviar um fundo próprio." },
       { q: "Posso corrigir a letra e os tempos?", a: "Sim. Antes de gerar você edita o texto, ajusta os tempos na timeline, divide ou junta linhas e vê tudo sincronizado no preview." },
       { q: "O que posso mudar no estilo?", a: "O modo, o gênero, o conceito visual, o movimento, a paleta e suas próprias cores, os efeitos, e a fonte, o tamanho, o contraste e a animação da letra." },
-      { q: "O que eu levo por música?", a: "Um lyric video Full HD 16:9, um vertical de 30 segundos e uma thumbnail JPG. Algumas contas também têm entregas ProRes." },
+      { q: "O que eu levo por música?", a: "Um lyric video Full HD 16:9, um vertical de 30 segundos e uma thumbnail JPG. Se produzimos para a sua gravadora com o Genly Studio, também o Canvas do Spotify e, se precisar, o art track e a entrega em ProRes." },
       { q: "Posso fazer um vídeo com várias cenas?", a: "Sim. O modo multicena divide a música em partes com uma estética em comum, e você pode refazer uma cena sem mexer nas outras. Usa créditos extras." },
       { q: "Posso trabalhar várias músicas juntas?", a: "Sim. Você pode enviar até cinco arquivos MP3 ou WAV no mesmo lote e ajustar cada música separadamente." },
     ],
@@ -565,12 +603,13 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
             </div>
             <figure className="hm-feature">
               <div className="hm-feature__media">
-                <img src={`/landing/work/${FEATURED.id}.jpg`} alt={`${FEATURED.artist} — ${FEATURED.title}`} width="1280" height="720" fetchpriority="high" />
+                {/* Con movimiento reducido queda la imagen fija del mismo fragmento. */}
+                <video key={reducedMotion ? "still" : "motion"} src={HERO_CLIP.src} poster={HERO_CLIP.poster} aria-label={c.featureAlt} width="1280" height="720" autoPlay={!reducedMotion} muted loop playsInline preload={reducedMotion ? "none" : "auto"} />
               </div>
               <figcaption>
                 <span className="hm-feature__tag"><span className="hm-live" aria-hidden="true" />{c.featureTag}</span>
-                <span className="hm-feature__title"><strong>{FEATURED.artist}</strong> {FEATURED.title}</span>
-                <span className="hm-feature__meta">{c.featureMeta} · {FEATURED.duration}</span>
+                <span className="hm-feature__title"><strong>{c.featureTitle[0]}</strong> {c.featureTitle[1]}</span>
+                <span className="hm-feature__meta">{c.featureMeta}</span>
               </figcaption>
             </figure>
           </div>
@@ -592,7 +631,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
                 <p className="hm-path__foot">
                   {path.labelsLink
                     ? <a href="#sellos" onClick={() => setWorkMode("team")} className="hm-path__link">{path.labelsLink} <span aria-hidden="true">→</span></a>
-                    : path.footNote}
+                    : <>{path.footNote}{path.pricingLink && <a href="/sellos" className="hm-path__link hm-path__link--block">{path.pricingLink} <span aria-hidden="true">→</span></a>}</>}
                 </p>
               </article>
             ))}
@@ -623,12 +662,33 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
               </div>
             ))}
           </div>
+          <div className="hm-shell hm-art">
+            <h3 id="hm-art-title" className="hm-art__title">{c.artTitle}</h3>
+            <ul className="hm-art__grid" aria-labelledby="hm-art-title">
+              {ART_TRACKS.map((item) => (
+                <li key={item.id}>
+                  <figure className="hm-art__item">
+                    <img src={`/landing/art/${item.id}-800.jpg`} alt="" width="800" height="450" loading="lazy" decoding="async" />
+                    <figcaption className="hm-art__meta"><b>{item.artist}</b><span>{item.title}</span></figcaption>
+                  </figure>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
+
+        <section className="hm-section hm-shell hm-why" aria-labelledby="hm-why-title">
+          <p className="hm-kicker"><span>03</span>{c.whyEyebrow}</p>
+          <h2 id="hm-why-title">{c.whyTitle}</h2>
+          <ol className="hm-why__grid">
+            {c.why.map((item, index) => <li key={item.title}><span>0{index + 1}</span><h3>{item.title}</h3><p>{item.body}</p></li>)}
+          </ol>
         </section>
 
         <section id="estilos" className="hm-section hm-shell" aria-labelledby="hm-looks-title">
           <div className="hm-split-head">
             <div>
-              <p className="hm-kicker"><span>03</span>{c.looksEyebrow}</p>
+              <p className="hm-kicker"><span>04</span>{c.looksEyebrow}</p>
               <h2 id="hm-looks-title">{c.looksTitle}</h2>
             </div>
             <p className="hm-body">{c.looksBody}</p>
@@ -655,7 +715,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section className="hm-section hm-shell" aria-labelledby="hm-direction-title">
           <div className="hm-direction">
             <div>
-              <p className="hm-kicker"><span>04</span>{c.directionEyebrow}</p>
+              <p className="hm-kicker"><span>05</span>{c.directionEyebrow}</p>
               <h2 id="hm-direction-title">{c.directionTitle}</h2>
               <p className="hm-body">{c.directionBody}</p>
               <p className="hm-small">{c.scenesNote}</p>
@@ -674,14 +734,14 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
         <section id="como-funciona" className="hm-paper" aria-labelledby="hm-workflow-title">
           <div className="hm-shell">
-            <p className="hm-kicker"><span>05</span>{c.workflowEyebrow}</p>
+            <p className="hm-kicker"><span>06</span>{c.workflowEyebrow}</p>
             <h2 id="hm-workflow-title">{c.workflowTitle}</h2>
             <ol className="hm-steps">
               {c.workflow.map((step, index) => <li key={step.title}><span>0{index + 1}</span><h3>{step.title}</h3><p>{step.body}</p></li>)}
             </ol>
             <div className="hm-outputs">
               <div>
-                <p className="hm-kicker"><span>06</span>{c.outputsEyebrow}</p>
+                <p className="hm-kicker"><span>07</span>{c.outputsEyebrow}</p>
                 <h2>{c.outputsTitle}</h2>
                 <p className="hm-small">{c.proNote}</p>
               </div>
@@ -700,7 +760,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section id="sellos" className="hm-labels" aria-labelledby="hm-labels-title">
           <div className="hm-shell hm-labels__grid">
             <div>
-              <p className="hm-kicker"><span>07</span>{c.labelsEyebrow}</p>
+              <p className="hm-kicker"><span>08</span>{c.labelsEyebrow}</p>
               <h2 id="hm-labels-title">{c.labelsTitle}</h2>
               <p className="hm-body">{c.labelsBody}</p>
               <ul className="hm-checks">{c.labelsPoints.map((point) => <li key={point}><CheckIcon />{point}</li>)}</ul>
@@ -727,7 +787,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
 
         <section id="preguntas" className="hm-section hm-shell hm-faq" aria-labelledby="hm-faq-title">
           <div>
-            <p className="hm-kicker"><span>08</span>{c.faqEyebrow}</p>
+            <p className="hm-kicker"><span>09</span>{c.faqEyebrow}</p>
             <h2 id="hm-faq-title">{c.faqTitle}</h2>
           </div>
           <div className="hm-faq__list">
