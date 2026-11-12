@@ -58,3 +58,26 @@ export function buildGenerationJob(a) {
     error: null,
   };
 }
+
+// "Generar sin revisar": the wizard's FILE entry (UploadZone fans every batch
+// pick out to files[*]) goes straight to the queue, with no review/approve
+// step in between. It must carry the SAME visual contract as the reviewed
+// path — look, variant, typography, colours, title card — or the render
+// silently falls back to plain white text (incident 11-nov-2026: the look
+// chosen in the wizard never reached the first render).
+export function buildDirectGenerationJob(entry) {
+  const f = entry || {};
+  return buildGenerationJob({
+    ...f,
+    artist: String(f.artist || "").trim(),
+    // The worker transcribes: no editor segments, revision or version.
+    segments: undefined,
+    segmentsRevision: undefined,
+    editorRevision: undefined,
+    editorVersionId: undefined,
+    transcribeJobId: null,
+    campaignId: null,
+    campaignItemId: null,
+    bgCacheKey: null,
+  });
+}

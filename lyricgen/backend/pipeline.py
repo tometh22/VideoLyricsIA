@@ -1668,6 +1668,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                             and _prev.get("lyric_variant") not in (None, "") \
                             and str(_prev_genre).strip().lower() == str(_cur_genre).strip().lower():
                         _look_rp["lyric_variant"] = _prev.get("lyric_variant")
+                    # The signature already rendered for that same variant
+                    # (same look, same operator genre) travels with it:
+                    # lyric_look_runtime.wants_original keeps a job that
+                    # rendered a non-original recipe for variant 0 as it was,
+                    # so a retry never restyles a delivered video.
+                    _cur_variant = _look_rp.get("lyric_variant")
+                    if _prev.get("lyric_look") == lyric_look and _prev.get("lyric_variant_sig") \
+                            and _cur_variant not in (None, "") \
+                            and str(_prev.get("lyric_variant")) == str(_cur_variant) \
+                            and str(_prev.get("lyric_genre") or "").strip().lower() \
+                            == str(lyric_genre or "").strip().lower():
+                        _look_rp["lyric_variant_sig"] = _prev.get("lyric_variant_sig")
                 except Exception:
                     pass
                 _look_opts, _look_update = _llr.prepare_opts(
@@ -1830,6 +1842,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         match_lyrics=match_lyrics,
                         allow_people=_compute_allow_people(job_id, background_hint),
                         job_id=job_id,
+                        # Same composition/lighting guidance the single
+                        # background gets for the chosen look (Arco's empty
+                        # centre, Neón's low-key light, …).
+                        lyric_look=lyric_look,
                     )
                     bg_image_path = _scene_timeline
                     _scenes_active = True
@@ -14493,8 +14509,12 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           *, match_lyrics=True, operator_prompt=None,
                           bg_verbatim=False, creative_mode=None,
                           atmospherics_policy=None, anchors=None,
-                          shared_light=None):
+                          shared_light=None, lyric_look=""):
     """Fabrica la callable que scenes.build_scene_plan usa por escena.
+
+    ``lyric_look``: cada escena recibe la misma guía de composición/luz del
+    look que recibe el fondo único (``_steer_prompt_for_look``), salvo un
+    prompt del operador "tal cual" (verbatim), que nunca se toca.
 
     ``operator_prompt`` is the only user-authored value. The callable argument
     named ``background_hint`` is legacy scenes.py API and is INTERNAL context
@@ -14524,7 +14544,7 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
         # `palette`, pero una paleta no fija una hora: dos escenas pueden
         # compartir colores y estar una al mediodía y otra de noche.
         _ctx = f"{_light_line} {background_hint}".strip() if _light_line else background_hint
-        return _get_unique_prompt(
+        result = _get_unique_prompt(
             lyrics_text=lyrics_text, artist=artist, job_id=job_id,
             song_title=song_title, genre=genre, concept=concept,
             movement_style=movement_style, match_lyrics=_scene_match_lyrics,
@@ -14539,6 +14559,10 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
             # del lado visual. Se extraen una vez en _generate_scene_background.
             anchors=anchors,
         )
+        _verbatim = bool(bg_verbatim and operator_prompt and str(operator_prompt).strip())
+        if lyric_look and not _verbatim and isinstance(result, dict) and result.get("prompt"):
+            result = {**result, "prompt": _steer_prompt_for_look(result["prompt"], lyric_look)}
+        return result
     return prompt_fn
 
 
@@ -15014,7 +15038,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                               allow_people: bool = False,
                               atmospherics_policy: dict | None = None,
                               job_id: str = None, target_w: int = 1920,
-                              target_h: int = 1080) -> tuple[str, dict]:
+                              target_h: int = 1080,
+                              lyric_look: str = "") -> tuple[str, dict]:
     """Orquesta el fondo multi-escena. Devuelve (timeline_path, scene_plan).
 
     detect → biblia → scene plan → N clips Veo (con recurrencia de coro) →
@@ -15058,7 +15083,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       creative_mode=creative_mode,
                                       atmospherics_policy=atmospherics_policy,
                                       anchors=_scene_anchors,
-                                      shared_light=(bible or {}).get("light"))
+                                      shared_light=(bible or {}).get("light"),
+                                      lyric_look=lyric_look)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style))
