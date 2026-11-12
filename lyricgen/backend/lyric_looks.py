@@ -1179,6 +1179,13 @@ def _floor_events(look: Look, n: int, tokens: list[str], start: float, end: floa
     # Break long lines into balanced rows (same break as the plain text) so
     # the slab never runs off the frame while it grows toward the camera.
     rows = _ass._balanced_breaks(" ".join(tokens), base_fs * 1.6, width).split("\n")
+    # Long lines in 9:16 broke into 6-7 rows and the slab still ran off the
+    # bottom as it grew. Past five rows, shrink the type until the line fits
+    # in five (never below 60 % of the base size).
+    fs = base_fs
+    while len(rows) > 5 and fs > base_fs * 0.6:
+        fs = max(int(fs * 0.9), int(base_fs * 0.6))
+        rows = _ass._balanced_breaks(" ".join(tokens), fs * 1.6, width).split("\n")
     cuts, acc = set(), 0
     for r in rows[:-1]:
         acc += len(r.split())
@@ -1197,7 +1204,7 @@ def _floor_events(look: Look, n: int, tokens: list[str], start: float, end: floa
         y0, y1, grow = height * 0.40, height * 0.47, 104
     return [_dialogue(2, start, end,
                       "{" + f"\\an5\\move({width // 2},{_n(y0)},{width // 2},{_n(y1)},0,{dur})"
-                      f"\\q2\\fs{base_fs}\\frx30\\frz{yaw}"
+                      f"\\q2\\fs{fs}\\frx30\\frz{yaw}"
                       f"\\fscx90\\fscy90\\t(0,{dur},1.4,\\fscx{grow}\\fscy{grow})"
                       f"\\fad(220,260)" + "}" + text)]
 
