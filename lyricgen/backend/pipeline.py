@@ -333,6 +333,30 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
     return out
 
 
+def _drop_stale_canvas_keys(job_id: str, uploaded: dict | None) -> None:
+    """Saca de `s3_keys` todo Canvas que ESTE render no subió.
+
+    `files["canvas*_url"]` no se persiste (no hay columna): la API deriva las
+    URLs del Canvas de `s3_keys` (database.canvas_files_from_s3_keys). Pero
+    `s3_keys` se MERGEA key por key y /edit no lo resetea, así que si en este
+    render el Canvas falló, el upload falló o el dueño dejó de ser admin, la
+    key del render anterior seguía ahí apuntando a un archivo de OTRO fondo.
+    El archivo viejo no se pierde: _snapshot_previous_deliverables ya lo
+    archivó como `{key}.vN`. Best-effort: un fallo acá no puede costar la
+    entrega del master.
+    """
+    stale = [ft for ft in CANVAS_FILE_TYPES if ft not in (uploaded or {})]
+    if not stale:
+        return
+    try:
+        from jobs import remove_s3_keys
+        remove_s3_keys(job_id, stale)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[CANVAS] no se pudieron limpiar keys viejas job=%s %s: %s",
+                       job_id, stale, exc)
+
+
 def _write_edit_audit(action: str, detail: dict) -> None:
     """Insert an audit_log row from the worker context.
 
@@ -2654,7 +2678,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # longer needs to do its own update_job(s3_keys=...) because that
         # would REPLACE any concurrent prores prewarm key. Critical
         # deliverable failures raise — caught by the outer except below.
-        _upload_deliverables_to_r2(job_id, job_dir, files)
+        _uploaded_keys = _upload_deliverables_to_r2(job_id, job_dir, files)
+        # El Canvas se expone desde s3_keys: que no sobreviva uno que este
+        # render no produjo (ver _drop_stale_canvas_keys).
+        _drop_stale_canvas_keys(job_id, _uploaded_keys)
 
         # Drop intermediate files (looped backgrounds, gradient fallbacks).
         # Deliverables are already removed above when R2 was used.
@@ -22396,6 +22423,10 @@ def run_edit_pipeline(
             if k not in ("umg_master_url", "umg_short_url")
         }
         s3_keys = _upload_deliverables_to_r2(job_id, job_dir, upload_files)
+        # /edit no resetea s3_keys y el upload sólo MERGEA: sin esto, un
+        # Canvas que falló en este edit dejaba viva la key del render
+        # anterior (otro fondo), y la API la expondría como descargable.
+        _drop_stale_canvas_keys(job_id, s3_keys)
 
         # Invalidate the lazy ProRes cache so the next /download/umg_master
         # re-transcodes from the freshly re-rendered lyric_video.mp4 instead
