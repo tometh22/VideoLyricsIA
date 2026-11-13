@@ -13,7 +13,7 @@ export function mediaIdentity(url = "") {
 // Polling renews the R2 signature every five seconds. Reassigning src for
 // those renewals aborts playback. Only a new object/render replaces it;
 // an expired/broken URL can be renewed explicitly.
-export default function RequestVideo({ url, poster, renderIdentity, videoRef, label }) {
+export default function RequestVideo({ url, poster, renderIdentity, videoRef, label, onTimeUpdate }) {
   const identity = `${mediaIdentity(url)}:${renderIdentity}`;
   const [source, setSource] = useState(url);
   const [error, setError] = useState(false);
@@ -34,6 +34,7 @@ export default function RequestVideo({ url, poster, renderIdentity, videoRef, la
     <video ref={videoRef} src={source} poster={poster || undefined}
       controls preload="metadata" playsInline
       onError={() => setError(true)}
+      onTimeUpdate={onTimeUpdate}
       className="aspect-video max-h-[25rem] w-full bg-black object-contain"
       aria-label={label} />
     {error && <div role="alert" className="p-3 text-caption text-amber-200">

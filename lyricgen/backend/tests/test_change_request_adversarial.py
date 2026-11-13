@@ -242,7 +242,8 @@ def test_text_patch_invalidates_word_metadata_not_independent_style_or_timing():
                         word_timestamps=[1], pos=[0.5, 0.8], locked=True)]
     built = proposal('0:10 debe decir "después"', segments)
     result, _ = apply_operations(segments, built, [built["operations"][0]["id"]])
-    assert result == [segment(9.0, 11.0, "después", pos=[0.5, 0.8], locked=True)]
+    assert result == [{**segment(9.0, 11.0, "después", pos=[0.5, 0.8], locked=True),
+                       "alignment_stale": True}]
 
 
 def test_prompt_prioritizes_all_visual_constraints_and_excludes_lyric_edits():

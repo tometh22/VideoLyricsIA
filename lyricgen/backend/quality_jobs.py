@@ -419,6 +419,7 @@ def _snapshot(job_id: str):
                 if len(lexicon_terms) >= 120:
                     break
         return {
+            "tenant_id": str(row.tenant_id),
             "revision": int(row.segments_revision or 0),
             "status": row.status,
             "approved_at": row.approved_at.isoformat() if row.approved_at else None,

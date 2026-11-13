@@ -480,6 +480,11 @@ def record_delivery(campaign_id: str, body: DeliveryRequest, current_user=Depend
     evidence = (job.render_params or {}).get("campaign_render_evidence") or {}
     if job.status != "done" or not job.approved_at or not job.video_url or evidence.get("video_sha256") != body.video_sha256:
         fail("La entrega requiere el archivo vigente y aprobado, con huella verificada", 409)
+    from delivery_acoustic_qc import require_delivery_review
+    try:
+        require_delivery_review(job)
+    except ValueError as exc:
+        fail(str(exc), 409)
     previous = _logs(db, campaign, "delivered").filter(AuditLog.detail["job_id"].as_string() == job.job_id,
                  AuditLog.detail["video_sha256"].as_string() == body.video_sha256).first()
     if previous:

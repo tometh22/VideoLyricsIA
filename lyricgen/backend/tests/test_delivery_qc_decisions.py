@@ -328,3 +328,37 @@ def test_external_qc_rejects_mismatched_finding_count(client, admin_token, db):
 
     assert response.status_code == 422
     assert response.json()["detail"] == "external_qc_finding_count_mismatch"
+
+
+def test_pilot_decision_requires_reason_current_asset_and_objective_repair(client, user_token, db, monkeypatch):
+    from delivery_acoustic_qc import source_binding
+    owner = _me(client, user_token)
+    job = _job(db, owner)
+    monkeypatch.setenv('QUALITY_PILOT_JOB_IDS', job.job_id)
+    monkeypatch.setenv('QUALITY_DELIVERY_REVIEW_REQUIRED', '1')
+    monkeypatch.setattr('storage.object_etag', lambda _: 'v1')
+    job.s3_keys = {'video':'test/video.mp4'}
+    report = dict(job.delivery_qc)
+    report.update(render_asset={'key':'test/video.mp4','etag':'v1','sha256':'a'*64}, render_identity={'sha256':'a'*64},
+        acoustic={'required':True, 'binding':source_binding(job,[]), 'render_edit_count':0,
+                  'metadata':{'artist':job.artist,'song_title':job.song_title}})
+    report['issues'][0].update(requires_recorded_review=True, result_status='REVIEW')
+    job.delivery_qc = report
+    db.commit()
+    endpoint = f'/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision'
+    headers = {'Authorization':f'Bearer {user_token}'}
+    report_id = job.delivery_qc['report_id']
+    assert client.post(endpoint,headers=headers,json={'decision':'acknowledged','expected_report_id':report_id}).status_code == 422
+    response = client.post(endpoint,headers=headers,json={'decision':'acknowledged','expected_report_id':report_id,'reason':'Escuché el master y confirmé esta variante en vivo'})
+    assert response.status_code == 200
+    db.refresh(job)
+    report_id = job.delivery_qc['report_id']
+    from copy import deepcopy
+    report = deepcopy(job.delivery_qc)
+    report['issues'][0].update(result_status='FAIL',status='OPEN',requires_recorded_review=False)
+    job.delivery_qc = report
+    db.commit()
+    report_id = job.delivery_qc['report_id']
+    assert client.post(endpoint,headers=headers,json={'decision':'resolved_manual','reason':'aceptado','expected_report_id':report_id}).status_code == 422
+    monkeypatch.setattr('storage.object_etag', lambda _: 'v2')
+    assert client.post(endpoint,headers=headers,json={'decision':'resolved_manual','reason':'aceptado','expected_report_id':report_id}).status_code == 409
