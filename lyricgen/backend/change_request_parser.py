@@ -4,12 +4,18 @@ from __future__ import annotations
 import re
 import unicodedata
 
-SCHEMA_VERSION = "change-request-parser-v6"
+SCHEMA_VERSION = "change-request-parser-v7"
 MAX_COMMENT_LENGTH = 24000
 MAX_INSTRUCTIONS = 400
 MAX_LITERAL_LENGTH = 500
 _TIME = r"(?:\d{1,2}:)?\d{1,2}:\d{2}"
 _TIME_RE = re.compile(_TIME)
+_EXPLICIT_INTERVAL = re.compile(
+    r"^desde\s+(?P<start>" + _TIME + r")\s+hasta\s+(?P<end>" + _TIME
+    + r")\s*[:—-]\s*(?P<text>.+)$", re.I | re.S,
+)
+_METADATA = re.compile(r"^(?:corregir|cambiar)\s+(?:el\s+)?(?P<field>artista|t[ií]tulo)\s*:\s*(?P<value>.+)$", re.I | re.S)
+_DELETE_FROM = re.compile(r"^(?:eliminar|borrar|quitar|sacar)\s+(?:todo\s+)?(?:desde|a\s+partir\s+de)\s+(?P<time>" + _TIME + r")$", re.I)
 _TIME_PREFIX = re.compile(r"^(?P<times>" + _TIME + r"(?:\s*(?:y|/|,)\s*" + _TIME + r")*)\s*[:_\-–—]?\s*(?P<payload>.*)$", re.S)
 _REPEAT = re.compile(r"\b(?:todas?\s+las?\s+(?:apariciones|veces|frases)|cada\s+vez|en\s+todo\s+el\s+tema|todos?\s+los?\s+(?:coros?|estribillos?))\b", re.I)
 _LAYOUT = re.compile(r"frases?\s+completas?.{0,60}(?:una|1|misma)\s+(?:sola\s+)?pantalla", re.I | re.S)
@@ -32,6 +38,13 @@ def fold_text(value: str) -> str:
     """Search/ranking only; not identity for mutation."""
     value = unicodedata.normalize("NFKD", (value or "").casefold())
     return " ".join(re.findall(r"[\w]+", "".join(ch for ch in value if not unicodedata.combining(ch))))
+
+
+def _seconds(value: str) -> float:
+    parts = [int(v) for v in value.split(":")]
+    if any(v >= 60 for v in parts[1:]) or (len(parts) == 3 and parts[1] >= 60):
+        raise ValueError("invalid_timecode")
+    return float(parts[-1] + 60 * parts[-2] + (3600 * parts[0] if len(parts) == 3 else 0))
 
 
 def _literal(value: str) -> str | None:
@@ -94,18 +107,29 @@ def parse_change_request(comment: str) -> dict:
         raise ValueError("change_request_comment_too_long")
     rows: list[dict] = []
     coverage: list[dict] = []
-    blocks = list(_blocks(comment))
+    blocks = []
+    for start, end, text in _blocks(comment):
+        offset = 0
+        for part in re.split(r"//", text):
+            left = len(part) - len(part.lstrip())
+            right = len(part.rstrip())
+            if right > left:
+                blocks.append((start + offset + left, start + offset + right, part.strip()))
+            offset += len(part) + 2
     if len(blocks) > MAX_INSTRUCTIONS:
         raise ValueError("change_request_too_many_instructions")
     layout = any(_positive_layout(text) for _, _, text in blocks)
 
-    def add(kind, start, end, *, reason=None, requested=None, current=None, times=None, scope="single", confidence="low"):
+    def add(kind, start, end, *, reason=None, requested=None, current=None, times=None, scope="single", confidence="low", requested_start=None, requested_end=None, field=None):
         if len(rows) >= MAX_INSTRUCTIONS:
             raise ValueError("change_request_too_many_instructions")
         row = {"id": f"instruction-{len(rows)+1}", "kind": kind,
                "source_excerpt": comment[start:end], "source_start": start, "source_end": end,
                "requested_text": requested, "current_text": current,
                "timecode_seconds": times, "scope": scope, "confidence": confidence, "reason": reason}
+        if requested_start is not None: row["requested_start"] = requested_start
+        if requested_end is not None: row["requested_end"] = requested_end
+        if field is not None: row["field"] = field
         rows.append(row)
         coverage.append({"start": start, "end": end, "instruction_id": row["id"],
                          "status": "manual" if kind.endswith("review") else "recognized"})
@@ -115,6 +139,36 @@ def parse_change_request(comment: str) -> dict:
         # A spaced list bullet is syntax, not a negative timestamp. Ambiguous
         # '-0:10' remains review-only instead of silently changing its sign.
         payload = re.sub(r"^[-*•]\s+", "", payload)
+        metadata = _METADATA.fullmatch(payload)
+        if metadata:
+            field = "artist" if metadata.group("field").casefold() == "artista" else "song_title"
+            value = metadata.group("value").strip().strip('"“”')
+            if value:
+                add("set_metadata", start, end, requested=value, field=field, confidence="high")
+            else:
+                add("manual_review", start, end, reason="metadata_value_missing")
+            continue
+        interval = _EXPLICIT_INTERVAL.fullmatch(payload)
+        if interval:
+            try:
+                first, last = _seconds(interval.group("start")), _seconds(interval.group("end"))
+                requested = _quoted_literal(interval.group("text"))
+            except ValueError:
+                first, last, requested = None, None, None
+            if requested and first is not None and last > first:
+                add("set_interval", start, end, requested=requested, requested_start=first,
+                    requested_end=last, times=first, confidence="high")
+            else:
+                add("manual_review", start, end, reason="invalid_interval_or_missing_quoted_phrase")
+            continue
+        delete = _DELETE_FROM.fullmatch(payload)
+        if delete:
+            try:
+                at = _seconds(delete.group("time"))
+                add("delete_from", start, end, times=at, confidence="high")
+            except ValueError:
+                add("manual_review", start, end, reason="invalid_timecode")
+            continue
         time_source = payload
         times: list[float | None] = [None]
         timed = _TIME_PREFIX.match(payload)

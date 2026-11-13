@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.168] - 2026-11-13
+
+### Added
+- Integrate Universal change-request automation, full-audio review, render-bound Delivery QC and recorded reviewer decisions. New behaviors remain flag-gated for staged rollout.
+
 ## [1.1.167] - 2026-11-11
 
 ### Changed

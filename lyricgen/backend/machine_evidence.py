@@ -310,6 +310,7 @@ def build_machine_evidence(result: dict) -> dict:
            if isinstance(result.get("_display_segmentation_proposal"), dict) else {}),
         "hypotheses_by_family": hypotheses,
         "capture": {
+            "pipeline_observation": _safe_json(result.get("_pipeline_observation")),
             **({"reconcile_stages": reconcile_capture} if reconcile_capture is not None else {}),
             "recognition_attempt_count": reported_attempt_count,
             "primary_present": bool(

@@ -614,5 +614,7 @@ def reconcile_job_outbox() -> dict:
         try:
             from queue_jobs import ensure_job_outbox_reconciler_scheduled
             ensure_job_outbox_reconciler_scheduled()
+            from queue_jobs import ensure_change_request_reconciler_scheduled
+            ensure_change_request_reconciler_scheduled()
         except Exception:
             pass

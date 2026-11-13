@@ -1358,6 +1358,10 @@ def enqueue_transcription_quality(job_id: str, *, expected_revision: int,
     Failure to enqueue never falls back to an API/short-worker thread: doing
     so would defeat the latency isolation this queue exists to provide.
     """
+    try:
+        enqueue_full_audio_review(job_id)
+    except Exception as exc:
+        logger.warning('full_audio_review_enqueue_failed job=%s error=%s', job_id, type(exc).__name__)
     if not transcription_quality_queue_enabled():
         try:
             from ops_metrics import increment
@@ -2407,3 +2411,51 @@ def queue_depth() -> dict:
         result[name] = len(Queue(name, connection=redis))
     result["backend"] = "redis"
     return result
+
+
+def ensure_change_request_reconciler_scheduled():
+    from datetime import timedelta, datetime, timezone
+    from rq import Queue
+    from quality_rollout import enabled
+    from change_request_automation import reconcile_change_requests
+    if not enabled('CHANGE_REQUEST_AUTOAPPLY_ENABLED'):
+        return None
+    _init_redis()
+    if _redis is None:
+        return None
+    bucket = int(datetime.now(timezone.utc).timestamp()) // 60 + 1
+    identity = f'change-request-reconciler:{bucket}'
+    active = _active_rq_job(_redis, identity)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, identity)
+    return Queue('default', connection=_redis).enqueue_in(
+        timedelta(seconds=60), reconcile_change_requests, job_timeout=110,
+        result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=identity,
+        meta=rq_payload_metadata('change_request_reconciler')).id
+
+
+def enqueue_full_audio_review(job_id):
+    from types import SimpleNamespace
+    from quality_rollout import full_review
+    if not full_review(SimpleNamespace(job_id=job_id)):
+        return None
+    from quality_jobs import _snapshot
+    from full_audio_review import binding, run_full_review_job
+    from shadow_reference_import import digest
+    snapshot = _snapshot(job_id)
+    if snapshot is None:
+        return None
+    source = binding(snapshot)
+    _init_redis()
+    if _redis is None:
+        return None
+    from rq import Queue
+    identity = 'full-audio-review:' + digest([job_id, source])
+    # Finished jobs are not repurchased on every render/recheck.
+    if _redis.exists('rq:job:' + identity):
+        return identity
+    return Queue('transcription_quality', connection=_redis).enqueue(
+        run_full_review_job, job_id, source, job_id=identity, job_timeout=7200,
+        result_ttl=604800, failure_ttl=604800,
+        meta=rq_payload_metadata('full_audio_review')).id

@@ -310,6 +310,9 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                         failed_critical.append(f"{ftype_short} (key persistence failed)")
                     continue
                 out[ftype_short] = key
+                if ftype_short == "video":
+                    from delivery_acoustic_qc import bind_uploaded_render
+                    bind_uploaded_render(job_id, local, key)
                 # Upload confirmed — delete the local copy so the disk doesn't
                 # fill up (a HD ProRes master is ~5 GB, a 240 GB NVMe fills
                 # after ~50 UMG deliveries).
