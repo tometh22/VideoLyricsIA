@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.169] - 2026-11-15
+
+### Added
+- Measure Universal lyric and timing correction rate by first publication with a complete 30-day follow-up cohort. Show the numerator, denominator, separate structure/repetition categories and deliveries whose publication date cannot be reconstructed.
+
 ## [1.1.168] - 2026-11-13
 
 ### Added
