@@ -1981,7 +1981,8 @@ def admin_change_requests(
     desde los dos entornos.
     """
     import change_request_stats as crs
-    from database import Delivery, DeliveryChangeRequest, scoped_deliveries_db
+    from database import (AuditLog, Delivery, DeliveryChangeRequest,
+                          SessionLocal, scoped_deliveries_db)
 
     with scoped_deliveries_db() as ddb:
         q = ddb.query(DeliveryChangeRequest)
@@ -1999,6 +2000,59 @@ def admin_change_requests(
         rows = q.order_by(DeliveryChangeRequest.submitted_at).all()
         result = crs.summarize(rows, deliveries_total=int(dq.scalar() or 0))
         result["period"] = period.strip() or None
+        # A monthly count of requests divided by monthly deliveries mixes two
+        # different cohorts. Use the append-only first-publication AuditLog
+        # event and a complete fixed follow-up window for the client defect rate.
+        work_db = SessionLocal()
+        try:
+            from sqlalchemy import or_
+            lyric_products = ("hits_lyrics", "rock_lyrics")
+            lyric_product_filter = or_(
+                Delivery.product_category.is_(None),
+                Delivery.product_category.in_(lyric_products),
+            )
+            all_deliveries = ddb.query(Delivery).filter(
+                Delivery.tenant_snapshot.ilike("%universal%"),
+                lyric_product_filter,
+            ).all()
+            request_rows = (
+                ddb.query(Delivery.job_id, Delivery.portal_id,
+                          DeliveryChangeRequest.submitted_at,
+                          DeliveryChangeRequest.comment)
+                .join(Delivery, Delivery.id == DeliveryChangeRequest.delivery_id)
+                .filter(Delivery.tenant_snapshot.ilike("%universal%"),
+                        lyric_product_filter)
+                .all()
+            )
+            publication_events = work_db.query(
+                AuditLog.created_at, AuditLog.action, AuditLog.detail
+            ).filter(AuditLog.action.in_(("delivery.create", "delivery.update"))).all()
+            if period.strip():
+                start, end = _month_bounds(period.strip())
+                publication_events = [
+                    event for event in publication_events
+                    if event[0] and start <= event[0] < end
+                ]
+            events = [(None, None, created_at, action, detail)
+                      for created_at, action, detail in publication_events]
+            cohorts = [(str(d.job_id), str(d.portal_id or "argentina"))
+                       for d in all_deliveries]
+            request_facts = [(str(job_id), str(portal or "argentina"), submitted_at, comment)
+                             for job_id, portal, submitted_at, comment in request_rows]
+            import change_request_stats as crs
+            result["delivery_cohort"] = crs.summarize_delivery_cohort(
+                cohorts, request_facts, events, followup_days=30,
+            )
+            result["delivery_cohort"]["period"] = period.strip() or None
+            result["delivery_cohort"]["status"] = "ready"
+        except Exception as exc:
+            logger.warning("[CHANGE-REQUEST-STATS] cohort history unavailable: %s", exc)
+            result["delivery_cohort"] = {
+                "status": "unavailable",
+                "note": "No se pudo reconstruir el historial de primera publicación.",
+            }
+        finally:
+            work_db.close()
         if include_raw:
             result["raw"] = [
                 {"id": r.id, "comment": r.comment,

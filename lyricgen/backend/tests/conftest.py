@@ -57,6 +57,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+# Some developer shells export a production allowlist. Tests that exercise a
+# local browser preflight must get an explicit deterministic test origin.
+os.environ["CORS_ORIGINS"] = "http://localhost:3000,http://localhost:5173"
 # La revisión rápida busca la letra oficial en lrclib en segundo plano; los
 # tests nunca salen a la red.
 os.environ.setdefault("LYRIC_REVIEW_FETCH_OFFICIAL", "0")

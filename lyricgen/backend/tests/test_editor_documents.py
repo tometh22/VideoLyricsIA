@@ -1636,7 +1636,12 @@ def test_analytics_events_store_client_time_or_fall_back_to_arrival(client):
             )
         }
     assert all(row.occurred_at is not None for row in rows.values())
-    assert abs((rows[1_000].occurred_at - client_time).total_seconds()) < 0.01
+    stored_client_time = rows[1_000].occurred_at
+    # SQLite returns timezone-aware DateTime values as naive; compare them in
+    # UTC, matching PostgreSQL's timestamptz behavior in production.
+    if stored_client_time.tzinfo is None:
+        stored_client_time = stored_client_time.replace(tzinfo=timezone.utc)
+    assert abs((stored_client_time - client_time).total_seconds()) < 0.01
     for position in (2_000, 3_000):
         lag = abs((rows[position].occurred_at - rows[position].created_at).total_seconds())
         assert lag < 60, position

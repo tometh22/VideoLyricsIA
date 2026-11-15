@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 
 def _fold(s: str) -> str:
@@ -181,4 +182,77 @@ def summarize(rows: list, deliveries_total: int | None = None) -> dict:
             "juntas), así que los shares suman más de 100%. El denominador "
             "son los pedidos, no las etiquetas."
         ),
+    }
+
+
+def summarize_delivery_cohort(deliveries, requests, publication_events, *,
+                             as_of: datetime | None = None,
+                             followup_days: int = 30) -> dict:
+    """Measure client lyric/timing requests against their first published cut.
+
+    ``deliveries`` are (job_id, portal_id) pairs. ``requests`` are
+    (job_id, portal_id, submitted_at, comment) rows. ``publication_events``
+    are (job_id, portal_id, created_at, action, detail) rows from AuditLog.
+    The append-only ``delivery.create`` audit event is used because the live
+    Delivery row's ``added_at`` is refreshed by later republishes.
+    """
+    now = as_of or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=followup_days)
+    first_publish = {}
+    for job_id, portal_id, created_at, action, detail in publication_events:
+        detail = detail if isinstance(detail, dict) else {}
+        job = detail.get("job_id")
+        portal = detail.get("portal_id") or "argentina"
+        if not job or action != "delivery.create" or not created_at:
+            continue
+        key = (str(job), str(portal))
+        stamp = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        if key not in first_publish or stamp < first_publish[key]:
+            first_publish[key] = stamp
+
+    delivered = {(str(job), str(portal or "argentina")) for job, portal in deliveries}
+    cohort = {key: stamp for key, stamp in first_publish.items()
+              if key in delivered and stamp <= cutoff}
+    affected = defaultdict(set)
+    request_count = defaultdict(int)
+    category_videos = defaultdict(set)
+    category_requests = defaultdict(int)
+    total_requests = 0
+    for job, portal, submitted_at, comment in requests:
+        key = (str(job), str(portal or "argentina"))
+        published_at = cohort.get(key)
+        if not published_at or not submitted_at:
+            continue
+        submitted = submitted_at if submitted_at.tzinfo else submitted_at.replace(tzinfo=timezone.utc)
+        if not (published_at <= submitted < published_at + timedelta(days=followup_days)):
+            continue
+        tags = set(classify(comment or ""))
+        relevant = tags & {"letra", "sincronizacion", "estructura", "repeticiones"}
+        lyric_or_timing = tags & {"letra", "sincronizacion"}
+        if not relevant or is_noise(comment or ""):
+            continue
+        if lyric_or_timing:
+            total_requests += 1
+            affected[key].update(lyric_or_timing)
+            request_count[key] += 1
+        for tag in relevant:
+            category_videos[tag].add(key)
+            category_requests[tag] += 1
+
+    return {
+        "followup_days": followup_days,
+        "as_of": now.isoformat(),
+        "cohort_start": min(cohort.values()).isoformat() if cohort else None,
+        "cohort_end": max(cohort.values()).isoformat() if cohort else None,
+        "delivered_videos": len(delivered),
+        "eligible_videos": len(cohort),
+        "videos_without_reconstructable_first_publish": len(delivered - set(first_publish)),
+        "videos_with_lyric_or_timing_request": len(affected),
+        "lyric_or_timing_request_rate": round(len(affected) / len(cohort), 4) if cohort else None,
+        "request_count": total_requests,
+        "requests_per_affected_video": round(total_requests / len(affected), 2) if affected else None,
+        "videos_by_category": {tag: len(keys) for tag, keys in category_videos.items()},
+        "requests_by_category": dict(category_requests),
+        "categories_are_nonexclusive": True,
+        "note": "La cohorte solo incluye videos con evento de primera publicación reconstruible y seguimiento completo.",
     }
