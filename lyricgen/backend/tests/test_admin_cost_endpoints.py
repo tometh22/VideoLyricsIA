@@ -506,6 +506,8 @@ def test_change_requests_endpoint_shape(client, admin_token):
         assert key in body
     keys = {c["key"] for c in body["categories"]}
     assert "puntos_finales" in keys
+    assert body["delivery_cohort"]["status"] == "ready"
+    assert body["delivery_cohort"]["followup_days"] == 30
 
 
 def test_change_requests_rejects_malformed_period(client, admin_token):
