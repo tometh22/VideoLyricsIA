@@ -46,9 +46,15 @@ def digest(value) -> str:
     ).encode()).hexdigest()
 
 
+# off: nothing. shadow: plan + report only. suggest: shadow + the editor shows
+# each proposal as a one-click reviewer suggestion (never applied by the
+# pipeline). enforce: signed, fresh-job automatic application.
+MODES = frozenset({"off", "shadow", "suggest", "enforce"})
+
+
 def mode() -> str:
     value = os.environ.get("DISPLAY_SEGMENTATION_MODE", "shadow").strip().lower()
-    return value if value in {"off", "shadow", "enforce"} else "off"
+    return value if value in MODES else "off"
 
 
 def _number(value) -> float:
@@ -270,6 +276,102 @@ def apply(segments: list[dict], proposal: dict, *, source: dict) -> list[dict]:
     return output
 
 
+# ── Reviewer suggestions (DISPLAY_SEGMENTATION_MODE=suggest) ─────────────────
+# Read-only. The editor shows each item as "Cortar acá" / "Unir con la
+# siguiente"; only the reviewer's click changes the document, through the
+# same editor split/merge that keeps per-word clocks. Nothing here mutates.
+SUGGESTION_SCHEMA = "display-segmentation-suggestions-v1"
+MERGE_MAX_GAP_S = 1.5
+_CLOSING_PUNCTUATION = re.compile(r"[,;:.!?…][\)\]\"’”]*$")
+# Words that never close a sung phrase in ES/PT (articles, prepositions,
+# contractions, prenominal possessives, relatives). Post-positive PT
+# possessives ("amor meu") and ES "no" (negation) are deliberately absent.
+_OPEN_ENDED = _DANGLING | frozenset(
+    "quem quien cuyo cuya cujo cuja pelo pela pelos pelas num numa ao aos à às pro pra mis tus sus nuestro nuestra".split()
+)
+
+
+def _row_identity(row: dict):
+    value = row.get("segment_id", row.get("_id"))
+    return None if value is None else str(value)
+
+
+def _merge_suggestions(segments, config, skip: set[int]) -> list[dict]:
+    """A line that strands an open-ended word ("…feliz quem" / "Sabe", or an
+    orphan "En") is joined with the next one when both fit one card."""
+    out = []
+    for i in range(len(segments) - 1):
+        a, b = segments[i], segments[i + 1]
+        if i in skip or i + 1 in skip or not isinstance(a, dict) or not isinstance(b, dict):
+            continue
+        if _protected(a) or _protected(b):
+            continue
+        ta, tb = str(a.get("text") or "").split(), str(b.get("text") or "").split()
+        if not ta or not tb or _CLOSING_PUNCTUATION.search(ta[-1]) or _token(ta[-1]) not in _OPEN_ENDED:
+            continue
+        try:
+            a_start, a_end = _number(a.get("start")), _number(a.get("end"))
+            b_start, b_end = _number(b.get("start")), _number(b.get("end"))
+        except ValueError:
+            continue
+        # Simultaneous voices or a nested echo are not one phrase.
+        if b_start < a_start or b_end <= a_end or b_start - a_end > MERGE_MAX_GAP_S:
+            continue
+        merged = ta + tb
+        if len(merged) > config.max_words or len(" ".join(merged)) > config.max_chars:
+            continue
+        out.append({
+            "kind": "merge", "index": i,
+            "segment_id": _row_identity(a), "next_segment_id": _row_identity(b),
+            "text": a["text"], "next_text": b["text"], "merged_text": " ".join(merged),
+            "start": a_start, "end": b_end, "reason": "open_ended_line",
+        })
+    return out
+
+
+def suggestions(segments, *, protected_indices=(), config: Config = Config()) -> list[dict]:
+    """Split/merge proposals for the reviewer, computed on the CURRENT lines.
+
+    Splits are exactly the planner's partitions (same word-clock contract as
+    shadow/enforce). Merges are conservative phrase-boundary hints: a line
+    ending in an open-ended word, sung within MERGE_MAX_GAP_S of the next line,
+    whose union still fits one card.
+    Every item carries the exact text it was computed on so the client can
+    refuse to apply it to a line that changed since.
+    """
+    if not isinstance(segments, list) or not segments:
+        return []
+    try:
+        proposal = plan(segments, source={"protected_quality_indices": sorted(set(protected_indices))},
+                        config=config)
+    except (ValueError, TypeError, KeyError):
+        return []
+    items = []
+    split_indices = set()
+    for change in proposal["changes"]:
+        row = segments[change["index"]]
+        tokens = row["text"].split()
+        split_indices.add(change["index"])
+        items.append({
+            "kind": "split", "index": change["index"], "segment_id": _row_identity(row),
+            "text": row["text"], "start": row["start"], "end": row["end"],
+            "cuts": [boundary["token"] for boundary in change["boundaries"]],
+            "basis": [boundary["basis"] for boundary in change["boundaries"]],
+            "parts": [{"text": " ".join(tokens[a:b]), "token_range": [a, b]}
+                      for a, b in change["ranges"]],
+        })
+    try:
+        items.extend(_merge_suggestions(segments, config, split_indices))
+    except (ValueError, TypeError, KeyError):
+        pass
+    for item in items:
+        # Identity = line + content, not position: an edit above must not turn
+        # a suggestion the reviewer dismissed into a "new" one.
+        item["id"] = digest([SUGGESTION_SCHEMA, item["kind"], item["segment_id"],
+                             item["text"], item.get("next_text"), item.get("cuts")])[:16]
+    return sorted(items, key=lambda item: (item["index"], item["kind"]))
+
+
 def run(segments, *, source, fresh: bool, authorization: dict) -> tuple[list, dict | None, dict | None]:
     """One finalizer stage; application requires an independently signed grant."""
     current_mode = mode()
@@ -279,7 +381,10 @@ def run(segments, *, source, fresh: bool, authorization: dict) -> tuple[list, di
     report = {k: deepcopy(proposal[k]) for k in (
         "schema", "policy_version", "source", "source_hash", "proposal_hash", "config", "review",
     )}
-    report.update(mode=current_mode, status="shadow", before=len(segments),
+    # `suggest` is shadow for the pipeline: the proposal is only surfaced to
+    # the reviewer by the editor API, which recomputes it on current lines.
+    report.update(mode=current_mode, status="suggest" if current_mode == "suggest" else "shadow",
+                  before=len(segments),
                   after=len(segments), proposed_count=len(proposal["changes"]), applied_count=0,
                   authorization_status=authorization.get("status", "missing"),
                   candidates=[{k: deepcopy(c[k]) for k in ("index", "parent_id", "start", "end")}

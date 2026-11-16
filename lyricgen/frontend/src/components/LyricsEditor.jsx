@@ -31,7 +31,9 @@ import {
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
-import { planSegmentSplit, tokenSpans } from "../lib/splitWords";
+import { mergeLineRows, planSegmentSplit, tokenSpans } from "../lib/splitWords";
+import { applyDisplaySuggestions, resolveDisplaySuggestions } from "../lib/displaySegmentationSuggestions";
+import DisplaySegmentationSuggestions from "./DisplaySegmentationSuggestions";
 import { lineStructureProperties, mergeTimingMode, splitTimingMode } from "../lib/lineStructureEvent";
 import { PLAYBACK_EVENT_NAME, createPlaybackCoverage, playbackEventProperties } from "../lib/playbackCoverage";
 import useLocalStorage from "../hooks/useLocalStorage";
@@ -3825,9 +3827,10 @@ export default function LyricsEditor({
   };
 
   // Merge a line with the NEXT line: concatenate text + per-word timing,
-  // start = first.start, end = second.end. If only one side has `words` we
-  // can't fabricate timing for the gap → drop words (karaoke falls back to
-  // uniform distribution, consistent with the split fallback).
+  // start = first.start, end = second.end. A side without `words` for its
+  // current text recovers them from its recognizer evidence; if one side
+  // still has none we can't fabricate timing for the gap → drop words
+  // (karaoke falls back to uniform distribution, as the split fallback).
   const mergeSeg = (id, trigger = "button") => {
     const mergeIdx = edited.findIndex((s) => s._id === id);
     if (mergeIdx !== -1 && mergeIdx < edited.length - 1) {
@@ -3840,19 +3843,48 @@ export default function LyricsEditor({
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1 || idx >= prev.length - 1) return prev;
-      const a = prev[idx];
-      const b = prev[idx + 1];
-      const text = `${(a.text || "").trim()} ${(b.text || "").trim()}`.trim();
-      const aw = Array.isArray(a.words) ? a.words : null;
-      const bw = Array.isArray(b.words) ? b.words : null;
-      const mergedWords = aw && bw ? [...aw, ...bw] : null;
-      const { words: _awDrop, ...aNoWords } = a;
-      const merged = {
-        ...aNoWords, text, start: a.start, end: b.end,
-        ...(mergedWords ? { words: mergedWords } : {}),
-      };
+      // lib/splitWords.mergeLineRows: both lines' clocks (recovered from the
+      // recognizer evidence when a row lost its `words`) travel together.
+      const merged = mergeLineRows(prev[idx], prev[idx + 1]);
       return [...prev.slice(0, idx), merged, ...prev.slice(idx + 2)];
     });
+  };
+
+  // DISPLAY_SEGMENTATION_MODE=suggest: the server sends split/merge proposals
+  // computed on the saved lines; nothing is applied until the reviewer clicks.
+  // A proposal whose line changed since is not shown (exact-text match).
+  const [dismissedDisplaySuggestions, setDismissedDisplaySuggestions] = useState(() => new Set());
+  const displaySuggestionItems = durableEditor.document?.display_segmentation_mode === "suggest"
+    ? durableEditor.document?.display_segmentation_suggestions?.items
+    : null;
+  const displaySuggestions = useMemo(
+    () => resolveDisplaySuggestions(displaySuggestionItems, sanitizedEdited, dismissedDisplaySuggestions),
+    [displaySuggestionItems, sanitizedEdited, dismissedDisplaySuggestions],
+  );
+  const acceptDisplaySuggestions = (items, trigger) => {
+    if (!items?.length) return;
+    const current = sanitizeSegments(editedRef.current);
+    const nextId = current.reduce((m, s) => Math.max(m, Number(s._id) || 0), -1) + 1;
+    const { segments: next, applied } = applyDisplaySuggestions(current, items, { nextId, mintSegmentId });
+    if (!applied.length) return;
+    for (const op of ["split", "merge"]) {
+      const done = applied.filter((item) => item.kind === op);
+      if (!done.length) continue;
+      trackLineStructure(op, trigger, done.map((item) => ({
+        mode: item.words ? "words" : "no_words",
+        start: item.row.start,
+        end: item.next ? Math.max(item.row.end, item.next.end) : item.row.end,
+      })));
+    }
+    recordEditorAction("display_suggestion", { count: applied.length });
+    // One reviewer click = one undo snapshot, as with the manual split/merge.
+    pushEditHistory();
+    setEdited(next);
+    setDismissedDisplaySuggestions((prev) => new Set([...prev, ...items.map((item) => item.id)]));
+  };
+  const dismissDisplaySuggestions = (items) => {
+    if (!items?.length) return;
+    setDismissedDisplaySuggestions((prev) => new Set([...prev, ...items.map((item) => item.id)]));
   };
 
   // Insert a duplicate of `seg` immediately after it. Same text, same
@@ -6170,6 +6202,14 @@ export default function LyricsEditor({
         stale={isDirty || (durableEditor.document?.display_segmentation
           ? !durableEditor.document.display_segmentation_current
           : Number(transcriptionQuality?.evaluated_revision) !== Number(segmentsRevision))}
+        onSeek={(seconds) => seekTo(seconds, false)} t={t} />
+      <DisplaySegmentationSuggestions
+        items={displaySuggestions}
+        disabled={syncMode}
+        onAccept={(item) => acceptDisplaySuggestions([item], "suggestion")}
+        onDismiss={(item) => dismissDisplaySuggestions([item])}
+        onAcceptAll={() => acceptDisplaySuggestions(displaySuggestions, "suggestion_all")}
+        onDismissAll={() => dismissDisplaySuggestions(displaySuggestions)}
         onSeek={(seconds) => seekTo(seconds, false)} t={t} />
       {editorV2Enabled && durableEditor.document?.auto_repair_undo_available && (
         <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-2 text-xs text-gray-200">
