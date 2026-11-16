@@ -359,10 +359,9 @@ describe("lookLineMotionStyle (modo en vivo)", () => {
     expect(parseFloat(end.transform.slice(6))).toBeGreaterThan(8);
   });
 
-  it("Cine: entra desenfocado y con letras abiertas que se cierran", () => {
+  it("Cine: entra transparente y con letras abiertas que se cierran", () => {
     const start = lookLineMotionStyle("cine", 0, 3);
     expect(start.opacity).toBe(0);
-    expect(start.filter).toBe("blur(10.00px)");
     expect(start.letterSpacing).toBe("0.220em");
     expect(lookLineMotionStyle("cine", 1.5, 3)).toMatchObject({ opacity: 1, letterSpacing: "0.03em" });
   });
@@ -599,5 +598,82 @@ describe("WizardLivePreview — composiciones aprobadas", () => {
       const texts = [...container.querySelectorAll("[data-editorial-look] text")].map(n => n.textContent).join(" ");
       expect(texts).toBe(texts.toLowerCase());
     }
+  });
+});
+
+// Reporte dd104256a7f1 (16-nov): con el audio corriendo la línea entera
+// titilaba y aparecía un recuadro detrás de la letra (el MP4 salía limpio).
+// Dos causas en el preview en vivo, ninguna en el render.
+describe("WizardLivePreview en vivo — sin titileo ni recuadro", () => {
+  const MOTIONS = ["zoom_through", "cine", "fade", "smear", "boil", "write_on"];
+
+  it.each(MOTIONS)("%s: el estilo por tick nunca anima `filter`", (motion) => {
+    for (let t = 0; t <= 3; t += 0.05) {
+      expect(lookLineMotionStyle(motion, t, 3, { textLen: 16 })).not.toHaveProperty("filter");
+    }
+  });
+
+  it.each(["duotono", "cosmico", "cine", "cinetico", "pelicula"])(
+    "%s: el bloque de letra en vivo no lleva filter ni lo transiciona, ni a mitad de línea ni en la salida",
+    async (code) => {
+      const refOut = { current: null };
+      const { container } = render(<LiveHarness refOut={refOut} lyricLook={code} textCase="upper" />);
+      for (const currentTime of [10.05, 12, 13.95]) {
+        await playLine(refOut, { ...LIVE_TICK, currentTime });
+        await waitFor(() => expect(container.querySelector('[data-testid="look-lyric"]')).not.toBeNull());
+        const blocks = [container.querySelector('[data-testid="look-lyric"]'),
+          ...container.querySelectorAll('[data-testid="look-lyric"] *')];
+        for (const el of blocks) {
+          expect(el.style.filter || "").not.toMatch(/blur/);
+          expect(el.style.transition || "").not.toMatch(/filter/);
+        }
+      }
+    },
+  );
+
+  it.each(["", "cosmico", "duotono"])(
+    "look '%s': un hueco entre líneas con el audio corriendo no muestra la frase de muestra",
+    async (code) => {
+      const refOut = { current: null };
+      const { container } = render(<LiveHarness refOut={refOut} lyricLook={code} textCase="original" />);
+      await playLine(refOut, { ...LIVE_TICK, activeLine: "y te tengo guardada en el pecho", currentTime: 11.5 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).toContain("pecho"));
+      // LyricsEditor publica activeLine "" con el reloj real entre dos líneas.
+      await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 14.1 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).not.toContain("pecho"));
+      expect(container.textContent.toLowerCase()).not.toContain("esta es tu letra");
+      expect(container.querySelector('[data-testid="look-lyric"]')).toBeNull();
+      // Vuelve la línea siguiente.
+      await playLine(refOut, { ...LIVE_TICK, activeLine: "según quién", activeStart: 14.3, activeEnd: 16, currentTime: 14.6 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).toContain("según quién"));
+      expect(container.textContent.toLowerCase()).not.toContain("esta es tu letra");
+    },
+  );
+
+  it("canción nueva (App resetea el tick a currentTime 0) vuelve al loop de muestra", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="cosmico" textCase="original" />);
+    await playLine(refOut, { ...LIVE_TICK, activeLine: "una línea", currentTime: 11.5 });
+    await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 12.5 });
+    await waitFor(() => expect(container.textContent).not.toContain("una línea"));
+    await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
+    await waitFor(() => expect(container.textContent.toLowerCase()).toContain("esta es tu letra"));
+  });
+
+  it("los clips no usan el atributo autoplay (Safari dibuja su botón de play encima de la letra)", () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play");
+    const { container } = render(
+      <WizardLivePreview style="oscuro" movementStyle="estandar" effect="snow" lyricLook="cosmico"
+        clipSrc="/movement_samples/estandar.mp4" />,
+    );
+    const videos = [...container.querySelectorAll("video")];
+    expect(videos.length).toBeGreaterThanOrEqual(2);
+    for (const v of videos) {
+      expect(v.hasAttribute("autoplay")).toBe(false);
+      expect(v.muted).toBe(true);
+      expect(v.loop).toBe(true);
+    }
+    expect(play).toHaveBeenCalled();
+    play.mockRestore();
   });
 });
