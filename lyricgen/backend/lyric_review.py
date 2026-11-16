@@ -57,12 +57,20 @@ from heard_words import (
     witness_words,
 )
 from witness_review import review_items as witness_review_items
+from reference_window import crop_reference
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
 MAX_ITEMS = 60
 PHRASE_REVIEW_MAX_WORDS = 8
 PHRASE_REVIEW_MAX_CHARS = 42
+# Un oído que coincide menos que esto con la pantalla es otra versión o una
+# alucinación (el testigo, que oye la canción entera con tiempos, 0,35).
+EAR_MIN_SIMILARITY = 0.45
+WITNESS_MIN_SIMILARITY = 0.35
+# La letra oficial se recorta al tramo que suena sólo si la pantalla tiene
+# bastante menos palabras que la canción (el audio es un fragmento).
+OFFICIAL_FRAGMENT_MAX_RATIO = 0.7
 # Más palabras que esto no se comparan contra los oídos (se avisa como canción
 # difícil): protege al servidor de letras gigantes o pegadas a propósito.
 MAX_REVIEW_TOKENS = 2500
@@ -434,6 +442,46 @@ def _ear_blocks(segments: list[dict], screen: list[dict], ear: list[dict],
             "spelling_only": spelling_only or style_only,
         })
     return out, similarity, confirmed
+
+
+def _official_ear(screen: list[dict], official_clean: str) -> tuple[list[dict], dict | None]:
+    """Tokens de la letra oficial como oído y, si el audio es un fragmento,
+    el tramo de la letra al que se recortaron.
+
+    La letra describe la canción entera. Si la pantalla tiene bastante menos
+    palabras (demo de 30 s, Short) y la letra completa no pasa el filtro de
+    similitud o parece corrupta, se recorta al tramo de líneas consecutivas
+    que suena (``reference_window``), con una línea de cada lado por si el
+    audio corta una línea a la mitad. Si ningún tramo coincide lo suficiente
+    (otra canción, otra versión) se sigue como siempre: se descarta.
+    Evaluación sobre 15 demos (16-11-2026): recall de texto 58 %→71 %, los
+    puntos de letra oficial aciertan el 84 %; la letra equivocada (ventana
+    0,39) queda afuera. Con la canción entera no cambia nada.
+    """
+    tokens = _ear_tokens(official_clean)
+    if not tokens:
+        return [], None
+    corrupt = _looks_corrupt(tokens, screen)
+    fragment = bool(screen) and len(tokens) <= MAX_REVIEW_TOKENS and \
+        len(screen) <= OFFICIAL_FRAGMENT_MAX_RATIO * len(tokens)
+    if fragment and (corrupt or opcode_similarity(
+            aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens]),
+            len(screen), len(tokens)) < EAR_MIN_SIMILARITY):
+        found = crop_reference(official_clean, " ".join(s["raw"] for s in screen), pad_lines=1)
+        if found is not None:
+            text, window = found
+            cropped = _ear_tokens(text)
+            if len(cropped) < len(tokens) and not _looks_corrupt(cropped, screen):
+                return cropped, window
+    return ([] if corrupt else tokens), None
+
+
+def _fragment_edge_addition(block: dict, n_screen: int) -> bool:
+    """Bloque en el borde del fragmento que AGREGA palabras de la letra."""
+    i1, i2 = block["scr_range"]
+    if i1 > 0 and i2 < n_screen:
+        return False
+    return block["fix"]["type"] == "insert" or len(block["diff_heard"]) > len(block["diff_screen"])
 
 
 def _only_style_difference(screen_raw: list[str], heard_raw: list[str]) -> bool:
@@ -1140,10 +1188,8 @@ def build_review(
     blocks: list[dict] = []
     similarity: dict[str, float] = {}
     confirmed_by_official: set[int] = set()
-    official_tokens = _ear_tokens(official_clean)
+    official_tokens, official_window = _official_ear(screen, official_clean)
     official_ops: list[tuple] = []
-    if official_tokens and _looks_corrupt(official_tokens, screen):
-        official_tokens = []
     witness_text = " ".join(w["word"] for w in witness)
     for source, tokens, timed in (
         ("witness", _ear_tokens(witness_text), witness),
@@ -1156,7 +1202,7 @@ def build_review(
         similarity[source] = round(sim, 3)
         # Un oído que casi no coincide con la pantalla es otra versión o una
         # alucinación: no aporta.
-        if sim >= (0.45 if source != "witness" else 0.35):
+        if sim >= (EAR_MIN_SIMILARITY if source != "witness" else WITNESS_MIN_SIMILARITY):
             blocks.extend(found)
         if source == "official":
             confirmed_by_official = confirmed
@@ -1174,6 +1220,11 @@ def build_review(
             covered = range(i1, i2) if i2 > i1 else (i1 - 1, i1)
             if all(k in confirmed_by_official for k in covered):
                 continue
+        if only_official and official_window is not None and _fragment_edge_addition(block, len(screen)):
+            # El borde del fragmento corta la letra: lo que sólo la letra
+            # oficial agrega antes de la primera o después de la última
+            # palabra puede no estar en el audio.
+            continue
         if only_official and block["fix"]["type"] == "insert" and (
             not same_version or len(block["diff_heard"]) > 3
         ):
@@ -1247,6 +1298,7 @@ def build_review(
             "witness": bool(witness), "gemini": bool(gemini),
             "official": bool(official_tokens), "memory": len(memory_pairs or {}),
             "similarity": similarity,
+            **({"official_window": official_window} if official_window else {}),
         },
         "risk": _risk(witness, similarity, pending, len(segments)),
     }

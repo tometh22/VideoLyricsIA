@@ -3,7 +3,8 @@
 - Letra oficial: la que pegó el operador para esta canción, la de la
   planilla de la campaña o, fuera de las campañas batch, la de lrclib. Las
   campañas batch son "sólo audio" (``reference_hypothesis.audio_only_batch_mode``):
-  para ellas nunca se busca ni se usa letra externa.
+  para ellas no se busca ni se usa letra externa, salvo con
+  ``LYRIC_REVIEW_OFFICIAL_IN_BATCH=1`` (ver ``_external_lyrics_allowed``).
 - Memoria de correcciones: lo que los revisores del MISMO tenant ya
   corrigieron en otras canciones del mismo artista (máquina → aprobado).
 
@@ -81,9 +82,30 @@ def _fetched_key(artist: str, title: str) -> str:
     return f"{_FETCHED_PREFIX}{digest[:16]}"
 
 
+def _official_in_batch_enabled() -> bool:
+    return os.environ.get("LYRIC_REVIEW_OFFICIAL_IN_BATCH", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _external_lyrics_allowed(job) -> bool:
-    """Las campañas batch se referencian sólo con el audio."""
-    return str(getattr(job, "workload_class", "") or "").lower() != "batch"
+    """Las campañas batch se referencian sólo con el audio.
+
+    ``LYRIC_REVIEW_OFFICIAL_IN_BATCH=1`` (apagado por defecto) deja que la
+    Revisión rápida de las campañas batch use también la letra de lrclib como
+    "oído": en el backtest de UMG (#112-#131) lrclib tenía la corrección del
+    cliente en 74 de 97 ítems. Sólo alimenta los puntos a revisar del editor;
+    la transcripción del lote sigue siendo sólo audio
+    (``reference_hypothesis.audio_only_batch_mode`` no cambia). Los mismos
+    resguardos de siempre: similitud mínima o ventana del fragmento, letra
+    corrupta descartada, lo que trae sólo la letra oficial es sugerencia (no
+    bloquea; si coincide con el testigo es obligatorio y, con
+    ``LYRIC_REVIEW_MODE=enforce``, frena la aprobación) y la búsqueda en
+    lrclib es gratuita, en segundo plano y se apaga con
+    ``LYRIC_REVIEW_FETCH_OFFICIAL=0``.
+    """
+    if str(getattr(job, "workload_class", "") or "").lower() != "batch":
+        return True
+    return _official_in_batch_enabled()
 
 
 def official_text(db, job) -> tuple[str, str]:
