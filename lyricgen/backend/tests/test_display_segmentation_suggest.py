@@ -2,6 +2,8 @@
 from copy import deepcopy
 import uuid
 
+import pytest
+
 import display_segmentation as ds
 from tests.test_display_segmentation import SOURCE, TEXT, line
 
@@ -53,6 +55,50 @@ def test_split_suggestion_carries_exact_text_cuts_and_parts():
     shifted = ds.suggestions([{"segment_id": "intro", "start": 0.0, "end": 1.0, "text": "Hola"}, line()])
     assert shifted[0]["index"] == 1 and shifted[0]["id"] == item["id"]
     assert rows == [line()]  # read-only
+
+
+def paused_line(text, *pauses, identity="p"):
+    """Word clocks with a sung pause before each token index in `pauses`."""
+    words, cursor = [], 1.0
+    for k, token in enumerate(text.split()):
+        if k in pauses:
+            cursor += 0.6
+        words.append({"word": token, "start": cursor, "end": cursor + 0.3})
+        cursor += 0.35
+    return {"segment_id": identity, "text": text, "start": 1.0, "end": cursor, "words": words}
+
+
+@pytest.mark.parametrize("text,pause_at", [
+    # Sued Silva L7 regression, synthetic: verb | preposition + complement.
+    ("Con los ojos de la fe pasa a mirar quien todavía tiene vida acá", 7),
+    # verb phrase | lowercase infinitive complement.
+    ("Esta noche yo quiero de verdad bailar contigo hasta que salga el sol", 6),
+    # Left side ends in a word that cannot close a phrase (not in _DANGLING).
+    ("Sinto mais forte e mais feliz quem sabe que muito pouco eu sei", 7),
+    # Right side opens with a lowercase article that continues the phrase.
+    ("Caminamos bajo el cielo gris mirando la luna que se va", 6),
+])
+def test_split_suggestion_never_strands_a_phrase(text, pause_at):
+    row = paused_line(text, pause_at)
+    # The validated shadow/enforce planner is unchanged: it still proposes
+    # the pause, which is why the guard lives only in reviewer suggestions.
+    shadow_cuts = [b["token"] for c in ds.plan([row], source=SOURCE)["changes"] for b in c["boundaries"]]
+    assert shadow_cuts == [pause_at]
+    assert all(pause_at not in item.get("cuts", []) for item in ds.suggestions([row]))
+
+
+def test_split_suggestion_guard_respects_closing_punctuation():
+    # "…gaveta," closes the phrase: a lowercase preposition may open the next card.
+    row = paused_line("Pela glock na gaveta, pelo gambé pulando a janela", 4)
+    items = ds.suggestions([row])
+    assert [(i["kind"], i["cuts"]) for i in items] == [("split", [4])]
+    assert [p["text"] for p in items[0]["parts"]] == ["Pela glock na gaveta,", "pelo gambé pulando a janela"]
+    # Sued Silva L7 shape: pauses after "fé," and after "passe". The
+    # suggestion cuts at the comma, never between "passe" and "a enxergar".
+    row = paused_line("Com os olhos da fé, passe a enxergar quem ainda tem vida aí", 5, 6)
+    items = ds.suggestions([row])
+    assert [p["text"] for p in items[0]["parts"]] == [
+        "Com os olhos da fé,", "passe a enxergar quem ainda tem vida aí"]
 
 
 def test_merge_suggestion_only_for_open_ended_line_that_fits_one_card():
