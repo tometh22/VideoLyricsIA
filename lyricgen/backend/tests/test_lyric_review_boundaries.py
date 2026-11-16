@@ -286,3 +286,58 @@ def test_kill_switch_turns_both_rules_off(monkeypatch):
     assert boundary_items(segs, machine_evidence=_evidence("es"))
     monkeypatch.setenv("LYRIC_REVIEW_BOUNDARY_RULES", "0")
     assert boundary_items(segs, machine_evidence=_evidence("es")) == []
+
+
+# --------------------------------------------------------------------------
+# Cada aparición se revisa y se descarta por separado.
+# --------------------------------------------------------------------------
+
+def _chorus_twice():
+    return [
+        _line("Esta línea abre la canción", 2.0, 4.5, sid="a"),
+        _line("Yo te espero en la", 5.0, 7.5, sid="b"),
+        _line("Una estrofa en el medio", 8.0, 10.5, sid="c"),
+        _line("Yo te espero en la", 11.0, 13.5, sid="d"),
+        _line("Y esta otra la cierra", 14.0, 16.5, sid="e"),
+    ]
+
+
+def _ours(review, kind):
+    return [i for i in review["items"] if i["kind"] == kind]
+
+
+def _sid(item):
+    return item["occurrences"][0]["line_segment_id"]
+
+
+def test_repeated_unfinished_phrase_gives_one_item_per_chorus():
+    items = _ours(build_review(_chorus_twice(), machine_evidence=_evidence("es")), "phrase_structure")
+    assert sorted(_sid(i) for i in items) == ["b", "d"]
+    assert all(len(i["occurrences"]) == 1 for i in items)
+    assert len({k for i in items for k in i["keys"]}) == 2
+
+
+def test_dismissing_one_chorus_keeps_the_other_and_retiming_reopens_it():
+    segs = _chorus_twice()
+    first = next(i for i in _ours(build_review(segs, machine_evidence=_evidence("es")), "phrase_structure")
+                 if _sid(i) == "b")
+    segs[1]["qa_dismissed"] = first["keys"]
+    left = _ours(build_review(segs, machine_evidence=_evidence("es")), "phrase_structure")
+    assert [_sid(i) for i in left] == ["d"]
+    segs[1]["end"] = 7.2  # alguien movió los tiempos: hay que volver a mirarla
+    again = _ours(build_review(segs, machine_evidence=_evidence("es")), "phrase_structure")
+    assert sorted(_sid(i) for i in again) == ["b", "d"]
+
+
+def test_repeated_line_ending_early_gives_independent_timing_items():
+    segs = _chorus_twice()
+    for k in (1, 3):
+        segs[k]["text"] = "Cantamos juntos esta vez"
+        segs[k]["words"] = _words(segs[k]["text"], segs[k]["start"], segs[k]["end"] + 0.4)
+        segs[k]["end"] -= 0.6
+    items = _ours(build_review(segs, machine_evidence=_evidence("es")), "timing")
+    assert sorted(_sid(i) for i in items) == ["b", "d"]
+    assert all(len(i["occurrences"]) == 1 for i in items)
+    segs[1]["qa_dismissed"] = next(i for i in items if _sid(i) == "b")["keys"]
+    left = _ours(build_review(segs, machine_evidence=_evidence("es")), "timing")
+    assert [_sid(i) for i in left] == ["d"]

@@ -24,6 +24,8 @@ revisión. Puro: sin I/O.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import os
 import re
 import unicodedata
@@ -110,6 +112,23 @@ def _tokens(text: str) -> list[str]:
 
 def _key_text(text: str) -> str:
     return " ".join(t for t in (norm_token(p) for p in str(text or "").split()) if t)
+
+
+def occurrence_key(prefix: str, segments: list[dict], index: int) -> str:
+    """Identidad de UNA aparición: línea, tiempos y texto, como
+    ``_rule_phrase_structure``. Cada repetición de un coro se revisa y se
+    descarta por separado, y mover sus tiempos vuelve a abrir el punto."""
+    seg = segments[index]
+    segment_id = seg.get("segment_id")
+    if segment_id is None:
+        segment_id = seg.get("_id")
+    if segment_id is None:
+        segment_id = f"index:{index}"
+    identity = json.dumps([
+        str(segment_id), _f(seg.get("start")), _f(seg.get("end")),
+        unicodedata.normalize("NFC", str(seg.get("text") or "")),
+    ], ensure_ascii=False)
+    return f"{prefix}:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def _fmt(seconds: float) -> str:
@@ -223,6 +242,7 @@ def timing_items(segments: list[dict], witness: list[dict] | None = None) -> lis
         if fix_end is not None:
             out.append({
                 "kind": "timing", "line": i, "required": False,
+                "key": occurrence_key("timing", segments, i),
                 "title": "Timing", "why": ". ".join(reasons) + f". Alargar hasta {_fmt(fix_end)} s.",
                 "sources": set(), "fix": {"type": "timing", "end": fix_end},
                 "action": "Alargar", "dismiss": "Está bien así",
@@ -230,7 +250,7 @@ def timing_items(segments: list[dict], witness: list[dict] | None = None) -> lis
         else:
             out.append({
                 "kind": "timing", "line": i, "required": False, "listen": True,
-                "key": f"timing:inspect:{_key_text(text)}:{start:.1f}",
+                "key": occurrence_key("timing:inspect", segments, i),
                 "title": "Revisar timing",
                 "why": ". ".join(reasons) + ". Escuchá si hay que ajustar cuándo entra o sale.",
                 "sources": {"witness"} if tail and i == last_index else set(),
@@ -298,7 +318,7 @@ def phrase_items(segments: list[dict], *, lang: str | None,
                    "Escuchá dónde cortarla.")
         out.append({
             "kind": "phrase_structure", "line": i, "required": False, "listen": True,
-            "key": f"phrase_structure:boundary:{_key_text(text)}",
+            "key": occurrence_key("phrase_structure:boundary", segments, i),
             "title": "Palabra sola en pantalla" if len(words) == 1 else "Revisar división de frases",
             "why": why, "sources": set(), "fix": {"type": "inspect_structure"},
             "action": "Escuchar", "dismiss": "Está bien así",

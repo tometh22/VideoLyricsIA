@@ -1444,9 +1444,10 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             group_sig = (item["kind"], fix["type"], item.get("key") or sig[0])
         else:
             # Signos, uniones, cortes y timing: sólo se agrupan líneas con el
-            # mismo texto (un coro), nunca líneas distintas.
+            # mismo texto (un coro), nunca líneas distintas. Un punto con
+            # identidad propia por aparición (timing) no se agrupa.
             group_sig = (item["kind"], fix["type"], _key_text(item["_line_text"]),
-                         fix.get("mode"), fix.get("direction"))
+                         fix.get("mode"), fix.get("direction"), item.get("key"))
         key = item.get("key") or _item_key(item["kind"], fix, item["_line_text"])
         g = grouped.get(group_sig)
         if g is None:
