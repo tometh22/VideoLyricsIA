@@ -22,6 +22,22 @@ SCHEMA = "display-segmentation-proposal-v1"
 # End/start fragments that almost always strand a function word. Conservative
 # across ES/EN/PT; unknown languages can still use punctuation + word clocks.
 _DANGLING = frozenset("a al de del el la los las un una unos unas y o que por para con sin en mi tu su te me se le les lo pero ni the an and or of to with for e os as um uma do da dos das em com".split())
+# Words that never close a sung phrase in ES/PT (articles, prepositions,
+# contractions, prenominal possessives, relatives). Post-positive PT
+# possessives ("amor meu") and ES "no" (negation) are deliberately absent.
+_OPEN_ENDED = _DANGLING | frozenset(
+    "quem quien cuyo cuya cujo cuja pelo pela pelos pelas num numa ao aos à às pro pra mis tus sus nuestro nuestra".split()
+)
+# Lowercase prepositions/articles that, opening the next card without any
+# punctuation before them, continue the phrase ("passe | a enxergar").
+# Conjunctions and relatives ("que", "y", "e", "mas") legitimately open a
+# phrase and are absent; so are ES "no"/"nos" and the ambiguous "o".
+_CONTINUES_PHRASE = frozenset(
+    "a al de del el la los las un una unos unas en por para con sin os as um uma do da dos das em com ao aos à às pra pro pelo pela pelos pelas num numa na nas".split()
+)
+# Lowercase infinitive opening a card right after a verb ("quiero | ver").
+_INFINITIVE = re.compile(r"^[^\W\d_]{2,}(?:ar|er|ir|ôr)$")
+_TRAILING_PUNCTUATION = re.compile(r"[,;:.!?…][\)\]\"’”]*$")
 _PRESENTATION = frozenset({
     "scale", "pos", "rot", "font", "font_size", "color", "event_type",
     "speaker", "layer", "style", "alignment", "voice", "language",
@@ -129,8 +145,28 @@ def _balanced(tokens: list[str]) -> bool:
     return all(text.count(a) == text.count(b) for a, b in (("(", ")"), ("[", "]")))
 
 
-def _boundary(tokens, words, k, config) -> str | None:
+def _phrase_continues(tokens, k) -> bool:
+    """Reviewer-suggestion guard: the cut would strand a phrase.
+
+    Never after a word that cannot close a phrase, and never before a
+    lowercase preposition/article or infinitive that continues it, unless
+    punctuation already closes the left side ("…gaveta, | pelo gambé").
+    """
+    left, right = tokens[k - 1], tokens[k]
+    if _TRAILING_PUNCTUATION.search(left):
+        return False
+    if _token(left) in _OPEN_ENDED:
+        return True
+    first = right.lstrip("¿¡\"'“‘([")
+    if not first or not first[0].islower():
+        return False
+    return _token(first) in _CONTINUES_PHRASE or bool(_INFINITIVE.match(_token(first)))
+
+
+def _boundary(tokens, words, k, config, phrase_guard: bool = False) -> str | None:
     if _token(tokens[k - 1]) in _DANGLING:
+        return None
+    if phrase_guard and _phrase_continues(tokens, k):
         return None
     if not _balanced(tokens[:k]) or not _balanced(tokens[k:]):
         return None
@@ -147,10 +183,10 @@ def _boundary(tokens, words, k, config) -> str | None:
     return None
 
 
-def _partition(row, config: Config):
+def _partition(row, config: Config, phrase_guard: bool = False):
     tokens, words = _parent(row)
     n = len(tokens)
-    allowed = {k: _boundary(tokens, words, k, config) for k in range(1, n)}
+    allowed = {k: _boundary(tokens, words, k, config, phrase_guard) for k in range(1, n)}
     # Endpoints stay EXACTLY as provided. Interior switches use the onset of
     # the next word, after the previous word has finished; no count-based time.
     clocks = {0: row["start"], n: row["end"], **{
@@ -178,7 +214,10 @@ def _partition(row, config: Config):
                     for _start, end in ranges[:-1]]
 
 
-def plan(segments: list[dict], *, source: dict, config: Config = Config()) -> dict:
+def plan(segments: list[dict], *, source: dict, config: Config = Config(),
+         phrase_guard: bool = False) -> dict:
+    """`phrase_guard` is only for reviewer suggestions; shadow/enforce keep
+    the validated display-phrases-v1 boundaries byte for byte."""
     if not (2 <= config.min_words <= config.target_words <= config.max_words <= 32
             and 16 <= config.max_chars <= 160
             and all(math.isfinite(v) and v > 0 for v in (
@@ -200,7 +239,7 @@ def plan(segments: list[dict], *, source: dict, config: Config = Config()) -> di
         try:
             if index in source.get("protected_quality_indices", []):
                 raise ValueError("parent_quality_review_required")
-            ranges, boundaries = _partition(row, config)
+            ranges, boundaries = _partition(row, config, phrase_guard)
             proposal["changes"].append({**base, "ranges": ranges, "boundaries": boundaries})
         except ValueError as exc:
             proposal["review"].append({**base, "reason": str(exc)})
@@ -283,12 +322,6 @@ def apply(segments: list[dict], proposal: dict, *, source: dict) -> list[dict]:
 SUGGESTION_SCHEMA = "display-segmentation-suggestions-v1"
 MERGE_MAX_GAP_S = 1.5
 _CLOSING_PUNCTUATION = re.compile(r"[,;:.!?…][\)\]\"’”]*$")
-# Words that never close a sung phrase in ES/PT (articles, prepositions,
-# contractions, prenominal possessives, relatives). Post-positive PT
-# possessives ("amor meu") and ES "no" (negation) are deliberately absent.
-_OPEN_ENDED = _DANGLING | frozenset(
-    "quem quien cuyo cuya cujo cuja pelo pela pelos pelas num numa ao aos à às pro pra mis tus sus nuestro nuestra".split()
-)
 
 
 def _row_identity(row: dict):
@@ -332,8 +365,10 @@ def _merge_suggestions(segments, config, skip: set[int]) -> list[dict]:
 def suggestions(segments, *, protected_indices=(), config: Config = Config()) -> list[dict]:
     """Split/merge proposals for the reviewer, computed on the CURRENT lines.
 
-    Splits are exactly the planner's partitions (same word-clock contract as
-    shadow/enforce). Merges are conservative phrase-boundary hints: a line
+    Splits are the planner's partitions (same word-clock contract as
+    shadow/enforce) with an extra phrase guard: never cut after a word that
+    cannot close a phrase, nor before a lowercase preposition/article or
+    infinitive that continues it. Merges are conservative phrase-boundary hints: a line
     ending in an open-ended word, sung within MERGE_MAX_GAP_S of the next line,
     whose union still fits one card.
     Every item carries the exact text it was computed on so the client can
@@ -343,7 +378,7 @@ def suggestions(segments, *, protected_indices=(), config: Config = Config()) ->
         return []
     try:
         proposal = plan(segments, source={"protected_quality_indices": sorted(set(protected_indices))},
-                        config=config)
+                        config=config, phrase_guard=True)
     except (ValueError, TypeError, KeyError):
         return []
     items = []
