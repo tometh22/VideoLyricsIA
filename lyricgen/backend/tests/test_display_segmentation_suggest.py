@@ -127,6 +127,25 @@ def test_merge_is_not_suggested_across_a_long_gap_a_lock_or_an_overflow():
     assert ds.suggestions(far) == ds.suggestions(locked) == ds.suggestions(long) == []
 
 
+@pytest.mark.parametrize("protected", [{0}, {1}])
+def test_protected_quality_line_gets_no_merge_suggestion_on_either_side(protected):
+    rows = [{"segment_id": "a", "start": 0.0, "end": 1.0, "text": "por la"},
+            {"segment_id": "b", "start": 1.1, "end": 2.0, "text": "calle"}]
+    assert [i["kind"] for i in ds.suggestions(rows)] == ["merge"]
+    assert ds.suggestions(rows, protected_indices=protected) == []
+
+
+def test_editor_protects_collapsed_timing_line_from_merge_suggestion():
+    # Review PR #1605: the editor passes evidence_issues() indices; a line
+    # with provider_timing_collapsed must not be offered "Unir con la siguiente".
+    from line_evidence import evidence_issues
+    rows = [{"segment_id": "a", "start": 0.0, "end": 1.0, "text": "por la", "provider_timing_collapsed": True},
+            {"segment_id": "b", "start": 1.1, "end": 2.0, "text": "calle"}]
+    protected = {issue["segment_index"] for issue in evidence_issues(rows)}
+    assert 0 in protected
+    assert ds.suggestions(rows, protected_indices=protected) == []
+
+
 def test_protected_quality_line_gets_no_split_suggestion():
     assert ds.suggestions([line()], protected_indices={0}) == []
     assert ds.suggestions("not a list") == [] and ds.suggestions([]) == []

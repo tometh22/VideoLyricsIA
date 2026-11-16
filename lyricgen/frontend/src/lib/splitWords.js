@@ -337,49 +337,87 @@ function usableClock(word) {
   return Number.isFinite(start) && Number.isFinite(end) && end >= start;
 }
 
+const wordText = (word) => word?.word ?? word?.text;
+
+/** Leftmost (or, with `fromEnd`, rightmost) in-order embedding of keys in words. */
+function embedding(keys, words, fromEnd = false) {
+  const picks = new Array(keys.length);
+  if (!fromEnd) {
+    let j = 0;
+    for (let k = 0; k < keys.length; k += 1) {
+      while (j < words.length && wordKey(wordText(words[j])) !== keys[k]) j += 1;
+      if (j >= words.length) return null;
+      picks[k] = j;
+      j += 1;
+    }
+  } else {
+    let j = words.length - 1;
+    for (let k = keys.length - 1; k >= 0; k -= 1) {
+      while (j >= 0 && wordKey(wordText(words[j])) !== keys[k]) j -= 1;
+      if (j < 0) return null;
+      picks[k] = j;
+      j -= 1;
+    }
+  }
+  return picks;
+}
+
 /**
  * Words for every visible token of `text`, in order, or null. Each token must
  * match (renderer key) a word of `words`; words the text no longer has (the
  * reviewer deleted them or moved them to another line) are skipped. A token
  * the words never had (a corrected or inserted word) makes it null: a clock
- * is never invented.
+ * is never invented. When skipping makes the occurrence ambiguous (a repeated
+ * word could come from more than one place: "Te amo Te amo siempre" for
+ * "Te amo siempre") it is null too, never the first match by default.
  */
 export function tokenWords(text, words) {
   const tokens = String(text ?? "").split(/\s+/).filter(Boolean);
   if (!tokens.length || !Array.isArray(words) || !words.length) return null;
-  const out = [];
-  let j = 0;
+  const keys = tokens.map(wordKey);
+  if (keys.some((key) => !key)) return null;
+  const first = embedding(keys, words);
+  if (!first) return null;
+  const last = embedding(keys, words, true);
+  if (!last || last.some((j, k) => j !== first[k])) return null;
   let lastStart = -Infinity;
-  for (const token of tokens) {
-    const key = wordKey(token);
-    if (!key) return null;
-    while (j < words.length && wordKey(words[j]?.word ?? words[j]?.text) !== key) j += 1;
-    if (j >= words.length || !usableClock(words[j]) || Number(words[j].start) < lastStart) return null;
+  const out = [];
+  for (const j of first) {
+    if (!usableClock(words[j]) || Number(words[j].start) < lastStart) return null;
     lastStart = Number(words[j].start);
     out.push({ ...words[j] });
-    j += 1;
   }
   return out;
 }
 
+function insideWindow(seg, words) {
+  const start = Number(seg.start);
+  const end = Number(seg.end);
+  if (!Array.isArray(words) || !Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return words.filter((w) => usableClock(w)
+    && Number(w.start) >= start - RECOVERY_WINDOW_TOLERANCE_S
+    && Number(w.end) <= end + RECOVERY_WINDOW_TOLERANCE_S);
+}
+
 /**
- * Best 1:1 word clocks for a line's current text: its own `words`, else the
- * recognizer's `provider_evidence.words` inside the line window. Null when
- * neither covers every token.
+ * Best 1:1 word clocks for a line's current text, or null:
+ * 1. its own `words` when they ARE the text, one per token (the renderer
+ *    contract; kept even if the line window was re-timed by hand);
+ * 2. otherwise its own words, then the recognizer's
+ *    `provider_evidence.words`, restricted to the CURRENT line window, so a
+ *    repeated word that was moved away to another line is never picked up
+ *    again; an occurrence that is still ambiguous declines recovery.
  */
 export function lineWords(seg) {
   if (!seg || typeof seg.text !== "string") return null;
-  const own = tokenWords(seg.text, seg.words);
-  if (own) return own;
-  const provider = seg.provider_evidence?.words;
-  if (!Array.isArray(provider)) return null;
-  const start = Number(seg.start);
-  const end = Number(seg.end);
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  const inside = provider.filter((w) => usableClock(w)
-    && Number(w.start) >= start - RECOVERY_WINDOW_TOLERANCE_S
-    && Number(w.end) <= end + RECOVERY_WINDOW_TOLERANCE_S);
-  return tokenWords(seg.text, inside);
+  const tokens = seg.text.split(/\s+/).filter(Boolean);
+  const own = Array.isArray(seg.words) ? seg.words : null;
+  if (own && own.length === tokens.length && tokens.length
+    && own.every((w, k) => wordKey(wordText(w)) === wordKey(tokens[k]))) {
+    return tokenWords(seg.text, own);
+  }
+  return tokenWords(seg.text, insideWindow(seg, own))
+    || tokenWords(seg.text, insideWindow(seg, seg.provider_evidence?.words));
 }
 
 /**
