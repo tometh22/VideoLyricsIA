@@ -56,6 +56,7 @@ from heard_words import (
     opcode_similarity,
     witness_words,
 )
+from witness_review import review_items as witness_review_items
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
@@ -123,6 +124,7 @@ KIND_GROUP = {
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
     "timing": "timing", "phrase_structure": "layout",
+    "witness_mismatch": "text", "witness_uncovered": "text",
 }
 
 
@@ -1222,6 +1224,9 @@ def build_review(
     items.extend(_rule_phrase_structure(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
+    # Testigo contra la pantalla en estudio (WITNESS_STUDIO_COMPARE_MODE):
+    # sólo "Escuchá este tramo", nunca obligatorio. Los vivos ya lo tienen.
+    items.extend(witness_review_items(segments, witness, machine_evidence))
     # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
     # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
     if same_version and official_ops:
