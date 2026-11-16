@@ -58,6 +58,7 @@ from heard_words import (
 )
 from witness_review import review_items as witness_review_items
 from reference_window import crop_reference
+from lyric_review_boundaries import boundary_items
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
@@ -1352,6 +1353,9 @@ def build_review(
     # Testigo contra la pantalla en estudio (WITNESS_STUDIO_COMPARE_MODE):
     # sólo "Escuchá este tramo", nunca obligatorio. Los vivos ya lo tienen.
     items.extend(witness_review_items(segments, witness, machine_evidence))
+    # Timing y fronteras de frase determinísticos: siempre sugerencias.
+    items.extend(boundary_items(segments, witness=witness, machine_evidence=machine_evidence,
+                                orphan_words=_ORPHANS))
     # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
     # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
     if same_version and official_ops:
