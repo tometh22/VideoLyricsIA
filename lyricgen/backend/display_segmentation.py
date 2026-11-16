@@ -396,7 +396,9 @@ def suggestions(segments, *, protected_indices=(), config: Config = Config()) ->
                       for a, b in change["ranges"]],
         })
     try:
-        items.extend(_merge_suggestions(segments, config, split_indices))
+        # A line whose timing/evidence the quality checks flagged gets no
+        # structural hint at all, on either side of the pair.
+        items.extend(_merge_suggestions(segments, config, split_indices | set(protected_indices)))
     except (ValueError, TypeError, KeyError):
         pass
     for item in items:

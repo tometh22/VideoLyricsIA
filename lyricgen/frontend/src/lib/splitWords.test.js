@@ -279,6 +279,40 @@ describe("word clocks survive split and merge", () => {
     expect(plan.b.words.map((w) => w.word)).toEqual(["tua", "prioridade"]);
   });
 
+  it("a repeated phrase moved away is disambiguated by the current line window", () => {
+    // Review PR #1605: "Te amo" was moved to the previous line; the remaining
+    // line kept all five words. The first "Te"/"amo" (1-2 s) are not its own.
+    const words = [
+      { word: "Te", start: 1.0, end: 1.5 }, { word: "amo", start: 2.0, end: 2.5 },
+      { word: "Te", start: 5.0, end: 5.4 }, { word: "amo", start: 6.0, end: 6.4 },
+      { word: "siempre", start: 7.0, end: 7.8 },
+    ];
+    const seg = { text: "Te amo siempre", start: 5, end: 8, words };
+    expect(lineWords(seg).map((w) => w.start)).toEqual([5.0, 6.0, 7.0]);
+    const plan = planSegmentSplit(seg, { splitTokenIndex: 2 });
+    expect(plan.timing).toBe("words");
+    expect(plan.a).toMatchObject({ text: "Te amo", start: 5, end: 6.4 });
+    expect(plan.a.words.map((w) => w.start)).toEqual([5.0, 6.0]);
+    expect(plan.b).toMatchObject({ text: "siempre", start: 7.0, end: 8 });
+  });
+
+  it("declines recovery when the occurrence of a repeated word is ambiguous", () => {
+    const words = [
+      { word: "Te", start: 1.0, end: 1.5 }, { word: "amo", start: 2.0, end: 2.5 },
+      { word: "Te", start: 5.0, end: 5.4 }, { word: "amo", start: 6.0, end: 6.4 },
+      { word: "siempre", start: 7.0, end: 7.8 },
+    ];
+    // Window covers both "Te amo": no way to tell which pair is this line's.
+    const seg = { text: "Te amo siempre", start: 0.8, end: 8, words };
+    expect(tokenWords(seg.text, words)).toBeNull();
+    expect(lineWords(seg)).toBeNull();
+    // Old path: char-ratio timing, no fabricated clocks.
+    const plan = planSegmentSplit(seg, { splitTokenIndex: 2 });
+    expect(plan.timing).toBe("char_ratio");
+    expect(plan.a.words).toBeNull();
+    expect(plan.b.words).toBeNull();
+  });
+
   it("mergeLineRows joins recovered clocks and keeps the outer bounds", () => {
     const a = { _id: 1, text: "No erro que já sarou?", start: 3.413, end: 7.566, provider_evidence: { words: EVIDENCE } };
     const b = { _id: 2, text: "Não sei", start: 7.616, end: 9.017, words: EVIDENCE.slice(5) };
