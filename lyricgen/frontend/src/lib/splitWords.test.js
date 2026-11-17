@@ -5,6 +5,10 @@ import {
   lastWordEnd,
   chooseSplitTokenIndex,
   planSegmentSplit,
+  lineWords,
+  tokenWords,
+  mergeLineRows,
+  splitLineAtTokens,
 } from "./splitWords";
 
 // The motivating defect: a divergent-live line where whisperX glued the next
@@ -225,5 +229,108 @@ describe("planSegmentSplit", () => {
     expect(planSegmentSplit(APRENDAMOS, { charOffset: 0 })).toBeNull();
     expect(planSegmentSplit(APRENDAMOS, { charOffset: APRENDAMOS.text.length })).toBeNull();
     expect(planSegmentSplit({ text: "solo", start: 0, end: 1 })).toBeNull();
+  });
+});
+
+// Demos 28-oct-2026 (job e59960ce3263): the row had lost `words` but still
+// carried the recognizer clocks in provider_evidence; the split saved both
+// halves by character ratio and without words.
+describe("word clocks survive split and merge", () => {
+  const EVIDENCE = [
+    { word: "No", start: 3.573, end: 3.793 }, { word: "erro", start: 3.934, end: 4.514 },
+    { word: "que", start: 4.594, end: 4.754 }, { word: "já", start: 4.814, end: 4.994 },
+    { word: "sarou", start: 5.074, end: 7.136 }, { word: "Não", start: 7.776, end: 7.896 },
+    { word: "sei", start: 8.036, end: 8.517 },
+  ];
+  const ROW = {
+    text: "No erro que já sarou? Não sei", start: 3.413, end: 9.017,
+    provider_evidence: { words: EVIDENCE },
+  };
+
+  it("lineWords recovers clocks from the recognizer evidence of the window", () => {
+    expect(lineWords(ROW).map((w) => w.word)).toEqual(["No", "erro", "que", "já", "sarou", "Não", "sei"]);
+    expect(lineWords({ ...ROW, start: 6, end: 9 })).toBeNull(); // outside the window
+    expect(lineWords({ ...ROW, text: "No erro que já curou? Não sei" })).toBeNull(); // corrected word
+  });
+
+  it("splitting a row without words keeps real word timing (not char ratio)", () => {
+    const plan = planSegmentSplit(ROW, { charOffset: "No erro que já sarou? ".length });
+    expect(plan.timing).toBe("words");
+    expect(plan.a).toMatchObject({ text: "No erro que já sarou?", start: 3.413, end: 7.136 });
+    expect(plan.b).toMatchObject({ text: "Não sei", start: 7.776, end: 9.017 });
+    expect(plan.a.words).toHaveLength(5);
+    expect(plan.b.words).toHaveLength(2);
+  });
+
+  it("a word moved to another line by hand is skipped, not mis-assigned", () => {
+    // "Pode" was moved to the next line: the words still hold it at the end.
+    const seg = {
+      text: "Enquanto eu for tua prioridade", start: 13.5, end: 16.4,
+      words: [
+        { word: "Enquanto", start: 13.655, end: 13.996 }, { word: "eu", start: 14.016, end: 14.076 },
+        { word: "for", start: 14.176, end: 14.396 }, { word: "tua", start: 14.456, end: 14.696 },
+        { word: "prioridade", start: 14.756, end: 15.996 }, { word: "Pode", start: 16.096, end: 16.376 },
+      ],
+    };
+    expect(tokenWords(seg.text, seg.words).map((w) => w.word)).toEqual(
+      ["Enquanto", "eu", "for", "tua", "prioridade"]);
+    const plan = planSegmentSplit(seg, { splitTokenIndex: 3 });
+    expect(plan.timing).toBe("words");
+    expect(plan.b.words.map((w) => w.word)).toEqual(["tua", "prioridade"]);
+  });
+
+  it("a repeated phrase moved away is disambiguated by the current line window", () => {
+    // Review PR #1605: "Te amo" was moved to the previous line; the remaining
+    // line kept all five words. The first "Te"/"amo" (1-2 s) are not its own.
+    const words = [
+      { word: "Te", start: 1.0, end: 1.5 }, { word: "amo", start: 2.0, end: 2.5 },
+      { word: "Te", start: 5.0, end: 5.4 }, { word: "amo", start: 6.0, end: 6.4 },
+      { word: "siempre", start: 7.0, end: 7.8 },
+    ];
+    const seg = { text: "Te amo siempre", start: 5, end: 8, words };
+    expect(lineWords(seg).map((w) => w.start)).toEqual([5.0, 6.0, 7.0]);
+    const plan = planSegmentSplit(seg, { splitTokenIndex: 2 });
+    expect(plan.timing).toBe("words");
+    expect(plan.a).toMatchObject({ text: "Te amo", start: 5, end: 6.4 });
+    expect(plan.a.words.map((w) => w.start)).toEqual([5.0, 6.0]);
+    expect(plan.b).toMatchObject({ text: "siempre", start: 7.0, end: 8 });
+  });
+
+  it("declines recovery when the occurrence of a repeated word is ambiguous", () => {
+    const words = [
+      { word: "Te", start: 1.0, end: 1.5 }, { word: "amo", start: 2.0, end: 2.5 },
+      { word: "Te", start: 5.0, end: 5.4 }, { word: "amo", start: 6.0, end: 6.4 },
+      { word: "siempre", start: 7.0, end: 7.8 },
+    ];
+    // Window covers both "Te amo": no way to tell which pair is this line's.
+    const seg = { text: "Te amo siempre", start: 0.8, end: 8, words };
+    expect(tokenWords(seg.text, words)).toBeNull();
+    expect(lineWords(seg)).toBeNull();
+    // Old path: char-ratio timing, no fabricated clocks.
+    const plan = planSegmentSplit(seg, { splitTokenIndex: 2 });
+    expect(plan.timing).toBe("char_ratio");
+    expect(plan.a.words).toBeNull();
+    expect(plan.b.words).toBeNull();
+  });
+
+  it("mergeLineRows joins recovered clocks and keeps the outer bounds", () => {
+    const a = { _id: 1, text: "No erro que já sarou?", start: 3.413, end: 7.566, provider_evidence: { words: EVIDENCE } };
+    const b = { _id: 2, text: "Não sei", start: 7.616, end: 9.017, words: EVIDENCE.slice(5) };
+    const merged = mergeLineRows(a, b);
+    expect(merged).toMatchObject({ _id: 1, text: "No erro que já sarou? Não sei", start: 3.413, end: 9.017 });
+    expect(merged.words).toHaveLength(7);
+    expect(mergeLineRows({ ...a, provider_evidence: undefined }, b).words).toBeUndefined();
+  });
+
+  it("splitLineAtTokens cuts several times keeping every slice of words", () => {
+    const parts = splitLineAtTokens(ROW, [5, 2]);
+    expect(parts.map((p) => p.text)).toEqual(["No erro", "que já sarou?", "Não sei"]);
+    expect(parts.map((p) => p.words.length)).toEqual([2, 3, 2]);
+    expect(parts[0].start).toBe(3.413);
+    expect(parts[0].end).toBe(4.514);
+    expect(parts[1].start).toBe(4.594);
+    expect(parts[2].end).toBe(9.017);
+    expect(splitLineAtTokens(ROW, [0])).toBeNull();
+    expect(splitLineAtTokens(ROW, [7])).toBeNull();
   });
 });

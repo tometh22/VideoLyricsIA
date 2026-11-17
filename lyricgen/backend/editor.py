@@ -750,6 +750,7 @@ def serialize_document(
         "original_segments": document.original_segments,
         **({"display_segmentation": display_report,
             "display_segmentation_current": display_current} if isinstance(display_report, dict) else {}),
+        **_display_segmentation_suggestions(document),
         "auto_repair_undo_available": bool(
             job is not None and auto_repair_undo_segments(job, document) is not None
         ),
@@ -763,6 +764,34 @@ def serialize_document(
             "active": lock_active,
             "user": _user_summary(db, document.lock_user_id) if lock_active else None,
             "expires_at": lock_expires.isoformat() if lock_active else None,
+        },
+    }
+
+
+def _display_segmentation_suggestions(document: EditorDocument) -> dict:
+    """Reviewer split/merge hints, only with DISPLAY_SEGMENTATION_MODE=suggest.
+
+    Recomputed on the document's CURRENT lines on every read (pure, no audio,
+    no network), so they never point at a line the reviewer already changed.
+    Lines with quality evidence issues are excluded, exactly as in shadow.
+    """
+    from display_segmentation import SUGGESTION_SCHEMA, mode, suggestions
+    if mode() != "suggest":
+        return {}
+    segments = document.current_segments if isinstance(document.current_segments, list) else []
+    try:
+        from line_evidence import evidence_issues
+        protected = {issue["segment_index"] for issue in evidence_issues(segments)}
+    except Exception:  # noqa: BLE001 - advisory metadata must not break the editor
+        protected = set()
+    try:
+        items = suggestions(segments, protected_indices=protected)
+    except Exception:  # noqa: BLE001
+        items = []
+    return {
+        "display_segmentation_mode": "suggest",
+        "display_segmentation_suggestions": {
+            "schema": SUGGESTION_SCHEMA, "revision": document.revision, "items": items,
         },
     }
 
