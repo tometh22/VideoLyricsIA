@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.170] - 2026-11-17
+
+### Fixed
+- Parse explicit metadata corrections phrased as “Corregir título a: …” or “Corregir artista a: …” as applicable change-request operations instead of sending them to manual review.
+
 ## [1.1.169] - 2026-11-15
 
 ### Added

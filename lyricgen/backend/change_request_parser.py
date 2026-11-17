@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-SCHEMA_VERSION = "change-request-parser-v7"
+SCHEMA_VERSION = "change-request-parser-v8"
 MAX_COMMENT_LENGTH = 24000
 MAX_INSTRUCTIONS = 400
 MAX_LITERAL_LENGTH = 500
@@ -14,7 +14,10 @@ _EXPLICIT_INTERVAL = re.compile(
     r"^desde\s+(?P<start>" + _TIME + r")\s+hasta\s+(?P<end>" + _TIME
     + r")\s*[:—-]\s*(?P<text>.+)$", re.I | re.S,
 )
-_METADATA = re.compile(r"^(?:corregir|cambiar)\s+(?:el\s+)?(?P<field>artista|t[ií]tulo)\s*:\s*(?P<value>.+)$", re.I | re.S)
+_METADATA = re.compile(
+    r"^(?:corregir|cambiar)\s+(?:el\s+)?(?P<field>artista|t[ií]tulo)"
+    r"(?:\s*:\s*|\s+a\s*:?\s*)(?P<value>.+)$", re.I | re.S,
+)
 _DELETE_FROM = re.compile(r"^(?:eliminar|borrar|quitar|sacar)\s+(?:todo\s+)?(?:desde|a\s+partir\s+de)\s+(?P<time>" + _TIME + r")$", re.I)
 _TIME_PREFIX = re.compile(r"^(?P<times>" + _TIME + r"(?:\s*(?:y|/|,)\s*" + _TIME + r")*)\s*[:_\-–—]?\s*(?P<payload>.*)$", re.S)
 _REPEAT = re.compile(r"\b(?:todas?\s+las?\s+(?:apariciones|veces|frases)|cada\s+vez|en\s+todo\s+el\s+tema|todos?\s+los?\s+(?:coros?|estribillos?))\b", re.I)

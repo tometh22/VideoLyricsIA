@@ -16,6 +16,29 @@ def test_metadata_and_unknown_prefix_are_not_dropped():
     assert [r['kind'] for r in rows] == ['set_metadata', 'timing_review', 'replace_text']
 
 
+def test_title_metadata_with_a_prefix_is_applicable_and_applies_exact_value():
+    comment = 'Corregir título a: Rasputin / Hey Jude'
+    parsed = parse_change_request(comment)
+    instruction = parsed['instructions'][0]
+    assert instruction['kind'] == 'set_metadata'
+    assert instruction['field'] == 'song_title'
+    assert instruction['requested_text'] == 'Rasputin / Hey Jude'
+
+    proposal = build_proposal(
+        comment=comment, segments=[{'start': 0, 'end': 3, 'text': 'Hey Jude'}],
+        base_revision=0, metadata={'artist': 'Divididos', 'song_title': 'Hey Jude'},
+    )
+    operation = proposal['operations'][0]
+    assert operation['kind'] == 'set_metadata'
+    assert operation['applicable'] is True
+    assert operation['automatic_apply_allowed'] is True
+    assert operation['proposed_value'] == 'Rasputin / Hey Jude'
+    _, applied = apply_operations(
+        [{'start': 0, 'end': 3, 'text': 'Hey Jude'}], proposal, [operation['id']],
+    )
+    assert applied[0]['proposed_value'] == 'Rasputin / Hey Jude'
+
+
 def test_apostrophes_are_lyrics_not_quotes():
     row = parse_change_request("3:58 La cola p'acá balanceando")['instructions'][0]
     assert row['kind'] == 'manual_review'
