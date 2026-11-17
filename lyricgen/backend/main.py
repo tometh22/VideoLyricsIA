@@ -163,6 +163,7 @@ from admin import router as admin_router
 from finance_ledger import router as finance_router
 from corpus import router as corpus_router
 from batch_campaigns import router as batch_campaign_router
+from team_coordination import router as team_router
 from art_track_campaigns import router as art_track_campaign_router
 from status_page import router as status_page_router
 from status_page import admin_router as status_admin_router
@@ -679,6 +680,7 @@ app.include_router(admin_router)
 app.include_router(finance_router)
 app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
+app.include_router(team_router)
 from campaign_creative import router as campaign_creative_router
 app.include_router(campaign_creative_router)
 from campaign_mix import router as campaign_mix_router

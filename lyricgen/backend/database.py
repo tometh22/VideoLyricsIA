@@ -994,6 +994,42 @@ class BatchCampaignItem(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class TeamCoordinator(Base):
+    """Scoped permission; never grants platform administration."""
+    __tablename__ = "team_coordinators"
+    tenant_id = Column(String(100), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class TeamAssignment(Base):
+    __tablename__ = "team_assignments"
+    item_id = Column(String(36), ForeignKey("batch_campaign_items.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    assignee_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    priority = Column(String(10), nullable=False, default="normal")
+    due_date = Column(Date, nullable=True)
+    note = Column(Text, nullable=False, default="")
+    blocked_reason = Column(Text, nullable=False, default="")
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+
+class TeamActivity(Base):
+    __tablename__ = "team_activity"
+    __table_args__ = (Index("ix_team_activity_tenant_created", "tenant_id", "created_at"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False)
+    item_id = Column(String(36), ForeignKey("batch_campaign_items.id", ondelete="CASCADE"), nullable=True)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(String(40), nullable=False)
+    detail = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class BatchUploadSession(Base):
     """Short-lived, campaign-only credential exchanged from a pairing code."""
 

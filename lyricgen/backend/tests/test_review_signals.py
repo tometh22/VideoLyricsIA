@@ -85,7 +85,7 @@ def test_alembic_upgrade_creates_review_signal_records(tmp_path):
     } <= columns
     assert "ix_review_signal_records_job_id" in indexes
     assert "ix_review_signal_records_kind_created" in indexes
-    assert version == "c0e2f4a6b8d0"
+    assert version == "e3f621bbc22f"
 
 
 def test_single_alembic_head():
@@ -95,7 +95,7 @@ def test_single_alembic_head():
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cfg = Config(os.path.join(backend_dir, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(backend_dir, "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["c0e2f4a6b8d0"]
+    assert ScriptDirectory.from_config(cfg).get_heads() == ["e3f621bbc22f"]
 
 
 @pytest.mark.parametrize("parent", ["a6c8e0f2b4d6", "b7d9f1a3c5e7"])
@@ -117,7 +117,7 @@ def test_promotion_from_either_environment_preserves_published_delivery(tmp_path
     upgrade("head")
     upgrade("head")  # repeat deploy is a no-op
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("SELECT version_num FROM alembic_version").fetchall() == [("c0e2f4a6b8d0",)]
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchall() == [("e3f621bbc22f",)]
         assert conn.execute("SELECT job_id, portal_id, product_category, file_types FROM deliveries").fetchall() == [
             ("releasecheck", "chile", "artists_art", '["video"]')]
 

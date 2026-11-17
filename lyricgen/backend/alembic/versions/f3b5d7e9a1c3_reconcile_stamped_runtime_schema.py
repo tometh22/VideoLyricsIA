@@ -60,6 +60,7 @@ def upgrade() -> None:
     later_revision_tables = {
         "batch_campaign_assets", "delivery_batches", "delivery_batch_items",
         "batch_campaign_reviewers",
+        "team_coordinators", "team_assignments", "team_activity",
     }
     missing_tables = (
         set(Base.metadata.tables) - set(inspector.get_table_names())

@@ -49,6 +49,7 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const TeamPage = lazy(() => import("./components/TeamPage"));
 const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
 const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
@@ -592,6 +593,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
     pathname === "/admin/cola" ? "review_queue" :
     pathname.startsWith("/campaigns") ? "campaigns" :
+    pathname === "/team" ? "team" :
+    pathname === "/my-tasks" ? "my_tasks" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
@@ -650,6 +653,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
     else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "team") navigate("/team");
+    else if (id === "my_tasks") navigate("/my-tasks");
     else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
@@ -6697,6 +6702,8 @@ export default function App() {
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
           <Route path="/review/:jobId" element={wizardScreen} />
+          <Route path="/team" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
+          <Route path="/my-tasks" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />

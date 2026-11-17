@@ -75,6 +75,7 @@ function SystemStatusDot({ open }) {
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
   const [campaignsEnabled, setCampaignsEnabled] = useState(false);
+  const [teamAccess, setTeamAccess] = useState(null);
 
   useEffect(() => {
     const token = localStorage.getItem("genly_token");
@@ -88,7 +89,20 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     return () => { active = false; };
   }, [user?.id, user?.tenant_id]);
 
+  useEffect(() => {
+    if (!campaignsEnabled) { setTeamAccess(null); return undefined; }
+    const controller = new AbortController();
+    fetch(`${API}/team/access`, { signal: controller.signal, headers: { Authorization: `Bearer ${localStorage.getItem("genly_token") || ""}` } })
+      .then(r => r.ok ? r.json() : null).then(setTeamAccess).catch(() => {});
+    return () => controller.abort();
+  }, [campaignsEnabled, user?.id, user?.tenant_id]);
+
   const items = ITEMS_BASE(t);
+  if (teamAccess) {
+    const icon = <span aria-hidden="true">▦</span>;
+    if (teamAccess.can_manage) items.push({ id: "team", label: "Mi equipo", path: "/team", icon });
+    items.push({ id: "my_tasks", label: "Mis tareas", path: "/my-tasks", icon });
+  }
   if (campaignsEnabled) {
     items.splice(2, 0, {
       id: "campaigns", label: "Campañas", path: "/campaigns",
@@ -108,7 +122,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     });
   }
   const groups = [
-    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history", "team", "my_tasks"].includes(item.id)) },
     { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 
