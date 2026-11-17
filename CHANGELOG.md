@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.172] - 2026-11-17
+
+### Added
+- Add tenant-scoped team coordination with persistent bulk song/campaign assignments, operator task lists, priorities, due dates, notes, blockers and progress derived from the existing review pipeline. Administrators can grant coordination without granting platform administration. Concurrent assignment conflicts roll back the entire batch.
+
 ## [1.1.171] - 2026-11-17
 
 ### Fixed

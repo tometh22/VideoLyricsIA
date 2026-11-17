@@ -4,7 +4,7 @@ La implementación agrega **Mi equipo** (`/team`) y **Mis tareas** (`/my-tasks`)
 
 ## Activación
 
-1. Aplicar la migración Alembic `b8c0d2e4f6a8` antes de iniciar la versión nueva del backend (`alembic upgrade head`, con la conexión del entorno correspondiente).
+1. Aplicar la migración Alembic `e3f621bbc22f` antes de iniciar la versión nueva del backend (`alembic upgrade head`, con la conexión del entorno correspondiente).
 2. Mantener habilitado `BATCH_CAMPAIGN_ENABLED` y autorizar el tenant en `BATCH_CAMPAIGN_SCOPES`, como para las campañas actuales.
 3. Un administrador entra a **Mi equipo**, selecciona el tenant correcto y activa **Puede coordinar este equipo** en el usuario de Agus. No se asigna por nombre ni se convierte a Agus en administradora. Recargar su sesión/página para actualizar el menú.
 4. Los operadores deben ser usuarios activos del mismo tenant. Un usuario común solo consulta sus asignaciones; la coordinación consulta y reparte todo el equipo. El administrador puede seleccionar otros tenants.
