@@ -574,7 +574,7 @@ def test_scene_plan_validation_requires_matching_policy_fingerprint(monkeypatch)
         "policy_mode": "enforce",
         "allow_atmospherics": False,
     }
-    fingerprint = "background-v5:enforce:deny|people:deny"
+    fingerprint = "background-v5:enforce:deny|people:deny|anatomy:v1"
     plan = {
         "scenes": [
             {
@@ -867,9 +867,8 @@ def test_scene_clips_parallel_timeout_propagates(monkeypatch, tmp_path):
             plan, str(tmp_path), artist="A", song_title="S", job_id=None)
 
 
-def test_scene_validation_observe_skip_avoids_vision(monkeypatch, tmp_path):
-    """Con observe + SCENE_VALIDATION_OBSERVE_SKIP=1, NO se llama a Vision por
-    clip pero el clip se conserva con veredicto passed sintetizado."""
+def test_scene_observe_still_checks_anatomy(monkeypatch, tmp_path):
+    """Observe keeps normal people but must scan every clip for anatomy."""
     import veo_breaker
     monkeypatch.setattr(veo_breaker, "is_open", lambda: False)
     monkeypatch.setenv("BACKGROUND_VALIDATION_ENFORCEMENT", "observe")
@@ -896,7 +895,7 @@ def test_scene_validation_observe_skip_avoids_vision(monkeypatch, tmp_path):
     clip_for_key = pipeline._generate_scene_clips(
         plan, str(tmp_path), artist="A", song_title="S", job_id="job123abc")
     assert set(clip_for_key) == {"a", "b"}
-    assert called["vision"] == 0  # skip real: cero llamadas a Vision
+    assert called["vision"] == 2
     for s in plan["scenes"]:
         assert s["validation"]["passed"] is True
-        assert s["validation"]["validation_scope"] == "observe_skipped_inline"
+        assert s["validation"]["observed_violation"] is True

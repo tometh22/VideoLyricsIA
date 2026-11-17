@@ -490,3 +490,23 @@ def test_staging_mode_nonumg_validates_by_default(db, monkeypatch):
 
 
 
+
+
+@pytest.mark.parametrize('anatomy', [False, True])
+def test_observe_only_rejects_anatomical_defects(db, monkeypatch, tmp_path, anatomy):
+    import content_validator
+    job_id = _job(db, tenant='universal_music', render_params={'force_content_validation': True})
+    monkeypatch.setenv('BACKGROUND_VALIDATION_ENFORCEMENT', 'observe')
+    category = 'anatomy' if anatomy else 'people'
+    monkeypatch.setattr(content_validator, 'validate_video', lambda *a, **kw: {
+        'passed': False, 'inconclusive': False,
+        'detections': {'people': True, 'anatomy': anatomy},
+        'issues': [{'frame': 0, 'type': f'{category}: visible evidence'}],
+    })
+    updates = []
+    monkeypatch.setattr(pipeline, 'update_job', lambda *a, **kw: updates.append(kw))
+    asset = tmp_path / 'bg.mp4'
+    asset.write_bytes(b'video')
+    assert pipeline._validate_background_asset_for_job(job_id, str(asset), '') is (not anatomy)
+    saved = [u['validation_result'] for u in updates if 'validation_result' in u][-1]
+    assert saved['passed'] is (not anatomy)

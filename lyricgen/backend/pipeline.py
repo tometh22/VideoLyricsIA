@@ -2239,7 +2239,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     update_job(job_id, validation_result=pre_validation)
                 if pre_validation.get("deferred"):
                     pass
-                elif not pre_validation["passed"] and _validation_observe_only():
+                elif (not pre_validation["passed"] and _validation_observe_only()
+                      and not _has_anatomy_violation(pre_validation)):
                     logger.warning(
                         "[VALIDATION] observe-only: keeping background "
                         "job=%s despite failed verdict issues=%s",
@@ -6758,14 +6759,23 @@ def _validation_observe_only() -> bool:
     """Kill-switch for validation *enforcement*, not detection.
 
     ``BACKGROUND_VALIDATION_ENFORCEMENT=observe`` keeps every Vision check,
-    its provenance row and the stored verdict, but never rejects, regenerates
-    or downgrades a background because of it. The default ("block") preserves
+    its provenance row and the stored verdict. Non-anatomical findings remain
+    observations; confirmed malformed anatomy still rejects the asset. The default ("block") preserves
     the fail-closed behavior, so production semantics are unchanged unless the
     environment opts in.
     """
     return (
         os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower()
         == "observe"
+    )
+
+
+def _has_anatomy_violation(result: dict) -> bool:
+    """Only affirmative anatomical evidence can override observation mode."""
+    return bool(
+        (result.get("detections") or {}).get("anatomy") is True
+        or any(str(item.get("type", "")).startswith("anatomy:")
+               for item in result.get("issues", []) if isinstance(item, dict))
     )
 
 
@@ -6777,6 +6787,9 @@ def _mark_validation_observed(result: dict) -> dict:
     stays inspectable under ``observed_issues``.
     """
     result = dict(result)
+    if _has_anatomy_violation(result):
+        result["passed"] = False
+        return result
     result["observed_violation"] = True
     result["observed_issues"] = list(result.get("issues") or [])
     result["enforcement"] = "observe"
@@ -6785,21 +6798,8 @@ def _mark_validation_observed(result: dict) -> dict:
 
 
 def _validation_parallel_enabled() -> bool:
-    """Overlap del Vision check del fondo único con el encode.
-
-    Solo bajo enforcement=observe: ahí el veredicto NUNCA reasigna
-    ``bg_image_path`` (no hay recovery/gradiente), así que el hilo y el
-    encode pueden leer el mismo archivo sin carrera de path. Bajo block
-    (prod) retorna False sin siquiera leer el flag → camino secuencial
-    byte-idéntico. Flag propio (``BACKGROUND_VALIDATION_PARALLEL``, default
-    0) separado del enforcement: compliance y perf necesitan rollback
-    independiente.
-    """
-    if not _validation_observe_only():
-        return False
-    return os.getenv("BACKGROUND_VALIDATION_PARALLEL", "0").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    """Anatomy can reject even in observe mode; validate before encoding."""
+    return False
 
 
 def _run_observe_validation(job_id: str, validate_fn) -> dict:
@@ -6840,19 +6840,8 @@ def _scene_concurrency() -> int:
 
 
 def _scene_validation_observe_skip() -> bool:
-    """Skip the inline per-clip Vision check on scene clips under observe.
-
-    Only meaningful when enforcement is already ``observe`` (the check can
-    never reject there, so it is pure latency). Off by default: with
-    parallel scene generation the validation overlaps and no longer costs
-    wall-clock, and keeping it preserves the per-scene verdicts we collect
-    to calibrate. Flip ``SCENE_VALIDATION_OBSERVE_SKIP=1`` for max speed.
-    """
-    if not _validation_observe_only():
-        return False
-    return os.getenv("SCENE_VALIDATION_OBSERVE_SKIP", "0").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    """Every clip must still be checked for malformed anatomy in observe mode."""
+    return False
 
 
 def _background_safety_policy(job_id: str | None, operator_prompt: str | None = None) -> dict:
@@ -7068,7 +7057,7 @@ def _validate_background_asset_for_job(
         verdict_out.update(result)
     update_job(job_id, validation_result=result)
     if result.get("passed") is not True:
-        if _validation_observe_only():
+        if _validation_observe_only() and not _has_anatomy_violation(result):
             logger.warning(
                 "[VALIDATION] observe-only: keeping background for job %s "
                 "despite failed verdict: %s", job_id, result.get("issues"),
@@ -7128,6 +7117,8 @@ def _should_keep_certified_background(
         return False
     if not verdict.get("inconclusive"):
         return False
+    if _has_anatomy_violation(prior_validation_result):
+        return False
     if prior_validation_result.get("passed") is not True:
         return False
     return bool(asset_path and os.path.exists(asset_path))
@@ -7154,6 +7145,8 @@ def _download_previously_certified_background(
     Returns None when there is nothing certified to fall back to; the caller
     then uses the gradient exactly as before.
     """
+    if _has_anatomy_violation(prior_validation_result):
+        return None
     if prior_validation_result.get("passed") is not True:
         return None
     if not bg_r2_key_cached or not storage.is_enabled():
@@ -7226,7 +7219,7 @@ def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
         if validation.get("passed") is True:
             continue
         detections = validation.get("detections") or {}
-        if detections.get("people") or detections.get("brand"):
+        if any(detections.get(c) for c in ("people", "brand", "anatomy")):
             return True
         blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
         if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
@@ -7257,6 +7250,8 @@ def _inherit_inconclusive_scene_verdict(
     verdict was inherited.
     """
     if not cache_only or not verdict.get("inconclusive"):
+        return False
+    if _has_anatomy_violation(prior_validation):
         return False
     if prior_validation.get("passed") is not True:
         return False
@@ -12284,6 +12279,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         )
     _base_negatives = (
         f"{_ip_negatives}"
+        " no disconnected, duplicated or fused human limbs,"
         # Anti-UI-de-cámara (incidente 2026-06-19, multi-escena "No Hay Santos"):
         # la biblia "found footage / film viejo" hacía que Veo dibujara una
         # interfaz de camcorder falsa — visor, indicador REC, timecode, texto de
@@ -13298,6 +13294,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     safe_prompt = (
         f"{prompt}. Photorealistic photograph, real photo. "
         f"No text, no words, no letters,{_people_suffix} no logos, "
+        "no disconnected, duplicated or fused human limbs, "
         "no readable signage, no illustration, no drawing, no cartoon, "
         "no anime, no 3D render, no CGI."
     )
@@ -14597,7 +14594,7 @@ def _scene_validation_policy_fingerprint(
 ) -> str:
     """Fingerprint every independent dimension trusted by scene edit skips."""
     people = "allow" if allow_people else "deny"
-    return f"{cache_policy_fingerprint(atmospherics_policy)}|people:{people}"
+    return f"{cache_policy_fingerprint(atmospherics_policy)}|people:{people}|anatomy:v1"
 
 
 def _scene_plan_has_current_clip_validation(
@@ -14625,6 +14622,8 @@ def _scene_plan_has_current_clip_validation(
         found = True
         validation = scene.get("validation")
         if not isinstance(validation, dict) or validation.get("passed") is not True:
+            return False
+        if _has_anatomy_violation(validation):
             return False
         expected_allow_people = bool(scene.get("allow_people", False))
         if job_id:
@@ -14836,7 +14835,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                         key, job_id, _scene_validation.get("issues"),
                     )
                 elif _scene_validation.get("passed") is not True:
-                    if _validation_observe_only():
+                    if _validation_observe_only() and not _has_anatomy_violation(_scene_validation):
                         logger.warning(
                             "[SCENES] observe-only: keeping clip %s job=%s "
                             "despite failed verdict issues=%s",
@@ -16457,7 +16456,7 @@ def _select_validated_background(
             logger.info("[VALIDATION] bg accepted on attempt %s: %s",
                         attempt, os.path.basename(candidate))
             return candidate, issues
-        if _validation_observe_only():
+        if _validation_observe_only() and not _has_anatomy_violation(result):
             logger.warning(
                 "[VALIDATION] observe-only: accepting library bg %s "
                 "despite failed verdict issues=%s",
