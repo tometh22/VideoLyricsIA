@@ -83,8 +83,40 @@ def env(db, monkeypatch):
     app.include_router(team.router)
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: actor
-    with TestClient(app) as client:
-        yield client, db, actor, users, campaign, items
+    item_ids = [item.id for item in items]
+    user_ids = [user.id for user in users]
+    campaign_id = campaign.id
+    try:
+        with TestClient(app) as client:
+            yield client, db, actor, users, campaign, items
+    finally:
+        # These HTTP calls commit. Remove only this fixture's data so later
+        # campaign fixtures and aggregate tests see a clean shared CI database.
+        db.rollback()
+        job_ids = db.query(Job.job_id).filter(Job.campaign_id == campaign_id)
+        db.query(TeamActivity).filter_by(tenant_id=tenant).delete(
+            synchronize_session=False
+        )
+        db.query(TeamCoordinator).filter_by(tenant_id=tenant).delete(
+            synchronize_session=False
+        )
+        db.query(TeamAssignment).filter(TeamAssignment.item_id.in_(item_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(EditorDocument).filter(EditorDocument.job_id.in_(job_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(Job).filter_by(campaign_id=campaign_id).delete(
+            synchronize_session=False
+        )
+        db.query(BatchCampaignItem).filter(BatchCampaignItem.id.in_(item_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(BatchCampaign).filter_by(id=campaign_id).delete(
+            synchronize_session=False
+        )
+        db.query(User).filter(User.id.in_(user_ids)).delete(synchronize_session=False)
+        db.commit()
 
 
 def payload(items, assignee, version=0):
