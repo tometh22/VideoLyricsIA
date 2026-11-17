@@ -44,7 +44,7 @@ def test_quota_error_is_retried_before_failing_closed(monkeypatch):
     attempts = {"n": 0}
 
     class _Resp:
-        text = '{"detections":{"people":false,"atmospherics":false,"brand":false},"issues":[]}'
+        text = '{"detections":{"people":false,"atmospherics":false,"brand":false,"text":false,"anatomy":false},"issues":[]}'
 
     def _call_with_timeout(fn, timeout_s=None, label=None):
         attempts["n"] += 1
@@ -282,3 +282,14 @@ def test_edit_pipeline_wires_the_keep_branch():
         "the keep decision needs the pre-edit verdict, snapshotted before this "
         "edit overwrites validation_result"
     )
+
+
+@pytest.mark.parametrize('anatomy', [False, True])
+def test_observed_people_can_be_reused_but_malformed_anatomy_cannot(tmp_path, anatomy):
+    asset = tmp_path / 'bg.mp4'
+    asset.write_bytes(b'video')
+    prior = {'passed': True, 'observed_violation': True, 'enforcement': 'observe',
+             'detections': {'people': True, 'anatomy': anatomy}}
+    assert pipeline._should_keep_certified_background(
+        'lyrics', verdict={'passed': False, 'inconclusive': True},
+        prior_validation_result=prior, asset_path=str(asset)) is (not anatomy)

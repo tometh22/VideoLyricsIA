@@ -1,8 +1,8 @@
 """Content validation for generated background assets.
 
 Gemini Vision is used as a classifier, not as the policy authority.  It
-reports independent detections for people, atmospheric effects, commercial
-brands and readable text; the caller then decides which dimensions are allowed
+reports independent detections for people, malformed anatomy, atmospheric
+effects, commercial brands and readable text; the caller then decides which dimensions are allowed
 for this render.  Keeping detection separate from enforcement prevents an opt-in
 for one visual element from accidentally disabling the other safety gates.
 
@@ -146,7 +146,7 @@ def _check_frame_with_gemini(image_path: str) -> dict:
 
     Returns ``safe`` for backwards compatibility plus independent
     ``detections`` and categorized ``issues``.  ``safe`` only reflects the
-    immutable people/brand baseline; atmospheric permission is applied by
+    people/brand/anatomy baseline; atmospheric permission is applied by
     :func:`_evaluate_frame_result`.
     Raises ValidatorCheckError if the verdict cannot be produced (caller
     must decide policy: pre-fix this fell through to "safe" silently,
@@ -200,6 +200,17 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "instruments, furniture, vehicles, clothing laid on a surface, "
             "footprints, tools, doors, paths, or recently disturbed objects are "
             "not people.\n\n"
+            "Set detections.anatomy=true for clearly malformed human anatomy: "
+            "disconnected or floating limbs, extra or fused limbs, or body parts "
+            "emerging implausibly from objects or the ground without a coherent "
+            "body. Report this independently of people, even without a face. "
+            "Do not flag normal cropping, natural occlusion, ordinary poses, "
+            "disability, prostheses, empty clothing, or distant ambiguous shapes. "
+            "Normal people, faces, hands and feet are NOT anatomical defects. "
+            "If perspective, occlusion or cropping plausibly explains a shape, "
+            "set anatomy=false. Only report unmistakable visible defects, including "
+            "realistic detached mannequin limbs used as human body parts. "
+            "Describe the specific visible defect, not an inferred injury.\n\n"
             "Set detections.atmospherics=true if smoke, fog, haze, mist, "
             "steam, vapor, a smoke machine, or a smoke-like atmospheric cloud "
             "is visibly present. Ordinary clouds in the sky, rain, dust, lens "
@@ -259,8 +270,8 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "object could be operated by one. "
             "Respond ONLY with JSON using exactly this schema: "
             '{"detections":{"people":true/false,"atmospherics":true/false,'
-            '"brand":true/false,"text":true/false},'
-            '"issues":[{"category":"people|atmospherics|brand|text",'
+            '"brand":true/false,"text":true/false,"anatomy":true/false},'
+            '"issues":[{"category":"people|atmospherics|brand|text|anatomy",'
             '"reason":"specific visible evidence"}]}'
         )
         response = None
@@ -303,10 +314,10 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             detections = data.get("detections")
             if not isinstance(detections, dict):
                 raise ValidatorCheckError("Gemini Vision 'detections' must be a JSON object")
-            categories = ("people", "atmospherics", "brand")
+            categories = ("people", "atmospherics", "brand", "text", "anatomy")
             if any(type(detections.get(category)) is not bool for category in categories):
                 raise ValidatorCheckError(
-                    "Gemini Vision detections must contain boolean people, atmospherics and brand"
+                    "Gemini Vision detections must contain boolean people, atmospherics, brand, text and anatomy"
                 )
             issues = data.get("issues", [])
             if not isinstance(issues, list) or not all(
@@ -328,7 +339,7 @@ def _check_frame_with_gemini(image_path: str) -> dict:
                 if issue.get("reason", "").strip():
                     detections[issue["category"]] = True
             return {
-                "safe": not detections["people"] and not detections["brand"],
+                "safe": not any(detections[c] for c in ("people", "brand", "anatomy")),
                 "detections": {category: detections[category] for category in categories},
                 "issues": issues,
             }
@@ -346,6 +357,7 @@ def _evaluate_frame_result(
     allow_atmospherics: bool,
     enforce_atmospherics: bool,
     enforce_text: bool = False,
+    anatomy_only: bool = False,
 ) -> dict:
     """Apply render policy to a classifier result.
 
@@ -365,7 +377,7 @@ def _evaluate_frame_result(
             "passed": legacy_safe and not legacy_issues,
             "issues": legacy_issues,
             "detections": {"people": False, "atmospherics": False,
-                           "brand": False, "text": False},
+                           "brand": False, "text": False, "anatomy": False},
             "observations": [],
         }
 
@@ -374,9 +386,10 @@ def _evaluate_frame_result(
         "atmospherics": detections.get("atmospherics") is True,
         "brand": detections.get("brand") is True,
         "text": detections.get("text") is True,
+        "anatomy": detections.get("anatomy") is True,
     }
     reasons_by_category: dict[str, list[str]] = {
-        "people": [], "atmospherics": [], "brand": [], "text": [],
+        "people": [], "atmospherics": [], "brand": [], "text": [], "anatomy": [],
     }
     for item in result.get("issues", []):
         if isinstance(item, dict) and item.get("category") in reasons_by_category:
@@ -396,6 +409,8 @@ def _evaluate_frame_result(
     blocked_categories = []
     if normalized["people"] and not allow_people:
         blocked_categories.append("people")
+    if normalized["anatomy"]:
+        blocked_categories.append("anatomy")
     if normalized["brand"]:
         blocked_categories.append("brand")
     if (
@@ -411,12 +426,20 @@ def _evaluate_frame_result(
     if normalized["text"] and enforce_text:
         blocked_categories.append("text")
 
+    observed_categories = []
+    if anatomy_only:
+        observed_categories = [c for c in blocked_categories if c != "anatomy"]
+        blocked_categories = [c for c in blocked_categories if c == "anatomy"]
+
     blocked_issues = []
     for category in blocked_categories:
         reasons = reasons_by_category[category] or [f"Detected prohibited {category}"]
         blocked_issues.extend(f"{category}: {reason}" for reason in reasons)
 
-    observations = []
+    observations = [
+        f"{c}: {reason}" for c in observed_categories
+        for reason in (reasons_by_category[c] or [f"Detected {c}"])
+    ]
     if normalized["atmospherics"] and not allow_atmospherics:
         reasons = reasons_by_category["atmospherics"] or ["Atmospheric effect detected"]
         observations.extend(f"atmospherics: {reason}" for reason in reasons)
@@ -455,7 +478,7 @@ def validate_video(
         tool_name="gemini-2.5-flash-vision",
         tool_provider="google_vertex",
         prompt=(
-            "Classify frames for people, commercial brands and atmospheric effects; "
+            "Classify frames for people, malformed anatomy, commercial brands and atmospheric effects; "
             f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
             f"observe_atmospherics={observe_atmospherics}, "
             f"enforce_atmospherics={enforce_atmospherics}"
@@ -468,7 +491,7 @@ def validate_video(
     check_errors = 0
     frames_checked = 0
     detected = {"people": False, "atmospherics": False, "brand": False,
-                "text": False}
+                "text": False, "anatomy": False}
     observations = []
 
     try:
@@ -485,10 +508,11 @@ def validate_video(
                 allow_people=allow_people,
                 allow_atmospherics=allow_atmospherics,
                 enforce_atmospherics=enforce_atmospherics,
+                anatomy_only=os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower() == "observe",
             )
             for category, present in verdict["detections"].items():
                 detected[category] = detected[category] or present
-            if observe_atmospherics:
+            if verdict["observations"]:
                 observations.extend(
                     {"frame": i, "type": issue}
                     for issue in verdict["observations"]
@@ -589,7 +613,7 @@ def validate_image(
         tool_name="gemini-2.5-flash-vision-image",
         tool_provider="google_vertex",
         prompt=(
-            "Classify image for people, commercial brands and atmospheric effects; "
+            "Classify image for people, malformed anatomy, commercial brands and atmospheric effects; "
             f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
             f"observe_atmospherics={observe_atmospherics}, "
             f"enforce_atmospherics={enforce_atmospherics}"
@@ -622,11 +646,12 @@ def validate_image(
         allow_people=allow_people,
         allow_atmospherics=allow_atmospherics,
         enforce_atmospherics=enforce_atmospherics,
+        anatomy_only=os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower() == "observe",
     )
     issues = [{"frame": 0, "type": issue} for issue in verdict["issues"]]
     observations = (
         [{"frame": 0, "type": issue} for issue in verdict["observations"]]
-        if observe_atmospherics else []
+        if verdict["observations"] else []
     )
     passed = verdict["passed"]
 

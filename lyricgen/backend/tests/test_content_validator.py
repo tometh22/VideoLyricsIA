@@ -343,3 +343,110 @@ def test_legacy_safe_with_unattributed_issues_fails_closed():
     )
 
     assert result["passed"] is False
+
+
+def test_malformed_anatomy_blocks_image_even_when_people_allowed(tmp_path, monkeypatch):
+    image = tmp_path / 'beach.jpg'
+    image.write_bytes(b'image')
+    monkeypatch.setattr(content_validator, '_check_frame_with_gemini', lambda _: {
+        'detections': {'people': False, 'brand': False, 'atmospherics': False,
+                       'text': False, 'anatomy': False},
+        # Contradictory boolean must not suppress concrete evidence.
+        'issues': [{'category': 'anatomy', 'reason': 'Disconnected legs emerging from sand'}],
+    })
+    result = content_validator.validate_image(str(image), allow_people=True)
+    assert result['passed'] is False
+    assert result['inconclusive'] is False
+    assert result['detections']['anatomy'] is True
+    assert 'Disconnected legs' in result['issues'][0]['type']
+
+
+def test_malformed_anatomy_blocks_video_and_cleans_frames(tmp_path, monkeypatch):
+    frames_dir = tmp_path / 'frames'
+    frames_dir.mkdir()
+    frame = frames_dir / 'frame.jpg'
+    frame.write_bytes(b'frame')
+    monkeypatch.setattr(content_validator, '_extract_frames', lambda _: ([str(frame)], str(frames_dir), 1))
+    monkeypatch.setattr(content_validator, '_check_frame_with_gemini', lambda _: {
+        'detections': {'people': False, 'brand': False, 'atmospherics': False,
+                       'text': False, 'anatomy': True}, 'issues': [],
+    })
+    result = content_validator.validate_video('beach.mp4', allow_people=True)
+    assert result['passed'] is False
+    assert result['inconclusive'] is False
+    assert result['detections']['anatomy'] is True
+    assert not frames_dir.exists()
+
+
+def test_classifier_requires_anatomy_verdict(tmp_path, monkeypatch):
+    import json
+    import sys
+    import types
+    import pytest
+    import pipeline
+
+    image = tmp_path / 'frame.jpg'
+    image.write_bytes(b'frame')
+    detections = dict(people=False, brand=False, atmospherics=False, text=False)
+    client = types.SimpleNamespace(models=types.SimpleNamespace(
+        generate_content=lambda **_: types.SimpleNamespace(text=json.dumps({
+            'detections': detections, 'issues': [],
+        }))
+    ))
+    fake_genai = types.ModuleType('google.genai')
+    fake_genai.types = types.SimpleNamespace(
+        Part=types.SimpleNamespace(from_bytes=lambda **kw: kw),
+        GenerateContentConfig=lambda **kw: kw, ThinkingConfig=lambda **kw: kw,
+    )
+    google = types.ModuleType('google')
+    google.genai = fake_genai
+    monkeypatch.setitem(sys.modules, 'google', google)
+    monkeypatch.setitem(sys.modules, 'google.genai', fake_genai)
+    monkeypatch.setattr(pipeline, '_get_genai_client', lambda: client)
+    monkeypatch.setattr(pipeline, '_call_with_timeout', lambda fn, **_: fn())
+    with pytest.raises(content_validator.ValidatorCheckError, match='anatomy'):
+        content_validator._check_frame_with_gemini(str(image))
+    detections['anatomy'] = False
+    assert content_validator._check_frame_with_gemini(str(image))['safe'] is True
+    detections['anatomy'] = True
+    result = content_validator._check_frame_with_gemini(str(image))
+    assert result['safe'] is False
+    assert result['detections']['anatomy'] is True
+
+
+def test_observe_scans_past_normal_people_to_find_later_anatomy(tmp_path, monkeypatch):
+    monkeypatch.setenv('BACKGROUND_VALIDATION_ENFORCEMENT', 'observe')
+    frame_dir = tmp_path / 'frames'
+    frame_dir.mkdir()
+    frames = [frame_dir / f'{i}.jpg' for i in range(2)]
+    for frame in frames:
+        frame.write_bytes(b'frame')
+    monkeypatch.setattr(content_validator, '_extract_frames',
+                        lambda _: ([str(p) for p in frames], str(frame_dir), 2))
+    results = iter([
+        {'detections': {'people': True, 'anatomy': False}, 'issues': []},
+        {'detections': {'people': True, 'anatomy': True},
+         'issues': [{'category': 'anatomy', 'reason': 'Fused duplicated legs'}]},
+    ])
+    monkeypatch.setattr(content_validator, '_check_frame_with_gemini', lambda _: next(results))
+    result = content_validator.validate_video('video.mp4')
+    assert result['frames_checked'] == 2
+    assert result['passed'] is False
+    assert result['inconclusive'] is False
+    assert result['issues'] == [{'frame': 1, 'type': 'anatomy: Fused duplicated legs'}]
+    assert any(o['type'].startswith('people:') for o in result['observations'])
+
+
+def test_normal_people_pass_in_observe(tmp_path, monkeypatch):
+    monkeypatch.setenv('BACKGROUND_VALIDATION_ENFORCEMENT', 'observe')
+    image = tmp_path / 'portrait.jpg'
+    image.write_bytes(b'image')
+    monkeypatch.setattr(content_validator, '_check_frame_with_gemini', lambda _: {
+        'detections': {'people': True, 'anatomy': False},
+        'issues': [{'category': 'people', 'reason': 'Normal recognizable face'}],
+    })
+    result = content_validator.validate_image(str(image), allow_people=False)
+    assert result['passed'] is True
+    assert result['issues'] == []
+    assert result['detections']['people'] is True
+    assert result['observations']
