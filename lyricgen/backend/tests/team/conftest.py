@@ -17,3 +17,9 @@ def setup_db():
 @pytest.fixture(scope="session", autouse=True)
 def isolate_background_library():
     yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_used_prompt_history():
+    # Coordination does not import pipeline or generate prompts/media.
+    yield
