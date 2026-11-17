@@ -317,6 +317,47 @@ class CreateUserRequest(BaseModel):
     # "universal_music" consumen del mismo plan mensual aunque no se vean
     # los videos entre sí. Vacío = sin grupo (cuota por tenant).
     billing_group: str = ""
+    # Additional lyric campaigns this user can review outside their workspace.
+    campaign_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
+@router.get("/user-assignment-options")
+async def user_assignment_options(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Workspace and campaign choices for the admin user-creation flow."""
+    from database import BatchCampaign
+
+    workspace_ids = {
+        value for (value,) in db.query(User.tenant_id).distinct().all() if value
+    }
+    workspace_ids.update(
+        value for (value,) in db.query(Job.tenant_id).distinct().all() if value
+    )
+    workspace_ids.update(
+        value for (value,) in db.query(BatchCampaign.tenant_id).distinct().all() if value
+    )
+    workspaces = []
+    for workspace_id in sorted(workspace_ids, key=str.casefold):
+        workspaces.append({
+            "id": workspace_id,
+            "users": db.query(User.id).filter(User.tenant_id == workspace_id, User.is_active.is_(True)).count(),
+            "campaigns": db.query(BatchCampaign.id).filter(BatchCampaign.tenant_id == workspace_id).count(),
+        })
+    campaigns = db.query(BatchCampaign).filter(
+        BatchCampaign.kind == "lyric_video",
+        BatchCampaign.status == "active",
+    ).order_by(BatchCampaign.name.asc()).limit(500).all()
+    return {
+        "workspaces": workspaces,
+        "campaigns": [{
+            "id": campaign.id,
+            "name": campaign.name,
+            "tenant_id": campaign.tenant_id,
+            "expected_count": campaign.expected_count,
+        } for campaign in campaigns],
+    }
 
 
 @router.post("/users")
@@ -348,6 +389,20 @@ async def create_user_admin(
         # Without this, admin-managed teams can only ever have one user
         # (whoever was created first claims the tenant; later users in
         # the same team get rejected with "Tenant 'X' already exists").
+        campaign_ids = list(dict.fromkeys(body.campaign_ids))
+        if campaign_ids:
+            from database import BatchCampaign
+
+            campaigns = db.query(BatchCampaign).filter(
+                BatchCampaign.id.in_(campaign_ids),
+                BatchCampaign.kind == "lyric_video",
+                BatchCampaign.status == "active",
+            ).all()
+            if len(campaigns) != len(campaign_ids):
+                raise HTTPException(status_code=422, detail="Una o más campañas ya no están disponibles")
+        else:
+            campaigns = []
+
         user = create_user(
             db,
             username=body.username,
@@ -358,25 +413,46 @@ async def create_user_admin(
             tenant_id=body.tenant_id.strip() or None,
             ai_authorized=body.ai_authorized,
             enforce_reserved=False,
+            commit=False,
         )
-        _post_create_dirty = False
         if body.allow_overage:
             user.allow_overage = True
-            _post_create_dirty = True
         if body.ai_authorized:
             # Stamp audit fields so the authorization is attributable to
             # the admin that created the user, mirroring authorize-ai.
             user.ai_authorized_at = datetime.now(timezone.utc)
             user.ai_authorized_by = admin["id"]
-            _post_create_dirty = True
         if body.billing_group.strip():
             user.billing_group = body.billing_group.strip().lower()
-            _post_create_dirty = True
-        if _post_create_dirty:
-            db.commit()
-            db.refresh(user)
+        if campaigns:
+            from database import BatchCampaignReviewer, AuditLog
+            from batch_campaigns import _scope_enabled
+            cross_workspace = [campaign for campaign in campaigns if campaign.tenant_id != user.tenant_id]
+            if cross_workspace and not _scope_enabled({
+                "id": user.id, "role": user.role, "tenant_id": user.tenant_id,
+                "billing_group": user.billing_group,
+            }):
+                raise HTTPException(status_code=422, detail="El workspace elegido todavía no tiene acceso a campañas")
+            for campaign in campaigns:
+                if campaign.tenant_id == user.tenant_id:
+                    continue
+                db.add(BatchCampaignReviewer(
+                    campaign_id=campaign.id,
+                    user_id=user.id,
+                    granted_by=admin["id"],
+                ))
+            db.add(AuditLog(
+                user_id=admin["id"], action="admin.user_campaign_access_granted",
+                detail={"target_user": user.id, "campaign_ids": [c.id for c in cross_workspace]},
+            ))
+        db.commit()
+        db.refresh(user)
         return user.to_dict()
+    except HTTPException:
+        db.rollback()
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
 

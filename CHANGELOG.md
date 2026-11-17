@@ -5,6 +5,10 @@
 ### Fixed
 - Reject clearly malformed human anatomy in generated backgrounds even in observation mode, while retaining normal people and ambiguous or naturally occluded anatomy. Validate before encoding and scan every scene so observation shortcuts cannot publish a detected defect. Retry or replace rejected generated backgrounds using the existing recovery path.
 
+### Added
+### Added
+- Streamline admin user creation with searchable workspaces and selectable lyric campaigns, granting cross-workspace review access in the same transaction.
+
 ## [1.1.170] - 2026-11-17
 
 ### Fixed
