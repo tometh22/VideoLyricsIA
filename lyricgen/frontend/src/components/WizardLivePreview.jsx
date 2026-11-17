@@ -11,7 +11,7 @@ import {
 import { lookWithVariant } from "../lib/lyricLookVariants";
 import {
   lookLineMotionStyle, renderLookLayout, LookBackdrop, LOOK_LAYOUT_KEYFRAMES,
-  buildWordParts, BuildDoodles,
+  buildWordParts, BuildDoodles, LIVE_LINE_TRANSITION,
 } from "./lookPreviewLayouts";
 
 // Movimientos de línea en vivo: viven con los layouts de los looks; se
@@ -125,6 +125,21 @@ const LOOK_SAMPLE_ANIM = {
   cine: `wlp-look-cine ${LOOK_LOOP_S}s ease-out both`,
   fade: `wlp-look-fade ${LOOK_LOOP_S}s linear both`,
 };
+
+// Los clips del preview son decorado mudo en loop. Con el atributo `autoPlay`,
+// Safari dibuja su botón nativo de "play" (círculo oscuro con triángulo)
+// ENCIMA de la letra cuando no lo deja arrancar solo (Modo de bajo consumo,
+// autoplay bloqueado por sitio) — se ve en la captura del reporte de
+// dd104256a7f1. Arrancarlo por código da el mismo resultado cuando el
+// navegador lo permite y, si no, el clip queda quieto SIN el botón (WebKit
+// sólo lo muestra para `autoplay` bloqueado). Referencia estable a nivel de
+// módulo: React la llama sólo al montar/desmontar, no en cada tick del audio.
+function playMutedLoop(video) {
+  if (!video || !video.paused) return;
+  video.muted = true;
+  const p = video.play();
+  if (p && typeof p.catch === "function") p.catch(() => {});
+}
 
 export default function WizardLivePreview({
   style = "auto",
@@ -277,10 +292,25 @@ export default function WizardLivePreview({
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
           setLivePlaybackTick({ ...tick, lineSeq: lineSeqRef.current });
         }
-      } else if (lastTickRef.current.activeLine) {
-        // El operador pausó/paró el audio — limpiar para volver al loop sample.
-        // This rAF effect outlives React renders. Its captured state can still
-        // be null after a song has played, so use the live ref to clear it.
+      } else if (tick && tick.currentTime > 0) {
+        // Hueco ENTRE líneas con el audio corriendo: LyricsEditor publica
+        // activeLine "" con el reloj real. Antes esto caía al loop de
+        // muestra, así que en cada hueco aparecía "ESTA ES TU LETRA" con su
+        // animación y a los pocos ms volvía la línea real: la letra entera
+        // titilaba en cada cambio de línea. El render no muestra nada en un
+        // hueco, así que el preview tampoco. Se conserva lineSeq/historial
+        // (no es una canción nueva). Sólo un setState por hueco.
+        const last = lastTickRef.current;
+        if (last.activeLine || !last.gap) {
+          if (last.activeLine) liveHistoryRef.current = [...liveHistoryRef.current, last.activeLine].slice(-3);
+          lastTickRef.current = { activeLine: "", currentTime: tick.currentTime, gap: true };
+          setLivePlaybackTick({ activeLine: "", gap: true, currentTime: tick.currentTime, lineSeq: lineSeqRef.current });
+        }
+      } else if (lastTickRef.current.activeLine || lastTickRef.current.gap) {
+        // App reseteó el tick (canción nueva: currentTime 0) — volver al
+        // loop sample. This rAF effect outlives React renders. Its captured
+        // state can still be null after a song has played, so use the live
+        // ref to clear it.
         lastTickRef.current = { activeLine: "", currentTime: -1 };
         liveHistoryRef.current = [];
         lineSeqRef.current = 0;
@@ -309,7 +339,10 @@ export default function WizardLivePreview({
     [baseLook, lookResolved, lyricFontMain, lyricFontKey, lyricAltColor, lyricAccentColor, lookCatalog],
   );
   const lookPreview = look ? look.preview : null;
-  const isLiveTick = !!(livePlaybackTick && livePlaybackTick.activeLine);
+  // Hueco entre líneas con el audio corriendo: no hay letra en pantalla
+  // (como en el render), y tampoco vuelve el loop de muestra.
+  const isLiveGap = !!(livePlaybackTick && livePlaybackTick.gap);
+  const isLiveTick = !!(livePlaybackTick && (livePlaybackTick.activeLine || isLiveGap));
   const [lookLoopIdx, setLookLoopIdx] = useState(0);
   useEffect(() => {
     if (!baseLook || isLiveTick || renderedVideoUrl) return undefined;
@@ -347,7 +380,7 @@ export default function WizardLivePreview({
       },
     };
     return clipIsVideo ? (
-      <video key={key} {...common} autoPlay loop muted playsInline />
+      <video key={key} {...common} ref={playMutedLoop} loop muted playsInline />
     ) : (
       <img key={key} {...common} alt="" draggable={false} />
     );
@@ -707,7 +740,10 @@ export default function WizardLivePreview({
   if (lookPreview) {
     const lp = lookPreview;
     const live = liveActive;
-    const lineIdx = live ? (live.lineSeq || 0) : lookLoopIdx;
+    // En un hueco la placa/tinta sigue siendo la de la última línea.
+    const lineIdx = live
+      ? (live.lineSeq || 0)
+      : (isLiveGap ? (livePlaybackTick.lineSeq || 0) : lookLoopIdx);
     // Manuscritas / chat van en el case original de la letra (backend
     // force_case="original"); el resto respeta el textCase del operador.
     const keepCase = lp.forceCase === "original";
@@ -739,7 +775,8 @@ export default function WizardLivePreview({
     const lineMotion = live
       ? {
         ...lookLineMotionStyle(lp.motion, live.currentTime - live.activeStart, live.activeEnd - live.activeStart),
-        transition: "transform 60ms linear, opacity 60ms linear, filter 60ms linear",
+        // Sin `filter`: ver LIVE_LINE_TRANSITION (recuadro + titileo en vivo).
+        transition: LIVE_LINE_TRANSITION,
       }
       : { animation: LOOK_SAMPLE_ANIM[lp.motion] };
 
@@ -1167,7 +1204,7 @@ export default function WizardLivePreview({
               ? "wlp-rgb-overlay 2.8s steps(1,end) infinite"
               : undefined,
           }}
-          autoPlay loop muted playsInline
+          ref={playMutedLoop} loop muted playsInline
         />
       ) : null}
       {/* palette / mood color-grade over the footage — softened: `color` blend
@@ -1205,8 +1242,10 @@ export default function WizardLivePreview({
         <div className="absolute inset-0 pointer-events-none" data-look-layer="grain" style={{ backgroundImage: GRAIN_URI, mixBlendMode: "overlay", opacity: 0.28, animation: "wlp-look-grain .5s steps(1,end) infinite" }} />
       ) : null}
 
-      {/* lyric — vertically centered, mirroring the real render (\an5 center) */}
-      {lookLyric ? (
+      {/* lyric — vertically centered, mirroring the real render (\an5 center).
+          En un hueco entre líneas (audio corriendo) no hay letra, como en el
+          render. */}
+      {isLiveGap ? null : lookLyric ? (
         <div className="absolute inset-0 flex items-center justify-center px-[8%] text-center" data-lyric-look={look.code}>
           {lookLyric}
         </div>

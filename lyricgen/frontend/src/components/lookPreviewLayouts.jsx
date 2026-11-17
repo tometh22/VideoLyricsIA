@@ -37,9 +37,28 @@ function seedOf(str) {
 }
 
 /**
+ * Transición de los estilos en vivo: SÓLO transform y opacity.
+ *
+ * El estilo en vivo se recalcula en cada tick del audio (~20 por segundo), así
+ * que cada tick arranca una transición nueva. Con `filter` en la lista (y un
+ * `blur()` en el valor) el bloque de letra entero vivía en una superficie de
+ * filtro que el navegador re-crea en cada tick, encima del <video> que se
+ * mueve: la línea completa "titilaba" y, en la salida de Cósmico (escala
+ * hasta 9×), el desenfoque se dibujaba como un recuadro translúcido detrás de
+ * la letra. libass desenfoca glifo por glifo y no tiene ese problema, por eso
+ * el MP4 sale limpio. Transform y opacity se componen sin re-rasterizar.
+ */
+export const LIVE_LINE_TRANSITION = "transform 60ms linear, opacity 60ms linear";
+
+/**
  * Estilo de línea de un look en un instante (modo en vivo). Espejo de
  * backend lyric_looks._line_motion / ass_render zoom_through: entrada y salida
  * caen DENTRO de la ventana de la línea. `opts.textLen` lo usa write_on.
+ *
+ * Nunca devuelve `filter` (ver LIVE_LINE_TRANSITION): el desenfoque de las
+ * entradas/salidas del render se aproxima con opacidad + escala. El loop de
+ * muestra (sin audio) sigue usando sus keyframes con blur: es UNA animación
+ * CSS por ciclo, no una por tick.
  */
 export function lookLineMotionStyle(motion, elapsedS, durS, opts = {}) {
   const dur = Math.max(0.05, durS);
@@ -59,7 +78,6 @@ export function lookLineMotionStyle(motion, elapsedS, durS, opts = {}) {
     return {
       transform: `scale(${(1.08 + 7.92 * q * q).toFixed(3)})`,
       opacity: 1 - q,
-      filter: `blur(${(6 * q).toFixed(2)}px)`,
     };
   }
   if (motion === "cine") {
@@ -69,15 +87,14 @@ export function lookLineMotionStyle(motion, elapsedS, durS, opts = {}) {
       const q = clamp01(t / enter);
       return {
         opacity: q,
-        filter: `blur(${(10 * (1 - q)).toFixed(2)}px)`,
         letterSpacing: `${(0.22 - 0.19 * q).toFixed(3)}em`,
       };
     }
     if (t > dur - exit) {
       const q = clamp01((t - (dur - exit)) / exit);
-      return { opacity: 1 - q, filter: `blur(${(8 * q).toFixed(2)}px)`, letterSpacing: "0.03em" };
+      return { opacity: 1 - q, letterSpacing: "0.03em" };
     }
-    return { opacity: 1, filter: "blur(0px)", letterSpacing: "0.03em" };
+    return { opacity: 1, letterSpacing: "0.03em" };
   }
   if (motion === "fade") {
     const f = Math.min(0.16, Math.max(0.06, dur * 0.08));
@@ -87,11 +104,10 @@ export function lookLineMotionStyle(motion, elapsedS, durS, opts = {}) {
   if (motion === "smear") {
     const exit = Math.min(0.26, Math.max(0.12, dur * 0.12));
     const q = clamp01((t - (dur - exit)) / exit);
-    if (q <= 0) return { opacity: 1, transform: "none", filter: "blur(0px)" };
+    if (q <= 0) return { opacity: 1, transform: "none" };
     return {
       opacity: 1 - q,
       transform: `scaleX(${(1 + 1.3 * q).toFixed(3)})`,
-      filter: `blur(${(8 * q).toFixed(2)}px)`,
     };
   }
   // Duotono: la tinta crece, "hierve" (adentro) y se barre de costado.
@@ -100,14 +116,13 @@ export function lookLineMotionStyle(motion, elapsedS, durS, opts = {}) {
     const exit = Math.min(0.26, Math.max(0.12, dur * 0.12));
     if (t < enter) {
       const q = clamp01(t / enter);
-      return { opacity: q, transform: `scale(${(0.7 + 0.3 * q).toFixed(3)})`, filter: "blur(0px)" };
+      return { opacity: q, transform: `scale(${(0.7 + 0.3 * q).toFixed(3)})` };
     }
     const q = clamp01((t - (dur - exit)) / exit);
-    if (q <= 0) return { opacity: 1, transform: "none", filter: "blur(0px)" };
+    if (q <= 0) return { opacity: 1, transform: "none" };
     return {
       opacity: 1 - q,
       transform: `scale(${(1 + 2.2 * q).toFixed(3)}, ${(1 + 0.15 * q).toFixed(3)})`,
-      filter: `blur(${(10 * q).toFixed(2)}px)`,
     };
   }
   // Romántico: la cursiva se escribe de izquierda a derecha.
@@ -631,7 +646,7 @@ function kineticLayout(ctx) {
     </div>
   ));
   const wrapStyle = live
-    ? { ...lookLineMotionStyle("smear", ctx.elapsed, ctx.dur), transition: "transform 60ms linear, opacity 60ms linear, filter 60ms linear" }
+    ? { ...lookLineMotionStyle("smear", ctx.elapsed, ctx.dur), transition: LIVE_LINE_TRANSITION }
     : { animation: `wlp-look-smear ${loopS}s linear both` };
   return { body, wrapStyle, frame: true };
 }
@@ -971,7 +986,7 @@ function lineInkLayout(ctx) {
       </span>
     );
     const wrapStyle = live
-      ? { ...lookLineMotionStyle("boil", ctx.elapsed, ctx.dur), transition: "transform 60ms linear, opacity 60ms linear, filter 60ms linear" }
+      ? { ...lookLineMotionStyle("boil", ctx.elapsed, ctx.dur), transition: LIVE_LINE_TRANSITION }
       : { animation: `wlp-look-boilline ${loopS}s linear both` };
     return { body, wrapStyle, frame: false };
   }

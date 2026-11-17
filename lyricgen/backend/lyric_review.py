@@ -56,12 +56,22 @@ from heard_words import (
     opcode_similarity,
     witness_words,
 )
+from witness_review import review_items as witness_review_items
+from reference_window import crop_reference
+from lyric_review_boundaries import boundary_items
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
 MAX_ITEMS = 60
 PHRASE_REVIEW_MAX_WORDS = 8
 PHRASE_REVIEW_MAX_CHARS = 42
+# Un oído que coincide menos que esto con la pantalla es otra versión o una
+# alucinación (el testigo, que oye la canción entera con tiempos, 0,35).
+EAR_MIN_SIMILARITY = 0.45
+WITNESS_MIN_SIMILARITY = 0.35
+# La letra oficial se recorta al tramo que suena sólo si la pantalla tiene
+# bastante menos palabras que la canción (el audio es un fragmento).
+OFFICIAL_FRAGMENT_MAX_RATIO = 0.7
 # Más palabras que esto no se comparan contra los oídos (se avisa como canción
 # difícil): protege al servidor de letras gigantes o pegadas a propósito.
 MAX_REVIEW_TOKENS = 2500
@@ -123,6 +133,7 @@ KIND_GROUP = {
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
     "timing": "timing", "phrase_structure": "layout",
+    "witness_mismatch": "text", "witness_uncovered": "text",
 }
 
 
@@ -432,6 +443,119 @@ def _ear_blocks(segments: list[dict], screen: list[dict], ear: list[dict],
             "spelling_only": spelling_only or style_only,
         })
     return out, similarity, confirmed
+
+
+def _official_ear(screen: list[dict], official_clean: str) -> tuple[list[dict], dict | None]:
+    """Tokens de la letra oficial como oído y, si el audio es un fragmento,
+    el tramo de la letra al que se recortaron.
+
+    La letra describe la canción entera. Si la pantalla tiene bastante menos
+    palabras (demo de 30 s, Short) y la letra completa no pasa el filtro de
+    similitud o parece corrupta, se recorta al tramo de líneas consecutivas
+    que suena (``reference_window``), con una línea de cada lado por si el
+    audio corta una línea a la mitad. Si ningún tramo coincide lo suficiente
+    (otra canción, otra versión) se sigue como siempre: se descarta.
+    Evaluación sobre 15 demos (16-11-2026): recall de texto 58 %→71 %, los
+    puntos de letra oficial aciertan el 84 %; la letra equivocada (ventana
+    0,39) queda afuera. Con la canción entera no cambia nada.
+    """
+    tokens = _ear_tokens(official_clean)
+    if not tokens:
+        return [], None
+    corrupt = _looks_corrupt(tokens, screen)
+    fragment = bool(screen) and len(tokens) <= MAX_REVIEW_TOKENS and \
+        len(screen) <= OFFICIAL_FRAGMENT_MAX_RATIO * len(tokens)
+    if fragment and (corrupt or opcode_similarity(
+            aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens]),
+            len(screen), len(tokens)) < EAR_MIN_SIMILARITY):
+        found = crop_reference(official_clean, " ".join(s["raw"] for s in screen), pad_lines=1)
+        if found is not None:
+            text, window = found
+            cropped = _ear_tokens(text)
+            if len(cropped) < len(tokens) and not _looks_corrupt(cropped, screen):
+                return cropped, window
+    return ([] if corrupt else tokens), None
+
+
+def _fragment_edge_addition(block: dict, n_screen: int) -> bool:
+    """Bloque en el borde del fragmento que AGREGA palabras de la letra."""
+    i1, i2 = block["scr_range"]
+    if i1 > 0 and i2 < n_screen:
+        return False
+    return block["fix"]["type"] == "insert" or len(block["diff_heard"]) > len(block["diff_screen"])
+
+
+def _listen_item(kind: str, line: int, sources: set, fix: dict) -> dict:
+    heard = fix.get("replace") if fix["type"] == "replace" else fix.get("text")
+    return {
+        "kind": kind, "line": line, "required": False, "listen": True,
+        "title": "Escuchá este tramo", "why": _listen_hint(sources, heard or ""),
+        "sources": sources, "fix": fix, "alternatives": [],
+        "action": "Escuchar", "dismiss": "Está bien así",
+    }
+
+
+def _drops_neighbour_words(fix: dict) -> bool:
+    """Un reemplazo que en realidad corresponde a una PARTE de lo que borra:
+    «Dai-me um» → «Dá me» suena como «Dai-me» y se come el «um» que el oído
+    no oyó. Aplicarlo de un clic borraría una palabra cantada."""
+    if fix.get("type") != "replace":
+        return False
+    find = [norm_token(w) for w in str(fix.get("find") or "").split()]
+    find = [w for w in find if w]
+    heard = "".join(norm_token(w) for w in str(fix.get("replace") or "").split())
+    if len(find) < 2 or not heard:
+        return False
+
+    def ratio(words: list[str]) -> float:
+        return difflib.SequenceMatcher(None, "".join(words), heard, autojunk=False).ratio()
+
+    whole = ratio(find)
+    for k in range(1, len(find)):
+        for part in (find[:k], find[k:]):
+            score = ratio(part)
+            if score >= 0.8 and score > whole:
+                return True
+    return False
+
+
+def _one_click_guard(ear_items: list[tuple[dict, tuple[int, int]]],
+                     withheld: list[tuple[set, int, tuple[int, int]]]) -> list[dict]:
+    """Sólo se ofrece un arreglo de un clic si es una edición limpia y
+    completa de un tramo contiguo de palabras. Si no, el punto pasa a
+    "Escuchá este tramo" y su arreglo queda marcado ``one_click: False``.
+
+    - No borra palabras vecinas que el oído no oyó (``_drops_neighbour_words``).
+    - No es la mitad de una frase: si el mismo oído tenía otra diferencia en
+      la misma línea, pegada (a lo sumo una palabra en el medio), que no se
+      propone, aplicar sólo ésta deja la línea a medias («Mas tu não será»
+      con la letra «Mas tu não serás»; «Tudo menos e Salvador» con la letra
+      «Tudo Menos É Mais e Nattanzinho em Salvador»).
+    """
+    def near(a: tuple[int, int], b: tuple[int, int]) -> bool:
+        return a != b and b[0] <= a[1] + 1 and a[0] <= b[1] + 1
+
+    pending = list(ear_items)
+    out: list[dict] = []
+    changed = True
+    while changed:
+        changed = False
+        keep = []
+        for item, span in pending:
+            broken = item["fix"].get("one_click") is False or _drops_neighbour_words(item["fix"])
+            partial = any(
+                line == item["line"] and set(srcs) & set(item["sources"]) and near(span, other)
+                for srcs, line, other in withheld
+            )
+            if broken or partial:
+                fix = {**item["fix"], "one_click": False}
+                out.append(_listen_item(item["kind"], item["line"], item["sources"], fix))
+                withheld.append((item["sources"], item["line"], span))
+                changed = True
+            else:
+                keep.append((item, span))
+        pending = keep
+    return out + [item for item, _span in pending]
 
 
 def _only_style_difference(screen_raw: list[str], heard_raw: list[str]) -> bool:
@@ -1138,10 +1262,8 @@ def build_review(
     blocks: list[dict] = []
     similarity: dict[str, float] = {}
     confirmed_by_official: set[int] = set()
-    official_tokens = _ear_tokens(official_clean)
+    official_tokens, official_window = _official_ear(screen, official_clean)
     official_ops: list[tuple] = []
-    if official_tokens and _looks_corrupt(official_tokens, screen):
-        official_tokens = []
     witness_text = " ".join(w["word"] for w in witness)
     for source, tokens, timed in (
         ("witness", _ear_tokens(witness_text), witness),
@@ -1154,7 +1276,7 @@ def build_review(
         similarity[source] = round(sim, 3)
         # Un oído que casi no coincide con la pantalla es otra versión o una
         # alucinación: no aporta.
-        if sim >= (0.45 if source != "witness" else 0.35):
+        if sim >= (EAR_MIN_SIMILARITY if source != "witness" else WITNESS_MIN_SIMILARITY):
             blocks.extend(found)
         if source == "official":
             confirmed_by_official = confirmed
@@ -1162,6 +1284,10 @@ def build_review(
                 official_ops = aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens])
     same_version = similarity.get("official", 0.0) >= 0.85
     human_edited = _human_edited_lines(segments, original_segments)
+    # Diferencias de un oído que no se proponen por duda (borde del fragmento,
+    # agregado de otra versión): un arreglo pegado a una de ellas queda a medias.
+    withheld: list[tuple[set, int, tuple[int, int]]] = []
+    ear_items: list[tuple[dict, tuple[int, int]]] = []
     for block in _merge_ear_blocks(blocks):
         sources = block["sources"]
         only_official = sources == {"official"}
@@ -1172,11 +1298,18 @@ def build_review(
             covered = range(i1, i2) if i2 > i1 else (i1 - 1, i1)
             if all(k in confirmed_by_official for k in covered):
                 continue
+        if only_official and official_window is not None and _fragment_edge_addition(block, len(screen)):
+            # El borde del fragmento corta la letra: lo que sólo la letra
+            # oficial agrega antes de la primera o después de la última
+            # palabra puede no estar en el audio.
+            withheld.append((sources, block["line"], (i1, i2)))
+            continue
         if only_official and block["fix"]["type"] == "insert" and (
             not same_version or len(block["diff_heard"]) > 3
         ):
             # Otra versión (en vivo, con partes habladas): lo que sólo la
             # letra oficial agrega no se propone.
+            withheld.append((sources, block["line"], (i1, i2)))
             continue
         if block["spelling_only"] and "official" not in sources:
             continue  # "urgo"/"hurgo" sólo lo decide la letra oficial
@@ -1195,22 +1328,17 @@ def build_review(
             # Un solo oído automático acierta el lugar pero casi nunca el texto
             # (pedidos #112-#131: 48 puntos, texto correcto en 6; y ~1 falsa
             # alarma por canción aprobada). Se ofrece escuchar, no corregir.
-            heard = block["fix"].get("replace") if kind == "heard_different" else block["fix"].get("text")
-            items.append({
-                "kind": kind, "line": block["line"], "required": False, "listen": True,
-                "title": "Escuchá este tramo", "why": _listen_hint(sources, heard or ""),
-                "sources": sources, "fix": block["fix"], "alternatives": [],
-                "action": "Escuchar", "dismiss": "Está bien así",
-            })
+            ear_items.append((_listen_item(kind, block["line"], sources, block["fix"]), (i1, i2)))
             continue
-        items.append({
+        ear_items.append(({
             "kind": kind, "line": block["line"], "required": len(sources) >= 2 and not edited,
             "title": "Se escucha distinto" if kind == "heard_different" else "Falta texto",
             "why": _why(sources), "sources": sources, "fix": block["fix"],
             "alternatives": block.get("alternatives") or [],
             "action": "Corregir" if kind == "heard_different" else "Agregar",
             "dismiss": "Está bien así" if kind == "heard_different" else "No se canta",
-        })
+        }, (i1, i2)))
+    items.extend(_one_click_guard(ear_items, withheld))
 
     vocabulary = {norm_token(w["word"]) for w in witness} | {
         t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in official_tokens}
@@ -1222,6 +1350,12 @@ def build_review(
     items.extend(_rule_phrase_structure(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
+    # Testigo contra la pantalla en estudio (WITNESS_STUDIO_COMPARE_MODE):
+    # sólo "Escuchá este tramo", nunca obligatorio. Los vivos ya lo tienen.
+    items.extend(witness_review_items(segments, witness, machine_evidence))
+    # Timing y fronteras de frase determinísticos: siempre sugerencias.
+    items.extend(boundary_items(segments, witness=witness, machine_evidence=machine_evidence,
+                                orphan_words=_ORPHANS))
     # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
     # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
     if same_version and official_ops:
@@ -1242,6 +1376,7 @@ def build_review(
             "witness": bool(witness), "gemini": bool(gemini),
             "official": bool(official_tokens), "memory": len(memory_pairs or {}),
             "similarity": similarity,
+            **({"official_window": official_window} if official_window else {}),
         },
         "risk": _risk(witness, similarity, pending, len(segments)),
     }
@@ -1309,9 +1444,10 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             group_sig = (item["kind"], fix["type"], item.get("key") or sig[0])
         else:
             # Signos, uniones, cortes y timing: sólo se agrupan líneas con el
-            # mismo texto (un coro), nunca líneas distintas.
+            # mismo texto (un coro), nunca líneas distintas. Un punto con
+            # identidad propia por aparición (timing) no se agrupa.
             group_sig = (item["kind"], fix["type"], _key_text(item["_line_text"]),
-                         fix.get("mode"), fix.get("direction"))
+                         fix.get("mode"), fix.get("direction"), item.get("key"))
         key = item.get("key") or _item_key(item["kind"], fix, item["_line_text"])
         g = grouped.get(group_sig)
         if g is None:

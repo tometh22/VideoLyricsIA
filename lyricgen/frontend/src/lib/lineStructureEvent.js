@@ -5,6 +5,8 @@
 // caracteres, separado en "la línea no tenía palabras" y "tenía palabras pero
 // ya no coinciden con el texto" (texto corregido después del alineado).
 
+import { lineWords } from "./splitWords";
+
 const hasWords = (seg) => Array.isArray(seg?.words) && seg.words.length > 0;
 
 // `plan` es el resultado de planSegmentSplit (null = no se partió).
@@ -15,8 +17,9 @@ export function splitTimingMode(seg, plan) {
 }
 
 export function mergeTimingMode(a, b) {
-  const aw = hasWords(a);
-  const bw = hasWords(b);
+  // A side that lost `words` but whose clocks are recovered still merges with words.
+  const aw = hasWords(a) || lineWords(a) != null;
+  const bw = hasWords(b) || lineWords(b) != null;
   if (aw && bw) return "words";
   return aw || bw ? "one_side" : "no_words";
 }

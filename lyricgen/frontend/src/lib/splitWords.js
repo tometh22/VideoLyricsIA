@@ -234,7 +234,10 @@ export function chooseSplitTokenIndex(text, words) {
 export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = null } = {}) {
   const text = typeof seg?.text === "string" ? seg.text : "";
   const tokens = tokenSpans(text);
-  const words = Array.isArray(seg?.words) ? seg.words : null;
+  // Prefer clocks that provably belong to THIS text (own words, or the
+  // provider's words of this window when the row lost them); otherwise the
+  // historical positional mapping of whatever `words` the row carries.
+  const words = lineWords(seg) || (Array.isArray(seg?.words) ? seg.words : null);
   const bounds = wordBoundaries(tokens, words);
 
   let cut = null;
@@ -300,4 +303,158 @@ export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = nul
     b: { text: textB, start: Math.min(segEnd - MIN_HALF_S, midTime), end: segEnd, words: wordsB },
     timing: "char_ratio",
   };
+}
+
+// ─── Word clocks that survive split / merge ─────────────────────────────────
+//
+// Demos 28-oct-2026: 28 of 94 approved lines ended with `words: []`. Rows that
+// had lost their `words` (or whose text had been touched) were split by
+// character ratio and both halves were saved without clocks, although every
+// row still carried the recognizer's clocks in `provider_evidence.words`.
+// These helpers recover a 1:1 word array for the CURRENT text — the renderer
+// contract: one word per visible token with the same letters
+// (ass_render._word_timings, lib/karaokeTiming).
+
+const RECOVERY_WINDOW_TOLERANCE_S = 0.3;
+
+/** Renderer token key: NFC, lowercase, letters/digits only (accents kept). */
+export function wordKey(value) {
+  return String(value ?? "").normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function usableClock(word) {
+  if (!word || typeof word !== "object") return false;
+  if (word.synthetic || word.estimated || word.stale) return false;
+  const start = Number(word.start);
+  const end = Number(word.end);
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start;
+}
+
+const wordText = (word) => word?.word ?? word?.text;
+
+/** Leftmost (or, with `fromEnd`, rightmost) in-order embedding of keys in words. */
+function embedding(keys, words, fromEnd = false) {
+  const picks = new Array(keys.length);
+  if (!fromEnd) {
+    let j = 0;
+    for (let k = 0; k < keys.length; k += 1) {
+      while (j < words.length && wordKey(wordText(words[j])) !== keys[k]) j += 1;
+      if (j >= words.length) return null;
+      picks[k] = j;
+      j += 1;
+    }
+  } else {
+    let j = words.length - 1;
+    for (let k = keys.length - 1; k >= 0; k -= 1) {
+      while (j >= 0 && wordKey(wordText(words[j])) !== keys[k]) j -= 1;
+      if (j < 0) return null;
+      picks[k] = j;
+      j -= 1;
+    }
+  }
+  return picks;
+}
+
+/**
+ * Words for every visible token of `text`, in order, or null. Each token must
+ * match (renderer key) a word of `words`; words the text no longer has (the
+ * reviewer deleted them or moved them to another line) are skipped. A token
+ * the words never had (a corrected or inserted word) makes it null: a clock
+ * is never invented. When skipping makes the occurrence ambiguous (a repeated
+ * word could come from more than one place: "Te amo Te amo siempre" for
+ * "Te amo siempre") it is null too, never the first match by default.
+ */
+export function tokenWords(text, words) {
+  const tokens = String(text ?? "").split(/\s+/).filter(Boolean);
+  if (!tokens.length || !Array.isArray(words) || !words.length) return null;
+  const keys = tokens.map(wordKey);
+  if (keys.some((key) => !key)) return null;
+  const first = embedding(keys, words);
+  if (!first) return null;
+  const last = embedding(keys, words, true);
+  if (!last || last.some((j, k) => j !== first[k])) return null;
+  let lastStart = -Infinity;
+  const out = [];
+  for (const j of first) {
+    if (!usableClock(words[j]) || Number(words[j].start) < lastStart) return null;
+    lastStart = Number(words[j].start);
+    out.push({ ...words[j] });
+  }
+  return out;
+}
+
+function insideWindow(seg, words) {
+  const start = Number(seg.start);
+  const end = Number(seg.end);
+  if (!Array.isArray(words) || !Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return words.filter((w) => usableClock(w)
+    && Number(w.start) >= start - RECOVERY_WINDOW_TOLERANCE_S
+    && Number(w.end) <= end + RECOVERY_WINDOW_TOLERANCE_S);
+}
+
+/**
+ * Best 1:1 word clocks for a line's current text, or null:
+ * 1. its own `words` when they ARE the text, one per token (the renderer
+ *    contract; kept even if the line window was re-timed by hand);
+ * 2. otherwise its own words, then the recognizer's
+ *    `provider_evidence.words`, restricted to the CURRENT line window, so a
+ *    repeated word that was moved away to another line is never picked up
+ *    again; an occurrence that is still ambiguous declines recovery.
+ */
+export function lineWords(seg) {
+  if (!seg || typeof seg.text !== "string") return null;
+  const tokens = seg.text.split(/\s+/).filter(Boolean);
+  const own = Array.isArray(seg.words) ? seg.words : null;
+  if (own && own.length === tokens.length && tokens.length
+    && own.every((w, k) => wordKey(wordText(w)) === wordKey(tokens[k]))) {
+    return tokenWords(seg.text, own);
+  }
+  return tokenWords(seg.text, insideWindow(seg, own))
+    || tokenWords(seg.text, insideWindow(seg, seg.provider_evidence?.words));
+}
+
+/**
+ * Join `a` with the following line `b`: text concatenated, outer bounds kept
+ * (a.start .. the later end) and `words` = both arrays joined when BOTH lines
+ * have clocks for their current text (recovered when needed). Otherwise no
+ * words: never half a karaoke line with fabricated clocks.
+ */
+export function mergeLineRows(a, b) {
+  const text = `${String(a?.text || "").trim()} ${String(b?.text || "").trim()}`.trim();
+  const aw = lineWords(a) || (Array.isArray(a?.words) ? a.words : null);
+  const bw = lineWords(b) || (Array.isArray(b?.words) ? b.words : null);
+  const { words: _dropped, ...rest } = a || {};
+  return {
+    ...rest,
+    text,
+    start: a?.start,
+    end: Math.max(Number(a?.end), Number(b?.end)),
+    ...(aw && bw ? { words: [...aw, ...bw] } : {}),
+  };
+}
+
+/**
+ * Cut `seg` before each token index of `cuts` (0 < k < tokens). Same rules as
+ * planSegmentSplit, left to right: each part keeps its slice of `words`, the
+ * inner boundaries come from the word clocks and the outer bounds stay the
+ * line's own. Returns [{ text, start, end, words }] or null.
+ */
+export function splitLineAtTokens(seg, cuts) {
+  const tokens = tokenSpans(seg?.text);
+  const sorted = [...new Set((cuts || []).map(Number))].sort((x, y) => x - y);
+  if (!sorted.length || sorted.some((k) => !Number.isInteger(k) || k <= 0 || k >= tokens.length)) {
+    return null;
+  }
+  const parts = [];
+  let rest = { ...seg, words: lineWords(seg) || seg?.words };
+  let consumed = 0;
+  for (const cut of sorted) {
+    const plan = planSegmentSplit(rest, { splitTokenIndex: cut - consumed });
+    if (!plan) return null;
+    parts.push(plan.a);
+    consumed = cut;
+    rest = { ...rest, text: plan.b.text, start: plan.b.start, end: plan.b.end, words: plan.b.words };
+  }
+  parts.push({ text: rest.text, start: rest.start, end: rest.end, words: rest.words || null });
+  return parts;
 }

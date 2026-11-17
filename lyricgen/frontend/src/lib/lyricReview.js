@@ -7,6 +7,7 @@
 // que vio el servidor, el arreglo NO se aplica (devuelve 0 aplicados) y el
 // editor avisa: nunca se corrige a ciegas otra línea.
 import { findAlertLineIndex, lineWithAlertInserted, normToken } from "./heardWords";
+import { lineWords, wordKey } from "./splitWords";
 
 const nfc = (value) => String(value || "").normalize("NFC");
 const keyText = (value) => nfc(value).split(/\s+/).map(normToken).filter(Boolean).join(" ");
@@ -81,9 +82,57 @@ function lineIndexFor(segments, occurrence) {
 }
 
 function joinWords(a, b) {
-  const wa = Array.isArray(a.words) ? a.words : null;
-  const wb = Array.isArray(b.words) ? b.words : null;
+  const wa = lineWords(a) || (Array.isArray(a.words) ? a.words : null);
+  const wb = lineWords(b) || (Array.isArray(b.words) ? b.words : null);
   return wa && wb ? [...wa, ...wb] : undefined;
+}
+
+// "Reacomodar": las mismas palabras cambian de línea ("Senhor" pasa a la
+// anterior). Si las líneas nuevas son exactamente las palabras de las viejas,
+// en orden, cada una se queda con sus relojes y los bordes INTERNOS entre
+// líneas consecutivas pasan a los de sus palabras. Si no (se cambió una
+// palabra), null: el llamador las deja sin palabras, como antes.
+const TOUCH_GAP_S = 0.02;
+
+function relayoutWords(segments, indexes, texts) {
+  const order = indexes.map((index, k) => ({ index, k })).sort((x, y) => x.index - y.index);
+  const pool = [];
+  for (const { index } of order) {
+    const words = lineWords(segments[index]);
+    if (!words) return null;
+    pool.push(...words);
+  }
+  let cursor = 0;
+  const result = new Map();
+  for (const { index, k } of order) {
+    const tokens = nfc(texts[k]).split(/\s+/).filter(Boolean);
+    const slice = pool.slice(cursor, cursor + tokens.length);
+    if (slice.length !== tokens.length
+      || tokens.some((token, j) => !wordKey(token) || wordKey(token) !== wordKey(slice[j].word ?? slice[j].text))) {
+      return null;
+    }
+    cursor += tokens.length;
+    result.set(index, slice);
+  }
+  if (cursor !== pool.length) return null;
+  const times = new Map(order.map(({ index }) => [index, {
+    start: Number(segments[index].start), end: Number(segments[index].end),
+  }]));
+  for (let j = 0; j + 1 < order.length; j += 1) {
+    const a = order[j].index;
+    const b = order[j + 1].index;
+    if (b !== a + 1) continue;
+    const aWords = result.get(a);
+    const bWords = result.get(b);
+    const aEnd = Number(aWords[aWords.length - 1].end);
+    const bStart = Math.max(Number(bWords[0].start), aEnd + TOUCH_GAP_S);
+    times.get(a).end = aEnd;
+    times.get(b).start = bStart;
+  }
+  for (const [, t] of times) {
+    if (!(Number.isFinite(t.start) && Number.isFinite(t.end) && t.end - t.start >= 0.01)) return null;
+  }
+  return { words: result, times };
 }
 
 // "Unir" con la línea que vio el servidor (por identidad), nunca con la que
@@ -117,10 +166,16 @@ function relayout(segments, fix) {
     (s) => String(s.segment_id || "") === String(line.segment_id || "")));
   if (indexes.some((i) => i === -1)) return null;
   if (lines.some((line, k) => line.expect && keyText(segments[indexes[k]].text) !== line.expect)) return null;
+  const moved = relayoutWords(segments, indexes, lines.map((line) => line.text || ""));
   return segments.map((segment, i) => {
     const k = indexes.indexOf(i);
-    // Las palabras cambian de línea: los tiempos por palabra ya no sirven.
-    return k === -1 ? segment : { ...segment, text: lines[k].text, words: undefined };
+    if (k === -1) return segment;
+    if (moved) {
+      const { start, end } = moved.times.get(i);
+      return { ...segment, text: lines[k].text, start, end, words: moved.words.get(i) };
+    }
+    // Cambió alguna palabra: no hay relojes para el texto nuevo.
+    return { ...segment, text: lines[k].text, words: undefined };
   });
 }
 
