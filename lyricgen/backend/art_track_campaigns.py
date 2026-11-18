@@ -1090,8 +1090,24 @@ def _evaluate_close_intent(db, ddb, row, job, active, changed) -> tuple[list, li
 
 
 def _text_gate(db, job, resolvable) -> list[dict]:
-    """Pedidos a dejar abiertos porque su texto no está en la letra publicada."""
+    """Pedidos a dejar abiertos porque algún punto no está en la letra publicada.
+
+    El envío por campaña no pide justificaciones: un pedido con un punto ✘
+    queda abierto y se cierra desde Cambios/Campañas, punto por punto. Antes
+    "Marcar todos" cerraba por publicación pedidos corregidos a medias."""
     import change_request_publish_guard as guard
+    import change_request_verification as verification
+    if resolvable and verification.enabled():
+        kept = []
+        for request in resolvable:
+            try:
+                result = verification.verify_request(db, job, request, at=_now())
+            except Exception:
+                logger.warning("[DELIVERY] verification failed for change request %s", request.id, exc_info=True)
+                continue
+            if result is not None and result["blocking"]:
+                kept.append(verification.kept_entry(request, result))
+        return kept
     if not resolvable or not guard.enabled():
         return []
     _closable, kept = guard.text_gate(db, job, resolvable, _now())
@@ -1282,10 +1298,10 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         "resolved_change_requests": [r.id for r in resolvable],
                     }))
                     if text_kept:
-                        import change_request_publish_guard as guard
+                        import change_request_verification as verification
                         for kept in text_kept:
-                            db.add(guard.text_not_found_audit(op.created_by, job, kept, "campaign_bulk",
-                                                              delivery_batch_id=op.id, delivery_id=active.id))
+                            db.add(verification.kept_audit(op.created_by, job, kept, "campaign_bulk",
+                                                           delivery_batch_id=op.id, delivery_id=active.id))
                     ddb.commit()
                     db.commit()
                 except Exception:
