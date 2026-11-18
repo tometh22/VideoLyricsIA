@@ -669,7 +669,13 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
     assert batch.require_prebackground_approval(job)["editor_revision"] == approved_revision + 1
 
 
-def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch):
+@pytest.mark.parametrize("metadata,expected_ids", [
+    ([{}, {}], ["index:0", "index:1"]),
+    ([{"segment_id": "same"}, {"segment_id": "same"}], ["index:0", "index:1"]),
+    ([{"id": 16}, {"id": 16}], ["index:0", "index:1"]),
+    ([{}, {"segment_id": "index:0"}], ["index:0#1", "index:1"]),
+])
+def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch, metadata, expected_ids):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
     item = db.query(BatchCampaignItem).filter(
@@ -677,8 +683,8 @@ def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch)
     ).one()
     user = db.query(User).first()
     segments = [
-        {"start": 0, "end": 1, "text": "Hello"},
-        {"start": 1, "end": 2, "text": "mundo"},
+        {**metadata[0], "start": 0, "end": 1, "text": "Hello"},
+        {**metadata[1], "start": 1, "end": 2, "text": "mundo"},
     ]
     audio_sha = "c" * 64
     job = Job(
@@ -705,12 +711,32 @@ def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch)
     ))
     db.commit()
 
+    # A qualified occurrence ID is not a bypass: partial, reordered,
+    # repeated and stale attestations still fail on this exact document.
+    for ids, revision in [
+        (expected_ids[:1], 0), (list(reversed(expected_ids)), 0),
+        ([expected_ids[0], expected_ids[0]], 0), (expected_ids, 1),
+    ]:
+        with pytest.raises(HTTPException) as rejected:
+            batch.approve_campaign_lyrics(
+                campaign.id, job.job_id,
+                batch.LyricsApprovalRequest(editor_revision=revision, confirmed_line_ids=ids,
+                    lyrics_confirmed=True, timings_confirmed=True, heard_against_audio=True),
+                {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}, db,
+            )
+        assert rejected.value.status_code == 409
+        if revision:
+            assert rejected.value.detail == "editor_revision_conflict"
+        else:
+            assert rejected.value.detail["code"] == "review_lines_incomplete_or_stale"
+        db.rollback()
+
     response = batch.approve_campaign_lyrics(
         campaign.id,
         job.job_id,
         batch.LyricsApprovalRequest(
             editor_revision=0,
-            confirmed_line_ids=["index:0", "index:1"],
+            confirmed_line_ids=expected_ids,
             lyrics_confirmed=True,
             timings_confirmed=True,
             heard_against_audio=True,
@@ -721,6 +747,10 @@ def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch)
 
     assert response["status"] == "lyrics_approved"
     assert batch.require_prebackground_approval(job)["confirmed_line_count"] == 2
+
+    persisted = db.query(EditorDocument).filter_by(job_id=job.job_id).one()
+    assert persisted.current_segments == segments
+    assert job.segments_json == segments
 
 
 def test_human_approval_recovers_missing_reference_from_machine_evidence(
@@ -1650,3 +1680,26 @@ def test_queue_and_next_share_accent_code_and_unordered_search(db, monkeypatch, 
                  search="divididos otra", version=None, artist=None, reviewed_by=None,
                  x_editor_session="campaign_search_session", current_user=actor, db=db)
         assert result["job_id"] == ids[0]
+
+@pytest.mark.parametrize("segments,expected", [
+    ([{"segment_id": "same"}, {"segment_id": "same"}], ["index:0", "index:1"]),
+    ([{"id": "legacy"}, {"id": "legacy"}], ["index:0", "index:1"]),
+    ([{}, {"segment_id": "index:0"}], ["index:0#1", "index:1"]),
+    ([{"segment_id": "same"}, {"segment_id": "same"}, {"id": "index:0"}],
+     ["index:0#1", "index:1", "index:0"]),
+    ([{}, {"segment_id": "unique"}], ["index:0", "unique"]),
+])
+def test_review_ids_distinguish_legacy_occurrences_without_rewriting_rows(segments, expected):
+    from copy import deepcopy
+    before = deepcopy(segments)
+    assert batch._review_line_ids(segments) == expected
+    assert segments == before
+    assert len(set(expected)) == len(segments)
+
+
+def test_review_identity_shared_frontend_contract():
+    import json
+    from pathlib import Path
+    cases = json.loads((Path(__file__).resolve().parents[2] / "frontend" / "src" / "shared" / "reviewLineIds.json").read_text())
+    for case in cases:
+        assert batch._review_line_ids(case["segments"]) == case["expected"], case["name"]

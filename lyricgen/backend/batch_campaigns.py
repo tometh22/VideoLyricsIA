@@ -10,6 +10,7 @@ from __future__ import annotations
 from campaign_search import matches_search, matches_song
 
 import hashlib
+from collections import Counter
 import logging
 import math
 import os
@@ -1263,15 +1264,31 @@ def claim_next_review(
 
 
 def _review_line_ids(segments: list[dict[str, Any]]) -> list[str]:
+    def identity_text(value):
+        if isinstance(value, str):
+            return value.strip()
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and abs(value) <= 2**53 - 1 and math.isfinite(value) and value == int(value)):
+            return str(int(value))
+        return ""
+
+    # Match frontend reviewLineIds: identities attest occurrences in this
+    # exact revision, not a repair of stored segment metadata. Old split/copy
+    # operations can leave repeated IDs; reserve all literal IDs before
+    # allocating positional keys so even literal index:N/#suffix IDs are safe.
+    candidates = [identity_text(segment.get("segment_id"))
+                  or identity_text(segment.get("id")) or f"index:{index}"
+                  for index, segment in enumerate(segments)]
+    counts = Counter(candidates)
+    reserved = set(candidates)
     line_ids: list[str] = []
-    for index, segment in enumerate(segments):
-        value = str(segment.get("segment_id") or segment.get("id") or "").strip()
-        # Campaigns created before stable line identities were introduced
-        # contain only ordered lyric rows. Approval is already bound to the
-        # exact EditorDocument revision/version; this deterministic fallback
-        # lets the one song-level attestation cover those legacy rows without
-        # weakening the stale/partial-list check below.
-        value = value or f"index:{index}"
+    for index, value in enumerate(candidates):
+        if counts[value] > 1:
+            base = value = f"index:{index}"
+            suffix = 1
+            while value in reserved or value in line_ids:
+                value = f"{base}#{suffix}"
+                suffix += 1
         if value in line_ids:
             raise HTTPException(
                 status_code=409,

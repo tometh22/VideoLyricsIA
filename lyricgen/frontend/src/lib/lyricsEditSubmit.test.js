@@ -295,3 +295,13 @@ describe("submitLyricsEdit", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+it.each(["review_line_identity_missing", "review_lines_incomplete_or_stale"])(
+  "explains %s without retrying or bypassing the approval guard", code => {
+    const result = campaignApprovalFailure({ status: 409 }, { detail: { code } }, () => null);
+    expect(result.reason).toBe("http-409");
+    expect(result.message).toMatch(/Guardá tus cambios/);
+    expect(result.message).not.toContain(code);
+    expect(result.conflict).toBeNull();
+  },
+);

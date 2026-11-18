@@ -1,3 +1,4 @@
+import { reviewLineIds } from "../lib/reviewLineIds";
 import DisplaySegmentationNotice from "./DisplaySegmentationNotice";
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { editorSeekProperties } from "../lib/editorSeekTelemetry";
@@ -4521,17 +4522,10 @@ export default function LyricsEditor({
     // The campaign CTA is the one song-level attestation. Send every line
     // identity from that exact persisted snapshot so the backend can still
     // reject stale/partial documents without requiring per-line clicks.
-    const confirmedLineIdsForApproval = cleaned
-      .filter((segment) => requireLineReview || reviewedLineIds.includes(segment._id))
-      .map((segment, index) => {
-        const persistedIdentity = String(segment.segment_id || segment.id || "").trim();
-        // The August campaign was materialized before stable `segment_id`s
-        // existed. Its durable revision still binds the exact snapshot, so
-        // use the same ordered fallback as the API instead of submitting an
-        // empty list and making every legacy song impossible to approve.
-        return persistedIdentity || `index:${index}`;
-      })
-      .filter(Boolean);
+    const cleanedReviewIds = reviewLineIds(cleaned);
+    const confirmedLineIdsForApproval = cleanedReviewIds.filter((_, index) =>
+      requireLineReview || reviewedLineIds.includes(cleaned[index]._id));
+
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
@@ -4623,6 +4617,7 @@ export default function LyricsEditor({
       // write, including equivalent identity/renderer metadata replacements.
       // Non-campaign reviews retain only the originally reviewed occurrences.
       const confirmedIdsForSnapshot = (snapshot) => {
+        const snapshotReviewIds = reviewLineIds(snapshot);
         const unmatched = new Set(cleaned.map((_, index) => index));
         return snapshot.flatMap((segment, index) => {
           let reviewed = requireLineReview;
@@ -4639,7 +4634,7 @@ export default function LyricsEditor({
             }
           }
           if (!reviewed) return [];
-          return [String(segment.segment_id || segment.id || "").trim() || `index:${index}`];
+          return [snapshotReviewIds[index]];
         });
       };
       let approvalResult = null;
