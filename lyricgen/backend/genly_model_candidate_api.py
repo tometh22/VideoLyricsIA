@@ -55,23 +55,47 @@ def _changed(old, new):
     return False
 
 
-def _segments(rows, duration):
+def _segments(rows, duration, baseline=None):
     if not isinstance(rows, list) or not rows or len(rows) > 5000:
         raise ValueError("invalid_candidate_segments")
     cleaned = []
-    for row in rows:
+    baseline = baseline if isinstance(baseline, list) and len(baseline) == len(rows) else []
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError("invalid_candidate_segment")
         start, end = _number(row.get("start")), _number(row.get("end"))
         text = row.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 2000 or not 0 <= start < end <= duration + .001:
             raise ValueError("invalid_candidate_segment")
+        old = baseline[index] if baseline else None
         if cleaned and start < cleaned[-1]["end"] - .0001:
-            raise ValueError("candidate_timeline_overlap")
+            # Existing editor timelines may contain overlaps. Retaining the
+            # exact pair's bounds does not introduce or enlarge an overlap.
+            inherited_overlap = (baseline and
+                (start, end) == (old.get("start"), old.get("end")) and
+                (cleaned[-1]["start"], cleaned[-1]["end"]) ==
+                (baseline[index - 1].get("start"), baseline[index - 1].get("end")))
+            if not inherited_overlap:
+                raise ValueError("candidate_timeline_overlap")
         item = {"text": text.strip(), "start": start, "end": end}
         if row.get("words"):
             if not isinstance(row["words"], list) or len(row["words"]) > 1000:
                 raise ValueError("invalid_candidate_words")
+            # Legacy word evidence can disagree with edited accents/text or
+            # contain historical timing defects. Preserve it byte-for-byte
+            # only when the live source has exactly the same text and words,
+            # and the line's bounds have not narrowed. This is preservation,
+            # never a new alignment certification.
+            inherited_words = (old is not None and text == old.get("text") and
+                               row["words"] == old.get("words") and
+                               start <= _number(old.get("start")) and
+                               end >= _number(old.get("end")))
+            if inherited_words:
+                item["words"] = deepcopy(old["words"])
+                if "word_alignment_status" in old:
+                    item["word_alignment_status"] = deepcopy(old["word_alignment_status"])
+                cleaned.append(item)
+                continue
             words = []
             for word in row["words"]:
                 if not isinstance(word, dict):
@@ -227,7 +251,7 @@ def prepare_candidate(song, report):
     if status == "complete" and not coverage["full_audio_covered"]:
         raise ValueError("complete_result_has_audio_gaps")
     baseline = deepcopy(song["segments"])
-    candidate = _segments(report.get("candidate_segments"), coverage["duration_seconds"])
+    candidate = _segments(report.get("candidate_segments"), coverage["duration_seconds"], baseline=baseline)
     if len(candidate) != len(baseline):
         raise ValueError("candidate_line_correspondence_required")
     original_keys = {_view(row) for row in song.get("original_segments", [])}

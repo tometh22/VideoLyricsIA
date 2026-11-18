@@ -117,6 +117,54 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(len(candidate["changes"]), 1)
         self.assertEqual(proposal["windows"][0]["suggestion_type"], "timing")
 
+    def test_real_legacy_accent_mismatch_is_retained_without_recertification(self):
+        # Minimal reproduction of Es Tan Facil's unchanged live line 29.
+        row = {"text": "Al final, tú vas a perder", "start": 140.26, "end": 143.39,
+               "words": [{"word": word, "start": start, "end": end, "score": .9}
+                         for word, start, end in [("Al", 140.34, 140.62), ("final", 140.72, 141.14),
+                            ("tu", 141.16, 141.38), ("vas", 141.38, 141.64),
+                            ("a", 141.68, 141.76), ("perder", 141.82, 143.)]]}
+        song, report = fixture()
+        song.update(segments=[deepcopy(row)], original_segments=[deepcopy(row)], segments_sha256=digest([row]))
+        report.update(source=source_binding(song), candidate_segments=[deepcopy(row)],
+                      coverage={"duration_seconds": 150., "analyzed_intervals": [[0., 150.]]})
+        candidate, proposal = api.prepare_candidate(song, report)
+        self.assertEqual(candidate["segments"], [row])
+        self.assertIsNone(proposal)
+        report["candidate_segments"][0]["end"] = 144.
+        candidate, _ = api.prepare_candidate(song, report)
+        self.assertEqual(candidate["segments"][0]["words"], row["words"])
+        self.assertNotIn("word_alignment_status", candidate["segments"][0])
+        for change in ("text", "words", "bounds"):
+            altered = deepcopy(report)
+            if change == "text":
+                altered["candidate_segments"][0]["text"] += " más"
+            elif change == "words":
+                altered["candidate_segments"][0]["words"][0]["end"] += .01
+            else:
+                altered["candidate_segments"][0]["start"] += .01
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "words_text_mismatch"):
+                api.prepare_candidate(song, altered)
+
+    def test_only_exact_legacy_overlap_bounds_are_allowed(self):
+        song, report = fixture()
+        song["segments"][0]["end"] = 4.2
+        song["original_segments"] = deepcopy(song["segments"])
+        song["segments_sha256"] = digest(song["segments"])
+        report.update(source=source_binding(song), candidate_segments=deepcopy(song["segments"]))
+        candidate, proposal = api.prepare_candidate(song, report)
+        self.assertEqual(candidate["segments"], song["segments"])
+        self.assertIsNone(proposal)
+        for index, field, value in [(0, "end", 4.3), (1, "start", 3.9), (1, "end", 6.1)]:
+            altered = deepcopy(report)
+            altered["candidate_segments"][index][field] = value
+            with self.subTest(index=index, field=field), self.assertRaisesRegex(ValueError, "timeline_overlap"):
+                api.prepare_candidate(song, altered)
+        song, report = fixture()
+        report["candidate_segments"][0]["end"] = 4.2
+        with self.assertRaisesRegex(ValueError, "timeline_overlap"):
+            api.prepare_candidate(song, report)
+
     def test_metadata_and_client_proposal_are_not_trusted(self):
         song, report = fixture()
         song["segments"][0].update(pos=[.5, .8], scale=1.2, rot=3, speaker="lead")
