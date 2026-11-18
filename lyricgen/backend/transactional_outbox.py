@@ -7,10 +7,13 @@ timeout never requires rewinding an editor revision (the classic ABA bug).
 
 from __future__ import annotations
 
+import logging
 import uuid
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 
 OUTBOX_CONSUMER_MIN_LEASE_SECONDS = 3900
@@ -176,6 +179,20 @@ def create_pipeline_outbox_event(
     pipeline_kwargs: dict[str, Any],
 ):
     """Commit-ready intent for a render pipeline invocation."""
+    # Every render (generate, edit, retry, campaign, art track) passes here:
+    # the title card and the portal snapshot both come from the Job, so the
+    # UMG-canonical artist/title is fixed once, before anything is drawn.
+    try:
+        from umg_metadata import normalize_job
+
+        fixed = normalize_job(db, job)
+    except Exception:  # pragma: no cover - a name check never blocks a render
+        logger.warning("[OUTBOX] metadata normalization skipped job=%s", job.job_id, exc_info=True)
+        fixed = None
+    if fixed is not None:
+        artist = fixed.artist
+        if "song_title" in pipeline_kwargs:
+            pipeline_kwargs = {**pipeline_kwargs, "song_title": fixed.title}
     event = create_outbox_event(
         db,
         job_id=job.job_id,

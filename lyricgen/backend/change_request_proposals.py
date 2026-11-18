@@ -393,6 +393,23 @@ def _manual_operation(instruction: dict) -> dict:
     }
 
 
+def _canonical_request_met(metadata, field, requested) -> bool:
+    """"Corregir artista: LOS ENANITOS VERDES" ya está cumplido si el video
+    dice "Los Enanitos Verdes": el catálogo de UMG fija la escritura y el
+    render vuelve a ella; proponer el cambio otra vez no lo acerca."""
+    if not requested or field not in {"artist", "song_title"}:
+        return False
+    try:
+        from umg_metadata import normalize
+    except ImportError:  # pragma: no cover
+        return False
+    if field == "artist":
+        expected = normalize(requested, metadata.get("song_title") or "").artist
+    else:
+        expected = normalize(metadata.get("artist") or "", requested).title
+    return bool(expected) and metadata.get(field) == expected != requested
+
+
 def _explicit_timing_operation(segments, instruction, metadata, duration):
     op = _manual_operation(instruction)
     kind = instruction.get("kind")
@@ -404,7 +421,8 @@ def _explicit_timing_operation(segments, instruction, metadata, duration):
         if field not in {"artist", "song_title"} or not instruction.get("requested_text"):
             op["reason"] = "unsupported_metadata_field"
             return op
-        if metadata.get(field) == instruction.get("requested_text"):
+        if metadata.get(field) == instruction.get("requested_text") or _canonical_request_met(
+                metadata, field, instruction.get("requested_text")):
             op.update(status="already_satisfied", reason="already_satisfied", warnings=[])
             return op
     elif kind == "delete_from":
