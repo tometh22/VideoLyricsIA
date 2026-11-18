@@ -84,6 +84,8 @@ describe("third audit: structure and deferred propagation", () => {
       neighbour,
     ], { referenceLyrics: "primera parte\nsegunda parte" });
     fireEvent.click(screen.getByRole("button", { name: /Aplicar corrección/ }));
+    expect(segmentsStore.get(job)).toHaveLength(2);
+    fireEvent.click(screen.getByTestId("confirm-apply-fixes"));
     const saved = canonicalizeEditorSegments(segmentsStore.get(job));
     expect(saved).toHaveLength(3);
     expect(saved.find(row => row.segment_id === "neighbour")).toMatchObject(neighbour);
