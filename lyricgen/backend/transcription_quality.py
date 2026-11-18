@@ -413,6 +413,10 @@ def supersede_pending_analysis(
         for key in ("reference_hypothesis_unavailable", "manual_full_review_required"):
             if key in quality:
                 updated[key] = deepcopy(quality[key])
+    # Bound to the recording, not to the edited text (same as the reference):
+    # the language review must keep comparing the edited lines against it.
+    if isinstance(quality.get("language_probe"), dict):
+        updated["language_probe"] = deepcopy(quality["language_probe"])
     updated.update({
         "decision": "review_required", "render_blocked": True,
         "analysis_pending": False,

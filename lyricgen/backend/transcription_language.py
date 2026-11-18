@@ -356,6 +356,89 @@ def diagnostic_reference_text(result: dict) -> str:
     return str(result.get("reference_lyrics") or "")
 
 
+
+# --- Independent sung-language probe (language_probe.py) -----------------
+# WhisperX can translate a verse instead of transcribing it when it guesses the
+# wrong language from the intro. The output is then "mixed" (es + en) and the
+# contract above exempts it as a bilingual song, and without a reference no
+# discrepancy can fire. The probe is audio-derived and lyric-free: it only says
+# which languages are sung. A delivered line confidently written in a language
+# the probe never heard, or in a non-Latin script the probe never heard, is a
+# language discrepancy for human review. Never forces, never rewrites.
+_NON_LATIN_SCRIPT = re.compile(
+    "[\u0370-\u03FF\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u10A0-\u10FF"
+    "\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]"
+)
+_LATIN_SCRIPT_PROBE_LANGUAGES = SUPPORTED_LANGUAGES | frozenset(
+    "ca gl eu la nl sv da no nb nn pl cs sk ro hu tr id ms tl sw fi et lv lt sl hr bs sq is ga cy vi".split()
+)
+_PROBE_MIN_LINE_WORDS = 3
+_PROBE_MIN_CONFLICT_LINES = 2
+
+
+def line_language(text: str) -> str | None:
+    """Confident language of ONE line, or ``None`` (the usual answer).
+
+    Needs two marker hits, more than twice the runner-up, and one diagnostic
+    marker. Short or Romance-ambiguous lines abstain.
+    """
+    normalized = unicodedata.normalize("NFC", text or "").casefold()
+    normalized = normalized.replace("\u2019", "'").replace("'", " ")
+    tokens = re.findall(r"[^\W\d_]+", normalized, re.UNICODE)
+    if len(tokens) < _PROBE_MIN_LINE_WORDS:
+        return None
+    scores = sorted(
+        ((sum(token in markers for token in tokens), language)
+         for language, markers in _MARKERS.items()),
+        reverse=True,
+    )
+    (best, language), (runner, _) = scores[0], scores[1]
+    if best < 2 or best <= 2 * runner:
+        return None
+    if not set(tokens) & _DIAGNOSTIC_MARKERS[language]:
+        return None
+    return language
+
+
+def probe_conflict_indices(output, language_probe) -> list[int]:
+    """Lines whose language the independent probe never heard.
+
+    Abstains (``[]``) when the probe is missing/unavailable, reports a
+    language this module cannot classify (no coercion of e.g. Catalan), or
+    fewer than two lines conflict.
+    """
+    probe = language_probe if isinstance(language_probe, dict) else {}
+    if probe.get("status") != "ok":
+        return []
+    heard = {str(code).strip().lower() for code in probe.get("languages") or [] if code}
+    if not heard or not heard <= SUPPORTED_LANGUAGES:
+        return []
+    latin_only = heard <= _LATIN_SCRIPT_PROBE_LANGUAGES
+    conflicts = []
+    for index, text in enumerate(_texts(output)):
+        if latin_only and _NON_LATIN_SCRIPT.search(text or ""):
+            conflicts.append(index)
+            continue
+        language = line_language(text)
+        if language and language not in heard:
+            conflicts.append(index)
+    return conflicts if len(conflicts) >= _PROBE_MIN_CONFLICT_LINES else []
+
+
+def probe_summary(language_probe) -> dict | None:
+    """Client-safe view of the probe (no lyric text ever lives in it)."""
+    probe = language_probe if isinstance(language_probe, dict) else None
+    if not probe:
+        return None
+    main = normalize_language(probe.get("main_language"))
+    return {
+        "status": str(probe.get("status") or "unavailable"),
+        "source": str(probe.get("source") or "gemini"),
+        "main_language": main,
+        "languages": sorted(str(code) for code in probe.get("languages") or []),
+    }
+
+
 def build_language_contract(
     output,
     reference_text: str = "",
@@ -363,6 +446,7 @@ def build_language_contract(
     *,
     expected_hint: str | None = None,
     infer_uncertain_from_request: bool = True,
+    language_probe: dict | None = None,
 ) -> dict:
     """Single source of truth for the language / discrepancy contract.
 
@@ -395,6 +479,10 @@ def build_language_contract(
         and expected_language not in detected_languages
         and not mixed_language
     )
+    # The probe conflict deliberately ignores ``mixed_language``: a verse
+    # translated by the ASR is exactly what makes an output look bilingual.
+    probe_indices = probe_conflict_indices(output, language_probe)
+    language_conflict = bool(language_conflict or probe_indices)
     divergence = reference_divergence(output, reference_text)
     localized_drift = localized_reference_drift(output, reference_text)
     output_reference_divergence = bool(
@@ -426,8 +514,13 @@ def build_language_contract(
         "language_uncertain": language_uncertain,
         "output_reference_divergence": output_reference_divergence,
         "output_reference_divergence_ratio": round(divergence["ratio"], 3),
-        "output_reference_unexplained_indices": sorted(set(divergence["unexplained_indices"]) | set(localized_drift)),
+        "output_reference_unexplained_indices": sorted(
+            set(divergence["unexplained_indices"]) | set(localized_drift) | set(probe_indices)
+        ),
         "output_reference_localized_drift_indices": localized_drift,
+        "language_probe": probe_summary(language_probe),
+        "language_probe_conflict": bool(probe_indices),
+        "language_probe_conflict_indices": probe_indices,
         "needs_language_review": bool(
             language_conflict or output_reference_divergence
         ),
@@ -440,7 +533,10 @@ __all__ = [
     "diagnose_language_state",
     "detect_text_language",
     "detect_text_languages",
+    "line_language",
     "normalize_language",
+    "probe_conflict_indices",
+    "probe_summary",
     "reference_divergence",
     "resolve_transcription_language",
 ]

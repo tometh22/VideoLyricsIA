@@ -48,6 +48,13 @@ def reference_text_of(transcription_quality) -> str:
     return str(hypothesis.get("reference_text") or "")
 
 
+def language_probe_of(transcription_quality) -> dict | None:
+    """The independent sung-language probe persisted on the job, or None."""
+    tq = transcription_quality if isinstance(transcription_quality, dict) else {}
+    probe = tq.get("language_probe")
+    return probe if isinstance(probe, dict) else None
+
+
 def resolution_matches(transcription_quality, revision, segments) -> bool:
     """True only when a human resolution is bound to the CURRENT revision+hash.
 
@@ -79,6 +86,9 @@ def review_payload(segments, transcription_quality, revision) -> dict:
         # block approvals across the catalogue. Only reconstructable evidence
         # (reference discrepancy / conflict) may gate.
         infer_uncertain_from_request=False,
+        # Audio-derived, lyric-free and persisted with the job, so it is as
+        # reconstructable as the reference and may gate approval.
+        language_probe=language_probe_of(transcription_quality),
     )
     payload["language_review_resolved"] = resolution_matches(
         transcription_quality, revision, segments,
