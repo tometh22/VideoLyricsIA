@@ -17,12 +17,12 @@ import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, File, Form, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, File, Form, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 import delivery_freshness
 from auth import get_current_user, has_scenes_access
@@ -312,7 +312,9 @@ def validate_combination(db, campaign, settings, group, user):
 @router.get("/{campaign_id}/creative")
 def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     campaign = _campaign(db, campaign_id, current_user)
-    jobs = {j.campaign_item_id: j for j in db.query(Job).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
+    jobs = {j.campaign_item_id: j for j in db.query(
+        Job.campaign_item_id, Job.job_id, Job.status,
+    ).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
     plan = _plan(campaign)
     plan = {**plan, "groups": [
         {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
@@ -610,13 +612,23 @@ def save_individual(campaign_id: str, item_id: str, body: IndividualRequest,
     return {"revision": plan["revision"]}
 
 
-def campaign_jobs(db, campaign):
+def campaign_jobs(db, campaign, *, job_id=None):
     # Include pre-feature variants by ancestry, always intersecting tenant.
     from sqlalchemy import select, or_
     lineage = select(Job.job_id).where(Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id).cte(recursive=True)
     lineage = lineage.union(select(Job.job_id).join(lineage, Job.parent_job_id == lineage.c.job_id).where(
         Job.tenant_id == campaign.tenant_id, or_(Job.campaign_id.is_(None), Job.campaign_id == campaign.id)))
-    return db.query(Job).filter(Job.job_id.in_(select(lineage.c.job_id)), Job.tenant_id == campaign.tenant_id).all()
+    query = db.query(Job).options(load_only(
+        Job.job_id, Job.parent_job_id, Job.campaign_item_id,
+        Job.artist, Job.song_title, Job.filename, Job.status,
+        Job.created_at, Job.approved_at, Job.video_url, Job.render_params,
+        # Publication freshness must keep using the current render identity.
+        Job.previous_versions, Job.edit_count, Job.completed_at,
+        raiseload=True,
+    )).filter(Job.job_id.in_(select(lineage.c.job_id)), Job.tenant_id == campaign.tenant_id)
+    if job_id is not None:
+        query = query.filter(Job.job_id == job_id)
+    return query.all()
 
 
 def portal_history(job_ids, tenant_id):
@@ -718,11 +730,19 @@ def portal_history(job_ids, tenant_id):
     return result
 
 
-def history_rows(db, campaign):
+def history_rows(db, campaign, *, items=None, job_id=None):
     rows = []
     jobs_by_id = {}
-    codes = {item.id: item.technical_code for item in _items(db, campaign)}
-    for j in sorted(campaign_jobs(db, campaign), key=lambda j: (str(j.created_at), j.job_id), reverse=True):
+    jobs = campaign_jobs(db, campaign, job_id=job_id)
+    if items is None:
+        # The history only needs item codes, not private source manifests.
+        item_ids = {job.campaign_item_id for job in jobs if job.campaign_item_id}
+        items = db.query(BatchCampaignItem.id, BatchCampaignItem.technical_code).filter(
+            BatchCampaignItem.campaign_id == campaign.id,
+            BatchCampaignItem.id.in_(item_ids),
+        ).all() if item_ids else []
+    codes = {item.id: item.technical_code for item in items}
+    for j in sorted(jobs, key=lambda j: (str(j.created_at), j.job_id), reverse=True):
         jobs_by_id[j.job_id] = j
         rp = j.render_params or {}
         if not j.video_url and not rp.get("campaign_creative_receipt") and j.status not in {"queued", "processing", "rendering", "editing", "pending_review", "done"}:
@@ -786,12 +806,49 @@ def public_audit_detail(value):
 
 
 @router.get("/{campaign_id}/creative/report")
-def report(campaign_id: str, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+def report(
+    campaign_id: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+    *,
+    job_id: Annotated[str | None, Query(min_length=12, max_length=12)] = None,
+    history_limit: Annotated[int | None, Query(ge=0, le=200)] = None,
+    history_offset: Annotated[int, Query(ge=0)] = 0,
+):
     campaign = _campaign(db, campaign_id, current_user)
+    # Drawers need evidence for one song, not every video, assignment and
+    # audit JSON in the campaign. Keep the full export contract as the default.
+    if job_id is not None:
+        videos = history_rows(db, campaign, job_id=job_id)
+        if not videos:
+            fail("Video no disponible en esta campaña", 404)
+        return {"campaign_id": campaign.id, "name": campaign.name, "at": now(),
+                "contract": {}, "groups": [], "videos": videos,
+                "assignments": [], "history": []}
     contract = _plan(campaign).get("contract") or {}
-    videos = history_rows(db, campaign)
-    delivered = {(r.detail["job_id"], r.detail["video_sha256"]) for r in _logs(db, campaign, "delivered").all()}
     items = {i.id: i for i in _items(db, campaign)}
+    videos = history_rows(db, campaign, items=items.values())
+    history_query = db.query(
+        AuditLog.created_at, AuditLog.user_id, AuditLog.action, AuditLog.detail,
+    ).filter(AuditLog.action.in_([
+        "campaign.creative.applied", "campaign.creative.undone", "campaign.creative.individual",
+        "campaign.creative.rendered", "campaign.creative.delivered",
+    ]), AuditLog.detail["campaign_id"].as_string() == campaign.id).order_by(AuditLog.id)
+    if history_limit is None:
+        history = history_query.all()
+        delivered = {(r.detail["job_id"], r.detail["video_sha256"]) for r in history
+                     if r.action == "campaign.creative.delivered"}
+        history_has_more = False
+    else:
+        # Paginate in SQL, before reading/decoding the potentially large JSON.
+        fetched = history_query.offset(history_offset).limit(history_limit + 1).all() if history_limit else []
+        history = fetched[:history_limit]
+        history_has_more = len(fetched) > history_limit
+        delivered = {(r.job_id, r.video_sha256) for r in db.query(
+            AuditLog.detail["job_id"].as_string().label("job_id"),
+            AuditLog.detail["video_sha256"].as_string().label("video_sha256"),
+        ).filter(AuditLog.action == "campaign.creative.delivered",
+                 AuditLog.detail["campaign_id"].as_string() == campaign.id).all()}
     groups = []
     for index, g in enumerate(contract.get("groups", [])):
         ids = {i for i in contract.get("item_ids", []) if i in items and (items[i].render_overrides or {}).get(ASSIGNMENT, {}).get("group_id") == g["id"]}
@@ -802,14 +859,18 @@ def report(campaign_id: str, current_user=Depends(get_current_user), db: Session
                        "approved": sum(v["status"] == "done" and bool(v["approved_at"]) for v in principal),
                        "verified": sum(v["compliance"] == "verified" for v in principal),
                        "delivered": sum((v["job_id"], v["evidence"].get("video_sha256")) in delivered for v in principal)})
-    return {"campaign_id": campaign.id, "name": campaign.name, "at": now(), "contract": contract,
+    result = {"campaign_id": campaign.id, "name": campaign.name, "at": now(), "contract": contract,
             "groups": groups, "videos": videos, "delivery_note": "La generación no acredita entrega al cliente. Registrar la entrega del archivo aprobado.",
             "assignments": [{"item_id": i.id, "artist": i.artist, "title": i.title or i.filename,
                              "assignment": (i.render_overrides or {}).get(ASSIGNMENT) or {},
                              "settings": effective_settings(campaign, i.render_overrides)} for i in items.values()],
             "history": [{"at": str(r.created_at), "actor": r.user_id, "action": r.action, "detail": public_audit_detail(r.detail)}
-                        for r in db.query(AuditLog).filter(AuditLog.action.in_(["campaign.creative.applied", "campaign.creative.undone", "campaign.creative.individual", "campaign.creative.rendered", "campaign.creative.delivered"]),
-                        AuditLog.detail["campaign_id"].as_string() == campaign.id).order_by(AuditLog.id).all()]}
+                        for r in history]}
+    if history_limit is not None:
+        result["history_pagination"] = {"offset": history_offset, "limit": history_limit,
+                                        "has_more": history_has_more,
+                                        "next_offset": history_offset + len(history) if history_has_more else None}
+    return result
 
 
 @router.get("/{campaign_id}/creative/export.csv")

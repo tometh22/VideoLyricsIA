@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.174] - 2026-11-18
+
+### Fixed
+- Speed up campaign navigation with grouped summary counts, bounded job projections, shared review activity reads, and on-demand review and delivery details. Keep publication freshness, reviewer provenance and tenant permissions intact.
+- Coalesce campaign refresh requests and avoid polling unchanged reports while navigating between campaign stages.
+
 ## [1.1.173] - 2026-11-17
 
 ### Fixed

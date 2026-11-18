@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import "./ContractReport.print.css";
-import { authHeaders, campaignApiBase } from "../../lib/campaignApi";
+import { authHeaders, campaignApiBase, campaignRequest } from "../../lib/campaignApi";
 import { Banner, Button, EmptyState, ProgressBar } from "./ui";
 
 const METRICS = [
@@ -17,16 +18,43 @@ async function download(campaignId, extension) {
 }
 
 /** Contract and compliance: what was promised versus what exists as evidence. */
-export default function ContractReport({ campaignId, report, fields = {}, items = [], onRegister }) {
+export default function ContractReport({ campaignId, report: initialReport, fields = {}, items = [], onRegister }) {
   const [error, setError] = useState("");
+  const [loadedReport, setLoadedReport] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const currentReport = useRef(initialReport);
+  currentReport.current = initialReport;
+  useEffect(() => { setLoadedReport(null); }, [initialReport]);
+  const report = loadedReport || initialReport;
   if (!report) return null;
+  const loadMoreHistory = async () => {
+    if (loadingHistory) return;
+    setLoadingHistory(true); setError("");
+    const source = initialReport;
+    try {
+      const next = await campaignRequest(`/batch/campaigns/${encodeURIComponent(campaignId)}/creative/report?history_limit=50&history_offset=${report.history_pagination.next_offset}`);
+      if (currentReport.current !== source) return;
+      setLoadedReport({ ...report, history: [...(report.history || []), ...(next.history || [])], history_pagination: next.history_pagination });
+    } catch (err) { setError(err.message); }
+    finally { setLoadingHistory(false); }
+  };
   const contract = report.contract || {};
   const universe = contract.item_ids?.length || 0;
   const hasContract = Boolean(contract.revision || contract.agreement || report.groups?.length);
   const exports = <div className="campaign-no-print flex flex-wrap gap-2">
     <Button size="sm" onClick={() => download(campaignId, "csv").catch((e) => setError(e.message))}>Exportar CSV</Button>
     <Button size="sm" onClick={() => download(campaignId, "xlsx").catch((e) => setError(e.message))}>Exportar Excel</Button>
-    <Button size="sm" variant="ghost" onClick={() => {
+    <Button size="sm" variant="ghost" disabled={loadingHistory} onClick={async () => {
+      // Printing is an explicit request for the entire audit, unlike opening
+      // this screen. Never silently print only the first history page.
+      if (report.history_pagination?.has_more) {
+        setLoadingHistory(true);
+        try {
+          const complete = await campaignRequest(`/batch/campaigns/${encodeURIComponent(campaignId)}/creative/report`);
+          flushSync(() => setLoadedReport(complete));
+        } catch (err) { setError(err.message); return; }
+        finally { setLoadingHistory(false); }
+      }
       const nodes = [...document.querySelectorAll("#campaign-contract-report details")];
       const closed = nodes.filter((node) => !node.open);
       closed.forEach((node) => { node.open = true; });
@@ -83,7 +111,7 @@ export default function ContractReport({ campaignId, report, fields = {}, items 
         </details>)}
       </div>
     </section>
-    {report.history?.length > 0 && <section className="space-y-2">
+    {(report.history?.length > 0 || report.history_pagination?.has_more) && <section className="space-y-2">
       <h3 className="font-semibold">Historial de cambios</h3>
       <div className="divide-y divide-white/[0.06] rounded-card ring-1 ring-white/[0.06]">
         {report.history.map((entry, index) => <details key={index} className="px-4 py-2.5 text-sm">
@@ -95,6 +123,7 @@ export default function ContractReport({ campaignId, report, fields = {}, items 
           </div>)}
         </details>)}
       </div>
+      {report.history_pagination?.has_more && <Button size="sm" disabled={loadingHistory} onClick={loadMoreHistory}>{loadingHistory ? "Cargando historial…" : "Cargar más cambios"}</Button>}
     </section>}
   </div>;
 }
