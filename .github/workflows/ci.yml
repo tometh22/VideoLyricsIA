@@ -30,7 +30,9 @@ jobs:
   backend_fast:
     name: backend-fast
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
@@ -84,7 +86,9 @@ jobs:
       github.event_name != 'pull_request' ||
       github.base_ref != 'staging' ||
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: lyricgen/backend
@@ -281,7 +285,9 @@ jobs:
        github.base_ref != 'staging' ||
        vars.STAGING_MERGE_QUEUE_ENABLED != 'true')
     needs: [backend_shards]
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Require every shard to succeed
@@ -302,7 +308,9 @@ jobs:
       github.event_name != 'pull_request' ||
       github.base_ref != 'staging' ||
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: lyricgen/frontend
@@ -353,7 +361,9 @@ jobs:
       github.event_name != 'pull_request' ||
       github.base_ref != 'staging' ||
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     env:
       DATABASE_URL: postgresql+psycopg2://genly:genly@127.0.0.1:5432/genly_editor_e2e
       JWT_SECRET: editor-e2e-ci-secret
@@ -436,7 +446,9 @@ jobs:
       github.event_name != 'pull_request' ||
       github.base_ref != 'staging' ||
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: sentinel
@@ -465,7 +477,9 @@ jobs:
       github.event_name != 'pull_request' ||
       github.base_ref != 'staging' ||
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -504,7 +518,9 @@ jobs:
   ci_gate:
     name: ci-gate
     if: always()
-    runs-on: ubuntu-latest
+    # Fijado 18-nov-2026: ubuntu-latest migra a 26.04 (FFmpeg 8, libavcodec62) y el
+    # fixture ProRes de test_validate_umg_master sale sin color_space. Sin cambiar el validador.
+    runs-on: ubuntu-24.04
     needs: [backend_fast, backend, frontend, editor-collaboration, sentinel, docker]
     env:
       EVENT_NAME: ${{ github.event_name }}
