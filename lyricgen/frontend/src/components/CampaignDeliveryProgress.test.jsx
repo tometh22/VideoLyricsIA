@@ -27,6 +27,16 @@ it("explains a partial delivery and selects only failed videos for retry", async
   expect(screen.getByRole("link", { name: "Abrir portal Chile" })).toHaveAttribute("href", "https://umgchile.genly.pro");
 });
 
+it("tells which artist or title UMG expects when a song is held back", async () => {
+  const request = vi.fn().mockResolvedValue({ status: "partial", sent_count: 0, total_count: 1, items: [
+    { job_id: "j1", status: "failed", error_code: "metadata_not_canonical",
+      error_detail: "El nombre no es el que pidió UMG: corregí artista «Charly García» (Editar → artista/título) y volvé a renderizar antes de publicar." },
+  ] });
+  render(<CampaignDeliveryProgress operationId="op-m" request={request} onSelectFailed={vi.fn()} />);
+  expect(await screen.findByText(/no están escritos como los pide UMG/)).toBeInTheDocument();
+  expect(screen.getByText(/«Charly García»/)).toBeInTheDocument();
+});
+
 it("retries a failed status lookup without creating another delivery", async () => {
   const request = vi.fn().mockRejectedValueOnce(new Error("Sin conexión")).mockResolvedValue({ status: "completed", sent_count: 2, total_count: 2, items: [] });
   render(<CampaignDeliveryProgress operationId="operation-2" request={request} onSelectFailed={vi.fn()} />);

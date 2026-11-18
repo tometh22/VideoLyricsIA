@@ -118,7 +118,15 @@ export default function ChangeRequestQueue({
                     {workflow.label}
                   </p>
                   <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] text-gray-600">
-                    <span className="truncate">{PORTAL_LABELS[delivery.portal_id] || delivery.portal_id || "Portal"}</span>
+                    <span className="truncate">
+                      {PORTAL_LABELS[delivery.portal_id] || delivery.portal_id || "Portal"}
+                      {item.recurrences?.length > 0 && (
+                        <span className="ml-1.5 rounded-full bg-red-500/15 px-1.5 py-0.5 font-semibold text-red-200"
+                          title={`Repite puntos del pedido #${item.recurrences[0].request_id}, ya cerrado`}>
+                          Reincidencia
+                        </span>
+                      )}
+                    </span>
                     <span className="shrink-0">{fmtAgo(item.submitted_at)}</span>
                   </div>
                 </div>

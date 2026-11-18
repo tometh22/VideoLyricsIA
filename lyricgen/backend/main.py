@@ -18731,6 +18731,17 @@ def request_edit(
     if _new_title:
         job.song_title = _new_title
         edit_params["song_title"] = _new_title
+    # Una corrección de nombre en un video de UMG se recuerda: la próxima
+    # canción del mismo artista ya sale escrita como la pidió el cliente.
+    import umg_metadata as _umg_metadata
+    if _umg_metadata.applies_to_job(job):
+        for _field, _before, _after in (
+            ("artist", _pre_edit_artist, _new_artist),
+            ("song_title", _pre_edit_song_title, _new_title),
+        ):
+            if _after and (_before or "") != _after:
+                _umg_metadata.record_correction(
+                    db, job, field_name=_field, before=_before or "", after=_after)
 
     if _library_swap:
         # Resolver el asset ANTES de flipear el status: _resolve_library_
@@ -18842,6 +18853,18 @@ def request_edit(
             "change_request_proposal_id": body.change_request_proposal_id,
         },
     ))
+    # The edit worker reads artist/title from the Job row: fix the
+    # UMG-canonical name before the re-render draws the title card.
+    try:
+        _canonical = _umg_metadata.normalize_job(db, job)
+    except Exception:  # pragma: no cover - a name check never blocks an edit
+        logger.warning("[EDIT] metadata normalization skipped job=%s", job_id, exc_info=True)
+        _canonical = None
+    if _canonical is not None:
+        if "artist" in edit_params:
+            edit_params["artist"] = job.artist
+        if "song_title" in edit_params:
+            edit_params["song_title"] = job.song_title
     # Commit the publication intent in the same transaction as the Job and
     # EditorDocument mutation. An ambiguous Redis timeout must not rewind an
     # editor revision and re-open the ABA window for an old callback.
@@ -21226,6 +21249,8 @@ class SendToUMGRequest(BaseModel):
     # abiertos más nuevos que la versión aprobada. Exige motivo; se audita.
     publish_anyway: bool = False
     override_reason: str | None = Field(default=None, max_length=1000)
+    # Justificación interna por punto ✘ del pedido que esta publicación cierra.
+    change_request_point_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -21334,6 +21359,13 @@ def admin_create_delivery_from_job(
                     "message": "Para publicar igual con pedidos abiertos, escribí el motivo.",
                 })
             _guard_override = (_guard, _reason)
+
+    # The title card already shows the artist/title this job was rendered
+    # with: a name UMG asked to write differently cannot reach the portal.
+    from umg_metadata import publication_problem as _metadata_problem
+    _metadata_block = _metadata_problem(db, job)
+    if _metadata_block:
+        raise HTTPException(status_code=409, detail=_metadata_block)
 
     # UMG has its own contractual preflight even when the general QC rollout
     # is observe/off. Check before storage calls or ProRes queue work.
@@ -21583,6 +21615,7 @@ def admin_create_delivery_from_job(
     resolved_requests = []
     resolved_comments: list[str] = []
     kept_open_requests: list[dict] = []
+    verification_by_request: dict[int, dict] = {}
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -21599,9 +21632,25 @@ def admin_create_delivery_from_job(
             # Recheck after copying/locking: a newly submitted request or a
             # different case was never reviewed by this publication intent.
             validate_reviewed_cut()
+            # Cada punto del pedido contra la letra que se publica: con un ✘
+            # sin justificar, el pedido queda abierto. La publicación sigue.
+            import change_request_verification as _crv
+            if _crv.enabled():
+                try:
+                    _result = _crv.verify_request(db, job, request, at=now)
+                except Exception:
+                    logger.warning("[CR-VERIFY] publish: no se pudo verificar %s", request.id, exc_info=True)
+                    _result = None
+                _overrides = _crv.parse_overrides(body.change_request_point_overrides)
+                if _result is not None and _crv.missing_overrides(_result, _overrides):
+                    kept_open_requests.append(_crv.kept_entry(request, _result))
+                    continue
+                if _result is not None:
+                    verification_by_request[request.id] = _crv.audit_summary(
+                        _result, _crv.clean_overrides(_result, _overrides))
             # Un pedido de texto cuyo texto no está en la letra publicada
             # queda abierto. La publicación sigue igual.
-            if _cr_guard.enabled():
+            elif _cr_guard.enabled():
                 _closable, _kept = _cr_guard.text_gate(db, job, [request], now)
                 if _kept:
                     kept_open_requests.extend(_kept)
@@ -21653,6 +21702,8 @@ def admin_create_delivery_from_job(
             "previous_publication": previous_publication,
             "kept_open_change_requests": [entry["id"] for entry in kept_open_requests],
             "change_request_guard_override": bool(_guard_override),
+            **({"change_request_verification": {str(k): v for k, v in verification_by_request.items()}}
+               if verification_by_request else {}),
         },
     ))
     if _guard_override is not None:
@@ -21660,8 +21711,9 @@ def admin_create_delivery_from_job(
             current_user["id"], job, _guard_override[0], _guard_override[1], "admin_publish",
             portal_id=portal_id, delivery_id=delivery.id,
         ))
+    import change_request_verification as _crv
     for _kept in kept_open_requests:
-        db.add(_cr_guard.text_not_found_audit(
+        db.add(_crv.kept_audit(
             current_user["id"], job, _kept, "admin_publish", delivery_id=delivery.id,
         ))
     db.commit()
@@ -22808,6 +22860,17 @@ async def admin_list_change_requests(
         u.id: u
         for u in (ddb.query(User).filter(User.id.in_(user_ids)).all() if user_ids else [])
     }
+    # Reincidencias: un pedido que repite un punto (mismo tiempo o mismo
+    # texto) de un pedido YA CERRADO de la misma entrega. Es la medida de
+    # "se cerró a medias"; no bloquea nada.
+    try:
+        import change_request_verification as _crv
+        _history = (ddb.query(DeliveryChangeRequest)
+                    .filter(DeliveryChangeRequest.delivery_id.in_(delivery_ids)).all() if delivery_ids else [])
+        recurrences_by_request = _crv.recurrences_by_request(_history)
+    except Exception:
+        logger.warning("[CR-VERIFY] no se pudieron calcular reincidencias", exc_info=True)
+        recurrences_by_request = {}
 
     # Bulk-fetch the underlying jobs (NO tenant scope — this is an admin-only
     # endpoint, so the operator legitimately sees every tenant's job here)
@@ -22916,6 +22979,7 @@ async def admin_list_change_requests(
             "resolved_by": resolver.username if resolver else None,
             "resolved_by_revision": cr.resolved_by_revision,
             "resolution_source": cr.resolution_source,
+            "recurrences": recurrences_by_request.get(cr.id, []),
             "proposal": (
                 {
                     "id": proposal.id,
@@ -23099,6 +23163,54 @@ def _change_request_context(ddb: Session, cr_id: int):
     return cr, delivery
 
 
+def _change_request_close_verification(db: Session, ddb: Session, cr, raw_overrides, *, job=None, at=None):
+    """Bloquea el cierre si un punto del pedido no está en la letra aprobada.
+
+    Devuelve el resumen para la auditoría local (con las justificaciones del
+    operador) o None si la verificación está apagada o no hay job/letra. Un
+    punto ✘ sin justificación responde 409 ``change_request_points_unverified``
+    con la verificación completa para que el panel la muestre.
+    """
+    import change_request_verification as _crv
+    if not _crv.enabled() or cr is None:
+        return None
+    try:
+        if job is None:
+            delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).first()
+            job = (db.query(Job).filter(Job.job_id == delivery.job_id).first()
+                   if delivery is not None and delivery.job_id else None)
+        result = _crv.verify_request(db, job, cr, at=at)
+    except Exception:
+        # Es una ayuda para no cerrar a medias, no puede trabar el cierre por
+        # un dato raro: se registra y se cierra como antes.
+        logger.warning("[CR-VERIFY] no se pudo verificar el pedido %s", getattr(cr, "id", None), exc_info=True)
+        return {"error": "verification_failed"}
+    if result is None:
+        return None
+    overrides = _crv.parse_overrides(raw_overrides)
+    if _crv.missing_overrides(result, overrides):
+        raise HTTPException(status_code=409, detail=_crv.blocked_detail(result))
+    return _crv.audit_summary(result, _crv.clean_overrides(result, overrides))
+
+
+@app.get('/admin/change-requests/{cr_id}/verification')
+def admin_change_request_verification(cr_id: int, current_user: dict = Depends(get_current_user),
+                                      db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
+    """✔/✘ por punto del pedido contra la letra aprobada vigente, y si repite
+    puntos de un pedido anterior ya cerrado de la misma entrega."""
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='Admin only')
+    import change_request_verification as _crv
+    cr, delivery = _read_change_request_context(db, ddb, cr_id)
+    siblings = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.delivery_id == delivery.id).all()
+    recurrences = _crv.recurrences_by_request(siblings).get(cr.id, [])
+    ddb.rollback()
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first() if delivery.job_id else None
+    result = _crv.verify_request(db, job, cr) if _crv.enabled() else None
+    return {'change_request_id': cr.id, 'enabled': _crv.enabled(), 'verification': result,
+            'recurrences': recurrences}
+
+
 def _read_change_request_context(db: Session, ddb: Session, cr_id: int):
     """Read-only entry snapshot without holding two pooled connections.
 
@@ -23167,6 +23279,8 @@ class ConfirmPublicationRequest(BaseModel):
     publication_review_token: str | None = Field(default=None, min_length=64, max_length=64)
     publication_review_reason: str = Field(default='', max_length=2000)
     confirmed_published_review: bool = False
+    # Justificación interna por punto ✘ de la verificación automática.
+    point_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 @app.post('/admin/change-requests/{cr_id}/confirm-publication')
@@ -23225,7 +23339,10 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
             })
         # The human may attest an already corrected publication even when
         # editor timestamps/text matching cannot prove it. This closes ONLY
-        # this request; it never approves, renders or publishes a job.
+        # this request; it never approves, renders or publishes a job. Each
+        # point that the lyric check marks ✘ still needs its own reason: a
+        # single "revisé todo" was how incomplete fixes got closed.
+        verification_audit = _change_request_close_verification(db, ddb, cr, body.point_overrides, job=job)
         now = datetime.now(timezone.utc)
         revision = context['published_revision']
         cr.resolved_at = now
@@ -23241,6 +23358,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
             'published_render_fingerprint': delivery.published_render_fingerprint,
             'confirmed_items': body.confirmed_items,
             'reason': reason, 'review_token': body.publication_review_token,
+            **({'verification': verification_audit} if verification_audit else {}),
         }))
         db.commit()
         return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
@@ -23257,9 +23375,18 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
     manual_text_review = None
     import change_request_publish_guard as _cr_guard
-    if body.text_review_token and not _cr_guard.enabled():
+    import change_request_verification as _crv
+    verification_audit = None
+    if _crv.enabled():
+        # Punto por punto contra la letra publicada. Reemplaza al control de
+        # texto anterior, que aceptaba la frase en cualquier parte de la
+        # canción y dejaba cerrar un estribillo arreglado una sola vez.
+        if body.text_review_token:
+            raise HTTPException(status_code=409, detail='La comprobación cambió. Actualizá y revisá el pedido antes de cerrar.')
+        verification_audit = _change_request_close_verification(db, ddb, cr, body.point_overrides, job=job)
+    elif body.text_review_token and not _cr_guard.enabled():
         raise HTTPException(status_code=409, detail='La comprobación cambió. Actualizá y revisá el pedido antes de cerrar.')
-    if _cr_guard.enabled():
+    if _cr_guard.enabled() and not _crv.enabled():
         # Exact matching remains the default. A failed match may be a typo
         # in the customer's comment; accept only an explicit human review of
         # the same discrepancies, bound to this published cut with a reason.
@@ -23308,6 +23435,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         'editor_revision': body.reviewed_editor_revision,
         'confirmed_items': body.confirmed_items,
         **({'manual_text_review': manual_text_review} if manual_text_review else {}),
+        **({'verification': verification_audit} if verification_audit else {}),
     }))
     db.commit()
     return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
@@ -23718,6 +23846,16 @@ def admin_patch_change_request_proposal(
     operation["proposed_segments_hash"] = segments_content_hash([proposed])
     operation["operator_adjusted"] = True
     operation["confidence"] = "operator"
+    # Las repeticiones de la misma línea siguen al ajuste, salvo las que el
+    # operador ya ajustó a mano por separado.
+    for sibling in operations:
+        if (sibling.get("repetition_of") == operation.get("id") and not sibling.get("operator_adjusted")
+                and len(sibling.get("current_segments") or []) == 1):
+            follow = {**dict(sibling["current_segments"][0]), "text": proposed["text"]}
+            for key in ("words", "word_timestamps", "tokens"):
+                follow.pop(key, None)
+            sibling["proposed_segments"] = [follow]
+            sibling["proposed_segments_hash"] = segments_content_hash([follow])
     row.operations = operations
     row.updated_at = datetime.now(timezone.utc)
     db.add(AuditLog(
@@ -24265,6 +24403,10 @@ async def admin_resolve_change_request(
             "code": "resolution_reason_required",
             "message": "Explicá por qué el pedido está atendido. Cerrar manualmente no publica otro video.",
         })
+    # Cada punto del pedido contra la letra publicada: un ✘ sólo se cierra
+    # con una justificación interna por punto (nunca llega al cliente).
+    verification_audit = _change_request_close_verification(
+        db, ddb, cr, (body or {}).get("point_overrides") if isinstance(body, dict) else None)
     now = datetime.now(timezone.utc)
     cr.resolved_at = now
     cr.updated_at = now
@@ -24283,6 +24425,7 @@ async def admin_resolve_change_request(
             "change_request_id": cr_id,
             "delivery_id": cr.delivery_id,
             "note_preview": note[:200] if note else None,
+            **({"verification": verification_audit} if verification_audit else {}),
         },
     ))
     db.commit()

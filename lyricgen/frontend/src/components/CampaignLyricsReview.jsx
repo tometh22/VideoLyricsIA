@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { planReviewedSegmentSplit } from "../lib/splitWords";
 import { useI18n } from "../i18n";
+import RepeatOccurrencesList, { repeatApplyLabel, selectedRepeatIds } from "./RepeatOccurrencesList";
 
 const timestamp = value => {
   const ticks = Math.max(0, Math.round((Number(value) || 0) * 10));
@@ -11,7 +12,7 @@ const timestamp = value => {
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable, activeId = null, isPlaying = false,
   onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
   getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
-  suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation }) {
+  suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation, onTogglePropagation }) {
   const { t } = useI18n();
   const [markedOnly, setMarkedOnly] = useState(false);
   const [follow, setFollow] = useState(true);
@@ -181,9 +182,10 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
           <p className="mb-2 break-words">{propagationPrompt.newText}</p>
           <p>{(t("editor.repeat_prompt") || "Esta línea se repite en otras {n}. ¿Aplicar el cambio a todas?").replace("{n}", propagationPrompt.matchIds.length)}</p>
           <div className="mt-2 flex flex-wrap gap-2">
-            <button type="button" className={button} onClick={onApplyPropagation}>{(t("editor.repeat_apply_all") || "Aplicar a todas ({n})").replace("{n}", propagationPrompt.matchIds.length)}</button>
+            <button type="button" className={button} onClick={onApplyPropagation} disabled={!selectedRepeatIds(propagationPrompt).length}>{repeatApplyLabel(propagationPrompt, t)}</button>
             <button type="button" className={button} onClick={onDismissPropagation}>{t("editor.repeat_only_this") || "Solo esta"}</button>
           </div>
+          <RepeatOccurrencesList prompt={propagationPrompt} segments={segments} onToggle={onTogglePropagation} t={t} />
         </div>}
         <div className="mt-4 flex flex-wrap gap-2">
           <button className={`${button} bg-brand text-white`} disabled={!audioAvailable} onClick={() => onListen(selected)}>{t("review_workspace.listen") || "Escuchar 2 s antes"}</button>

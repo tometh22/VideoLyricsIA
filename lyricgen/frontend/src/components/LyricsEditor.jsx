@@ -11,6 +11,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import CampaignLyricsReview from "./CampaignLyricsReview";
+import RepeatOccurrencesList, { repeatApplyLabel, selectedRepeatIds } from "./RepeatOccurrencesList";
 import LocalDraftRecovery from "./LocalDraftRecovery";
 import ReanchorProgressDialog from "./ReanchorProgressDialog";
 import { reanchorFailureMessage, shouldRecoverReanchor } from "../lib/reanchorResult";
@@ -2075,7 +2076,10 @@ export default function LyricsEditor({
       row._id === id && normalizeLineForMatch(row.text) === previousText
     )));
     if (!matchIds.length) setPropagationPrompt(null);
-    else if (matchIds.length !== propagationPrompt.matchIds.length) setPropagationPrompt({ ...propagationPrompt, matchIds });
+    else if (matchIds.length !== propagationPrompt.matchIds.length) {
+      setPropagationPrompt({ ...propagationPrompt, matchIds,
+        excludedIds: (propagationPrompt.excludedIds || []).filter((id) => matchIds.includes(id)) });
+    }
   }, [edited, propagationPrompt]);
 
   // Tap-to-sync mode — operator hits Space (or button) while audio
@@ -3741,9 +3745,17 @@ export default function LyricsEditor({
       .filter((s) => s._id !== id && normalizeLineForMatch(s.text) === prevNorm)
       .map((s) => s._id);
     if (matchIds.length > 0) {
-      setPropagationPrompt({ id, newText, matchIds, prevText: start.text });
+      setPropagationPrompt({ id, newText, matchIds, prevText: start.text, excludedIds: [] });
     }
   };
+
+  // Dejar afuera una repetición: se canta distinto a propósito.
+  const togglePropagationOccurrence = (occurrenceId) => setPropagationPrompt((prompt) => {
+    if (!prompt) return prompt;
+    const excluded = new Set(prompt.excludedIds || []);
+    if (excluded.has(occurrenceId)) excluded.delete(occurrenceId); else excluded.add(occurrenceId);
+    return { ...prompt, excludedIds: [...excluded] };
+  });
 
   const applyPropagation = () => {
     if (!propagationPrompt) return;
@@ -3755,7 +3767,7 @@ export default function LyricsEditor({
       return;
     }
     const previousText = normalizeLineForMatch(prevText);
-    const matchIds = propagationPrompt.matchIds.filter((id) => current.some((row) => (
+    const matchIds = selectedRepeatIds(propagationPrompt).filter((id) => current.some((row) => (
       row._id === id && normalizeLineForMatch(row.text) === previousText
     )));
     if (!matchIds.length) { setPropagationPrompt(null); return; }
@@ -6915,6 +6927,7 @@ export default function LyricsEditor({
                 }}
                 suggestionsById={suggestionsById} onApplySuggestion={applySuggestion}
                 propagationPrompt={propagationPrompt} onApplyPropagation={applyPropagation} onDismissPropagation={dismissPropagation}
+                onTogglePropagation={togglePropagationOccurrence}
               />
             ) : (
               <>
@@ -7240,8 +7253,8 @@ export default function LyricsEditor({
                         ya señalan la línea sin saturar; el navegador
                         secuencial del banner ("Revisar →") lleva a cada una. */}
                     {propagationPrompt && propagationPrompt.id === seg._id && (
-                      <div className="flex items-center gap-2 mt-1.5 px-3 py-2 rounded-xl
-                        bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
+                      <div className="mt-1.5 px-3 py-2 rounded-xl bg-brand/10 ring-1 ring-brand/30 text-xs text-white">
+                      <div className="flex items-center gap-2">
                         <span className="flex-1">
                           {(t("editor.repeat_prompt") || "Esta línea se repite en otras {n}. ¿Aplicar el cambio a todas?")
                             .replace("{n}", propagationPrompt.matchIds.length)}
@@ -7250,10 +7263,10 @@ export default function LyricsEditor({
                           type="button"
                           onMouseDown={(e) => e.preventDefault()}
                           onClick={applyPropagation}
-                          className="px-2.5 py-1 rounded-lg bg-brand text-white font-medium hover:bg-brand/80 transition-colors whitespace-nowrap"
+                          disabled={!selectedRepeatIds(propagationPrompt).length}
+                          className="px-2.5 py-1 rounded-lg bg-brand text-white font-medium hover:bg-brand/80 transition-colors whitespace-nowrap disabled:opacity-40"
                         >
-                          {(t("editor.repeat_apply_all") || "Aplicar a todas ({n})")
-                            .replace("{n}", propagationPrompt.matchIds.length)}
+                          {repeatApplyLabel(propagationPrompt, t)}
                         </button>
                         <button
                           type="button"
@@ -7264,6 +7277,9 @@ export default function LyricsEditor({
                         >
                           {t("editor.repeat_only_this") || "Solo esta"}
                         </button>
+                      </div>
+                      <RepeatOccurrencesList prompt={propagationPrompt} segments={edited}
+                        onToggle={togglePropagationOccurrence} t={t} />
                       </div>
                     )}
                     {/* Wrap indicator + split action. Suprimido per-line

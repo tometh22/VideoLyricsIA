@@ -227,10 +227,24 @@ def test_approval_gate_blocks_umg_campaigns(monkeypatch):
     with pytest.raises(LyricReviewPending) as exc:
         require_resolved(db, document, job)
     assert exc.value.review["required_count"] == 1
-    # Un re-render por pedido de cambio sólo frena por letra perdida.
-    require_resolved(db, document, job, scope="missing_only")
+    # Un re-render por pedido de cambio frena por letra perdida y por el
+    # estilo del portal de UMG: ahí reaparecían los signos y el punto final
+    # que el cliente ya había pedido sacar.
+    with pytest.raises(LyricReviewPending):
+        require_resolved(db, document, job, scope="missing_only")
     monkeypatch.setenv("LYRIC_REVIEW_MODE", "observe")
     require_resolved(db, document, job)
+
+
+def test_missing_only_scope_ignores_style_outside_umg(monkeypatch):
+    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
+    monkeypatch.setenv("LYRIC_REVIEW_ENFORCE_TENANTS", "b2c")
+    db, document, job = _gate_fixture(workload_class="single", tenant="b2c")
+    with pytest.raises(LyricReviewPending):
+        require_resolved(db, document, job)
+    # Sin entrega UMG no hay perfil de portal: un re-render por pedido de
+    # cambio sigue frenando sólo por letra perdida.
+    require_resolved(db, document, job, scope="missing_only")
 
 
 def test_approval_gate_scope_by_tenant(monkeypatch):
