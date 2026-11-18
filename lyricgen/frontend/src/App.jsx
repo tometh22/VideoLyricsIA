@@ -589,6 +589,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const activeView =
+    pathname.startsWith("/review/") ? "review_queue" :
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
     pathname === "/admin/cola" ? "review_queue" :
@@ -672,7 +673,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   }
 
   return (
-    <div className="min-h-screen overflow-x-hidden bg-surface flex">
+    <div className={`min-h-screen ${pathname.startsWith("/review/") ? "overflow-x-clip" : "overflow-x-hidden"} bg-surface flex`}>
       <Sidebar
         activeView={activeView}
         onNav={handleNav}
@@ -6362,7 +6363,7 @@ export default function App() {
             // que es justo abajo del banner stack del wizard. Sin cambio
             // visual perceptible para el operador, pero conceptualmente
             // correcto en el nuevo layout.
-            stickyHeaderTop={0}
+            stickyHeaderTop={dedicatedCampaignReview ? 72 : 0}
             segments={currentReview.segments}
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}

@@ -1,10 +1,17 @@
 # Changelog
 
-## [1.1.173] - 2026-11-18
+## [1.1.174] - 2026-11-18
 
 ### Fixed
 - Speed up campaign navigation with grouped summary counts, bounded job projections, shared review activity reads, and on-demand review and delivery details. Keep publication freshness, reviewer provenance and tenant permissions intact.
 - Coalesce campaign refresh requests and avoid polling unchanged reports while navigating between campaign stages.
+
+## [1.1.173] - 2026-11-17
+
+### Fixed
+- Restore click-to-play in lyric review and follow the playing line without changing the editing selection or text focus. Keep playback controls visible below the app header.
+- Show compact horizontal time ranges, separate playback from selection, respect the marked filter during previous/next navigation and expose stale/failed phrase analysis in a compact disclosure.
+- Correct timestamp rounding at minute boundaries and the active navigation item during lyric review.
 
 ## [1.1.172] - 2026-11-17
 
