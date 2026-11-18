@@ -1056,3 +1056,35 @@ describe("cerrar un pedido ya publicado", () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe("verificación punto por punto antes de cerrar", () => {
+  it("un punto ✘ bloquea el cierre manual hasta justificarlo y la justificación viaja aparte de la nota", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url) => ({
+      ok: true,
+      json: async () => (String(url).includes("/verification") ? {
+        enabled: true, recurrences: [],
+        verification: { revision: 3, counts: { ok: 0, fail: 1, manual: 0 }, points: [
+          { id: "p-9", kind: "punctuation", status: "fail", reason: "question_marks_remain",
+            excerpt: "0:13 sin signos de interrogación", line: { start: 13, end: 15, text: "¿Quién sos?" } },
+        ] },
+      } : { segments: [] }),
+    })));
+    const resolve = vi.fn();
+    renderPanel({}, { resolveChangeRequest: resolve });
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    fireEvent.change(screen.getByLabelText("Motivo del cierre sin publicar"), { target: { value: "Corregido" } });
+    const close = screen.getByRole("button", { name: "Confirmar cierre" });
+    await screen.findByLabelText(/No verificado: 0:13/);
+    await waitFor(() => expect(close).toBeDisabled());
+    fireEvent.change(screen.getByLabelText(/Justificación interna/), { target: { value: "La pregunta es real" } });
+    await waitFor(() => expect(close).toBeEnabled());
+    fireEvent.click(close);
+    expect(resolve).toHaveBeenCalledWith(7, "Corregido", { "p-9": "La pregunta es real" });
+    vi.unstubAllGlobals();
+  });
+
+  it("marca la reincidencia en la cola", () => {
+    renderPanel({ recurrences: [{ point_id: "p-1", request_id: 3, excerpt: "0:13" }] });
+    expect(screen.getAllByText("Reincidencia").length).toBeGreaterThan(0);
+  });
+});

@@ -6,7 +6,7 @@
 // al mismo punto del flujo.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { fmtDate, fmtAgo } from "../../adminApi";
+import { API, fetchJson, fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
@@ -23,6 +23,7 @@ import { ClientVisibilityControl } from "./ClientVisibility";
 import PublishedRequestChecklist from "./PublishedRequestChecklist";
 import PublishedTextReview from "./PublishedTextReview";
 import PublishedHumanReview from "./PublishedHumanReview";
+import RequestVerification from "./RequestVerification";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -31,6 +32,11 @@ import {
   workflowAllows,
   workflowMatchesFilter,
 } from "./changeRequestWorkflow";
+
+// Las justificaciones por punto viajan sólo si hay alguna (los handlers
+// conservan su firma de siempre cuando no hace falta).
+const withOverrides = (args, overrides) => (
+  overrides && Object.keys(overrides).length ? [...args, overrides] : args);
 
 // Estados en los que el job está re-renderizando: publicar ahora no tiene
 // sentido porque los archivos se están por reemplazar.
@@ -287,7 +293,7 @@ export default function ChangeRequestsPanel({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [filteredRequests, selectRequest, selectedItem?.id]);
 
-  const publishItem = useCallback((item) => {
+  const publishItem = useCallback((item, pointOverrides) => {
     const status = publicationStatus(item.publication);
     if (status.needsProResSetup) {
       setProResSetup({
@@ -300,7 +306,8 @@ export default function ChangeRequestsPanel({
     if (item.publication?.render_fingerprint && !window.confirm(
       `¿Revisaste el video y confirmás publicar esta actualización en UMG ${item.delivery?.portal_id === "chile" ? "Chile" : "Argentina"}? El pedido quedará resuelto en ese portal.`,
     )) return;
-    publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication);
+    publishDeliveryUpdate(...withOverrides(
+      [item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication], pointOverrides));
   }, [prepareProRes, publishDeliveryUpdate]);
 
   useEffect(() => {
@@ -406,10 +413,11 @@ export default function ChangeRequestsPanel({
               resolving={crResolvingId === selectedItem.id}
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
-              onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
-              onConfirmPublication={(confirmedItems, textReview) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems, textReview)}
+              onResolve={(overrides) => resolveChangeRequest(...withOverrides([selectedItem.id, drafts[selectedItem.id]], overrides))}
+              onConfirmPublication={(confirmedItems, textReview, overrides) => confirmChangeRequestPublication?.(
+                ...withOverrides([selectedItem.id, selectedItem.publication, confirmedItems, textReview], overrides))}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
-              onPublish={() => publishItem(selectedItem)}
+              onPublish={(overrides) => publishItem(selectedItem, overrides)}
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
               onRefresh={() => refreshChangeRequests()}
@@ -541,6 +549,14 @@ function ChangeRequestCard({
     && workflow.allowed_actions.includes("confirm_publication");
   const [checklist, setChecklist] = useState({ ready: false, count: 0 });
   const onChecklistChange = useCallback((ready, count) => setChecklist({ ready, count }), []);
+  // Verificación automática punto por punto: cada ✘ necesita una
+  // justificación interna antes de cualquier cierre (manual o publicación).
+  const [verificationGate, setVerificationGate] = useState({ ready: true, overrides: {} });
+  const loadVerification = useCallback(
+    () => fetchJson(`${API}/admin/change-requests/${item.id}/verification`), [item.id]);
+  const verificationKey = [item.updated_at, item.publication?.editor_revision,
+    item.publication?.render_fingerprint, item.publication?.revision].join("|");
+  const pointOverrides = verificationGate.overrides;
   const textReview = confirmsPublication
     && actionNotice?.textReview?.renderFingerprint === item.publication?.render_fingerprint
     && actionNotice?.textReview?.editorRevision === item.publication?.editor_revision
@@ -555,8 +571,8 @@ function ChangeRequestCard({
     summaryProposal: item.proposal,
     proposalEnabled,
     qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
-    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim(),
-      unchecked: confirmsPublication && (!checklist.ready || Boolean(textReview)) },
+    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim() || !verificationGate.ready,
+      unchecked: confirmsPublication && (!checklist.ready || Boolean(textReview) || !verificationGate.ready) },
   });
   const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   const primaryWiring = {
@@ -565,12 +581,12 @@ function ChangeRequestCard({
     see_error: { href: editorUrl },
     refresh: { onClick: onRefresh },
     reopen: { onClick: onReopen },
-    publish: { onClick: onPublish },
-    prepare_master: { onClick: onPublish },
+    publish: { onClick: () => onPublish(pointOverrides) },
+    prepare_master: { onClick: () => onPublish(pointOverrides) },
     review_proposal: { onClick: proposal ? scrollToProposal : onLoadProposal },
     render: { onClick: onReviewRender },
-    close: { onClick: onResolve },
-    confirm_publication: { onClick: () => onConfirmPublication?.(checklist.count) },
+    close: { onClick: () => onResolve(pointOverrides) },
+    confirm_publication: { onClick: () => onConfirmPublication?.(checklist.count, undefined, pointOverrides) },
   };
   const primaryAction = { ...view.primary, ...(primaryWiring[view.primary.key] || {}) };
   const closeForm = !isResolved && (closeOpen || view.primary.key === "close");
@@ -722,10 +738,21 @@ function ChangeRequestCard({
             </p>
           </section>
 
+          {!isResolved && (
+            <RequestVerification
+              load={loadVerification}
+              refreshKey={verificationKey}
+              onChange={setVerificationGate}
+              onSeek={seekVideo}
+            />
+          )}
+
           {humanReviewOpen && canReviewPublication && (
             <div ref={humanReviewRef}>
-              <PublishedHumanReview key={item.published_review.review_token} item={item} busy={resolving}
-                onConfirm={onConfirmPublication} onCancel={() => setHumanReviewOpen(false)} />
+              <PublishedHumanReview key={item.published_review.review_token} item={item}
+                busy={resolving} verificationReady={verificationGate.ready}
+                onConfirm={(count, review) => onConfirmPublication?.(count, review, pointOverrides)}
+                onCancel={() => setHumanReviewOpen(false)} />
             </div>
           )}
 
@@ -745,7 +772,7 @@ function ChangeRequestCard({
               review={textReview}
               checklistReady={checklist.ready}
               busy={resolving}
-              onConfirm={(reason) => onConfirmPublication?.(checklist.count, { token: textReview.token, reason })}
+              onConfirm={(reason) => onConfirmPublication?.(checklist.count, { token: textReview.token, reason }, pointOverrides)}
             />
           )}
 
@@ -811,8 +838,8 @@ function ChangeRequestCard({
                   </button>
                   <button
                     type="button"
-                    onClick={onResolve}
-                    disabled={resolving || !draft.trim() || !allows("resolve")}
+                    onClick={() => onResolve(pointOverrides)}
+                    disabled={resolving || !draft.trim() || !allows("resolve") || !verificationGate.ready}
                     className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
                   >
                     {resolving ? "Guardando…" : "Confirmar cierre"}
@@ -1476,6 +1503,9 @@ function ChangeRequestProposal({
                         ? "Frase completa en una sola pantalla"
                       : "Pedido explícito del cliente"}
                   {operation.scope === "all_matching" ? " · todas las apariciones" : ""}
+                  {operation.repetition_of
+                    ? ` · misma línea que en ${Math.floor((operation.repetition_of_start || 0) / 60)}:${String(Math.floor((operation.repetition_of_start || 0) % 60)).padStart(2, "0")}: el mismo cambio en esta repetición (destildala si no va)`
+                    : ""}
                   {operation.status === "applied" ? " · aplicado" : ""}
                 </p>
               </div>

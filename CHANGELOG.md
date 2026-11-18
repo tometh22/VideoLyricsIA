@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.175] - 2026-11-17
+
+### Fixed
+- Verify every point of a client change request against the approved lyrics before closing it, on every close path (manual close and confirm-publication in Cambios, publishing the reviewed cut, manual close and bulk send in Campaigns). Text must be present at the cited time (a phrase fixed in another repetition of the chorus no longer counts), "says X" must be gone, explicit "Desde X hasta Y" intervals and prose timing must have moved the line towards what was asked, artist/title must match with accents, and requested punctuation must be removed. Each failing point blocks the close unless the operator writes an internal justification for that point; justifications are stored in the local audit log and never shown to the client. Publications keep going and leave a request with unjustified failing points open. Background and free-prose points stay as manual checks. `CHANGE_REQUEST_CLOSE_VERIFICATION=0` restores the previous behaviour.
+- Flag a request that repeats a point (same cited time or text) of an already closed request on the same delivery as a recurrence in Cambios and Campaigns.
+
+### Added
+- Propose the same correction on the other repetitions of a corrected line when a change request is analysed: each identical repetition becomes its own operation, never auto-applied, and can be unticked. Operator adjustments of the requested line follow to its repetitions.
+- List each repetition with its time in the editor's "apply to all repetitions" prompt so one can be left out.
+- Add `scripts/backtest_change_request_verification.py`, an offline backtest of the verification over exported requests and editor versions.
+
 ## [1.1.172] - 2026-11-17
 
 ### Added

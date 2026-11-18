@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { splitRequestItems } from "./changeRequestWorkflow";
 
-export default function PublishedHumanReview({ item, busy, onConfirm, onCancel }) {
+export default function PublishedHumanReview({ item, busy, onConfirm, onCancel, verificationReady = true }) {
   const [reason, setReason] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
   const [checked, setChecked] = useState(() => new Set());
@@ -9,7 +9,9 @@ export default function PublishedHumanReview({ item, busy, onConfirm, onCancel }
     const parsed = splitRequestItems(item.comment);
     return parsed.length ? parsed : [{ text: item.comment || "Pedido completo" }];
   }, [item.comment]);
-  const ready = checked.size === points.length && acknowledged && Boolean(reason.trim());
+  // Los puntos ✘ de la verificación automática necesitan su propia
+  // justificación: "revisé todo" no alcanza para cerrarlos.
+  const ready = checked.size === points.length && acknowledged && Boolean(reason.trim()) && verificationReady;
   const toggle = (index) => setChecked(old => {
     const next = new Set(old);
     if (next.has(index)) next.delete(index); else next.add(index);
@@ -35,6 +37,7 @@ export default function PublishedHumanReview({ item, busy, onConfirm, onCancel }
       Revisé esta versión publicada y confirmo que el pedido está atendido.
     </label>
     <p className="text-label text-gray-400">Se cierra sólo este pedido. La aprobación del cliente sigue siendo independiente.</p>
+    {!verificationReady && <p aria-live="polite" className="text-label text-red-200">Hay puntos ✘ en la verificación contra la letra: corregilos o justificá cada uno antes de confirmar.</p>}
     <div className="flex flex-wrap gap-2">
       <button type="button" disabled={busy || !ready}
         onClick={() => onConfirm(checked.size, { publicationToken: item.published_review.review_token, reason: reason.trim() })}
