@@ -51,7 +51,7 @@ export default function CampaignListPage() {
   const status = params.get("status") || "";
   const product = params.get("product") || "";
   const scope = campaignViews.some(([key]) => key === params.get("scope")) ? params.get("scope") : "all";
-  const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }));
+  const list = useCampaignResource("campaigns:list", ({ signal }) => campaignRequest("/batch/campaigns", { signal }), { staleMs: 15000, pollMs: 60000 });
   const changeCampaigns = useMemo(() => (list.data?.items || []).filter(campaign => inCampaignView(campaign, "changes"))
     .sort((a, b) => String(a.pipeline?.flags?.oldest_change_request_at || "9999").localeCompare(String(b.pipeline?.flags?.oldest_change_request_at || "9999"))), [list.data]);
   const selectedChanges = changeCampaigns.find(campaign => campaign.id === params.get("changes_campaign")) || changeCampaigns[0];

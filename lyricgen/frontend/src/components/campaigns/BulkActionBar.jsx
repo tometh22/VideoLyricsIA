@@ -4,7 +4,9 @@ import { canDiscard, canGenerate, canSend } from "./songModel";
 /** Floating bar for the current selection; only shows actions that apply. */
 export default function BulkActionBar({ songs, kind, canManage, canEditPrompts = false, portalSends = true, onClear, onAction, hiddenCount = 0 }) {
   if (!songs.length) return null;
-  const generate = kind !== "art_track" ? songs.filter(canGenerate) : [];
+  // Overview rows do not download render settings. Eligibility is rechecked
+  // against fresh creative data before opening the generation confirmation.
+  const generate = kind !== "art_track" ? songs.filter(song => song.creative ? canGenerate(song) : song.stage === "ready") : [];
   const approve = canManage ? songs.filter((song) => song.stage === "qc" && song.current_status === "pending_review" && song.current_job_id && song.has_video) : [];
   const send = canManage && portalSends ? songs.filter(canSend) : [];
   const discard = songs.filter(canDiscard);

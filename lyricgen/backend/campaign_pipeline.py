@@ -65,6 +65,11 @@ _JOB_COLUMNS = (
     Job.parent_job_id, Job.pilot_id, Job.created_at, Job.approved_at, Job.approved_by,
     Job.video_url, Job.error,
 )
+# Item rows need render identity for publication freshness, not the lyrics,
+# quality evidence or render configuration stored on the same job row.
+_DETAIL_JOB_COLUMNS = _JOB_COLUMNS + (
+    Job.previous_versions, Job.edit_count, Job.completed_at,
+)
 _ITEM_COLUMNS = (
     BatchCampaignItem.id, BatchCampaignItem.campaign_id, BatchCampaignItem.ordinal,
     BatchCampaignItem.filename, BatchCampaignItem.title, BatchCampaignItem.artist,
@@ -124,8 +129,7 @@ def _load_lineage(db: Session, campaigns: list[BatchCampaign], *, full: bool) ->
     if not wanted:
         return result
     query = db.query(Job).filter(Job.job_id.in_(list(wanted)), Job.pilot_id.is_(None))
-    if not full:
-        query = query.options(load_only(*_JOB_COLUMNS))
+    query = query.options(load_only(*(_DETAIL_JOB_COLUMNS if full else _JOB_COLUMNS), raiseload=True))
     for job in query.all():
         campaign_id = wanted.get(job.job_id)
         if campaign_id and job.tenant_id == tenant_of[campaign_id]:
@@ -420,6 +424,7 @@ def campaign_pipeline(
     snapshot["is_admin"] = current_user.get("role") == "admin"
     from campaign_change_requests import actions_enabled as change_request_actions_enabled
     snapshot["features"] = {
+        "bulk_prompts": True,
         "change_requests_inbox": change_requests_inbox_enabled(),
         "change_request_actions": change_request_actions_enabled(),
     }
