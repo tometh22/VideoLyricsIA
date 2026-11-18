@@ -25,8 +25,24 @@ def _utc(value):
     return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 
 
-def saved_review_history(db, job_ids):
-    from database import AuditLog, EditorVersion, ProductEvent, User
+def review_activity(db, job_ids):
+    """One request-local heartbeat read shared by attribution and minute totals."""
+    from database import ProductEvent
+    if not job_ids:
+        return []
+    return db.query(
+        ProductEvent.job_id, ProductEvent.user_id, ProductEvent.created_at,
+        ProductEvent.occurred_at,
+        ProductEvent.properties["revision"].as_integer().label("revision"),
+        ProductEvent.properties["session_id"].label("session_id"),
+    ).filter(
+        ProductEvent.name == "editor_activity_heartbeat",
+        ProductEvent.job_id.in_(job_ids),
+    ).order_by(ProductEvent.created_at).all()
+
+
+def saved_review_history(db, job_ids, *, activity_events=None):
+    from database import AuditLog, EditorVersion, User
     from sqlalchemy import func
 
     if not job_ids:
@@ -35,13 +51,7 @@ def saved_review_history(db, job_ids):
     # lock at ingestion. Revision and time bind activity to this particular save;
     # a login, document owner, or an earlier visit does not prove an edit.
     activity = {}
-    beats = db.query(
-        ProductEvent.job_id, ProductEvent.user_id, ProductEvent.created_at,
-        ProductEvent.properties["revision"].as_integer().label("revision"),
-    ).filter(
-        ProductEvent.name == "editor_activity_heartbeat",
-        ProductEvent.job_id.in_(job_ids),
-    ).order_by(ProductEvent.created_at).all()
+    beats = review_activity(db, job_ids) if activity_events is None else activity_events
     for beat in beats:
         if beat.created_at and beat.revision is not None:
             activity.setdefault((beat.job_id, beat.user_id), []).append((_utc(beat.created_at), beat.revision))

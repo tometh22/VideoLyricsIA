@@ -1,10 +1,16 @@
 # Changelog
 
-## [1.1.174] - 2026-11-18
+## [1.1.175] - 2026-11-18
 
 ### Added
 - Add a staging full-song Genly model pilot: authenticated editor requests, leased local Mac inference, private source-bound candidate storage and manual adoption through existing editor suggestions. Preserve approved songs, human edits and stale revisions.
 - Add reproducible historical-correction corpus preparation, CPU edit-risk training, measured local LoRA experiments and serial MLX recognition/CTC alignment. Use corroborated word edits and verified vocal continuity; keep uncertain hypotheses for review instead of replacing line timing wholesale. No paid inference or external GPU is required.
+
+## [1.1.174] - 2026-11-18
+
+### Fixed
+- Speed up campaign navigation with grouped summary counts, bounded job projections, shared review activity reads, and on-demand review and delivery details. Keep publication freshness, reviewer provenance and tenant permissions intact.
+- Coalesce campaign refresh requests and avoid polling unchanged reports while navigating between campaign stages.
 
 ## [1.1.173] - 2026-11-17
 
