@@ -1,0 +1,603 @@
+{
+  "synthetic": true,
+  "revision": 289,
+  "distinct_id_count": 63,
+  "segments": [
+    {
+      "segment_id": "0",
+      "id": null,
+      "start": 0,
+      "end": 1,
+      "text": "Synthetic line 1",
+      "locked": true
+    },
+    {
+      "segment_id": "1",
+      "id": null,
+      "start": 2,
+      "end": 3,
+      "text": "Synthetic line 2",
+      "locked": false
+    },
+    {
+      "segment_id": "2",
+      "id": null,
+      "start": 4,
+      "end": 5,
+      "text": "Synthetic line 3",
+      "locked": false
+    },
+    {
+      "segment_id": "3",
+      "id": null,
+      "start": 6,
+      "end": 7,
+      "text": "Synthetic line 4",
+      "locked": true
+    },
+    {
+      "segment_id": "4",
+      "id": null,
+      "start": 8,
+      "end": 9,
+      "text": "Synthetic line 5",
+      "locked": false
+    },
+    {
+      "segment_id": "5",
+      "id": null,
+      "start": 10,
+      "end": 11,
+      "text": "Synthetic line 6",
+      "locked": false
+    },
+    {
+      "segment_id": "6",
+      "id": null,
+      "start": 12,
+      "end": 13,
+      "text": "Synthetic line 7",
+      "locked": true
+    },
+    {
+      "segment_id": "7",
+      "id": null,
+      "start": 14,
+      "end": 15,
+      "text": "Synthetic line 8",
+      "locked": false
+    },
+    {
+      "segment_id": "8",
+      "id": null,
+      "start": 16,
+      "end": 17,
+      "text": "Synthetic line 9",
+      "locked": false
+    },
+    {
+      "segment_id": "9",
+      "id": null,
+      "start": 18,
+      "end": 19,
+      "text": "Synthetic line 10",
+      "locked": true
+    },
+    {
+      "segment_id": "10",
+      "id": null,
+      "start": 20,
+      "end": 21,
+      "text": "Synthetic line 11",
+      "locked": false
+    },
+    {
+      "segment_id": "11",
+      "id": null,
+      "start": 22,
+      "end": 23,
+      "text": "Synthetic line 12",
+      "locked": false
+    },
+    {
+      "segment_id": "12",
+      "id": null,
+      "start": 24,
+      "end": 25,
+      "text": "Synthetic line 13",
+      "locked": true
+    },
+    {
+      "segment_id": "13",
+      "id": null,
+      "start": 26,
+      "end": 27,
+      "text": "Synthetic line 14",
+      "locked": false
+    },
+    {
+      "segment_id": "14",
+      "id": null,
+      "start": 28,
+      "end": 29,
+      "text": "Synthetic line 15",
+      "locked": false
+    },
+    {
+      "segment_id": "15",
+      "id": null,
+      "start": 30,
+      "end": 31,
+      "text": "Synthetic line 16",
+      "locked": true
+    },
+    {
+      "segment_id": "16",
+      "id": null,
+      "start": 32,
+      "end": 33,
+      "text": "Synthetic line 17",
+      "locked": false
+    },
+    {
+      "segment_id": "17",
+      "id": null,
+      "start": 34,
+      "end": 35,
+      "text": "Synthetic line 18",
+      "locked": false
+    },
+    {
+      "segment_id": "18",
+      "id": null,
+      "start": 36,
+      "end": 37,
+      "text": "Synthetic line 19",
+      "locked": true
+    },
+    {
+      "segment_id": "19",
+      "id": null,
+      "start": 38,
+      "end": 39,
+      "text": "Synthetic line 20",
+      "locked": false
+    },
+    {
+      "segment_id": "16",
+      "id": null,
+      "start": 40,
+      "end": 41,
+      "text": "Synthetic line 21",
+      "locked": false
+    },
+    {
+      "segment_id": "21",
+      "id": null,
+      "start": 42,
+      "end": 43,
+      "text": "Synthetic line 22",
+      "locked": true
+    },
+    {
+      "segment_id": "22",
+      "id": null,
+      "start": 44,
+      "end": 45,
+      "text": "Synthetic line 23",
+      "locked": false
+    },
+    {
+      "segment_id": "23",
+      "id": null,
+      "start": 46,
+      "end": 47,
+      "text": "Synthetic line 24",
+      "locked": false
+    },
+    {
+      "segment_id": "24",
+      "id": null,
+      "start": 48,
+      "end": 49,
+      "text": "Synthetic line 25",
+      "locked": true
+    },
+    {
+      "segment_id": "25",
+      "id": null,
+      "start": 50,
+      "end": 51,
+      "text": "Synthetic line 26",
+      "locked": false
+    },
+    {
+      "segment_id": "26",
+      "id": null,
+      "start": 52,
+      "end": 53,
+      "text": "Synthetic line 27",
+      "locked": false
+    },
+    {
+      "segment_id": "27",
+      "id": null,
+      "start": 54,
+      "end": 55,
+      "text": "Synthetic line 28",
+      "locked": true
+    },
+    {
+      "segment_id": "28",
+      "id": null,
+      "start": 56,
+      "end": 57,
+      "text": "Synthetic line 29",
+      "locked": false
+    },
+    {
+      "segment_id": "29",
+      "id": null,
+      "start": 58,
+      "end": 59,
+      "text": "Synthetic line 30",
+      "locked": false
+    },
+    {
+      "segment_id": "25",
+      "id": null,
+      "start": 60,
+      "end": 61,
+      "text": "Synthetic line 31",
+      "locked": true
+    },
+    {
+      "segment_id": "31",
+      "id": null,
+      "start": 62,
+      "end": 63,
+      "text": "Synthetic line 32",
+      "locked": false
+    },
+    {
+      "segment_id": "32",
+      "id": null,
+      "start": 64,
+      "end": 65,
+      "text": "Synthetic line 33",
+      "locked": false
+    },
+    {
+      "segment_id": "33",
+      "id": null,
+      "start": 66,
+      "end": 67,
+      "text": "Synthetic line 34",
+      "locked": true
+    },
+    {
+      "segment_id": "34",
+      "id": null,
+      "start": 68,
+      "end": 69,
+      "text": "Synthetic line 35",
+      "locked": false
+    },
+    {
+      "segment_id": "35",
+      "id": null,
+      "start": 70,
+      "end": 71,
+      "text": "Synthetic line 36",
+      "locked": false
+    },
+    {
+      "segment_id": "36",
+      "id": null,
+      "start": 72,
+      "end": 73,
+      "text": "Synthetic line 37",
+      "locked": true
+    },
+    {
+      "segment_id": "37",
+      "id": null,
+      "start": 74,
+      "end": 75,
+      "text": "Synthetic line 38",
+      "locked": false
+    },
+    {
+      "segment_id": "38",
+      "id": null,
+      "start": 76,
+      "end": 77,
+      "text": "Synthetic line 39",
+      "locked": false
+    },
+    {
+      "segment_id": "39",
+      "id": null,
+      "start": 78,
+      "end": 79,
+      "text": "Synthetic line 40",
+      "locked": true
+    },
+    {
+      "segment_id": "40",
+      "id": null,
+      "start": 80,
+      "end": 81,
+      "text": "Synthetic line 41",
+      "locked": false
+    },
+    {
+      "segment_id": "41",
+      "id": null,
+      "start": 82,
+      "end": 83,
+      "text": "Synthetic line 42",
+      "locked": false
+    },
+    {
+      "segment_id": "42",
+      "id": null,
+      "start": 84,
+      "end": 85,
+      "text": "Synthetic line 43",
+      "locked": true
+    },
+    {
+      "segment_id": "43",
+      "id": null,
+      "start": 86,
+      "end": 87,
+      "text": "Synthetic line 44",
+      "locked": false
+    },
+    {
+      "segment_id": "35",
+      "id": null,
+      "start": 88,
+      "end": 89,
+      "text": "Synthetic line 45",
+      "locked": false
+    },
+    {
+      "segment_id": "45",
+      "id": null,
+      "start": 90,
+      "end": 91,
+      "text": "Synthetic line 46",
+      "locked": true
+    },
+    {
+      "segment_id": "46",
+      "id": null,
+      "start": 92,
+      "end": 93,
+      "text": "Synthetic line 47",
+      "locked": false
+    },
+    {
+      "segment_id": "47",
+      "id": null,
+      "start": 94,
+      "end": 95,
+      "text": "Synthetic line 48",
+      "locked": false
+    },
+    {
+      "segment_id": "48",
+      "id": null,
+      "start": 96,
+      "end": 97,
+      "text": "Synthetic line 49",
+      "locked": true
+    },
+    {
+      "segment_id": "49",
+      "id": null,
+      "start": 98,
+      "end": 99,
+      "text": "Synthetic line 50",
+      "locked": false
+    },
+    {
+      "segment_id": "50",
+      "id": null,
+      "start": 100,
+      "end": 101,
+      "text": "Synthetic line 51",
+      "locked": false
+    },
+    {
+      "segment_id": "51",
+      "id": null,
+      "start": 102,
+      "end": 103,
+      "text": "Synthetic line 52",
+      "locked": true
+    },
+    {
+      "segment_id": "52",
+      "id": null,
+      "start": 104,
+      "end": 105,
+      "text": "Synthetic line 53",
+      "locked": false
+    },
+    {
+      "segment_id": "53",
+      "id": null,
+      "start": 106,
+      "end": 107,
+      "text": "Synthetic line 54",
+      "locked": false
+    },
+    {
+      "segment_id": "54",
+      "id": null,
+      "start": 108,
+      "end": 109,
+      "text": "Synthetic line 55",
+      "locked": true
+    },
+    {
+      "segment_id": "55",
+      "id": null,
+      "start": 110,
+      "end": 111,
+      "text": "Synthetic line 56",
+      "locked": false
+    },
+    {
+      "segment_id": "56",
+      "id": null,
+      "start": 112,
+      "end": 113,
+      "text": "Synthetic line 57",
+      "locked": false
+    },
+    {
+      "segment_id": "57",
+      "id": null,
+      "start": 114,
+      "end": 115,
+      "text": "Synthetic line 58",
+      "locked": true
+    },
+    {
+      "segment_id": "58",
+      "id": null,
+      "start": 116,
+      "end": 117,
+      "text": "Synthetic line 59",
+      "locked": false
+    },
+    {
+      "segment_id": "59",
+      "id": null,
+      "start": 118,
+      "end": 119,
+      "text": "Synthetic line 60",
+      "locked": false
+    },
+    {
+      "segment_id": "60",
+      "id": null,
+      "start": 120,
+      "end": 121,
+      "text": "Synthetic line 61",
+      "locked": true
+    },
+    {
+      "segment_id": "61",
+      "id": null,
+      "start": 122,
+      "end": 123,
+      "text": "Synthetic line 62",
+      "locked": false
+    },
+    {
+      "segment_id": "62",
+      "id": null,
+      "start": 124,
+      "end": 125,
+      "text": "Synthetic line 63",
+      "locked": false
+    },
+    {
+      "segment_id": "63",
+      "id": null,
+      "start": 126,
+      "end": 127,
+      "text": "Synthetic line 64",
+      "locked": true
+    },
+    {
+      "segment_id": "64",
+      "id": null,
+      "start": 128,
+      "end": 129,
+      "text": "Synthetic line 65",
+      "locked": false
+    },
+    {
+      "segment_id": "65",
+      "id": null,
+      "start": 130,
+      "end": 131,
+      "text": "Synthetic line 66",
+      "locked": false
+    }
+  ],
+  "approval_ids": [
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+    "index:16",
+    "17",
+    "18",
+    "19",
+    "index:20",
+    "21",
+    "22",
+    "23",
+    "24",
+    "index:25",
+    "26",
+    "27",
+    "28",
+    "29",
+    "index:30",
+    "31",
+    "32",
+    "33",
+    "34",
+    "index:35",
+    "36",
+    "37",
+    "38",
+    "39",
+    "40",
+    "41",
+    "42",
+    "43",
+    "index:44",
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51",
+    "52",
+    "53",
+    "54",
+    "55",
+    "56",
+    "57",
+    "58",
+    "59",
+    "60",
+    "61",
+    "62",
+    "63",
+    "64",
+    "65"
+  ]
+}

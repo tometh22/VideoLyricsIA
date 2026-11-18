@@ -1266,7 +1266,8 @@ def claim_next_review(
 def _review_line_ids(segments: list[dict[str, Any]]) -> list[str]:
     def identity_text(value):
         if isinstance(value, str):
-            return value.strip()
+            # Exactly the ECMAScript whitespace set used by reviewLineIds.
+            return value.strip(" \t\n\v\f\r\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         if (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and abs(value) <= 2**53 - 1 and math.isfinite(value) and value == int(value)):
             return str(int(value))

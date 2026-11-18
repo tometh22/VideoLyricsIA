@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
+
 ## [1.1.178] - 2026-11-18
 
 ### Fixed
