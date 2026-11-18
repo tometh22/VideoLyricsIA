@@ -642,6 +642,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
             "reference_hypothesis",
             "catalog_reference",
             "reviewer_campaign_status",
+            "local_genly_model",
             "pre_background_approval",
         ):
             if durable_key in previous:
@@ -669,6 +670,10 @@ def _persist_if_current(job_id: str, expected_revision: int,
                 "available": False, "reason": "prediction_failed",
                 "mutated_segments": False,
             }
+        from local_genly_review import quality_ranking
+        local_risk = quality_ranking(row.segments_json or [])
+        if local_risk is not None:
+            quality["local_review_risk"] = local_risk
         if operator_proposal:
             try:
                 from editor import persist_operator_review_proposal_if_current

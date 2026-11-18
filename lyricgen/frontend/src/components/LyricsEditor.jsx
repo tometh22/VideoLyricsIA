@@ -52,6 +52,7 @@ import LyricReviewPanel from "./LyricReviewPanel";
 import { applyReviewItem, dismissReviewItem, validItems } from "../lib/lyricReview";
 import { findAlertLineIndex } from "../lib/heardWords";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
+import LocalGenlyModelCandidate from "./LocalGenlyModelCandidate";
 import CatalogReference from "./CatalogReference";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
@@ -5495,6 +5496,11 @@ export default function LyricsEditor({
       <CompleteReviewerCandidate candidate={durableEditor.document?.reviewer_candidate}
         currentRevision={durableEditor.document?.revision} currentSegments={edited}
         onSeek={(start) => seekTo(start, true)} />
+
+      <LocalGenlyModelCandidate jobId={transcribeJobId} revision={durableEditor.document?.revision}
+        segments={edited} request={editorRequest} enabled={editorV2Enabled}
+        onSeek={(start) => seekTo(start, true)}
+        onProposalReady={(quality_proposal) => durableEditor.updateDocument({ quality_proposal })} />
 
       {!hasLyrics && (
         <section role="status" aria-label="Letra vacía" className="mb-4 rounded-xl border border-amber-300/25 bg-amber-300/5 p-4 text-sm text-amber-100">
