@@ -31,9 +31,13 @@ for (const mobile of [false, true]) {
     await page.goto(`/review/${jobId}`);
     const preview = page.getByTestId("review-live-preview");
     await expect(preview).toBeVisible();
-    await expect(preview.getByText(segments[0].text.toUpperCase(), { exact: true })).toBeVisible();
+    const native = preview.getByRole("img", { name: /Vista previa del texto del video/ });
+    await expect(native).toHaveAttribute("aria-label", `Vista previa del texto del video: ${segments[0].text.toUpperCase()}`);
+    await expect(native).toHaveAttribute("aria-busy", "false");
+    await expect(native.locator("canvas")).toBeVisible();
     await page.getByTestId("review-line-2").click();
-    await expect(preview.getByText("UNA SEGUNDA FRASE", { exact: true })).toBeVisible();
+    await expect(native).toHaveAttribute("aria-label", "Vista previa del texto del video: UNA SEGUNDA FRASE");
+    await expect(native).toHaveAttribute("aria-busy", "false");
     await page.getByTestId("review-line-1").click();
     const stale = page.getByTestId("quality-proposal-panel");
     await expect(stale).toHaveAttribute("data-proposal-state", "stale");
@@ -45,13 +49,15 @@ for (const mobile of [false, true]) {
     await stale.getByRole("button", { name: "Ocultar propuesta" }).click();
     await expect(stale).toHaveCount(0);
     await page.getByLabel("Letra de esta línea", { exact: true }).fill("Esta es mi letra revisada");
-    await expect(preview.getByText("ESTA ES MI LETRA REVISADA", { exact: true })).toBeVisible();
+    await expect(native).toHaveAttribute("aria-label", "Vista previa del texto del video: ESTA ES MI LETRA REVISADA");
+    await expect(native).toHaveAttribute("aria-busy", "false");
     await preview.scrollIntoViewIfNeeded();
     await preview.screenshot({ path: testInfo.outputPath("preview-panel.png") });
     await page.screenshot({ path: testInfo.outputPath("campaign-preview.png"), fullPage: true });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
     await page.locator('[data-tour="editor-approve-floating"]').click();
     await expect.poll(() => approvals.length).toBe(1);
+    expect(harness.creativeSaves.some(save => save.settings.font === "montserrat-bold")).toBe(true);
     expect(harness.saves.at(-1).segments[0]).toMatchObject({ text: "Esta es mi letra revisada", start: 0, end: 1.5 });
   });
 }

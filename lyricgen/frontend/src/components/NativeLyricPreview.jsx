@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { applyCase } from "./fontCatalog";
 
 const fontCache = new Map();
 async function loadFont(request, filename) {
@@ -35,6 +36,9 @@ export default function NativeLyricPreview({ segments, settings, jobId, request,
   const [state, setState] = useState("loading");
   const [retry, setRetry] = useState(0);
   const body = JSON.stringify({ segments, settings });
+  const spokenText = segments.filter(line => currentTime >= Number(line.start) && currentTime < Number(line.end))
+    .map(line => applyCase(line.text || "", settings.text_case || "upper")).join(" / ");
+  const imageLabel = `${t("review_workspace.render_preview") || "Vista previa del texto del video"}${spokenText ? `: ${spokenText}` : ""}`;
 
   useEffect(() => {
     let alive = true;
@@ -123,7 +127,7 @@ export default function NativeLyricPreview({ segments, settings, jobId, request,
 
   return <div ref={frame} className="relative overflow-hidden rounded-xl bg-[#0a0910]" style={{ aspectRatio: dimensions.width / dimensions.height }} data-testid="native-lyric-preview" aria-label={t("review_workspace.render_preview") || "Vista previa del texto del video"}>
     {backgroundUrl && <video ref={video} src={backgroundUrl} muted loop playsInline className="absolute inset-0 h-full w-full object-cover" />}
-    <div ref={host} className={`absolute left-0 top-0 origin-top-left ${state === "ready" ? "" : "invisible"}`}
+    <div ref={host} role="img" aria-label={imageLabel} aria-busy={state !== "ready"} className={`absolute left-0 top-0 origin-top-left ${state === "ready" ? "" : "invisible"}`}
       style={{ width: dimensions.width, height: dimensions.height, transform: `scale(${displayWidth / dimensions.width})` }} />
     {state !== "ready" && <div role="status" className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-3 text-center text-xs text-ink-secondary">
       <p>{state === "error" ? (t("review_workspace.preview_error") || "No se pudo mostrar la vista previa del texto.") : (t("review_workspace.preview_loading") || "Actualizando vista previa…")}</p>
