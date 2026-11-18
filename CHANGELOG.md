@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.181] - 2026-11-18
+## [1.1.184] - 2026-11-18
 
 ### Fixed
 - Flag lyrics written in a language that is not sung. When WhisperX guesses the wrong language from an intro it translates verses instead of transcribing them ("Gran Ídolo De Asia", Gilda "Rompo Las Cadenas": Spanish verses delivered in English or Japanese), and the output passed as a bilingual song with no alert. Every transcription now asks Gemini, in parallel and without requesting lyrics, which languages are sung (`transcription_quality.language_probe`, ~US$0.01 per song, retried on Vertex 429). Two or more delivered lines confidently written in a language the probe did not hear, or in a non-Latin script, raise the existing language-conflict review with those lines highlighted. Bilingual songs, unavailable probes and unclassifiable languages abstain; nothing is forced or rewritten. The probe survives edits and quality replays, and the gate recomputes it from persisted data. `SUNG_LANGUAGE_PROBE_ENABLED=0` turns it off.
