@@ -48,10 +48,11 @@ def _run_child(command, *, timeout_s):
     try:
         stdout, stderr = process.communicate(timeout=timeout_s)
         return process.returncode, stdout, stderr
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise
+    finally:
+        # A lost worker lease must not leave a separator running alone.
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
 
 
 def _prepare_local_stem(audio: Path, expected_sha: str, cache_dir: Path, *, python_executable=None,
@@ -279,4 +280,7 @@ def main():
 
 
 if __name__ == "__main__":
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
     raise SystemExit(main())

@@ -247,7 +247,7 @@ class WorkerTests(unittest.TestCase):
         with patch("genly_model_worker.LeaseHeartbeat", Heartbeat), \
                 patch("genly_model_worker.download_original", return_value=self.destination), \
                 patch("genly_model_worker.subprocess.Popen", return_value=process), \
-                patch("genly_model_worker.time.monotonic", side_effect=[0, 2000]):
+                patch("genly_model_worker.time.monotonic", side_effect=[0, 0, 2000]):
             with self.assertRaisesRegex(WorkerError, "inference_timeout"):
                 self.run_model_claim(client)
         process.terminate.assert_called_once()
@@ -289,6 +289,8 @@ class WorkerTests(unittest.TestCase):
             elif script == "run_qwen_genly_recognition.py":
                 self.assertEqual(completed, ["genly_model_stems.py"])
                 self.assertEqual(command[0], str(interpreter))
+                self.assertEqual(command[command.index("--model-name") + 1], "mlx-community/Qwen3-ASR-1.7B-4bit")
+                self.assertEqual(command[command.index("--memory-limit-gib") + 1], "2.75")
                 self.assertTrue(Path(command[command.index("--stem-manifest") + 1]).is_file())
                 output = Path(command[command.index("--output") + 1])
                 output.mkdir()

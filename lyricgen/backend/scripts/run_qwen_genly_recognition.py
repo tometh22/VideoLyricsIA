@@ -38,14 +38,17 @@ def main():
     duration = probe(args.audio)
     windows = plan_windows(duration, max_windows=args.max_windows)
     available = available_memory_gib(subprocess.check_output(["vm_stat"], text=True))
+    # The admission threshold was exercised by the serial local 1.7B runs.
+    # MLX's allocation ceiling is a separate bound, not a free-RAM estimate.
+    required = 1.8
     preflight = {"status": "preflight", "model": args.model_name,
                  "duration_seconds": duration, "windows": len(windows),
-                 "available_memory_gib": round(available, 3), "required_memory_gib": 1.8,
+                 "available_memory_gib": round(available, 3), "required_memory_gib": required,
                  "hosted_provider_calls": 0}
     if not args.execute:
         print(json.dumps(preflight))
         return 0
-    if available < 1.8:
+    if available < required:
         print(json.dumps({**preflight, "status": "blocked_memory"}))
         return 2
     if (args.output / "recognition.json").exists():

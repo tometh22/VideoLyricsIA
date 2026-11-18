@@ -10,6 +10,15 @@ import genly_model_stems as stems
 
 
 class LocalStemTests(unittest.TestCase):
+    def test_interrupted_helper_kills_separator_process_group(self):
+        process = Mock(pid=12345)
+        process.poll.return_value = None
+        process.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+        with patch.object(stems.subprocess, "Popen", return_value=process), patch.object(stems.os, "killpg") as kill:
+            with self.assertRaises(KeyboardInterrupt):
+                stems._run_child(["local-separator"], timeout_s=5)
+        kill.assert_called_once_with(12345, stems.signal.SIGKILL)
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)

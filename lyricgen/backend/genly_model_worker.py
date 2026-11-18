@@ -173,7 +173,8 @@ def run_claim(client, claim: dict, *, worker_id: str, output_root: Path,
               selector: Path, adapter: Path | None, model="base", device="mps",
               timeout_seconds=1800, stem_manifest: Path | None = None,
               qwen_python: Path | None = None, qwen_checkpoint: Path | None = None,
-              separate_vocals: bool = False, activity_vendor: Path | None = None) -> dict:
+              separate_vocals: bool = False, activity_vendor: Path | None = None,
+              qwen_model_name="mlx-community/Qwen3-ASR-1.7B-4bit", qwen_memory_limit_gib=2.75) -> dict:
     run_id = claim["run_id"]
     if not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in run_id):
         raise WorkerError("invalid_run_identity")
@@ -224,6 +225,7 @@ def run_claim(client, claim: dict, *, worker_id: str, output_root: Path,
             recognition_command = [str(qwen_python), str(Path(__file__).parent / "scripts/run_qwen_genly_recognition.py"),
                                    "--snapshot", str(folder / "snapshot.json"), "--audio", str(audio),
                                    "--selector", str(selector), "--checkpoint", str(qwen_checkpoint),
+                                   "--model-name", qwen_model_name, "--memory-limit-gib", str(qwen_memory_limit_gib),
                                    "--output", str(folder / "recognition"), "--execute"]
             if stem_manifest:
                 recognition_command.extend(["--stem-manifest", str(stem_manifest)])
@@ -236,6 +238,8 @@ def run_claim(client, claim: dict, *, worker_id: str, output_root: Path,
             for stage_command in commands:
                 if heartbeat.lost.is_set():
                     raise WorkerError("worker_lease_lost")
+                if time.monotonic() - started > timeout_seconds:
+                    raise WorkerError("inference_timeout")
                 process = subprocess.Popen(stage_command, stdout=log, stderr=log)
                 try:
                     while process.poll() is None:

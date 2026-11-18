@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--model", choices=["base", "target", "qwen"], default="base")
     parser.add_argument("--qwen-python", type=Path)
     parser.add_argument("--qwen-checkpoint", type=Path)
+    parser.add_argument("--qwen-model-name", default="mlx-community/Qwen3-ASR-1.7B-4bit")
+    parser.add_argument("--qwen-memory-limit-gib", type=float, default=2.75)
     parser.add_argument("--device", choices=["mps", "cpu"], default="mps")
     parser.add_argument("--stem-manifest", type=Path)
     parser.add_argument("--separate-vocals", action="store_true", help="Prepare missing stems locally using cached Demucs weights")
@@ -32,6 +34,8 @@ def main():
         parser.error("poll seconds must be between 5 and 60")
     if not args.selector.is_file():
         parser.error("selector artifact is required before advertising worker availability")
+    if not 1.5 <= args.qwen_memory_limit_gib <= 3:
+        parser.error("Qwen memory limit must be between 1.5 and 3 GiB")
     if args.model == "qwen" and (args.adapter or not args.qwen_python or not args.qwen_python.is_file()
                                 or not args.qwen_checkpoint or not args.qwen_checkpoint.is_dir()):
         parser.error("qwen requires its local interpreter/checkpoint and no Whisper adapter")
@@ -55,6 +59,7 @@ def main():
                                    model=args.model, device=args.device,
                                    qwen_python=args.qwen_python.resolve() if args.qwen_python else None,
                                    qwen_checkpoint=args.qwen_checkpoint.resolve() if args.qwen_checkpoint else None,
+                                   qwen_model_name=args.qwen_model_name, qwen_memory_limit_gib=args.qwen_memory_limit_gib,
                                    separate_vocals=args.separate_vocals,
                                    activity_vendor=args.activity_vendor.resolve() if args.activity_vendor else None,
                                    stem_manifest=args.stem_manifest.resolve() if args.stem_manifest else None)
