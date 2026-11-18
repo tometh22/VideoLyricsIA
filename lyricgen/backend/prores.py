@@ -152,6 +152,8 @@ def ensure_prores_exists(
     file_type: str,
     job: dict,
     tenant_id: str,
+    *,
+    require_r2_upload: bool = False,
 ) -> str:
     """Materialise the .mov for `file_type` (umg_master | umg_short).
 
@@ -167,6 +169,7 @@ def ensure_prores_exists(
     exception (ffmpeg failure, validator rejection) is re-raised by the
     underlying _transcode_to_prores.
     """
+    require_r2_upload = require_r2_upload or bool(job.get("_require_r2_upload"))
     if file_type not in FILE_MAP_PRORES:
         raise ValueError(
             f"ensure_prores_exists: unsupported file_type {file_type!r}"
@@ -187,7 +190,10 @@ def ensure_prores_exists(
     # MP4 means the source was re-rendered (edit/retry) after the .mov was
     # built — returning it would hand back the pre-edit cut. Fall through to
     # re-transcode in that case. (Freshness audit 2026-06-09.)
-    if os.path.exists(file_path) and _mov_is_fresh(file_path, source_path):
+    cached_file_ready = (
+        os.path.exists(file_path) and _mov_is_fresh(file_path, source_path)
+    )
+    if cached_file_ready and not require_r2_upload:
         return file_path
 
     umg_spec = job.get("umg_spec")
@@ -200,10 +206,13 @@ def ensure_prores_exists(
     with lock:
         # Double-check inside the lock: a sibling caller may have
         # finished a FRESH transcode while we were waiting.
-        if os.path.exists(file_path) and _mov_is_fresh(file_path, source_path):
+        cached_file_ready = (
+            os.path.exists(file_path) and _mov_is_fresh(file_path, source_path)
+        )
+        if cached_file_ready and not require_r2_upload:
             return file_path
 
-        if not os.path.exists(source_path):
+        if not cached_file_ready and not os.path.exists(source_path):
             source_key = (job.get("s3_keys") or {}).get(source_key_name)
             if source_key and storage.is_enabled():
                 os.makedirs(os.path.dirname(source_path), exist_ok=True)
@@ -216,10 +225,6 @@ def ensure_prores_exists(
                     f"Source {source_filename} not found; cannot generate ProRes."
                 )
 
-        spec = (
-            RenderSpec.umg(**umg_spec) if file_type == "umg_master"
-            else _short_prores_spec(umg_spec)
-        )
         # Freshness fence (audit 2026-06-09): the source lyric_video.mp4 is
         # MUTABLE — run_edit_pipeline overwrites it in place on an edit. This
         # transcode runs 60-300 s in a SEPARATE process (the per-(job,type)
@@ -235,40 +240,55 @@ def ensure_prores_exists(
         # from the new cut.
         fingerprint = _render_fingerprint(job_id, source_path)
 
-        # ffmpeg writes to .tmp; we rename atomically once the post-
-        # transcode validator is happy. Two processes may race on the
-        # same source but only one's os.replace lands. The loser's .tmp
-        # is overwritten or unlinked below.
-        tmp_path = f"{file_path}.tmp"
-        try:
-            _transcode_to_prores(source_path, tmp_path, spec)
-            if _is_superseded(job_id, source_path, fingerprint):
-                raise ProResSuperseded(
-                    f"Job {job_id} re-rendered during {file_type} transcode; "
-                    "discarding stale .mov (fingerprint changed)."
-                )
-            os.replace(tmp_path, file_path)
-        finally:
-            # If transcode raised mid-way (or we discarded a superseded
-            # build), drop the partial.
-            if os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+        if not cached_file_ready:
+            spec = (
+                RenderSpec.umg(**umg_spec) if file_type == "umg_master"
+                else _short_prores_spec(umg_spec)
+            )
+            # ffmpeg writes to .tmp; we rename atomically once the post-
+            # transcode validator is happy. Two processes may race on the
+            # same source but only one's os.replace lands. The loser's .tmp
+            # is overwritten or unlinked below.
+            tmp_path = f"{file_path}.tmp"
+            try:
+                _transcode_to_prores(source_path, tmp_path, spec)
+                if _is_superseded(job_id, source_path, fingerprint):
+                    raise ProResSuperseded(
+                        f"Job {job_id} re-rendered during {file_type} transcode; "
+                        "discarding stale .mov (fingerprint changed)."
+                    )
+                os.replace(tmp_path, file_path)
+            finally:
+                # If transcode raised mid-way (or we discarded a superseded
+                # build), drop the partial.
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
-        # Best-effort R2 upload so future downloads of this ProRes skip
-        # the transcode entirely. Don't fail the caller if it errors.
+        # Background prewarms may keep the local result when R2 has a
+        # transient issue. Portal-triggered work runs on a separate worker
+        # from the API, so it must confirm the R2 object before reporting
+        # success to the customer.
         # (Unreachable when superseded at os.replace — the raise above skips
         # this.)
         try:
-            if storage.is_enabled():
+            if not storage.is_enabled():
+                if require_r2_upload:
+                    raise RuntimeError("R2 storage is unavailable for portal ProRes.")
+            else:
                 from delivery_snapshots import pin_legacy_deliveries
                 pin_legacy_deliveries(job_id)
                 key = storage.upload_master(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )
-                if key:
+                if not key:
+                    if require_r2_upload:
+                        raise RuntimeError("R2 did not return a ProRes object key.")
+                else:
+                    if require_r2_upload and storage.object_status(key) != "exists":
+                        raise RuntimeError("ProRes upload was not confirmed in R2.")
                     # SECOND freshness fence (audit 2026-06-09): the upload
                     # above takes seconds (a 4K master is GBs). An edit/retry
                     # can land in that window — os.replace published a then-
@@ -317,12 +337,16 @@ def ensure_prores_exists(
         except ProResSuperseded:
             raise
         except Exception as e:  # pragma: no cover
+            if require_r2_upload:
+                raise
             logger.warning("[PRORES] R2 upload skipped: %s", e)
 
     return file_path
 
 
-def prewarm_prores(job_id: str, file_type: str) -> str | None:
+def prewarm_prores(
+    job_id: str, file_type: str, require_r2_upload: bool = False,
+) -> str | None:
     """Worker entrypoint for the optional pre-warm flow (G4).
 
     Loads the Job from Postgres, calls ensure_prores_exists, and
@@ -357,7 +381,18 @@ def prewarm_prores(job_id: str, file_type: str) -> str | None:
         db.close()
 
     try:
-        path = ensure_prores_exists(job_id, file_type, job, tenant_id)
+        try:
+            from rq import get_current_job
+            rq_job = get_current_job()
+            require_r2_upload = require_r2_upload or bool(
+                rq_job and (rq_job.meta or {}).get("portal_require_r2_upload")
+            )
+        except Exception:
+            pass
+        path = ensure_prores_exists(
+            job_id, file_type, job, tenant_id,
+            require_r2_upload=require_r2_upload,
+        )
         logger.info("[PRORES] prewarm: %s/%s ready at %s", job_id, file_type, path)
         return path
     except (ProResMisconfigured, ProResSourceMissing, ProResSuperseded) as e:

@@ -7,6 +7,7 @@ or job changes before applying a bulk operation.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 import copy
 import csv
 import hashlib
@@ -39,6 +40,14 @@ def field(label, group, kind="text", **kw):
     return {"label": label, "group": group, "kind": kind, **kw}
 
 
+import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
+import lyric_recipes as _lyric_recipes  # noqa: E402
+
+# Looks that paint the whole frame in every genre. Cinético does it only in
+# pop (its original design), so a Veo group needs the campaign's genre set to
+# one where it uses the song's background (lyric_recipes.may_own_background).
+_ALWAYS_OWN_BACKGROUND = {"pop70", "degrade"}
+
 FIELDS = {
     "font": field("Tipografía", "Letra", "select", options=[""] + CATALOG["fonts"]),
     "font_scale": field("Tamaño de letra", "Letra", "number", min=.6, max=1.5, step=.05),
@@ -48,6 +57,15 @@ FIELDS = {
     "text_contrast": field("Contraste", "Letra", "select", options=["subtle", "medium", "strong"]),
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
+    "lyric_look": field("Look de letra", "Letra", "select", options=["", *_lyric_looks.LOOKS]),
+    # Look variant: genre ("" = detectar), variant ("" = automática, sin
+    # repetir entre canciones de la campaña) and operator overrides.
+    "lyric_genre": field("Género del look", "Letra", "select", options=["", *_lyric_recipes.GENRES]),
+    "lyric_variant": field("Variante del look", "Letra", "text", max_length=4),
+    "lyric_font_main": field("Letra principal del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_font_key": field("Letra destacada del look", "Letra", "select", options=["", *sorted(_lyric_recipes.FONTS)]),
+    "lyric_alt_color": field("Color secundario del look", "Letra", "color"),
+    "lyric_accent_color": field("Color destacado del look", "Letra", "color"),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),
@@ -74,7 +92,9 @@ FIELDS = {
 RENDER_KEYS = (set(FIELDS) - {"scene_source"}) | {"match_lyrics", "bg_verbatim"}
 DEFAULTS = {"font": "", "font_scale": 1., "text_case": "upper", "text_contrast": "medium",
             "lyric_color": "#FFFFFF", "lyric_sung_color": "#FFFFFF", "lyrics_animation": "none",
-            "line_transition": "none", "background_id": None, "background_mode": "as_is",
+            "line_transition": "none", "lyric_look": "", "lyric_genre": "", "lyric_variant": "",
+            "lyric_font_main": "", "lyric_font_key": "", "lyric_alt_color": "", "lyric_accent_color": "",
+            "background_id": None, "background_mode": "as_is",
             "match_lyrics": True, "bg_verbatim": False, "background_hint": "", "genre": "", "concept": "",
             "movement_style": "", "effect": "", "style": "auto", "custom_colors": "",
             "animate_image": False, "enable_scenes": False, "title_template": "auto", "title_size": 1.,
@@ -108,6 +128,18 @@ def normalize_settings(settings):
         if not spec:
             fail(f"Ajuste no permitido: {key}")
         kind = spec["kind"]
+        if key == "lyric_variant":
+            # "" = automatic; else a variant number (the editor sends ints).
+            if value in ("", None):
+                value = ""
+            elif type(value) is int or (isinstance(value, str) and value.isdigit()):
+                if not 0 <= int(value) <= 9999:
+                    fail(f"{spec['label']}: fuera de rango")
+                value = str(int(value))
+            else:
+                fail(f"{spec['label']}: valor no válido")
+            out[key] = value
+            continue
         if kind == "boolean":
             if type(value) is not bool:
                 fail(f"{spec['label']}: se requiere sí/no")
@@ -124,7 +156,9 @@ def normalize_settings(settings):
                 fail(f"{spec['label']}: opción no disponible")
             if kind == "color":
                 import re
-                if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                # "" = automatic for colours whose default is "" (look variant).
+                if not (value == "" and DEFAULTS.get(key) == "") and \
+                        not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
                     fail("Color no válido")
         out[key] = value
     source = out.pop("scene_source", None)
@@ -154,9 +188,10 @@ class PlanRequest(Strict):
     revision: int = Field(ge=0)
     item_ids: list[str] = Field(min_length=1, max_length=1000)
     mode: Literal["percent", "count"] = "percent"
-    groups: list[Group] = Field(min_length=1, max_length=30)
+    groups: list[Group] = Field(min_length=1, max_length=512)
     seed: str = Field(default="campaign", min_length=1, max_length=100)
     replace_exceptions: bool = False
+    preserve_existing_pins: bool = False
     pin: bool = False
     contract: bool = False
     reason: str = Field(min_length=3, max_length=1000)
@@ -172,6 +207,19 @@ class UndoRequest(Strict):
     revision: int
     operation_id: str
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class SongPrompt(Strict):
+    item_id: str = Field(min_length=1, max_length=100)
+    scene: str = Field(default="", max_length=4000)
+
+
+class PromptRequest(Strict):
+    revision: int = Field(ge=0)
+    common: str = Field(default="", max_length=3000)
+    songs: list[SongPrompt] = Field(min_length=1, max_length=512)
+    source: Literal["prompt_improved", "prompt_literal"] = "prompt_improved"
+    replace_exceptions: bool = False
 
 
 def apportion(groups, count, mode):
@@ -212,7 +260,9 @@ def _items(db, campaign):
 def _snapshot(db, campaign):
     jobs = db.query(Job).filter(Job.campaign_id == campaign.id).all()
     docs = db.query(EditorDocument).filter(EditorDocument.job_id.in_([j.job_id for j in jobs])).all()
-    return digest({"defaults": campaign.default_render_params,
+    # Product routing is campaign metadata; changing its tab must not stale a creative preview.
+    defaults = {k: v for k, v in (campaign.default_render_params or {}).items() if k != "product_channel"}
+    return digest({"defaults": defaults,
                    "items": [(i.id, i.render_overrides, i.discard_record) for i in _items(db, campaign)],
                    "jobs": sorted((j.job_id, j.status, j.render_params) for j in jobs),
                    "docs": sorted((d.job_id, d.revision, str(d.lock_expires_at)) for d in docs)})
@@ -238,6 +288,11 @@ def validate_combination(db, campaign, settings, group, user):
             fail("Fondo no disponible para esta campaña", 404)
     if settings.get("enable_scenes") and (asset or not has_scenes_access(user)):
         fail("Escenas requiere acceso habilitado y fondo IA")
+    if (group.requirement in ("veo", "photo_effect") and settings.get("lyric_look")
+            and (settings.get("lyric_look") in _ALWAYS_OWN_BACKGROUND
+                 or _lyric_recipes.may_own_background(settings.get("lyric_look"),
+                                                      settings.get("lyric_genre") or ""))):
+        fail("Este look no usa fondo (pinta todo el cuadro): elegí otro look o un grupo sin fondo IA")
     if group.requirement == "photo_effect":
         if settings.get("effect") in (None, "", "none", "foto_viva"):
             fail("Foto fija requiere un efecto de superposición; Foto viva no es foto fija")
@@ -263,7 +318,12 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
         {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
         for group in plan.get("groups", [])
     ]}
+    from campaign_mix import catalog as mix_catalog
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
+            "mix_catalog": mix_catalog(), "features": {"bulk_prompts": True}, "portal_id": campaign.destination_portal,
+            "delivery_plan_period": (campaign.default_render_params or {}).get("delivery_plan_period", ""),
+            "can_view_account_balance": current_user.get("role") == "admin",
+            "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
             "veo_model": VEO_LITE,
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
@@ -316,7 +376,7 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             effective = effective_settings(campaign, {**before, **patch})
             validate_combination(db, campaign, effective, group, current_user)
             assignment = {"group_id": group.id, "group_name": group.name, "requirement": group.requirement,
-                          "model": group.model, "pinned": body.pin, "revision": body.revision + 1}
+                          "model": group.model, "pinned": body.pin or bool(body.preserve_existing_pins and before.get(ASSIGNMENT, {}).get("pinned")), "revision": body.revision + 1}
             if group.requirement == "creative" and not body.contract and before.get(ASSIGNMENT):
                 assignment = {**before[ASSIGNMENT], "revision": body.revision + 1,
                               "pinned": body.pin or before[ASSIGNMENT].get("pinned", False), "preset_name": group.name}
@@ -337,6 +397,41 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             "changes": [{**{k: c[k] for k in ("item_id", "artist", "title", "group")},
                          "before": effective_settings(campaign, c["before"]),
                          "after": effective_settings(campaign, c["after"])} for c in changes]}
+
+
+@router.post("/{campaign_id}/creative/prompts-preview")
+def preview_prompts(campaign_id: str, body: PromptRequest, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Assign explicit prompts to their songs through the existing frozen ledger.
+
+    One count=1 group per editable song, in the same seeded order used by
+    preview(). Keeping this mapping server-side avoids swapping scenes when
+    the UI selection order changes. Apply/undo retain the normal guards.
+    """
+    campaign = _campaign(db, campaign_id, current_user, True)
+    by_id = {song.item_id: song for song in body.songs}
+    if len(by_id) != len(body.songs):
+        fail("La selección contiene canciones repetidas")
+    selected = [item for item in _items(db, campaign) if item.id in by_id]
+    if len(selected) != len(by_id):
+        fail("Selección ajena a la campaña", 404)
+    available = [item for item in selected if body.replace_exceptions or not (item.render_overrides or {}).get(ASSIGNMENT, {}).get("pinned")]
+    if not available:
+        fail("Todos los diseños están fijados. Activá su reemplazo si querés cambiar los prompts.")
+    seed = "song-prompts-v1"
+    groups = []
+    for item in sorted(available, key=lambda item: digest([seed, item.id])):
+        prompt = "\n\n".join(part.strip() for part in (body.common, by_id[item.id].scene) if part.strip())
+        if not prompt or len(prompt) > 4000:
+            fail(f"{item.title or item.filename}: el prompt debe tener entre 1 y 4000 caracteres")
+        groups.append(Group(id="prompt-" + digest(item.id)[:20], name=("Prompt · " + (item.title or item.filename))[:100],
+            weight=1, requirement="creative", settings={"scene_source": body.source, "background_hint": prompt,
+                "background_id": None, "background_mode": "as_is"}))
+    result = preview(campaign_id, PlanRequest(revision=body.revision, item_ids=list(by_id), groups=groups,
+        mode="count", seed=seed, replace_exceptions=body.replace_exceptions, preserve_existing_pins=True,
+        reason="Edición de prompts de fondo en lote"), current_user, db)
+    positions = {item.id: (item.ordinal, item.id) for item in selected}
+    result["changes"].sort(key=lambda change: positions[change["item_id"]])
+    return result
 
 
 @router.post("/{campaign_id}/creative/apply")
@@ -433,6 +528,11 @@ def record_delivery(campaign_id: str, body: DeliveryRequest, current_user=Depend
     evidence = (job.render_params or {}).get("campaign_render_evidence") or {}
     if job.status != "done" or not job.approved_at or not job.video_url or evidence.get("video_sha256") != body.video_sha256:
         fail("La entrega requiere el archivo vigente y aprobado, con huella verificada", 409)
+    from delivery_acoustic_qc import require_delivery_review
+    try:
+        require_delivery_review(job)
+    except ValueError as exc:
+        fail(str(exc), 409)
     previous = _logs(db, campaign, "delivered").filter(AuditLog.detail["job_id"].as_string() == job.job_id,
                  AuditLog.detail["video_sha256"].as_string() == body.video_sha256).first()
     if previous:
@@ -450,6 +550,10 @@ def generation_receipt(db, job, submitted_revision, settings, actor):
     campaign = db.query(BatchCampaign).filter_by(id=job.campaign_id).one()
     item = db.query(BatchCampaignItem).filter_by(id=job.campaign_item_id).first()
     assignment = effective_veo_assignment((item.render_overrides or {}).get(ASSIGNMENT) if item else None)
+    if campaign.kind == "lyric_video" and (campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")):
+        from delivery_plan import assignment_type
+        if assignment_type(settings, assignment) == "unknown":
+            fail("Asigná Veo o Foto + efecto en el Plan de entrega antes de generar.", 409)
     if not assignment:
         return
     if str(assignment["revision"]) != str(submitted_revision):
@@ -530,9 +634,10 @@ def portal_history(job_ids, tenant_id):
         publications = ddb.query(
             Delivery.job_id, Delivery.portal_id,
             func.count(DeliveryChangeRequest.id),
+            func.min(DeliveryChangeRequest.submitted_at),
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
-            Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.approved_at, Delivery.content_updated_at, Delivery.added_at,
         ).outerjoin(DeliveryChangeRequest, and_(
             DeliveryChangeRequest.delivery_id == Delivery.id,
             DeliveryChangeRequest.resolved_at.is_(None),
@@ -543,22 +648,58 @@ def portal_history(job_ids, tenant_id):
             Delivery.job_id, Delivery.portal_id,
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
-            Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.approved_at, Delivery.content_updated_at, Delivery.added_at,
         ).all()
+        # Which of these jobs still have a FROZEN copy behind an active delivery.
+        # Read in Python (a JSON column cannot be grouped, and JSON null must read
+        # as "no snapshot" like everywhere else in the app).
+        from delivery_snapshots import is_hidden_from_client
+        frozen_jobs = set()
+        deliveries_per_job: dict = {}
+        hidden_per_job: dict = {}
+        for frozen_job, keys, stale_since, stale_reason_, visibility in ddb.query(
+                Delivery.job_id, Delivery.published_file_keys, Delivery.stale_since, Delivery.stale_reason,
+                Delivery.client_visibility,
+        ).filter(
+            Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id, Delivery.removed_at.is_(None),
+        ).all():
+            if keys is not None:
+                frozen_jobs.add(frozen_job)
+            # What the client's portal keeps out of view right now (operator choice
+            # or the automatic rule for unpublished changes).
+            deliveries_per_job[frozen_job] = deliveries_per_job.get(frozen_job, 0) + 1
+            if is_hidden_from_client(SimpleNamespace(
+                    published_file_keys=keys, stale_since=stale_since, stale_reason=stale_reason_,
+                    client_visibility=visibility)):
+                hidden_per_job[frozen_job] = hidden_per_job.get(frozen_job, 0) + 1
+        # "The client sees nothing": every active portal row of the job is hidden.
+        hidden_jobs = {job for job, total in deliveries_per_job.items() if hidden_per_job.get(job) == total}
     result = {}
-    for (job_id, portal_id, pending, fingerprint, revision,
-         stale_since, stale_reason, approved_at, content_updated_at) in publications:
+    for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
+         stale_since, stale_reason, approved_at, content_updated_at, added_at) in publications:
         row = result.setdefault(job_id, {
             "umg_portals": [], "pending_change_requests": 0,
             # Fingerprints publicados, para que el llamador compare contra el
             # render actual sin volver a la DB del portal.
             "published_fingerprints": [], "published_revision": 1,
             "portal_updating": False, "portal_awaiting_review": False,
+            "oldest_change_request_at": None,
+            "snapshot_pinned": job_id in frozen_jobs,
+            "client_hidden": job_id in hidden_jobs,
+            # When the portal last got this job (legacy rows have no fingerprint, so
+            # "corrected after this moment" is the only evidence that they are stale).
+            "published_baseline_at": None,
         })
+        baseline = content_updated_at or added_at
+        if baseline is not None and (row["published_baseline_at"] is None or baseline > row["published_baseline_at"]):
+            row["published_baseline_at"] = baseline
         portal = portal_id or "argentina"
         if portal not in row["umg_portals"]:
             row["umg_portals"].append(portal)
         row["pending_change_requests"] += pending
+        if pending and oldest_pending is not None and (
+                row["oldest_change_request_at"] is None or oldest_pending < row["oldest_change_request_at"]):
+            row["oldest_change_request_at"] = oldest_pending
         if fingerprint:
             row["published_fingerprints"].append(fingerprint)
         row["published_revision"] = max(row["published_revision"], revision or 1)

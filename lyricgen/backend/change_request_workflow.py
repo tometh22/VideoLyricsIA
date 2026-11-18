@@ -43,3 +43,131 @@ def render_state(job, document, request):
         'rendered_at': rendered_at.isoformat() if rendered_at else None,
         'can_render': job.status in {'done', 'pending_review', 'rejected'},
     }
+
+
+def published_answer(job, document, delivery, request):
+    """Whether the cut the portal ALREADY serves answers this open request.
+
+    A send that published the corrected cut without ticking the request left
+    it open, and nothing could close it "by publication" afterwards: the
+    portal is no longer behind, so no send can close it again. Evidence only,
+    mirroring ``closable_on_publish`` minus "the portal is behind": the fix was
+    saved after the request, the render matches that save, and the portal
+    published that exact render after the request arrived.
+    """
+    from delivery_freshness import needs_publish
+    if request.resolved_at is not None or job is None or delivery is None or document is None:
+        return False, "not_applicable"
+    if delivery.removed_at is not None or job.status not in {'done', 'pending_review'}:
+        return False, "not_applicable"
+    submitted_at = timestamp(request.submitted_at)
+    saved_at = timestamp(document.updated_at)
+    published_at = timestamp(delivery.content_updated_at)
+    if submitted_at is None or saved_at is None or saved_at < submitted_at:
+        return False, "no_fix_after_request"
+    if not render_state(job, document, request)['render_matches_editor']:
+        return False, "render_not_current"
+    if needs_publish(job, delivery):
+        return False, "not_published"
+    if published_at is None or published_at < submitted_at:
+        return False, "published_before_request"
+    return True, "ok"
+
+
+def case_state(*, publication, proposal_status=None, resolved_at=None,
+               resolution_source=None, proposal_enabled=True, available=True,
+               pending_manual=0):
+    """One conservative operator projection. Commands still revalidate authority.
+
+    Published state describes persisted delivery metadata, NOT an independent
+    consumer verification. Missing data never advances a completed step.
+    """
+    def state(key, step, label, detail, tone, actions):
+        if pending_manual and not resolved_at:
+            detail += f' Hay {pending_manual} instrucciones sin comprobación automática: debés revisarlas manualmente en el corte final.'
+        return dict(key=key, activeStep=step, label=label, detail=detail,
+                    tone=tone, allowed_actions=actions, pending_manual=pending_manual,
+                    schema_version='correction-workflow-v1')
+    if resolved_at:
+        if resolution_source == 'publication':
+            return state('resolved', 5, 'Pedido resuelto al publicar',
+                         'El registro vincula este cierre a una versión publicada. La aprobación del cliente es independiente.',
+                         'done', ['reopen'])
+        return state('resolved', 0, 'Pedido cerrado sin publicación',
+                     'Cierre manual: no confirma que se haya generado o publicado otro video.',
+                     'idle', ['reopen'])
+    if not available or not publication:
+        return state('unknown', 0, 'Estado por verificar',
+                     'No hay evidencia suficiente del trabajo y la entrega. Actualizá el estado.',
+                     'attention', ['refresh'])
+    p = publication
+    status = p.get('job_status')
+    if status in {'queued', 'processing', 'rendering', 'editing', 'transcribed_pending'}:
+        return state('rendering', 2, 'En cola' if status == 'queued' else 'Generando corte nuevo',
+                     'El trabajo continúa en segundo plano. Esto todavía no publica en el portal.',
+                     'busy', ['refresh'])
+    if status == 'error':
+        return state('blocked', 2, 'La generación necesita atención',
+                     'Abrí el trabajo para revisar el error y su recuperación. No vuelvas a aplicar los cambios guardados.',
+                     'attention', ['edit', 'refresh'])
+    base = ['edit', 'resolve'] + (['analyze'] if proposal_enabled else [])
+    # A proposal is advisory, not a mandatory apply receipt: corrections may
+    # have been made in the editor or campaign history. A current, identified
+    # cut can be reviewed for publication without reapplying an old proposal.
+    # This does not attest any proposal operation or clear manual warnings.
+    if (proposal_status in {'ready', 'partial', 'needs_input', 'stale', 'dismissed'}
+            and status in {'done', 'pending_review'}
+            and p.get('render_matches_editor') is True
+            and p.get('needs_publish') is True
+            and isinstance(p.get('render_fingerprint'), str)
+            and p['render_fingerprint'].strip()
+            and type(p.get('editor_revision')) is int
+            and p['editor_revision'] >= 0):
+        action = 'prepare_master' if p.get('prores_pending') else 'publish'
+        return state('publish', 3,
+                     'Preparar archivo profesional' if action == 'prepare_master'
+                     else 'Revisar video y publicar actualización',
+                     'El corte corresponde a la letra guardada. La propuesta sigue pendiente: revisá el pedido completo en el video antes de publicar; no hace falta volver a aplicarla si lo corregiste a mano.',
+                     'attention', base + ['review_proposal', action])
+    if proposal_status in {'ready', 'partial', 'needs_input', 'stale', 'dismissed'}:
+        key = 'analyze' if proposal_status in {'stale', 'dismissed'} else 'apply'
+        return state(key, 0 if key == 'analyze' else 1,
+                     'Hay que recalcular' if key == 'analyze' else 'Revisar propuesta y partes pendientes',
+                     'La existencia de un render o master no confirma que estas instrucciones estén atendidas.',
+                     'attention', base + ['review_proposal'] + (['review_render'] if p.get('can_render') else []))
+    if p.get('render_matches_editor') is False and p.get('can_render'):
+        if p.get('campaign_job'):
+            # Campaign songs render only after the song-level lyrics+timing
+            # approval, which lives in the editor; this panel's render would
+            # answer 409 lyrics_and_timing_approval_missing.
+            return state('render', 2, 'Aprobar letra y generar video',
+                         'La corrección está guardada. En canciones de campaña el video se genera al aprobar letra y timing en el editor.',
+                         'action', base + ['approve_in_editor'])
+        return state('render', 2, 'Revisar cambios guardados y generar video',
+                     'Confirmá la letra guardada. El video todavía no contiene esta revisión.',
+                     'action', base + ['review_render'])
+    if p.get('render_matches_editor') is not True:
+        return state('unknown', 0, 'Correspondencia del render por verificar',
+                     'No se comprobó que el corte use la revisión guardada.',
+                     'attention', base + ['refresh'])
+    if p.get('prores_pending'):
+        return state('publish', 3, 'Preparar archivo profesional',
+                     'El master debe corresponder al corte revisado antes de publicar.',
+                     'attention', base + ['prepare_master'])
+    if p.get('needs_publish') is True:
+        return state('publish', 3, 'Revisar video y publicar actualización',
+                     'Publicar confirma este corte y este pedido. El cliente conserva su aprobación independiente.',
+                     'attention', base + ['publish'])
+    if p.get('needs_publish') is False and p.get('revision') and p.get('answers_request') is True:
+        # Evidence that A fix was published, never that EVERY instruction was
+        # (5 of 10 requests closed this way on 2026-10-03 were incomplete):
+        # the panel makes the operator tick each point against the cut.
+        return state('review', 3, 'Publicado · revisá cada punto del pedido',
+                     'El portal ya tiene un video corregido después del pedido. Revisá cada punto contra el video; si falta alguno, corregilo y volvé a publicar.',
+                     'action', base + ['confirm_publication'])
+    if p.get('needs_publish') is False and p.get('revision'):
+        return state('review', 3, 'Publicación registrada · revisar pedido',
+                     'La entrega coincide según el registro. Verificá lo solicitado antes de cerrar con un motivo.',
+                     'action', base)
+    return state('unknown', 0, 'Publicación por verificar',
+                 'Actualizá el estado antes de confirmar la entrega.', 'attention', base + ['refresh'])

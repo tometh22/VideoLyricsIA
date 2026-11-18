@@ -123,6 +123,34 @@ export default function LyricVideoPreview({
   // The active segment drives selection box, readouts, handles and layout.
   const activeSeg = activeSegs.length > 0 ? activeSegs[activeSegs.length - 1] : null;
 
+  const cancelLayoutDrag = useCallback(() => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    setLive(null);
+    if (drag?.captureTarget?.hasPointerCapture?.(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture?.(drag.pointerId);
+    }
+  }, []);
+
+  // Playback can advance while the pointer is held. The gesture belongs to
+  // its original phrase, never to the next phrase reusing the same DOM node.
+  useEffect(() => {
+    if (dragRef.current && (dragRef.current.id !== activeSeg?._id
+      || dragRef.current.segmentId !== activeSeg?.segment_id)) cancelLayoutDrag();
+  }, [activeSeg?._id, activeSeg?.segment_id, cancelLayoutDrag]);
+
+  const layoutDragActive = live != null;
+  useEffect(() => {
+    if (!layoutDragActive) return undefined;
+    const escape = (event) => {
+      if (event.key !== "Escape" || event.isComposing) return;
+      event.preventDefault();
+      cancelLayoutDrag();
+    };
+    window.addEventListener("keydown", escape, true);
+    return () => window.removeEventListener("keydown", escape, true);
+  }, [layoutDragActive, cancelLayoutDrag]);
+
   const layoutOf = useCallback((seg) => {
     if (live && seg && live.id === seg._id) return live;
     return {
@@ -135,6 +163,7 @@ export default function LyricVideoPreview({
   const frameRect = () => frameRef.current?.getBoundingClientRect();
 
   const onPointerDown = useCallback((e, seg, mode) => {
+    if (e.button != null && e.button !== 0) return;
     e.stopPropagation();
     e.currentTarget.setPointerCapture?.(e.pointerId);
     onDragStart?.();
@@ -143,7 +172,8 @@ export default function LyricVideoPreview({
     const cx = rect ? rect.left + l.pos.x * rect.width : e.clientX;
     const cy = rect ? rect.top + l.pos.y * rect.height : e.clientY;
     dragRef.current = {
-      mode, id: seg._id,
+      mode, id: seg._id, segmentId: seg.segment_id,
+      pointerId: e.pointerId, captureTarget: e.currentTarget,
       originX: e.clientX, originY: e.clientY,
       origPos: l.pos, origScale: l.scale, origRot: l.rot,
       centerX: cx, centerY: cy,
@@ -156,7 +186,7 @@ export default function LyricVideoPreview({
 
   const onPointerMove = useCallback((e) => {
     const d = dragRef.current;
-    if (!d) return;
+    if (!d || d.pointerId !== e.pointerId) return;
     const rect = frameRect();
     if (!rect) return;
     if (Math.hypot(e.clientX - d.originX, e.clientY - d.originY) > CLICK_SLOP_PX) d.moved = true;
@@ -178,15 +208,15 @@ export default function LyricVideoPreview({
 
   const onPointerUp = useCallback((e, seg) => {
     const d = dragRef.current;
-    dragRef.current = null;
-    if (!d) { setLive(null); return; }
+    if (!d || d.pointerId !== e.pointerId) return;
     const committed = live;
-    setLive(null);
-    if (!d.moved) { onSelect?.(seg._id); return; }
-    if (committed) onLayoutChange?.(seg._id, {
+    cancelLayoutDrag();
+    if (d.id !== seg._id || d.segmentId !== seg.segment_id) return;
+    if (!d.moved) { onSelect?.(d.id); return; }
+    if (committed?.id === d.id) onLayoutChange?.(d.id, {
       pos: committed.pos, scale: committed.scale, rot: committed.rot,
     });
-  }, [live, onSelect, onLayoutChange]);
+  }, [live, onSelect, onLayoutChange, cancelLayoutDrag]);
 
   const bg = backgroundUrl
     ? null
@@ -235,6 +265,8 @@ export default function LyricVideoPreview({
         touchAction: "none",
       }}
       onPointerMove={onPointerMove}
+      onPointerCancel={cancelLayoutDrag}
+      onLostPointerCapture={cancelLayoutDrag}
     >
       {backgroundUrl && (
         <video

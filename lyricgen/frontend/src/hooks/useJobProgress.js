@@ -10,7 +10,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import { fetchSse, SseUnauthorizedError } from "../lib/fetchSse";
-import { fetchWithTimeout } from "../fetchWithTimeout";
 import { isTerminalStatus } from "../lib/jobStatus";
 
 export default function useJobProgress(jobId, { api, token } = {}) {
@@ -22,7 +21,6 @@ export default function useJobProgress(jobId, { api, token } = {}) {
   });
   const esRef = useRef(null);
   const pollRef = useRef(null);
-  const pollAbortRef = useRef(null);
 
   useEffect(() => {
     if (!jobId || !api) return undefined;
@@ -44,10 +42,6 @@ export default function useJobProgress(jobId, { api, token } = {}) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
-      if (pollAbortRef.current) {
-        try { pollAbortRef.current.abort(); } catch { /* noop */ }
-        pollAbortRef.current = null;
-      }
     };
 
     const apply = (data) => {
@@ -61,33 +55,20 @@ export default function useJobProgress(jobId, { api, token } = {}) {
     };
 
     const startPolling = () => {
-      if (pollRef.current) return;
       // /status/{id} returns the same row fields. Lower frequency than SSE
       // because each call is a full DB query; 3s matches the existing pattern.
-      const pollController = new AbortController();
-      pollAbortRef.current = pollController;
-      let running = false;
       const tick = async () => {
-        if (running || pollController.signal.aborted) return;
-        running = true;
         try {
-          const res = await fetchWithTimeout(`${api}/status/${jobId}`, {
+          const res = await fetch(`${api}/status/${jobId}`, {
             headers: token ? { Authorization: `Bearer ${token}` } : {},
-            signal: pollController.signal,
-          }, 10_000);
+          });
           if (res.status === 401) { forceReauth(); close(); return; }
           if (!res.ok) return;
           apply(await res.json());
-        } catch (error) {
-          if (error?.name !== "AbortError") {
-            // A transient timeout is retried by the next serialized tick.
-          }
-        } finally {
-          running = false;
-        }
+        } catch { /* ignore transient network */ }
       };
-      void tick();
-      pollRef.current = setInterval(() => { void tick(); }, 3000);
+      tick();
+      pollRef.current = setInterval(tick, 3000);
     };
 
     const controller = new AbortController();

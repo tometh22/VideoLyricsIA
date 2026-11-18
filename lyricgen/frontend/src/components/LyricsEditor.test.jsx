@@ -130,7 +130,7 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
     render(<LyricsEditor {...props} />);
     // Rediseño 2026-07: la confianza es una línea muted "Sincronizado con
     // tu letra"; el contador vive dentro del chip primario "Revisar · •N".
-    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/Pendiente de revisión/i)).toBeInTheDocument();
     // El chip navegador "Revisar" está presente y muestra el contador (3).
     expect(screen.getByTestId("review-next-btn")).toBeInTheDocument();
     expect(within(screen.getByTestId("review-next-btn")).getByText("3")).toBeInTheDocument();
@@ -147,7 +147,7 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/Pendiente de revisión/i)).toBeInTheDocument();
     // El chip "Revisar" muestra el contador aun con una sola línea (1).
     expect(within(screen.getByTestId("review-next-btn")).getByText("1")).toBeInTheDocument();
   });

@@ -2,8 +2,10 @@ import { reviewCreativeSettings } from "./lib/campaignCreative";
 import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
+import { pollReanchorTask } from "./lib/reanchorTask";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
+import { clearCampaignResourceCache } from "./hooks/useCampaignResource";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -47,6 +49,7 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const TeamPage = lazy(() => import("./components/TeamPage"));
 const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
 const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
@@ -74,7 +77,6 @@ import {
 } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { campaignApprovalFailure, translateBackendError } from "./lib/lyricsEditSubmit";
-import { requestIdempotencyKey } from "./lib/idempotency";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
@@ -95,7 +97,11 @@ import { fetchSse, SseUnauthorizedError } from "./lib/fetchSse";
 import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
-import { buildGenerationJob } from "./lib/buildGenerationJob";
+import { buildGenerationJob, buildDirectGenerationJob } from "./lib/buildGenerationJob";
+import { normalizeLyricLook, lyricColorForSubmit, lookOwnsBackground } from "./lib/lyricLooks";
+import {
+  LOOK_VARIANT_FIELDS, appendLookVariantFields, lookVariantFieldsFromParams, pickLookVariantFields,
+} from "./lib/lyricLookVariants";
 import {
   canRebuildMissingGenerationJob,
   isMissingGenerationJob,
@@ -108,8 +114,8 @@ import {
   PROACTIVE_URL_RETRY_MS,
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
-import { beginReviewResume, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
-import { creativeFieldsForReviewResume } from "./lib/reviewResume";
+import { beginReviewResume, reviewAlreadyOpen, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { creativeFieldsForReviewResume, mergeWizardPicksIntoResumedReview } from "./lib/reviewResume";
 import { editorSessionHeaders } from "./lib/editorSession";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -587,6 +593,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
     pathname === "/admin/cola" ? "review_queue" :
     pathname.startsWith("/campaigns") ? "campaigns" :
+    pathname === "/team" ? "team" :
+    pathname === "/my-tasks" ? "my_tasks" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
@@ -645,10 +653,23 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
     else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "team") navigate("/team");
+    else if (id === "my_tasks") navigate("/my-tasks");
     else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
   };
+
+  // El admin es un entorno aparte: pantalla completa, con su propia barra
+  // lateral y tema claro. No lleva la sidebar ni la topbar de la app.
+  if (pathname === "/admin") {
+    return (
+      <div className="min-h-screen">
+        <ServiceStatusBanner />
+        <Outlet />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen overflow-x-hidden bg-surface flex">
@@ -1595,6 +1616,12 @@ function VariantWizardRoute({
         frameFormat: params.frame_format || "full",
         lyricsAnimation: params.lyrics_animation || "none",
         lineTransition: params.line_transition || "none",
+        lyricLook: normalizeLyricLook(params.lyric_look || ""),
+        // Variante del look del padre (género / fuentes / colores). El
+        // NÚMERO no: una variante es otro video, arranca en automático y el
+        // backend le elige uno distinto al del padre (resolve con `fresh`).
+        ...lookVariantFieldsFromParams(params),
+        lyricVariant: "",
         // Normalizado igual que en edición: el backend persiste el valor CRUDO
         // y un padre con "dinamico" (lo emiten SceneEditModal y el derivado por
         // energía) no matchea ninguna tarjeta → la galería quedaba sin nada
@@ -1773,42 +1800,6 @@ function VariantWizardRoute({
   return wizardScreen;
 }
 
-// Sondeo del modo tarea del re-anclado (ver reanchorSegmentsOnBackend).
-const REANCHOR_TASK_POLL_MS = 3000;
-const REANCHOR_TASK_TIMEOUT_MS = 12 * 60 * 1000;
-const pollReanchorTask = async (jobId, taskId, onProgress) => {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < REANCHOR_TASK_TIMEOUT_MS) {
-    await new Promise((resolve) => setTimeout(resolve, REANCHOR_TASK_POLL_MS));
-    const elapsedS = Math.round((Date.now() - startedAt) / 1000);
-    if (typeof onProgress === "function") {
-      try { onProgress({ elapsedS, taskId }); } catch { /* progress is best-effort */ }
-    }
-    let res;
-    try {
-      res = await authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, { cache: "no-store" });
-    } catch (err) {
-      console.warn("[reanchor] task poll network error", err);
-      continue; // transient: keep polling until the deadline
-    }
-    if (res.status === 404) {
-      console.warn("[reanchor] task registry lost", taskId);
-      return { ok: false, reason: "task-lost" };
-    }
-    if (!res.ok) continue;
-    let record = null;
-    try { record = await res.json(); } catch { continue; }
-    if (record?.status !== "done") continue;
-    const httpStatus = Number(record.http_status);
-    const payload = record.payload || {};
-    if (httpStatus >= 200 && httpStatus < 300) return payload;
-    console.warn("[reanchor] task failed", httpStatus, payload?.detail || payload?.code || "");
-    return reanchorHttpFailure(httpStatus, payload, { terminal: true });
-  }
-  console.warn("[reanchor] task poll timed out", taskId);
-  return { ok: false, reason: "task-lost" };
-};
-
 export default function App() {
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -1852,6 +1843,14 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  const [campaignDesignJobId, setCampaignDesignJobId] = useState(null);
+  // Rendered campaign jobs use the existing edit wizard and have no
+  // transcribeJobId. Only an explicit first-pass review owns this workspace.
+  const dedicatedCampaignReview = Boolean(currentReview?.campaignId && currentReview?.transcribeJobId
+    && !currentReview?.editingJobId && !currentReview?.editMode && !currentReview?.variantMode);
+  const campaignDesignOpen = Boolean(dedicatedCampaignReview
+    && campaignDesignJobId === currentReview?.transcribeJobId);
+  useEffect(() => { setCampaignDesignJobId(null); }, [currentReview?.transcribeJobId]);
   const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
   // First-pass reviews, resumed sessions and back-navigation all have a
   // transcription job but previously never requested its peak envelope.
@@ -2075,7 +2074,8 @@ export default function App() {
     // review, el render usa el viejo.
     const fields = [
       "font", "textCase", "fontScale", "textContrast",
-      "lyricsAnimation", "lineTransition",
+      "lyricsAnimation", "lineTransition", "lyricLook",
+      ...LOOK_VARIANT_FIELDS.map(([camel]) => camel),
       "lyricColor", "lyricSungColor",
       "movementStyle", "effect", "concept", "genre",
       "backgroundHint", "bgVerbatim",
@@ -2102,7 +2102,7 @@ export default function App() {
   // preview caiga al sample hasta que el operador reproduzca la nueva canción.
   useEffect(() => {
     playbackTickRef.current = { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 };
-  }, [currentReview?.file?.name, files[0]?.file?.name]);
+  }, [reviewJobId, currentReview?.file?.name, files[0]?.file?.name]);
   // Capa B 2026-05-24 — wizardStage es la única fuente de verdad de qué muestra
   // el wizard. Reemplaza el `navigate("/review")` que disparaba el flash a
   // dashboard. URL se queda en /new mientras el operador transita upload →
@@ -2176,6 +2176,12 @@ export default function App() {
   const [backgroundMode, setBackgroundMode] = useState("as_is");
   const creativeReviewRef = useRef(currentReview);
   creativeReviewRef.current = currentReview;
+  const campaignRouteKeyRef = useRef(location.key);
+  campaignRouteKeyRef.current = location.key;
+  const campaignReviewStillCurrent = useCallback((review, routeKey) => (
+    campaignRouteKeyRef.current === routeKey
+    && creativeReviewRef.current?.transcribeJobId === review?.transcribeJobId
+  ), []);
   const campaignCreativeSave = useCampaignCreativeSave({
     identity: currentReview?.campaignCreativeRevision != null && currentReview?.campaignId
       ? `${currentReview.campaignId}/${currentReview.campaignItemId}` : null,
@@ -2400,6 +2406,14 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
+    // El wizard le acaba de dar a SU review la URL durable /review/<id>
+    // (effect "stable URL" de arriba): ya está en memoria con los picks del
+    // operador. /status sigue mandando en la transcripción y en los gates de
+    // idioma/referencia, pero su render_params está vacío hasta /generate:
+    // sin esto pisaba look, variante, tipografía, fondo y multi-escena
+    // (incidente 11-nov-2026) — ver reviewAlreadyOpen / mergeWizardPicks….
+    const wizardOwnReview = reviewAlreadyOpen(creativeReviewRef.current, resumeJobId)
+      ? creativeReviewRef.current : null;
     const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
     if (!attempt) return;
     (async () => {
@@ -2420,7 +2434,7 @@ export default function App() {
         };
         const preset = (snake, camel, fallback = "") =>
           campaignPreset[snake] ?? campaignPreset[camel] ?? fallback;
-        setCurrentReview({
+        const serverReview = {
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
           audioUrl: null,
@@ -2458,6 +2472,10 @@ export default function App() {
           fontScale: String(preset("font_scale", "fontScale", job.font_scale || "1.0")),
           lyricsAnimation: preset("lyrics_animation", "lyricsAnimation", job.lyrics_animation || "none"),
           lineTransition: preset("line_transition", "lineTransition", job.line_transition || "none"),
+          lyricLook: normalizeLyricLook(preset("lyric_look", "lyricLook", job.lyric_look || "")),
+          ...pickLookVariantFields(Object.fromEntries(LOOK_VARIANT_FIELDS.map(([camel, snake]) => (
+            [camel, preset(snake, camel, job[snake] ?? job.render_params?.[snake] ?? "")]
+          )))),
           lyricColor: preset("lyric_color", "lyricColor", job.lyric_color || "#FFFFFF"),
           lyricSungColor: preset("lyric_sung_color", "lyricSungColor", job.lyric_sung_color || "#FFFFFF"),
           textContrast: preset("text_contrast", "textContrast", job.text_contrast || "medium"),
@@ -2466,7 +2484,10 @@ export default function App() {
           referenceLyrics: job.reference_lyrics || "",
           referenceLinks: job.campaign?.review_reference_links || [],
           sourceReference: job.campaign?.source_reference || null,
-          campaignCreativeRevision: campaignPreset.creative_assignment?.revision ?? null,
+          // Individual creative edits can bootstrap an unassigned campaign
+          // item at revision 0; null disables its save hook entirely.
+          campaignCreativeRevision: campaignPreset.creative_assignment?.revision
+            ?? (job.campaign_id && job.campaign_item_id ? 0 : null),
           bgVerbatim: preset("bg_verbatim", "bgVerbatim", resumedCreativeFields.bgVerbatim),
           matchLyrics: preset("match_lyrics", "matchLyrics", true),
           titleTemplate: preset("title_template", "titleTemplate", "auto"),
@@ -2486,7 +2507,13 @@ export default function App() {
           campaignItemId: job.campaign_item_id || null,
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
-        });
+        };
+        // Funcional: si el operador tocó un pick mientras /status volaba,
+        // gana su último valor, no el de cuando arrancó el resume.
+        setCurrentReview((cur) => mergeWizardPicksIntoResumedReview(
+          serverReview,
+          wizardOwnReview && reviewAlreadyOpen(cur, resumeJobId) ? cur : null,
+        ));
         // Open the editor immediately and recover audio in the background.
         // Identity guards in the callback discard a late result if the
         // operator has already moved to another song.
@@ -2497,6 +2524,14 @@ export default function App() {
         // silencio (la variante "resume" del bug de Ana M.). El job
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
+        //
+        // Salvo que sea la review que el wizard acaba de crear: ahí el
+        // fondo, la multi-escena y el art track son lo que el operador
+        // eligió para ESTE batch y no se tocan.
+        if (wizardOwnReview) {
+          setWizardStage("review");
+          return;
+        }
         setBackgroundFile(null);
         const presetBackgroundId = preset("background_id", "backgroundId", null);
         setBackgroundId(job.campaign_id ? presetBackgroundId : null);
@@ -2531,6 +2566,9 @@ export default function App() {
         if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
         attempt.cancel(); // liberar sólo este intento, nunca el de otra canción
+        // La review del propio wizard ya está abierta y completa: un fallo
+        // del refresco no puede sacar al operador del editor.
+        if (wizardOwnReview) return;
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
@@ -2754,6 +2792,9 @@ export default function App() {
     // PR E: User B no debe heredar los segments editados de User A en la
     // misma máquina — el store es a nivel módulo, no muere con el unmount.
     try { segmentsStore.evictAll(); } catch { /* */ }
+    // Campaign snapshots (pipeline, review queue, videos) live in a module
+    // cache for instant tab switches; the next user must never see them.
+    try { clearCampaignResourceCache(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that
@@ -3260,10 +3301,7 @@ export default function App() {
           .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": requestIdempotencyKey(`transcribe-${jobId}`),
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             job_id: jobId,
             language: entry.language || "",
@@ -3376,15 +3414,11 @@ export default function App() {
       return;
     }
 
-    const jobList = files.map((f) => ({
-      filename: f.file.name, _file: f.file, artist: f.artist.trim(),
-      songTitle: (f.songTitle || "").trim(),
-      language: f.language, genre: f.genre || "", font: f.font || "",
-      concept: f.concept || "", movementStyle: f.movementStyle || "", effect: f.effect || "",
-      backgroundHint: f.backgroundHint || "", bgVerbatim: !!f.bgVerbatim,
-      status: "queued", current_step: null,
-      progress: 0, job_id: null, error: null,
-    }));
+    // Mismo contrato visual que el camino revisado (lib/buildGenerationJob):
+    // antes este map copiaba sólo fondo/fuente y dejaba afuera look, variante,
+    // tipografía, colores y portada → /generate recibía lyric_look="" y el
+    // video salía con la letra blanca plana (incidente 11-nov-2026).
+    const jobList = files.map((f) => buildDirectGenerationJob(f));
     setJobs(jobList);
     navigate("/generating");
     // Mismo cleanup que startGenerationWithSegments: el batch ya está en
@@ -3424,6 +3458,8 @@ export default function App() {
         // del batchDefault del operador. Init explícito acá.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        lyricLook: normalizeLyricLook(entry.lyricLook),
+        ...pickLookVariantFields(entry),
         // Title card customization (Full Rotor v1).
         titleTemplate: entry.titleTemplate || "auto",
         titleSize: entry.titleSize || "1.0",
@@ -3510,6 +3546,8 @@ export default function App() {
             // arriba (~línea 1163). Init explícito de los 2 ejes libass.
             lyricsAnimation: entry.lyricsAnimation || "none",
             lineTransition: entry.lineTransition || "none",
+            lyricLook: normalizeLyricLook(entry.lyricLook),
+            ...pickLookVariantFields(entry),
             segments: data.segments, referenceLyrics: data.reference_lyrics || "",
             segmentsRevision: Number.isInteger(data.segments_revision) ? data.segments_revision : 0,
             coverageWarning: !!data.coverage_warning,
@@ -3573,10 +3611,7 @@ export default function App() {
       });
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": requestIdempotencyKey(`transcribe-${uploadJobId}`),
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           job_id: uploadJobId,
           language: entry.language || "",
@@ -3671,6 +3706,8 @@ export default function App() {
         // Audit fix 2026-05-25: init explícito de los 2 ejes libass.
         lyricsAnimation: entry.lyricsAnimation || "none",
         lineTransition: entry.lineTransition || "none",
+        lyricLook: normalizeLyricLook(entry.lyricLook),
+        ...pickLookVariantFields(entry),
         // Title card customization (Full Rotor v1).
         titleTemplate: entry.titleTemplate || "auto",
         titleSize: entry.titleSize || "1.0",
@@ -3791,10 +3828,9 @@ export default function App() {
   // Pedimos async_mode: el backend contesta 202 {task_id} al instante y acá
   // sondeamos GET /reanchor/tasks/{task_id} hasta que termine, devolviendo
   // EXACTAMENTE la misma forma que el camino síncrono (LyricsEditor no
-  // cambia). Si el registro se perdió (404: réplica reemplazada) o el
-  // sondeo vence, devolvemos reason "task-lost" y el editor cae en su
-  // reconciliación por revisión. Un backend viejo responde 200/4xx directo
-  // y sigue el manejo síncrono de siempre.
+  // cambia). Conservamos task_id durante toda la espera: una revisión nueva
+  // de autosave no demuestra que esta tarea terminó. Un backend viejo responde
+  // 200/4xx directo y sigue el manejo síncrono de siempre.
   const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
     const { onProgress, ...requestExtra } = extra || {};
@@ -3809,7 +3845,10 @@ export default function App() {
         try { started = await res.clone().json(); } catch { /* non-JSON body */ }
         const taskId = started?.task_id;
         if (!taskId) return { ok: false, reason: "task-lost" };
-        return await pollReanchorTask(jobId, taskId, onProgress);
+        return await pollReanchorTask({
+          taskId, onProgress,
+          request: (options) => authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, options),
+        });
       }
       if (!res.ok) {
         let detail = "";
@@ -3868,6 +3907,21 @@ export default function App() {
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
+    const submissionRouteKey = campaignRouteKeyRef.current;
+    const submissionIsCurrent = () => {
+      const active = creativeReviewRef.current;
+      return isMountedRef.current && campaignRouteKeyRef.current === submissionRouteKey
+        && active != null && active.editingJobId === r.editingJobId
+        && active.transcribeJobId === r.transcribeJobId
+        && active.parentJobId === r.parentJobId
+        && !!active.variantMode === !!r.variantMode;
+    };
+    // The server may finish an accepted request after navigation. Preserve
+    // that result, but never clear a newer review, prompt or submit a retry.
+    const abandonedSubmission = (res, data) => ({
+      ok: res?.ok === true, abandoned: true, reason: "abandoned",
+      approvedEditorVersionId: data?.approved_editor_version_id || null,
+    });
 
     // Variant-wizard mode (2026-07-24): "Crear variante" abre el mismo
     // wizard, pero el submit crea un JOB NUEVO en vez de parchear el
@@ -3929,6 +3983,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // Cap de versiones por canción: el plan incluye N renders del
         // mismo tema; a partir del siguiente se factura extra. El backend
@@ -3952,10 +4007,12 @@ export default function App() {
             + (t("variant.overage_confirm_question") || "¿Crear la variante igual?");
           track("variant.overage_prompted", { job_id: parentJobId });
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({
             ...payload,
             acknowledge_variant_overage: true,
           }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -3978,6 +4035,9 @@ export default function App() {
         // el modal viejo navegaba a /job/:id, que no existe).
         navigate(newJobId ? `/videos/${newJobId}` : `/videos/${parentJobId}`, { replace: true });
         return;
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
         setVariantSubmitting(false);
@@ -4129,6 +4189,7 @@ export default function App() {
             });
             let _upData = {};
             try { _upData = await _up.json(); } catch { /* empty body */ }
+            if (!submissionIsCurrent()) return abandonedSubmission();
             if (!_up.ok || !_upData?.bg_r2_key) {
               const _friendly = translateBackendError(_upData?.detail, t) || `Error ${_up.status}`;
               alert({
@@ -4141,6 +4202,7 @@ export default function App() {
             }
             payload.custom_background_r2_key = _upData.bg_r2_key;
           } catch (e) {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.custom_bg_upload_failed_title") || "No pudimos subir el fondo",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4190,6 +4252,7 @@ export default function App() {
               },
             );
           } catch {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4197,8 +4260,10 @@ export default function App() {
             });
             return { ok: false, reason: "campaign-approval-network" };
           }
+          if (!submissionIsCurrent()) return abandonedSubmission();
           if (!approvalResponse.ok) {
             const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
@@ -4208,12 +4273,19 @@ export default function App() {
           }
         }
 
+        // The key must identify ONE submit: the same editor revision can carry a
+        // lyrics render and later a background regeneration for the same request,
+        // and a key shared across them made the backend answer 409 (same key,
+        // different body). Retries inside this submit reuse the nonce.
+        const submitNonce = (typeof crypto !== "undefined" && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
         const doPost = async (body) => {
           const requestRevision = Number.isInteger(body.editor_revision)
             ? body.editor_revision
             : (Number.isInteger(body.base_revision) ? body.base_revision : r.segmentsRevision);
           const umgIdempotencyKey = r.changeRequestContext
-            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId}:${requestRevision}`
+            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId ?? "manual"}:${submission.editType}:${requestRevision}:${submitNonce}`
             : null;
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
             method: "POST",
@@ -4229,6 +4301,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // YouTube already-published 409 retry.
         if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
@@ -4237,7 +4310,9 @@ export default function App() {
             "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
             + (url ? `\n\nYouTube: ${url}` : "");
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({ ...payload, allow_youtube_drift: true }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -4291,6 +4366,9 @@ export default function App() {
           { replace: true },
         );
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
       }
@@ -4300,6 +4378,7 @@ export default function App() {
     // the generic wizard's approve→generate transition: backgrounds and
     // renders are a separate, later stage triggered outside this screen.
     if (r.campaignId && r.transcribeJobId) {
+      const approvalRouteKey = campaignRouteKeyRef.current;
       // Never infer review from mere presence in the submitted document.
       // LyricsEditor supplies only the identities explicitly confirmed (or
       // deliberately edited) by the operator; the backend then compares this
@@ -4309,6 +4388,7 @@ export default function App() {
         : [];
       try {
         if (r.campaignCreativeRevision != null) await campaignCreativeSave.save();
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) return { ok: false, reason: "abandoned" };
         const response = await authFetch(
           `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
           {
@@ -4330,6 +4410,9 @@ export default function App() {
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           return campaignApprovalFailure(response, body, t);
+        }
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) {
+          return { ok: true, abandoned: true, approvedEditorVersionId: body?.approved_version_id || null };
         }
         wizardPersistence.clear();
         segmentsStore.evict(reviewStoreKey(r));
@@ -4371,6 +4454,11 @@ export default function App() {
       // lyricTransition + textMotion: deprecados 2026-05-23.
       lyricsAnimation: r.lyricsAnimation || "none",
       lineTransition: r.lineTransition || "none",
+      lyricLook: normalizeLyricLook(r.lyricLook),
+      // Variante del look + lo que /resolve eligió para ESTA canción en el
+      // preview: al generar, los "automático" viajan con ese número/género.
+      ...pickLookVariantFields(r),
+      lookResolved: r.lookResolved || null,
       textContrast: r.textContrast || "medium",
       lyricColor: r.lyricColor || "#FFFFFF",
       lyricSungColor: r.lyricSungColor || "#FFFFFF",
@@ -4591,7 +4679,12 @@ export default function App() {
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         formData.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         formData.append("line_transition", jobList[i].lineTransition || "none");
-        formData.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
+        // Look de letra ("" = sin look). Con look, el blanco default viaja
+        // como "" para no pisar el color propio del look (lib/lyricLooks).
+        formData.append("lyric_look", normalizeLyricLook(jobList[i].lyricLook));
+        formData.append("lyric_color", lyricColorForSubmit(jobList[i].lyricLook, jobList[i].lyricColor));
+        // Variante del look: sólo los campos con valor (lib/lyricLookVariants).
+        appendLookVariantFields(formData, jobList[i]);
         formData.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         formData.append("text_contrast", jobList[i].textContrast || "medium");
         // Title card customization (Full Rotor v1).
@@ -4880,7 +4973,12 @@ export default function App() {
         // lyric_transition + text_motion: deprecados 2026-05-23 (no se envían).
         generateBody.append("lyrics_animation", jobList[i].lyricsAnimation || "none");
         generateBody.append("line_transition", jobList[i].lineTransition || "none");
-        generateBody.append("lyric_color", jobList[i].lyricColor || "#FFFFFF");
+        // Look de letra ("" = sin look). Con look, el blanco default viaja
+        // como "" para no pisar el color propio del look (lib/lyricLooks).
+        generateBody.append("lyric_look", normalizeLyricLook(jobList[i].lyricLook));
+        generateBody.append("lyric_color", lyricColorForSubmit(jobList[i].lyricLook, jobList[i].lyricColor));
+        // Variante del look: sólo los campos con valor (lib/lyricLookVariants).
+        appendLookVariantFields(generateBody, jobList[i]);
         generateBody.append("lyric_sung_color", jobList[i].lyricSungColor || "#FFFFFF");
         generateBody.append("text_contrast", jobList[i].textContrast || "medium");
         // Title card customization (Full Rotor v1).
@@ -4979,6 +5077,7 @@ export default function App() {
         if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
         body.append("segments_json", "[]");
         body.append("art_track", "true");
+        body.append("art_track_preset", delivery.art_track_preset || "waveform");
         if ((delivery.label_line || "").trim()) {
           body.append("label_line", delivery.label_line.trim());
         }
@@ -5096,6 +5195,9 @@ export default function App() {
         // lyricTransition + textMotion: deprecados 2026-05-23.
         lyricsAnimation: last.lyricsAnimation || "none",
         lineTransition: last.lineTransition || "none",
+        lyricLook: normalizeLyricLook(last.lyricLook),
+        ...pickLookVariantFields(last),
+        lookResolved: last.lookResolved || null,
         textContrast: last.textContrast || "medium",
         segments: last.segments,
         referenceLyrics: "",
@@ -5405,6 +5507,15 @@ export default function App() {
       editMode: !!currentReview?.editMode || !!currentReview?.variantMode || !!currentReview?.campaignId,
       bgSelectMode,
       enableScenes,
+      // La variante resuelta manda: Cinético pinta tarjetas en pop pero usa
+      // el fondo de la canción en rock/metal (entonces sí hay que pre-generarlo).
+      lookOwnsBackground: (() => {
+        const res = currentReview?.lookResolved;
+        if (res && res.look === currentReview?.lyricLook && res.background) {
+          return res.background === "flat" || res.background === "gradient";
+        }
+        return lookOwnsBackground(currentReview?.lyricLook);
+      })(),
     }),
     api: API,
     authHeaders,
@@ -5776,6 +5887,9 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // Job cuyo audio suena en el editor: el preview pide sus beats reales
+        // para los looks beat_sync (Cinético / Neón).
+        beatsJobId={currentReview?.editingJobId || currentReview?.parentJobId || currentReview?.transcribeJobId || null}
         // 2026-07-16: callback ref para el slot del player bar bajo el video.
         onPlayerSlotRef={setPlayerSlotEl}
         // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
@@ -5827,6 +5941,7 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
+        initialStep={campaignDesignOpen ? 4 : null}
         editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
@@ -5842,6 +5957,9 @@ export default function App() {
             frameFormat: currentReview.frameFormat || "full",
             lyricsAnimation: currentReview.lyricsAnimation || "none",
             lineTransition: currentReview.lineTransition || "none",
+            lyricLook: normalizeLyricLook(currentReview.lyricLook),
+            // Variante del look del video (panel «Variante» del paso 4).
+            ...pickLookVariantFields(currentReview),
             movementStyle: currentReview.movementStyle || "",
             effect: currentReview.effect || "",
             // Los colores de letra TAMBIÉN se siembran, aunque su picker esté
@@ -5864,6 +5982,10 @@ export default function App() {
         // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
         // anillo violeta es la única señal, y es la que engañó al operador.
         editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
+        // Edición de un video hecho SIN fondo generado (look que pinta todo el
+        // cuadro): el paso de looks avisa si el operador elige uno que sí usa
+        // fondo. null fuera de la edición de un job existente. Sólo display.
+        existingBgOwnedByLook={currentReview?.editMode ? !!currentReview.backgroundOwnedByLook : null}
         // Plan EN VIVO (willApply / willDrop / blocked), desde la MISMA función
         // que arma el POST. Alimenta el resumen del paso final y el bloqueo del
         // bloque de fondo, para que el wizard deje de prometer cosas que el
@@ -5927,8 +6049,10 @@ export default function App() {
 
   const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     if (review?.transcribeJobId) {
       try {
         await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
@@ -5937,20 +6061,23 @@ export default function App() {
         });
       } catch { /* the lock expires safely even if release is unavailable */ }
     }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
     navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
-  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   const handleCampaignReviewNext = useCallback(async () => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     if (!review?.campaignId || !review?.transcribeJobId) {
       await handleCampaignReviewExit();
       return;
     }
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     let nextPath = campaignReturnPath || "/admin/cola";
     const returnParams = campaignReturnPath
       ? new URL(campaignReturnPath, window.location.origin).searchParams
@@ -5971,17 +6098,19 @@ export default function App() {
         nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
       }
     } catch { /* leave through the queue; the current draft is already saved */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     try {
       await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
         method: "DELETE",
         headers: editorSessionHeaders(),
       });
     } catch { /* the lock expires safely even if release is unavailable */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     segmentsStore.evict(reviewStoreKey(review));
     navigate(nextPath);
-  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -6093,7 +6222,7 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
-          <div className="w-full max-w-[980px]">
+          <div className={`w-full ${dedicatedCampaignReview ? "max-w-[1600px]" : "max-w-[980px]"}`}>
           {currentReview.transcribeJobId && (
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
               <div className="min-w-0">
@@ -6102,9 +6231,16 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 {currentReview.campaignId && (
                   <>
+                    {!campaignDesignOpen && <button type="button" className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                      onClick={() => {
+                        const open = () => setCampaignDesignJobId(currentReview.transcribeJobId);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(open); else open();
+                      }}>{t("review_workspace.design")}</button>}
+
                     <button
                       type="button"
                       onClick={() => {
@@ -6134,7 +6270,7 @@ export default function App() {
                         if (safeExit) void safeExit(handleCampaignReviewNext);
                         else void handleCampaignReviewNext();
                       }}
-                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
                     >
                       Siguiente
                     </button>
@@ -6154,11 +6290,38 @@ export default function App() {
             {campaignCreativeSave.error ? <span className="text-red-300">Ajustes sin guardar: {campaignCreativeSave.error} <button className="underline" onClick={() => campaignCreativeSave.save().catch(() => {})}>Reintentar guardado</button></span>
               : campaignCreativeSave.status === "saved" ? "Ajustes de campaña guardados" : "Guardando ajustes de esta canción…"}
           </div>}
+          {currentReview.transcriptionQuality?.auto_repair?.status === "applied" && (
+            <section
+              role="status"
+              aria-live="polite"
+              className="mb-3 rounded-xl bg-emerald-400/[0.08] px-4 py-3 ring-1 ring-emerald-300/25"
+              data-testid="auto-repair-summary"
+            >
+              <p className="text-sm font-semibold text-emerald-100">
+                Aplicamos mejoras automáticas antes de abrir el editor.
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
+                Ya podés seguir con la canción; revisá los cambios en el editor si querés.
+              </p>
+              <p className="mt-1 text-xs text-emerald-100/60">
+                {["timing_reversible", "content_reversible"].map((action) => {
+                  const count = Number(
+                    currentReview.transcriptionQuality.auto_repair.applied_actions?.[action] || 0,
+                  );
+                  if (!count) return null;
+                  const label = action === "timing_reversible"
+                    ? (count === 1 ? "ajuste de timing" : "ajustes de timing")
+                    : (count === 1 ? "corrección de letra" : "correcciones de letra");
+                  return `${count} ${label}`;
+                }).filter(Boolean).join(" · ")}
+              </p>
+            </section>
+          )}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
             // player bar se portalea ahí; null (modal/inline) → inline.
-            playerSlot={playerSlotEl}
+            playerSlot={dedicatedCampaignReview ? null : playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
@@ -6235,7 +6398,7 @@ export default function App() {
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
+            submitLabel={(currentReview.editMode || currentReview.editingJobId || currentReview.changeRequestContext) ? "Aprobar cambios y generar video" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
               ? registerCampaignReviewSafeExit
               : null}
@@ -6252,6 +6415,22 @@ export default function App() {
             segmentsRevision={currentReview.segmentsRevision || 0}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
+            onAutoRepairUndone={(document) => {
+              setCurrentReview((previous) => previous && (
+                previous.editingJobId || previous.transcribeJobId
+              ) === document.job_id ? {
+                ...previous,
+                segments: document.segments,
+                segmentsRevision: document.revision,
+                transcriptionQuality: {
+                  ...(previous.transcriptionQuality || {}),
+                  auto_repair: {
+                    ...(previous.transcriptionQuality?.auto_repair || {}),
+                    status: "undone",
+                  },
+                },
+              } : previous);
+            }}
             editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
@@ -6282,6 +6461,10 @@ export default function App() {
             // paridad con el wizard).
             lyricsAnimation={currentReview.lyricsAnimation || "none"}
             lineTransition={currentReview.lineTransition || "none"}
+            lyricLook={normalizeLyricLook(currentReview.lyricLook)}
+            // Video hecho sin fondo generado (look que pinta todo el cuadro):
+            // el selector de look avisa si se elige uno que sí usa fondo.
+            backgroundOwnedByLook={!!(currentReview.editMode && currentReview.backgroundOwnedByLook)}
             // Typography is now chosen LIVE in the editor preview (not in the
             // upload step). Thread the operator's choices back into
             // currentReview so handleApproveLyrics carries them to generate.
@@ -6290,6 +6473,12 @@ export default function App() {
             onContrastChange={(c) => setCurrentReview((r) => (r ? { ...r, textContrast: c } : r))}
             onAnimationChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricsAnimation: c } : r))}
             onLineTransitionChange={(c) => setCurrentReview((r) => (r ? { ...r, lineTransition: c } : r))}
+            onLyricLookChange={(c) => setCurrentReview((r) => (r ? { ...r, lyricLook: normalizeLyricLook(c) } : r))}
+            // Variante del look (panel «Variante» de la columna standalone).
+            lookVariant={{ ...pickLookVariantFields(currentReview), lyricColor: currentReview.lyricColor || "#FFFFFF" }}
+            lookArtist={currentReview.artist || ""}
+            lookSongTitle={currentReview.songTitle || ""}
+            onLookVariantChange={(field, value) => setCurrentReview((r) => (r ? { ...r, [field]: value } : r))}
             // UX specialist 2026-05-24: chip de status del pre-gen del
             // fondo. Status posibles: "idle" | "queued" | "generating" |
             // "done" | "error" | "disabled" (free-tier plan-tier guard).
@@ -6376,19 +6565,29 @@ export default function App() {
     );
   })();
 
-  // Capa B 2026-05-24 + Phase 2 2026-05-25 — wizardScreen siempre es
-  // newBatchScreen (UploadZone). El layout de 3 columnas del wizard
-  // (stepper + WizardLivePreview + contenido) abarca ahora también la
-  // review (paso 6): el contenido de reviewScreen se inyecta como render
-  // prop en UploadZone y aparece en la columna derecha del wizard. El
-  // operador NUNCA cambia de layout durante el flow — el preview central
-  // y el stepper persisten desde el drop del audio hasta "Crear videos".
-  // wizardStage queda como flag de back-compat (sessionStorage, /review
-  // como ruta legacy) pero NO controla qué pantalla se renderiza.
+  // Campaigns open in the dedicated review workspace. Visual design remains
+  // an explicit entry into the existing wizard, with saves flushed on exit.
+  // Creation and post-render editing retain their existing wizard flow.
   const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
   const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
     ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
-    : newBatchScreen;
+    : dedicatedCampaignReview ? (campaignDesignOpen ? <>
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <button type="button" className="btn-secondary" onClick={async () => {
+          const review = currentReview;
+          const routeKey = campaignRouteKeyRef.current;
+          try {
+            await campaignCreativeSave.save();
+            if (!campaignReviewStillCurrent(review, routeKey)) return;
+            const close = () => setCampaignDesignJobId(null);
+            const safeExit = campaignReviewSafeExitRef.current;
+            if (safeExit) await safeExit(close); else close();
+          } catch { /* The save hook exposes the error below and retains edits. */ }
+        }}>{t("review_workspace.back_to_lyrics")}</button>
+        {campaignCreativeSave.error && <p role="alert" className="text-red-300">{campaignCreativeSave.error}</p>}
+      </div>
+      {newBatchScreen}
+    </> : reviewScreen) : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
@@ -6503,13 +6702,11 @@ export default function App() {
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
           <Route path="/review/:jobId" element={wizardScreen} />
+          <Route path="/team" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
+          <Route path="/my-tasks" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
-          <Route path="/admin/cola" element={
-            user?.role === "admin"
-              ? <Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>
-              : <Navigate to="/dashboard" replace />
-          } />
+          <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

@@ -177,6 +177,7 @@ def test_live_lexical_mutation_declines_without_independent_verifier(monkeypatch
 
 
 def test_heuristic_phrase_segmenter_skips_llm_partition(monkeypatch):
+    monkeypatch.setenv("DISPLAY_SEGMENTATION_MODE", "off")
     monkeypatch.setenv("PHRASE_SEGMENTER_ENABLED", "1")
     import phrase_segmenter
 

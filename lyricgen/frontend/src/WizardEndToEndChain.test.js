@@ -14,6 +14,7 @@
 import { describe, it, expect } from "vitest";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
+import { normalizeLyricLook, lyricColorForSubmit } from "./lib/lyricLooks";
 
 // Mirror de la lógica de handleApproveLyrics (App.jsx:1495+) en su forma
 // pura: dado un currentReview + edited segments, qué shape va a
@@ -36,6 +37,7 @@ function _approvedJobFromReview(r, editedSegments, bgCacheKey) {
     fontScale: r.fontScale || "1.0",
     lyricsAnimation: r.lyricsAnimation || "none",
     lineTransition: r.lineTransition || "none",
+    lyricLook: normalizeLyricLook(r.lyricLook),
     textContrast: r.textContrast || "medium",
     lyricColor: r.lyricColor || "#FFFFFF",
     lyricSungColor: r.lyricSungColor || "#FFFFFF",
@@ -85,7 +87,8 @@ function _formDataFromJob(job, delivery, style, customColors, bg, inspiredByLyri
   f["font_scale"] = String(job.fontScale || "1.0");
   f["lyrics_animation"] = job.lyricsAnimation || "none";
   f["line_transition"] = job.lineTransition || "none";
-  f["lyric_color"] = job.lyricColor || "#FFFFFF";
+  f["lyric_look"] = normalizeLyricLook(job.lyricLook);
+  f["lyric_color"] = lyricColorForSubmit(job.lyricLook, job.lyricColor);
   f["lyric_sung_color"] = job.lyricSungColor || "#FFFFFF";
   f["text_contrast"] = job.textContrast || "medium";
   f["title_template"] = job.titleTemplate || "auto";
@@ -134,6 +137,7 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
       fontScale: "1.15",
       lyricsAnimation: "karaoke",
       lineTransition: "slide_up",
+      lyricLook: "pincel",
       textContrast: "strong",
       lyricColor: "#00FF00",
       lyricSungColor: "#FF00FF",
@@ -185,6 +189,9 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     // Lyrics motion
     expect(fd.lyrics_animation).toBe("karaoke");
     expect(fd.line_transition).toBe("slide_up");
+    // Look de letra + color elegido (pisa el del look → viaja tal cual).
+    expect(fd.lyric_look).toBe("pincel");
+    expect(fd.lyric_color).toBe("#00FF00");
 
     // Background
     expect(fd.movement_style).toBe("foto-parallax");
@@ -328,6 +335,20 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     expect(fds[2].text_contrast).toBe("strong");
   });
 
+  it("Look con el blanco default: lyric_color viaja vacío para no pisar el color del look", () => {
+    const review = {
+      file: { name: "song.mp3" },
+      artist: "X", songTitle: "", language: "es",
+      transcribeJobId: "j1",
+      lyricLook: "pelicula",
+      lyricColor: "#FFFFFF",
+    };
+    const job = buildGenerationJob(_approvedJobFromReview(review, [], null));
+    const fd = _formDataFromJob(job, { delivery_profile: "youtube" }, "auto", "", { bgSelectMode: "auto" }, true);
+    expect(fd.lyric_look).toBe("pelicula");
+    expect(fd.lyric_color).toBe("");
+  });
+
   it("Defaults seguros — cuando el operador NO toca opciones avanzadas", () => {
     const review = {
       file: { name: "song.mp3" },
@@ -341,6 +362,8 @@ describe("Wizard end-to-end chain — todas las elecciones persisten al /generat
     expect(fd.font_scale).toBe("1.0");
     expect(fd.lyrics_animation).toBe("none");
     expect(fd.line_transition).toBe("none");
+    expect(fd.lyric_look).toBe("");
+    expect(fd.lyric_color).toBe("#FFFFFF");
     expect(fd.text_contrast).toBe("medium");
     expect(fd.style).toBe("auto");
     expect(fd.match_lyrics).toBe("true");

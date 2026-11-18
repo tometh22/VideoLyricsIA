@@ -1,0 +1,31 @@
+{
+  "name": "UMG — Foto fija inspirada en la letra + efectos",
+  "version": 1,
+  "mode": "percent",
+  "settings": {
+    "font": "poppins-bold",
+    "font_scale": 1.3,
+    "text_case": "upper",
+    "lyrics_animation": "none",
+    "line_transition": "none",
+    "movement_style": "foto-parallax",
+    "scene_source": "lyrics",
+    "background_id": null,
+    "background_mode": "as_is",
+    "animate_image": false,
+    "enable_scenes": false,
+    "genre": "",
+    "concept": "",
+    "style": "auto",
+    "custom_colors": ""
+  },
+  "effects": [
+    {"id": "umg-photo-01-bokeh", "name": "UMG Foto fija · Bokeh", "effect": "bokeh"},
+    {"id": "umg-photo-02-light", "name": "UMG Foto fija · Luces", "effect": "light"},
+    {"id": "umg-photo-03-dust", "name": "UMG Foto fija · Polvo de luz", "effect": "dust"},
+    {"id": "umg-photo-04-embers", "name": "UMG Foto fija · Chispas", "effect": "embers"},
+    {"id": "umg-photo-05-confetti", "name": "UMG Foto fija · Confeti", "effect": "confetti"},
+    {"id": "umg-photo-06-film", "name": "UMG Foto fija · Película", "effect": "film"},
+    {"id": "umg-photo-07-bass", "name": "UMG Foto fija · Pulso de graves", "effect": "bass_pulse"}
+  ]
+}

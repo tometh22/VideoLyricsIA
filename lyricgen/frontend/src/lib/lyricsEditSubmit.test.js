@@ -206,6 +206,25 @@ describe("submitLyricsEdit", () => {
     expect(body.text_case).toBeUndefined();
     expect(body.text_contrast).toBeUndefined();
     expect(body.line_transition).toBeUndefined();
+    expect(body.lyric_look).toBeUndefined();
+  });
+
+  it("sends lyric_look when given, including '' to remove the look", async () => {
+    for (const lyricLook of ["cine", ""]) {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202, json: async () => ({}) });
+      vi.stubGlobal("fetch", fetchMock);
+      const res = await submitLyricsEdit({
+        jobId: "job-L",
+        segments: [{ start: 0, end: 1, text: "x" }],
+        // Mismo texto: sólo el look cambia, y eso alcanza para no ser no-op.
+        baselineSegments: [{ start: 0, end: 1, text: "x" }],
+        lyricLook,
+        t: () => null,
+      });
+      expect(res.ok).toBe(true);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.lyric_look).toBe(lyricLook);
+    }
   });
 
   it("returns {error} with friendly translation when backend rejects", async () => {

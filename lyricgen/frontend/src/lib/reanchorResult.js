@@ -17,6 +17,9 @@ export function reanchorHttpFailure(status, payload, { terminal = false } = {}) 
 }
 
 export function shouldRecoverReanchor(result) {
+  // A known task has already been polled through the recovery budget. Never
+  // replace its missing result with an unrelated autosave's newer revision.
+  if (result?.taskId) return false;
   // A completed refusal cannot turn into a successful alignment. In
   // particular, an unrelated autosave advancing the revision is not success.
   if (result?.terminal || result?.reason === "declined" || result?.reason === "structural_mismatch") return false;
@@ -31,6 +34,9 @@ export function shouldRecoverReanchor(result) {
 }
 
 export function reanchorFailureMessage(result, t) {
+  if (result?.taskId && !result?.terminal) {
+    return t("editor.reanchor_unconfirmed") || "No se pudo confirmar si terminó la re-sincronización. La letra pegada sigue acá. Comprobá la versión guardada antes de reintentar.";
+  }
   if (result?.phase === "save") {
     return t("editor.reanchor_save_failed") || "No se inició la re-sincronización porque no se pudieron guardar tus cambios. Reintentá el guardado; la letra pegada sigue acá.";
   }

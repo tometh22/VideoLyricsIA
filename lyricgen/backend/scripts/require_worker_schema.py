@@ -9,6 +9,8 @@ from database import engine
 
 
 REQUIRED_COLUMNS = {
+    ("ai_provenance", "predict_time_ms"),
+    ("ai_provenance", "queue_time_ms"),
     ("jobs", "transcription_quality"),
     ("jobs", "machine_snapshot_required"),
     ("jobs", "quality_learning_epoch"),
@@ -40,6 +42,7 @@ REQUIRED_COLUMNS = {
     ("quality_patterns", "fingerprint"),
     ("quality_fix_proposals", "candidate_config"),
     ("quality_experiment_runs", "candidate_config_hash"),
+    ("delivery_batch_items", "change_request_intent"),
     ("batch_campaigns", "id"),
     ("batch_campaign_items", "id"),
     ("batch_upload_sessions", "id"),

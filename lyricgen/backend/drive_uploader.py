@@ -235,6 +235,11 @@ def upload_via_rclone(
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if job is None:
             raise DriveUploadError(f"Job {job_id} no existe.")
+        from delivery_acoustic_qc import require_delivery_review
+        try:
+            require_delivery_review(job)
+        except ValueError as exc:
+            raise DriveUploadError(str(exc)) from None
         tenant_id = job.tenant_id
     finally:
         db.close()

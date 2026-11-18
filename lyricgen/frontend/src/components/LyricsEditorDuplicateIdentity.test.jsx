@@ -33,7 +33,7 @@ afterEach(() => {
   segmentsStore._clearAll();
 });
 
-function renderEditor() {
+function renderEditor(overrides = {}) {
   render(
     <LyricsEditor
       segments={[
@@ -46,6 +46,7 @@ function renderEditor() {
       onApprove={vi.fn()}
       onBack={vi.fn()}
       transcribeJobId={JOB_ID}
+      {...overrides}
     />,
   );
 }
@@ -67,6 +68,23 @@ describe("duplicar una línea crea identidad propia", () => {
     const ids = segments.map((row) => String(row.segment_id));
     expect(new Set(ids).size).toBe(3);
     expect(ids.filter((id) => id === "4")).toHaveLength(1);
+  });
+
+  it("al final del audio crea una copia editable con duración positiva, sin palabras o locks heredados", () => {
+    const original = { segment_id: "end-line", start: 3, end: 4, text: "última frase", locked: true,
+      words: [{ word: "última", start: 3, end: 3.5 }, { word: "frase", start: 3.5, end: 4 }] };
+    renderEditor({ segments: [original], audioUrl: "https://example.test/audio.wav" });
+    const audio = document.querySelector("audio");
+    Object.defineProperty(audio, "duration", { configurable: true, value: 4 });
+    fireEvent.loadedMetadata(audio);
+    const segments = duplicateFirstRow();
+    const copy = segments.find(line => line.segment_id !== "end-line");
+    expect(copy.end).toBeGreaterThan(copy.start);
+    expect(copy.end).toBeLessThanOrEqual(4);
+    expect(copy.words).toBeUndefined();
+    expect(copy.locked).toBeUndefined();
+    expect(copy.review).toBe(true);
+    expect(segments.find(line => line.segment_id === "end-line")).toMatchObject(original);
   });
 
   it("la copia sobrevive un rebase del editor (la forma exacta del incidente)", () => {

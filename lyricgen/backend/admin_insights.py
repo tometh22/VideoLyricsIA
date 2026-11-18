@@ -53,6 +53,7 @@ _IN_PROGRESS_STATUSES = (
 _DISTRIBUTION_KEYS = (
     "lyrics_animation",
     "line_transition",
+    "lyric_look",
     "effect",
     "movement_style",
     "text_case",
@@ -160,6 +161,7 @@ def job_choices(job) -> dict | None:
         "font": params.get("font") or None,
         "lyrics_animation": params.get("lyrics_animation") or None,
         "line_transition": params.get("line_transition") or None,
+        "lyric_look": params.get("lyric_look") or None,
         "effect": params.get("effect") or None,
         "movement_style": params.get("movement_style") or None,
         "text_case": params.get("text_case") or None,

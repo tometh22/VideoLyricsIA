@@ -75,6 +75,7 @@ function SystemStatusDot({ open }) {
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
   const [campaignsEnabled, setCampaignsEnabled] = useState(false);
+  const [teamAccess, setTeamAccess] = useState(null);
 
   useEffect(() => {
     const token = localStorage.getItem("genly_token");
@@ -88,25 +89,40 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     return () => { active = false; };
   }, [user?.id, user?.tenant_id]);
 
+  useEffect(() => {
+    if (!campaignsEnabled) { setTeamAccess(null); return undefined; }
+    const controller = new AbortController();
+    fetch(`${API}/team/access`, { signal: controller.signal, headers: { Authorization: `Bearer ${localStorage.getItem("genly_token") || ""}` } })
+      .then(r => r.ok ? r.json() : null).then(setTeamAccess).catch(() => {});
+    return () => controller.abort();
+  }, [campaignsEnabled, user?.id, user?.tenant_id]);
+
   const items = ITEMS_BASE(t);
+  if (teamAccess) {
+    const icon = <span aria-hidden="true">▦</span>;
+    if (teamAccess.can_manage) items.push({ id: "team", label: "Mi equipo", path: "/team", icon });
+    items.push({ id: "my_tasks", label: "Mis tareas", path: "/my-tasks", icon });
+  }
   if (campaignsEnabled) {
     items.splice(2, 0, {
       id: "campaigns", label: "Campañas", path: "/campaigns",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" strokeLinecap="round"/><circle cx="19" cy="18" r="2"/></svg>,
     });
-  }
-  if (user?.role === "admin") {
+    // The lyric review queue lives inside each campaign (stage "Letra");
+    // this entry opens the last campaign the reviewer worked on.
     items.splice(3, 0, {
-      id: "review_queue", label: "Cola de revisión", path: "/admin/cola",
+      id: "review_queue", label: "Revisión de letras", path: "/admin/cola",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9" strokeLinecap="round"/><path d="M18 16l2 2 3-4" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
+  }
+  if (user?.role === "admin") {
     items.push({
       id: "admin", label: "Admin", path: "/admin",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
   }
   const groups = [
-    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history", "team", "my_tasks"].includes(item.id)) },
     { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 

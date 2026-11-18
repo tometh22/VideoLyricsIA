@@ -14,6 +14,7 @@ import unicodedata
 from typing import Any, Mapping, Sequence
 
 from evidence_contracts import privacy_fingerprint
+from reference_window import find_reference_window
 
 
 _TRUSTED_SOURCES = {
@@ -25,6 +26,19 @@ _STOP = {
     "a", "an", "and", "are", "at", "for", "in", "is", "it", "of", "on",
     "the", "to", "you",
 }
+# Audio fragment rule (demos of ~30 s, Shorts, Canvas).  Catalogue text
+# describes the whole song, so measuring coverage against all of it rejects
+# every fragment (8-24 % coverage on 15 production demos, 16-Nov-2026, while
+# 85-100 % of the fragment's ASR was contained in the lyric).  When the audio
+# is at most FRAGMENT_MAX_AUDIO_S long, its ASR timeline is complete and the
+# ASR has at most FRAGMENT_MAX_TOKEN_RATIO of the reference's content tokens,
+# the metrics are measured on the window of consecutive reference lines that
+# best matches the ASR (``reference_window``; a wrong song scores ~0.39 and is
+# not windowed).  A windowed reference can at most attest VOCABULARY: it never
+# authorizes whole-song forced alignment, because the rest of the reference is
+# by definition not in this audio.  Full-length audio is never windowed.
+FRAGMENT_MAX_AUDIO_S = 120.0
+FRAGMENT_MAX_TOKEN_RATIO = 0.5
 
 
 def _tokens(value: Any, *, include_stop_words: bool = False) -> list[str]:
@@ -67,6 +81,35 @@ def assess_reference_attestation(
 ) -> dict[str, Any]:
     reference_tokens = _tokens(reference_text)
     asr_tokens = _tokens(_segments_text(asr_segments))
+    duration = _finite(audio_duration_s)
+    ends = [
+        value for value in (
+            _finite(segment.get("end", segment.get("e")))
+            for segment in asr_segments if isinstance(segment, Mapping)
+        ) if value is not None
+    ]
+    last_end = max(ends, default=0.0)
+    trailing_gap = max(0.0, duration - last_end) if duration else None
+    timeline_observed = bool(
+        duration is None
+        or trailing_gap is not None
+        and trailing_gap <= max(45.0, 0.20 * duration)
+    )
+
+    window = None
+    if (
+        duration is not None
+        and duration <= FRAGMENT_MAX_AUDIO_S
+        and timeline_observed
+        and asr_tokens
+        and len(asr_tokens) <= FRAGMENT_MAX_TOKEN_RATIO * len(reference_tokens)
+    ):
+        reference_lines = str(reference_text or "").splitlines()
+        window = find_reference_window(reference_lines, _segments_text(asr_segments))
+        if window is not None:
+            reference_tokens = _tokens("\n".join(
+                reference_lines[window["start_line"]:window["end_line"]]
+            ))
     overlap = _multiset_overlap(reference_tokens, asr_tokens)
     asr_containment = overlap / len(asr_tokens) if asr_tokens else 0.0
     reference_coverage = overlap / len(reference_tokens) if reference_tokens else 0.0
@@ -93,21 +136,6 @@ def assess_reference_attestation(
         + 0.20 * reference_coverage
     )
 
-    duration = _finite(audio_duration_s)
-    ends = [
-        value for value in (
-            _finite(segment.get("end", segment.get("e")))
-            for segment in asr_segments if isinstance(segment, Mapping)
-        ) if value is not None
-    ]
-    last_end = max(ends, default=0.0)
-    trailing_gap = max(0.0, duration - last_end) if duration else None
-    timeline_observed = bool(
-        duration is None
-        or trailing_gap is not None
-        and trailing_gap <= max(45.0, 0.20 * duration)
-    )
-
     trusted = str(reference_source or "") in _TRUSTED_SOURCES
     independently_attested = bool(
         len(reference_tokens) >= 4
@@ -127,6 +155,7 @@ def assess_reference_attestation(
     )
     global_alignment_supported = bool(
         local_vocabulary_supported
+        and window is None
         and not is_live
         and timeline_observed
         and reference_coverage >= 0.60
@@ -150,6 +179,8 @@ def assess_reference_attestation(
         reasons.append("live_structure_requires_local_alignment")
     if not structure_supported:
         reasons.append("reference_contains_unmatched_passage")
+    if window is not None:
+        reasons.append("reference_window_fragment")
     if local_vocabulary_supported and not global_alignment_supported and not is_live:
         reasons.append("global_structure_not_attested")
 
@@ -178,6 +209,14 @@ def assess_reference_attestation(
             "longest_unmatched_content_run": longest_unmatched_run,
             "timeline_observed": timeline_observed,
             "trailing_gap_s": round(trailing_gap, 6) if trailing_gap is not None else None,
+            # "window": coverage measured on the reference lines this audio
+            # fragment sings (see FRAGMENT_MAX_AUDIO_S), not on the song.
+            "coverage_scope": "window" if window is not None else "song",
+            "reference_window": (
+                {key: window[key] for key in (
+                    "start_line", "end_line", "score", "reference_lines",
+                )} if window is not None else None
+            ),
         },
         "identities": {
             # Catalogue lyrics are low-entropy copyrighted text.  Plain
@@ -218,3 +257,21 @@ def reference_gate_action(
     if not bool(report.get("allow_global_forced_alignment")):
         return "audio_first"
     return "reference_allowed"
+
+
+def effective_reference_gate_mode(
+    configured_mode: str,
+    *,
+    reference_source: str | None,
+    reference_required: bool,
+) -> str:
+    """Never let a catalogue lyric bypass independent audio attestation.
+
+    ``observe`` remains available for non-catalogue diagnostics. External
+    lyrics can replace heard words only after the ASR witness supports both
+    their vocabulary and whole-song structure.
+    """
+    source = str(reference_source or "").strip().lower()
+    if reference_required or source in {"lrclib", "genius", "gemini"}:
+        return "enforce"
+    return str(configured_mode or "off").strip().lower()

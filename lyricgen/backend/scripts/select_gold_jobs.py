@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Selecciona jobs "gold" para el benchmark desde las correcciones REALES
-de los operadores, y calcula el error baseline del pipeline sin re-correr nada.
+"""Selecciona revisiones operativas para diagnóstico, no gold independiente.
+
+Este script histórico no emite etiquetas válidas para autorizar auto-reparación:
+una edición o aprobación puede conservar errores, y una línea intacta no
+demuestra que el audio la respalde. Preferir
+``build_operator_calibration_queue.py`` para preparar escucha ciega con
+checkpoints verificables y controles.
+
+Calcula diferencias contra correcciones reales sin re-correr el pipeline.
 
 Contexto (análisis de prod 2026-07-03): los operadores de UMG registraron
 miles de correcciones de segmentos (audit_log action="lyrics.segments_diff",
-93% de timing, mediana 1,4 s). Cada job corregido y aprobado es ground truth:
-`segments_json` = lo que el humano consideró shippable. Este script:
+93% de timing, mediana 1,4 s). Cada job corregido y aprobado es un proxy
+operativo: `segments_json` = lo que el humano consideró entregable. Este script:
 
   1. `--write-list` — encuentra esos jobs y llena scripts/benchmark_jobs.txt
      (el input de build_benchmark_dataset.py), en vez de curarlo a mano.
@@ -14,7 +21,7 @@ miles de correcciones de segmentos (audit_log action="lyrics.segments_diff",
   2. `--baseline` — reconstruye el output ORIGINAL de la máquina rebobinando
      los diffs (cada audit guarda prev_start/prev_end/prev_text por segmento;
      aplicándolos de más nuevo a más viejo se recupera el estado pre-humano)
-     y reporta machine-vs-gold por línea: p50/p90 de |Δstart|, % de líneas
+     y reporta diferencias máquina-vs-revisión por línea: p50/p90 de |Δstart|, % de líneas
      dentro de 0.3 s / 1.0 s, % con texto cambiado. Es el número que
      cualquier mejora (p.ej. CTC_ALIGN_ENABLED) tiene que ganar.
 
@@ -103,12 +110,10 @@ def rewind_segments(final_segments: list[dict], audits: list[dict]) -> tuple[lis
 
 
 def score_machine_vs_gold(machine: list[dict], gold: list[dict]) -> dict:
-    """Error por línea entre el output de la máquina y el gold aprobado.
+    """Diferencia por línea frente a una revisión operativa, no error acústico.
 
-    La identidad es posicional (mismo índice = misma línea; en prod no hay
-    reorders). Las líneas que el humano no tocó cuentan como error 0 — el
-    operador las aceptó tal cual, que es la definición operativa de
-    "correcta".
+    La identidad es posicional y no verifica la ocurrencia acústica. Las
+    líneas intactas dan delta cero, pero no prueban que la máquina acertó.
     """
     n = min(len(machine), len(gold))
     d_starts, d_ends = [], []
@@ -213,7 +218,7 @@ def main() -> None:
     p.add_argument("--write-list", action="store_true",
                    help=f"escribe los job_ids en {DEFAULT_LIST.name}")
     p.add_argument("--baseline", action="store_true",
-                   help="reporta el error machine-vs-gold rebobinando los diffs")
+                   help="reporta diferencias operativas rebobinando los diffs")
     p.add_argument("--json", type=Path, default=None,
                    help="además del reporte, volcar todo a un JSON")
     p.add_argument("--limit", type=int, default=50,
@@ -228,7 +233,7 @@ def main() -> None:
         db.close()
 
     if not jobs:
-        print("No hay jobs gold con esos filtros.")
+        print("No hay jobs revisados con esos filtros.")
         sys.exit(1)
 
     def _looks_live(job):
@@ -245,7 +250,7 @@ def main() -> None:
         live_quota = min(len(live), max(8, (args.limit + 3) // 4))
         jobs = live[:live_quota] + studio[:args.limit - live_quota]
 
-    print(f"{len(jobs)} jobs gold (tenant LIKE {args.tenant_like!r}, "
+    print(f"{len(jobs)} jobs revisados; proxy operativo, no gold (tenant LIKE {args.tenant_like!r}, "
           f">= {args.min_diffs} correcciones)\n")
 
     results = []
@@ -291,8 +296,8 @@ def main() -> None:
         print(f"líneas ≤{_LOOSE_S}s:        {statistics.mean(agg_loose):.1f} %")
         print(f"líneas con texto Δ:   {statistics.mean(agg_text):.1f} %")
         if truncated_jobs:
-            print(f"⚠ {truncated_jobs} job(s) con saves truncados: el error real "
-                  f"es levemente MAYOR al reportado.")
+            print(f"⚠ {truncated_jobs} job(s) con saves truncados: la diferencia "
+                  f"operativa puede estar subestimada.")
     else:
         for r in results:
             audio = "✓" if r["has_audio"] else "✗ sin audio"
@@ -302,7 +307,7 @@ def main() -> None:
     if args.write_list:
         lines = [
             "# Autogenerado por select_gold_jobs.py — jobs 'done' con",
-            "# correcciones reales de operador (ground truth de timing+texto).",
+            "# correcciones de operador: proxy operativo, NO gold de timing/texto.",
             f"# Filtro: tenant LIKE {args.tenant_like!r}, >= {args.min_diffs} saves.",
         ]
         lines += [r["job_id"] for r in results if r["has_audio"]]

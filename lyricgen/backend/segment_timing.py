@@ -63,6 +63,7 @@ def _deduplicate_editor_collisions(segments: list[dict]) -> list[dict]:
     that copy has the same text and starts within the collision window it is
     not a second sung event; keeping both makes the playback cursor flicker.
     Different text is intentionally preserved because harmonies can overlap.
+    Distinct stable identities also preserve intentional operator copies.
     """
     out: list[dict] = []
     dropped: list[str] = []
@@ -74,7 +75,9 @@ def _deduplicate_editor_collisions(segments: list[dict]) -> list[dict]:
             start = 0.0
         duplicate = next(
             (previous for previous in out
-             if (_collision_text(previous) == text or _near_collision(previous, segment))
+             if not (previous.get("segment_id") is not None and segment.get("segment_id") is not None
+                     and str(previous["segment_id"]) != str(segment["segment_id"]))
+             and (_collision_text(previous) == text or _near_collision(previous, segment))
              and abs(float(previous.get("start") or 0) - start) < 0.35),
             None,
         )

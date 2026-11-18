@@ -144,6 +144,31 @@ def test_individual_pin_and_partial_bulk_keep_contract_group(db, setup):
     assert item.render_overrides["font_scale"] == 1.3
 
 
+
+def test_individual_design_starts_at_zero_without_assignment_and_rejects_stale_retry(db, setup):
+    campaign, items, actor = setup
+    item = items[0]
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              artist="Artista", filename="unassigned.wav", status="transcribed_pending")
+    db.add(job); db.commit()
+    assert creative.ASSIGNMENT not in item.render_overrides
+    result = creative.save_individual(campaign.id, item.id,
+        creative.IndividualRequest(revision=0, settings={"font": "poppins-bold"}), actor, db)
+    db.expire_all()
+    persisted = db.get(BatchCampaignItem, item.id)
+    assert result["revision"] == 1
+    assert persisted.render_overrides["font"] == "poppins-bold"
+    assert persisted.render_overrides[creative.ASSIGNMENT]["revision"] == 1
+    assert persisted.render_overrides["source_reference"] == {"status": "absent"}
+    with pytest.raises(HTTPException) as stale:
+        creative.save_individual(campaign.id, item.id,
+            creative.IndividualRequest(revision=0, settings={"font": "anton"}), actor, db)
+    assert stale.value.status_code == 409
+    db.rollback(); db.refresh(persisted)
+    assert persisted.render_overrides["font"] == "poppins-bold"
+
+
 def test_lock_and_render_progress_block_bulk(db, setup):
     campaign, items, actor = setup
     job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id, campaign_id=campaign.id,
@@ -354,9 +379,9 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
             # que sirve, no sólo que existe.
             " published_render_fingerprint TEXT, published_revision INTEGER,"
             " stale_since TEXT, stale_reason TEXT, approved_at TEXT,"
-            " content_updated_at TEXT)"
+            " content_updated_at TEXT, published_file_keys TEXT, added_at TEXT, client_visibility TEXT)"
         ))
-        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT)"))
+        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
         # `fingerprint` es el del render publicado. "viejo" no coincide con
         # ningún render actual, así que esa fila queda desactualizada: es el
         # caso que el portal ocultaba (mismo label, misma fecha, corte anterior).
@@ -369,10 +394,10 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
         ]:
             conn.execute(text(
                 "INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed,"
-                ":fingerprint,:revision,NULL,NULL,NULL,NULL)"
+                ":fingerprint,:revision,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"
             ), dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed,
                     fingerprint=fingerprint, revision=revision))
-        conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL),(2,1,'resolved'),(3,2,NULL),(4,3,NULL),(5,4,NULL),(6,5,NULL)"))
+        conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL,'2026-09-20 10:00:00.000000'),(2,1,'resolved','2026-09-19 10:00:00.000000'),(3,2,NULL,'2026-09-20 10:00:00.000000'),(4,3,NULL,'2026-09-20 10:00:00.000000'),(5,4,NULL,'2026-09-20 10:00:00.000000'),(6,5,NULL,'2026-09-20 10:00:00.000000')"))
 
     @contextmanager
     def portal_db():

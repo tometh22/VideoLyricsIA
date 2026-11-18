@@ -421,3 +421,165 @@ def test_render_real_las_variantes_son_visualmente_distintas(tmp_path):
     for a, b in ((1, 2), (1, 3), (2, 3)):
         d = mad(a, b)
         assert d > 8, f"v{a} y v{b} son casi el mismo plano (diferencia {d:.1f})"
+
+
+# --------------------------------------------------------------------------
+# Canvas descargable (bug 2026-11-11)
+#
+# El worker generaba y subía el Canvas (s3_keys["canvas*"] con archivos
+# válidos en R2) pero `files` nunca traía `canvas_url`: no hay columna y
+# update_job(files=...) sólo persiste video/short/thumbnail. Resultado:
+# /media-token/{id}/canvas → 404 "This job has no canvas" y el front no
+# montaba los tabs. Le pasaba a TODO job con Canvas, no sólo a los editados.
+# --------------------------------------------------------------------------
+
+import uuid
+
+from database import Job as _JobModel, SessionLocal as _Session, User as _UserModel
+
+
+_CANVAS_S3 = {
+    "canvas": "genly/{job}/canvas.mp4",
+    "canvas_v2": "genly/{job}/canvas_v2.mp4",
+    "canvas_v3": "genly/{job}/canvas_v3.mp4",
+}
+
+
+def _seed_admin_job(s3_keys: dict, *, status="done") -> str:
+    """Un job de admin con la forma exacta de los de prod: las tres columnas
+    *_url seteadas y el Canvas SÓLO en s3_keys."""
+    db = _Session()
+    try:
+        admin = db.query(_UserModel).filter(_UserModel.username == "admin").first()
+        job_id = uuid.uuid4().hex[:12]
+        db.add(_JobModel(
+            job_id=job_id,
+            user_id=admin.id,
+            tenant_id=admin.tenant_id,
+            artist="Canvas Test",
+            song_title="Descargable",
+            filename="song.mp3",
+            status=status,
+            delivery_profile="youtube",
+            progress=100,
+            video_url=f"/download/{job_id}/video",
+            short_url=f"/download/{job_id}/short",
+            thumbnail_url=f"/download/{job_id}/thumbnail",
+            s3_keys={k: v.format(job=job_id) for k, v in s3_keys.items()},
+        ))
+        db.commit()
+        return job_id
+    finally:
+        db.close()
+
+
+def _files_of(job_id: str) -> dict:
+    db = _Session()
+    try:
+        return db.query(_JobModel).filter(_JobModel.job_id == job_id).first().to_dict()["files"]
+    finally:
+        db.close()
+
+
+def _s3_keys_of(job_id: str) -> dict:
+    db = _Session()
+    try:
+        row = db.query(_JobModel).filter(_JobModel.job_id == job_id).first()
+        return dict(row.s3_keys or {})
+    finally:
+        db.close()
+
+
+def test_lista_de_canvas_de_database_es_la_del_pipeline():
+    """database no importa pipeline; si se agrega una variante en un lado y
+    no en el otro, esa variante vuelve a quedar sin URL."""
+    import database
+    assert database.CANVAS_FILE_TYPES == pipeline.CANVAS_FILE_TYPES
+
+
+def test_files_expone_el_canvas_que_existe_en_r2(setup_db):
+    job_id = _seed_admin_job({
+        "video": "genly/{job}/lyric_video.mp4",
+        "short": "genly/{job}/short.mp4",
+        "thumbnail": "genly/{job}/thumbnail.jpg",
+        **_CANVAS_S3,
+    })
+    files = _files_of(job_id)
+    for ft in pipeline.CANVAS_FILE_TYPES:
+        assert files[f"{ft}_url"] == f"/download/{job_id}/{ft}"
+    # Lo que ya estaba no cambia.
+    assert files["video_url"] == f"/download/{job_id}/video"
+    assert files["short_url"] == f"/download/{job_id}/short"
+
+
+def test_files_no_inventa_un_canvas_que_no_existe(setup_db):
+    """Un job sin Canvas (no-admin, o Canvas fallido) no anuncia ninguno, y
+    sólo se anuncian las variantes que de verdad están en R2."""
+    job_id = _seed_admin_job({"video": "genly/{job}/lyric_video.mp4",
+                              "canvas_v2": "genly/{job}/canvas_v2.mp4"})
+    files = _files_of(job_id)
+    assert "canvas_url" not in files
+    assert files["canvas_v2_url"] == f"/download/{job_id}/canvas_v2"
+    assert "canvas_v3_url" not in files
+
+
+def test_media_token_del_canvas_ya_no_da_404(client, admin_token):
+    """El síntoma de prod, end-to-end: el admin pide el token del Canvas de un
+    job cuyo Canvas está en R2 y recibe 200, no 404."""
+    job_id = _seed_admin_job({"video": "genly/{job}/lyric_video.mp4", **_CANVAS_S3})
+    for ft in pipeline.CANVAS_FILE_TYPES:
+        res = client.get(f"/media-token/{job_id}/{ft}",
+                         headers={"Authorization": f"Bearer {admin_token}"})
+        assert res.status_code == 200, (ft, res.text)
+        assert res.json()["token"]
+    # El 404 sigue valiendo cuando el Canvas NO existe.
+    sin_canvas = _seed_admin_job({"video": "genly/{job}/lyric_video.mp4"})
+    res = client.get(f"/media-token/{sin_canvas}/canvas",
+                     headers={"Authorization": f"Bearer {admin_token}"})
+    assert res.status_code == 404
+
+
+def test_un_render_sin_canvas_no_deja_vivo_el_canvas_anterior(setup_db):
+    """/edit no resetea s3_keys y el upload sólo mergea: si en este render el
+    Canvas falló (o el dueño dejó de ser admin), la key vieja —de OTRO fondo—
+    seguiría ahí y ahora la API la anunciaría como descargable."""
+    job_id = _seed_admin_job({"video": "genly/{job}/lyric_video.mp4",
+                              "short": "genly/{job}/short.mp4",
+                              **_CANVAS_S3})
+    # Este render subió video, short y sólo la variante 1 del Canvas.
+    pipeline._drop_stale_canvas_keys(job_id, {
+        "video": f"genly/{job_id}/lyric_video.mp4",
+        "short": f"genly/{job_id}/short.mp4",
+        "canvas": f"genly/{job_id}/canvas.mp4",
+    })
+    assert set(_s3_keys_of(job_id)) == {"video", "short", "canvas"}
+    assert "canvas_v2_url" not in _files_of(job_id)
+
+    # Un render sin ningún Canvas (o con R2 apagado → {}) los saca todos y
+    # no toca el resto.
+    pipeline._drop_stale_canvas_keys(job_id, {})
+    assert set(_s3_keys_of(job_id)) == {"video", "short"}
+    pipeline._drop_stale_canvas_keys(job_id, None)
+    assert set(_s3_keys_of(job_id)) == {"video", "short"}
+
+
+def test_limpiar_keys_viejas_es_best_effort(monkeypatch):
+    """Un fallo de DB al limpiar el Canvas no puede costar la entrega."""
+    import jobs
+
+    def boom(*a, **kw):
+        raise RuntimeError("db caída")
+    monkeypatch.setattr(jobs, "remove_s3_keys", boom)
+    pipeline._drop_stale_canvas_keys("cualquiera", {})  # no levanta
+
+
+def test_ambos_pipelines_limpian_el_canvas_despues_del_upload():
+    """Wiring a nivel fuente (run_pipeline/run_edit_pipeline manejan ffmpeg de
+    punta a punta; mismo enfoque que test_edit_prores_invalidation). Se pasa
+    el RESULTADO del upload, no `files`: cuenta lo que llegó a R2."""
+    import inspect
+    for fn, call in ((pipeline.run_pipeline, "_drop_stale_canvas_keys(job_id, _uploaded_keys)"),
+                     (pipeline.run_edit_pipeline, "_drop_stale_canvas_keys(job_id, s3_keys)")):
+        src = inspect.getsource(fn)
+        assert call in src, fn.__name__
+        assert src.index("_upload_deliverables_to_r2(") < src.index(call), fn.__name__

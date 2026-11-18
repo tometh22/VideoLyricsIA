@@ -234,3 +234,51 @@ def compute_and_cache_hires_waveform(
     except Exception as exc:
         logger.warning("[WAVEFORM] hires cache write failed for %s: %s", job_id, exc)
     return payload
+
+
+# --- Beat times for lyric-look previews (2026-10-09) ---------------------------
+#
+# Looks that kick/blink on the beat (lyric_looks.Look.beat_sync) render with the
+# song's real beats; the editor preview fetches the same beats so what the
+# operator sees pulses where the video will. Same storage/caching contract as
+# the waveform: computed once from the source audio, cached next to it.
+
+def beats_cache_key_for_job(job_id: str) -> str:
+    return f"waveform/{job_id}.beats.json"
+
+
+def compute_and_cache_beats(job_id: str, input_r2_key: str) -> dict | None:
+    """`{"bpm": float, "beats": [seconds...]}` for the job's source audio, or
+    None on any failure. Never raises."""
+    if not job_id or not input_r2_key:
+        return None
+    import storage
+    if not storage.is_enabled():
+        return None
+    cache_key = beats_cache_key_for_job(job_id)
+    try:
+        if storage.object_exists(cache_key):
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+                if storage.download_object(cache_key, tf.name):
+                    with open(tf.name, "r", encoding="utf-8") as f:
+                        return _json.loads(f.read())
+    except Exception as exc:
+        logger.warning("[BEATS] cache read failed for %s (will recompute): %s",
+                       job_id, exc)
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=True) as tf:
+        if not storage.download_object(input_r2_key, tf.name):
+            logger.warning("[BEATS] source audio download failed for %s", job_id)
+            return None
+        import beat_snap
+        found = beat_snap.detect_beats(tf.name)
+    if not found:
+        return None
+    payload = {"bpm": round(float(found[0] or 0.0), 2),
+               "beats": [round(float(b), 3) for b in found[1]]}
+    try:
+        storage.put_object_bytes(
+            cache_key, _json.dumps(payload).encode("utf-8"), "application/json"
+        )
+    except Exception as exc:
+        logger.warning("[BEATS] cache write failed for %s: %s", job_id, exc)
+    return payload

@@ -18,7 +18,7 @@
  *   tone          — "error" (default) | "warning" | "success" | "info"
  *   actionLabel   — optional CTA text (default: "Cerrar")
  */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 const TONE_STYLES = {
   error: {
@@ -93,14 +93,42 @@ export default function AlertModal({
   tone = "error",
   actionLabel = "Cerrar",
 }) {
-  // Escape-to-close. Matches Cmd+. / Esc on the modal patterns elsewhere.
+  const dialogRef = useRef(null);
+  // Keep keyboard and screen-reader users inside the active alert dialog.
   useEffect(() => {
     if (!open) return undefined;
+    const previousFocus = document.activeElement;
+    const getFocusable = () => [...(dialogRef.current?.querySelectorAll(
+      'button:not(:disabled), a[href], input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    ) || [])];
+    getFocusable()[0]?.focus();
     const onKey = (e) => {
-      if (e.key === "Escape") onClose?.();
+      if (e.key === "Escape") {
+        onClose?.();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const focusable = getFocusable();
+      if (!focusable.length) {
+        e.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && (document.activeElement === first || !dialogRef.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (document.activeElement === last || !dialogRef.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      previousFocus?.focus?.();
+    };
   }, [open, onClose]);
 
   if (!open) return null;
@@ -114,6 +142,9 @@ export default function AlertModal({
       role="alertdialog"
       aria-modal="true"
       aria-labelledby="alert-modal-title"
+      aria-describedby={description ? "alert-modal-description" : undefined}
+      tabIndex={-1}
+      ref={dialogRef}
     >
       <div className={
         "w-full max-w-md bg-surface-2 rounded-card ring-1 p-5 space-y-4 " +
@@ -134,7 +165,7 @@ export default function AlertModal({
               {title}
             </h3>
             {description && (
-              <p className="text-[13px] text-ink-secondary mt-1.5 leading-relaxed whitespace-pre-wrap break-words">
+              <p id="alert-modal-description" className="text-[13px] text-ink-secondary mt-1.5 leading-relaxed whitespace-pre-wrap break-words">
                 {description}
               </p>
             )}

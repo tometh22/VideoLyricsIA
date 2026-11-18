@@ -52,7 +52,11 @@ export function safeReviewReturnPath(value) {
   if (!value?.startsWith("/") || value.startsWith("//")) return null;
   try {
     const url = new URL(value, "https://genly.invalid");
+    const validChangeRequestReturn = url.pathname === "/admin"
+      && url.searchParams.get("section") === "cambios"
+      && /^\d+$/.test(url.searchParams.get("change_request_id") || "");
     return url.origin === "https://genly.invalid" &&
-      (url.pathname === "/admin/cola" || /^\/campaigns\/[^/]+$/.test(url.pathname)) ? value : null;
+      (url.pathname === "/admin/cola" || /^\/campaigns\/[^/]+$/.test(url.pathname)
+        || validChangeRequestReturn) ? value : null;
   } catch { return null; }
 }

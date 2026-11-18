@@ -38,6 +38,7 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
+      "/team/": "http://localhost:8000",
       "/auth": "http://localhost:8000",
       "/upload": "http://localhost:8000",
       "/transcribe": "http://localhost:8000",

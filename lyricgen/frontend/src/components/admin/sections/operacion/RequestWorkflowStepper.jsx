@@ -1,4 +1,8 @@
-import { WORKFLOW_STEPS } from "./changeRequestWorkflow";
+import {
+  STEP_STATE_LABELS,
+  correctionSentence,
+  correctionStepList,
+} from "./changeRequestWorkflow";
 
 const TONES = {
   action: "bg-brand/10 text-brand-light ring-brand/20",
@@ -8,32 +12,33 @@ const TONES = {
   idle: "bg-surface-2/50 text-gray-300 ring-white/[0.06]",
 };
 
-export default function RequestWorkflowStepper({ workflow }) {
-  const activeStep = Math.min(workflow?.activeStep || 0, WORKFLOW_STEPS.length);
+// Tres pasos (Corregir, Generar el video nuevo, Publicar) y UNA frase que
+// explica en qué punto está el pedido. `steps` y `sentence` se pueden pasar ya
+// calculados; si no, se derivan del `workflow` del servidor.
+export default function RequestWorkflowStepper({ workflow, steps, sentence }) {
+  const list = steps || correctionStepList(workflow);
+  const text = sentence || correctionSentence(workflow);
   return (
-    <div className="space-y-3" aria-label="Progreso del pedido">
-      <div className={`rounded-xl px-4 py-3 ring-1 ${TONES[workflow?.tone] || TONES.idle}`}>
-        <p className="text-caption font-semibold">{workflow?.label}</p>
-        <p className="text-label opacity-75 mt-0.5">{workflow?.detail}</p>
-      </div>
-      <ol className="grid grid-cols-5 gap-1" aria-label="Etapas del pedido">
-        {WORKFLOW_STEPS.map((step, index) => {
-          const complete = activeStep > index;
-          const active = activeStep === index;
-          return (
-            <li key={step.id} className="min-w-0">
-              <div className={`h-1 rounded-full ${
-                complete ? "bg-emerald-400" : active ? "bg-brand" : "bg-white/[0.08]"
-              }`} />
-              <p className={`mt-1.5 truncate text-[10px] font-medium ${
-                complete ? "text-emerald-300" : active ? "text-white" : "text-gray-600"
-              }`}>
-                {step.label}
-              </p>
-            </li>
-          );
-        })}
+    <div className="space-y-3" role="group" aria-label="Progreso del pedido">
+      <ol className="grid grid-cols-3 gap-2" aria-label="Pasos del pedido">
+        {list.map((step, index) => (
+          <li key={step.key} className="min-w-0" aria-current={step.state === "active" ? "step" : undefined}>
+            <div className={`h-1 rounded-full ${
+              step.state === "done" ? "bg-emerald-400" : step.state === "active" ? "bg-brand" : "bg-white/[0.08]"
+            }`} />
+            <p className={`mt-1.5 text-label font-medium leading-tight ${
+              step.state === "done" ? "text-emerald-300" : step.state === "active" ? "text-white" : "text-gray-500"
+            }`}>
+              <span aria-hidden="true">{step.state === "done" ? "✓" : index + 1}. </span>
+              {step.label}
+              <span className="sr-only"> ({STEP_STATE_LABELS[step.state]})</span>
+            </p>
+          </li>
+        ))}
       </ol>
+      <p className={`rounded-xl px-4 py-3 text-caption ring-1 ${TONES[workflow?.tone] || TONES.idle}`}>
+        {text}
+      </p>
     </div>
   );
 }

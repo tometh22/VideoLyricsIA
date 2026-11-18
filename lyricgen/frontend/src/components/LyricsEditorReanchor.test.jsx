@@ -298,9 +298,8 @@ describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
 describe("Botón visible 'Pegar letra oficial' (2026-09-14)", () => {
   it("aparece en la pestaña de texto (vista por defecto) y abre el modal sin pasar por Herramientas", () => {
     render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor: vi.fn() })} />);
-    // Vista por defecto = "Revisar letra": no hay menú Herramientas ahí…
-    expect(screen.queryByTestId("editor-overflow-btn")).toBeNull();
-    // …pero el CTA sí está.
+    // History/tools are also available in text view; pasting stays direct.
+    expect(screen.getByTestId("editor-overflow-btn")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("paste-lyrics-cta"));
     expect(screen.getByTestId("paste-lyrics-textarea")).toBeInTheDocument();
   });
@@ -364,6 +363,17 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
 
 
 describe("Loader bloqueante de re-sincronización", () => {
+  it("a known task timeout releases the dialog and preserves pasted lyrics", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "task-timeout", taskId: "slow-task" }));
+    const onReanchorReconcile = vi.fn(async () => ({ ok: true, revision: 9, segments: SEGMENTS }));
+    render(<LyricsEditor {...baseProps({ onReanchor, onReanchorReconcile })} />);
+    start("paste");
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("No se pudo confirmar"));
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull();
+    expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+  });
+
   function start(mode) {
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));

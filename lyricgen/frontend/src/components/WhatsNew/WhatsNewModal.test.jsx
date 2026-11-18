@@ -39,7 +39,7 @@ function setup(entryOverrides = {}, { user = { id: 1 } } = {}) {
 }
 
 describe("WhatsNewModal", () => {
-  it.each(["/admin/cola", "/review/job-123"])(
+  it.each(["/admin/cola", "/review/job-123", "/campaigns/ba3318bdfffe"])(
     "no interrumpe la entrega de revisión en %s",
     (pathname) => {
       window.history.pushState({}, "", pathname);

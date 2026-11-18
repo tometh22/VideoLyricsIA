@@ -33,6 +33,12 @@ const deps = {
 const flat = (groups) => groups.flatMap((g) => g.chips.map((c) => `${c.label}: ${c.value}`));
 
 describe("buildSettingsSummary", () => {
+  it("el look de letra se ve con su nombre, y 'sin look' no genera chip", () => {
+    expect(flat(buildSettingsSummary({ lyric_look: "pop70" }, deps))).toContain("Look: Pop 70s");
+    const keys = buildSettingsSummary({ lyric_look: "" }, deps).flatMap((g) => g.chips.map((c) => c.key));
+    expect(keys).not.toContain("lyric_look");
+  });
+
   it("el caso del reclamo: se ve que el video tiene Animado", () => {
     const out = buildSettingsSummary({ movement_style: "animado" }, deps);
     expect(flat(out)).toContain("Movimiento: Animado (ilustración)");
@@ -125,6 +131,20 @@ describe("describeSceneSource: dice la verdad sobre lo que hizo el worker", () =
   });
 });
 
+describe("variante del look", () => {
+  it("género, variante, fuentes y colores se ven con etiqueta; '' no genera chip", () => {
+    const chips = flat(buildSettingsSummary({
+      lyric_look: "cinetico", lyric_genre: "metal", lyric_variant: 3,
+      lyric_font_main: "rubik-dirt", lyric_font_key: "metal-mania", lyric_accent_color: "#D0101E", lyric_alt_color: "",
+    }, deps));
+    expect(chips).toEqual(expect.arrayContaining([
+      "Género del look: Metal", "Variante: 3", "Letra principal: Rubik Dirt",
+      "Letra destacada: Metal Mania", "Color destacado: #D0101E",
+    ]));
+    expect(chips.join(" ")).not.toMatch(/Color secundario/);
+  });
+});
+
 describe("el catálogo de ejes no se desincroniza del backend", () => {
   it("cubre los ejes de _VARIANT_OVERRIDABLE_FIELDS que son visuales", () => {
     // custom_colors, bg_verbatim y match_lyrics se muestran de otra forma
@@ -132,7 +152,7 @@ describe("el catálogo de ejes no se desincroniza del backend", () => {
     const shown = SETTINGS_GROUPS.flatMap((g) => g.axes.map((a) => a.key));
     for (const key of [
       "background_hint", "concept", "genre", "movement_style", "effect",
-      "lyrics_animation", "line_transition", "font", "font_scale", "text_case",
+      "lyrics_animation", "line_transition", "lyric_look", "font", "font_scale", "text_case",
       "text_contrast", "frame_format", "title_template", "title_size",
       "title_artist_font", "title_song_font",
     ]) {
@@ -184,6 +204,7 @@ describe("no se le muestran códigos internos ni defaults al operador", () => {
       text_contrast: ["subtle", "medium", "strong"],
       lyrics_animation: ["none", "karaoke", "word_reveal", "pop", "glow"],
       line_transition: ["none", "slide_up", "slide_side", "wipe", "dissolve_blur"],
+      lyric_look: ["", "cosmico", "cine", "pincel", "pop70", "pelicula", "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "duotono", "romantico", "degrade", "y2k"],
       title_template: ["auto", "centered", "lower_third", "badge"],
     };
     for (const [key, codes] of Object.entries(cases)) {

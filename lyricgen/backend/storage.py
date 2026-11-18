@@ -48,6 +48,66 @@ except (TypeError, ValueError):
     R2_CLEANUP_SPIKE_THRESHOLD = 100
 
 _client = None
+_metadata_client = None
+_metadata_client_lock = threading.Lock()
+
+
+def _get_metadata_client():
+    """Small bounded HEAD pool, independent of long-running upload/copy I/O."""
+    global _metadata_client
+    if _metadata_client is not None:
+        return _metadata_client
+    if not is_enabled():
+        return None
+    with _metadata_client_lock:
+        if _metadata_client is None:
+            import boto3
+            from botocore.config import Config
+            _metadata_client = boto3.client(
+                "s3", endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                config=Config(signature_version="s3v4", connect_timeout=3,
+                              read_timeout=5, max_pool_connections=8,
+                              retries={"total_max_attempts": 1, "mode": "standard"}),
+            )
+    return _metadata_client
+
+
+def object_identity(key: str) -> dict:
+    """Tri-state object identity for publication fences, not a content checksum.
+
+    ETags can be multipart/provider-specific; size+ETag is an object revision
+    precondition, not proof that several files came from one render generation.
+    Missing/invalid metadata and transport/auth failures are unknown, never a
+    missing object or a successful verification.
+    """
+    try:
+        client = _get_metadata_client()
+        if client is None or not key:
+            return {"status": "unavailable"}
+        value = client.head_object(Bucket=R2_BUCKET, Key=key)
+        etag = value.get("ETag")
+        size = value.get("ContentLength")
+        if (not isinstance(etag, str) or not etag.strip().strip('"')
+                or isinstance(size, bool) or not isinstance(size, int) or size < 0):
+            return {"status": "unavailable"}
+        return {"status": "exists", "etag": etag.strip().strip('"'), "size": size}
+    except Exception as exc:
+        code = str((getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return {"status": "missing"}
+        logger.warning("[R2] Object identity unavailable (%s)", type(exc).__name__)
+        return {"status": "unavailable"}
+
+
+def object_status_bounded(key: str) -> str:
+    """Tri-state audit HEAD through the short-timeout metadata pool.
+
+    Callers doing a batch must also enforce an overall deadline; socket timeouts
+    are not a hard wall-clock bound on DNS/scheduling for an entire batch.
+    """
+    return object_identity(key)["status"]
 
 
 def is_enabled() -> bool:
@@ -1264,7 +1324,7 @@ def delete_object(key: str) -> None:
         raise
 
 
-def copy_object(src_key: str, dst_key: str) -> bool:
+def copy_object(src_key: str, dst_key: str, *, expected_etag: str | None = None) -> bool:
     """Server-side copy from src_key to dst_key within the same bucket.
 
     Used by run_edit_pipeline to archive the previous version of a deliverable
@@ -1282,19 +1342,26 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     client = _get_client()
     if client is None:
         return False
-    if not object_exists(src_key):
+    if expected_etag is None and not object_exists(src_key):
         return False
+    conditions = {}
+    if expected_etag is not None:
+        normalized_etag = str(expected_etag).strip().strip('"')
+        if not normalized_etag or any(char in normalized_etag for char in '\r\n"'):
+            raise ValueError("invalid_copy_source_etag")
+        conditions["CopySourceIfMatch"] = f'"{normalized_etag}"'
     src = {"Bucket": R2_BUCKET, "Key": src_key}
+    managed_args = {"ExtraArgs": conditions} if conditions else {}
     if src_key.lower().endswith('.mov'):
         # Broadcast masters are frequently multi-GB. A single CopyObject
         # can consume all read-timeout retries before reaching the multipart
         # fallback below, leaving publication/render progress frozen for
         # minutes. The managed transfer selects multipart by size up front.
-        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
         logger.info("[R2] Copied master %s -> %s", src_key, dst_key)
         return True
     try:
-        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src)
+        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src, **conditions)
     except ClientError as e:
         code = (e.response or {}).get("Error", {}).get("Code", "")
         # Single-operation CopyObject caps at 5 GB on S3/R2 → a multi-GB
@@ -1303,7 +1370,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # which has no such limit.
         if code in ("EntityTooLarge", "InvalidRequest", "InvalidArgument"):
             logger.info("[R2] %s exceeds single-copy limit (%s) — using multipart copy", src_key, code)
-            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
         else:
             raise
     except (ReadTimeoutError, ConnectTimeoutError) as e:
@@ -1317,7 +1384,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # well under the timeout — so the same multipart path that handles
         # EntityTooLarge also dodges the per-request timeout.
         logger.info("[R2] %s single-copy timed out (%s) — using multipart copy", src_key, type(e).__name__)
-        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
     logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 

@@ -1,6 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
+    { "source": "/sellos", "destination": "/sellos/index.html" },
+    { "source": "/labels", "destination": "/sellos/index.html" },
+    { "source": "/gravadoras", "destination": "/sellos/index.html" },
+    { "source": "/privacidad", "destination": "/privacidad/index.html" },
+    { "source": "/privacy", "destination": "/privacidad/index.html" },
+    { "source": "/muestra/:slug", "destination": "/muestra/:slug/index.html" },
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "headers": [

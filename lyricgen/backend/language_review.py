@@ -14,6 +14,32 @@ from __future__ import annotations
 from transcription_language import build_language_contract
 
 
+def staging_advisory() -> bool:
+    """Staging-only switch: the language review warns but never blocks approval.
+
+    The discrepancy is still computed and shown; only the server-side 409 on
+    approve / approve-lyrics is skipped. Inert outside ENVIRONMENT=staging.
+    """
+    import os
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    return os.environ.get("LANGUAGE_REVIEW_STAGING_ADVISORY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def advisory() -> bool:
+    """The language review warns but never blocks approval, in ANY environment.
+
+    ``LANGUAGE_REVIEW_ADVISORY`` is the production-capable switch (an explicit
+    operator decision, default off, reported in /health) so a promotion can keep
+    the behaviour production had before the server-side 409 existed.
+    ``LANGUAGE_REVIEW_STAGING_ADVISORY`` (staging only) also turns it on.
+    """
+    import os
+    if os.environ.get("LANGUAGE_REVIEW_ADVISORY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return staging_advisory()
+
+
 def reference_text_of(transcription_quality) -> str:
     """The audio-derived reference lyrics persisted on the job, or ''."""
     tq = transcription_quality if isinstance(transcription_quality, dict) else {}

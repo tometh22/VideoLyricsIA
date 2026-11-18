@@ -9,6 +9,25 @@ import {
 } from "./changeRequestWorkflow";
 
 describe("change request workflow", () => {
+  it("uses the server projection and refuses a locally stale preview", () => {
+    const workflow = { key: "render", activeStep: 2, label: "Confirmá revisión", allowed_actions: ["review_render"] };
+    const item = { workflow, proposal: { content_hash: "h2" }, publication: { needs_publish: true } };
+    expect(requestWorkflow(item, { content_hash: "h2" })).toBe(workflow);
+    expect(requestWorkflow(item, { content_hash: "h1" })).toMatchObject({ key: "refresh", allowed_actions: ["refresh"] });
+  });
+
+  it("manual resolution does not paint all publication stages completed", () => {
+    const state = requestWorkflow({ resolved_at: "now", resolution_source: "manual" });
+    expect(state.label).toBe("Cerrado manualmente");
+    expect(state.activeStep).toBeLessThan(1);
+    expect(state.detail).toContain("no confirma");
+  });
+
+  it("includes a generated cut requiring review in the review filter and count", () => {
+    const item = { proposal: { status: "applied" }, publication: { render_matches_editor: true, needs_publish: false } };
+    expect(workflowMatchesFilter(requestWorkflow(item), "review")).toBe(true);
+    expect(workflowCounts([item], {}, true).review).toBe(1);
+  });
   it("prioritizes rendering and publication over proposal state", () => {
     const item = {
       proposal: { status: "ready" },

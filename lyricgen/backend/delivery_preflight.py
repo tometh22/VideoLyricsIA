@@ -202,7 +202,15 @@ def _aggregate(
     for index, occurrence in occurrences:
         # Repeated JAMAS -> JAMÁS becomes one intermittent issue, while a
         # different misspelling remains independently actionable.
-        grouped[(occurrence.code, occurrence.actual, occurrence.expected)].append(
+        # Timing/card-presence observations are one actionable category even
+        # when every occurrence has a different measured endpoint. Grouping by
+        # those measurements made the panel render the same generic warning
+        # dozens of times instead of one card with clickable timecodes.
+        if occurrence.code in {"LYRIC_END_BEFORE_WORD_END"}:
+            key = (occurrence.code, "", "")
+        else:
+            key = (occurrence.code, occurrence.actual, occurrence.expected)
+        grouped[key].append(
             (index, occurrence)
         )
 

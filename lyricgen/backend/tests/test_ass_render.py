@@ -640,6 +640,37 @@ def test_build_ass_dissolve_blur_emits_blur_in_and_out():
     assert d.count("\\t(") == 2          # focus-in + blur/shadow-out
 
 
+def test_build_ass_zoom_through_flies_in_holds_and_flies_out():
+    segs = [{"text": "lluvia espacial", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="zoom_through")]))
+    assert "\\fscx30\\fscy30" in d                 # arrives from far away
+    assert "\\fscx100\\fscy100" in d               # readable size
+    assert "\\fscx900\\fscy900" in d               # rushes past the lens
+    # Exit window is short: the line is readable for most of its 4 s.
+    assert "\\t(3680,4000,2.2," in d
+    assert "\\fad(" not in d                       # scale/alpha own enter+exit
+    assert "\\4a&H80&" in d                        # style shadow kept at 50%
+    assert "\\q2" in d and d.endswith("lluvia espacial")
+
+
+def test_zoom_through_prebreaks_long_lines_so_rows_do_not_jump():
+    segs = [{"text": "casi las dos en el país del no dormir", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="zoom_through", font_scale=1.25)]))
+    assert d.endswith("casi las dos en el\\Npaís del no dormir")
+
+
+def test_zoom_through_short_line_gets_gentler_exit():
+    segs = [{"text": "sí", "start": 1.0, "end": 2.0}]
+    d = _dialogue(_ass([_line(segs, transition="zoom_through")]))
+    assert "\\fscx450\\fscy450" in d and "\\fscx900" not in d
+
+
+def test_zoom_through_overrides_pop_scale():
+    segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
+    d = _dialogue(_ass([_line(segs, transition="zoom_through", animation="pop")]))
+    assert "\\fscx116" not in d
+
+
 def test_line_transition_preserves_approved_lyric_window():
     segs = [{"text": "hola", "start": 3.2, "end": 6.7}]
     line = _line(segs, transition="dissolve_blur")

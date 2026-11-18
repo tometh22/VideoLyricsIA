@@ -23,21 +23,12 @@ import { safeReviewReturnPath } from "../lib/reviewerNavigation";
 import { reviewJobPath } from "../lib/reviewJobRoute";
 import { editorSessionHeaders } from "../lib/editorSession";
 import { translateBackendError } from "../lib/lyricsEditSubmit";
-import { fetchWithTimeout } from "../fetchWithTimeout";
-import { requestIdempotencyKey } from "../lib/idempotency";
 
 const API = import.meta.env.VITE_API_URL || "";
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-function apiFetch(path, opts = {}, timeoutMs = 10_000) {
-  return fetchWithTimeout(`${API}${path}`, {
-    ...opts,
-    headers: { ...authHeaders(), ...opts.headers },
-  }, timeoutMs);
 }
 
 // Read the cached user out of localStorage. App.jsx is the source of truth
@@ -162,14 +153,11 @@ function EditableMetadataField({
         [backendKey]: trimmed,
       };
       if (allowYoutubeDrift) body.allow_youtube_drift = true;
-      const res = await apiFetch(`/edit/${jobId}`, {
+      const res = await fetch(`${API}/edit/${jobId}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": requestIdempotencyKey(`metadata-${jobId}`),
-        },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(body),
-      }, 15_000);
+      });
       if (res.status === 409) {
         const detail = (await res.json()).detail || {};
         if (detail.code === "youtube_already_published") {
@@ -279,7 +267,7 @@ function ProvenanceTab({ jobId, t }) {
   const [expandedId, setExpandedId] = useState(null);
 
   useEffect(() => {
-    apiFetch(`/provenance/${jobId}`)
+    fetch(`${API}/provenance/${jobId}`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((data) => { setRecords(data); setLoading(false); })
       .catch(() => setLoading(false));
@@ -325,7 +313,7 @@ function ProvenanceTab({ jobId, t }) {
         <p className="text-xs text-gray-500 uppercase tracking-wider">{t("prov.title") || "AI Provenance"}</p>
         <button
           onClick={async () => {
-            const res = await apiFetch(`/provenance/${jobId}/export`);
+            const res = await fetch(`${API}/provenance/${jobId}/export`, { headers: authHeaders() });
             if (!res.ok) return;
             const blob = await res.blob();
             const url = URL.createObjectURL(blob);
@@ -443,10 +431,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     let stopped = false;
     const heartbeat = async () => {
       try {
-        const res = await apiFetch(`/editor/${job.job_id}/lock/heartbeat`, {
+        const res = await fetch(`${API}/editor/${job.job_id}/lock/heartbeat`, {
           method: "POST",
-          headers: editorSessionHeaders(),
-        }, 10_000);
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
         if (!res.ok) throw new Error(`Heartbeat failed: ${res.status}`);
       } catch {
         // The visible queue remains authoritative; the next heartbeat retries.
@@ -457,11 +445,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     return () => {
       stopped = true;
       window.clearInterval(timer);
-      apiFetch(`/editor/${job.job_id}/lock`, {
+      fetch(`${API}/editor/${job.job_id}/lock`, {
         method: "DELETE",
-        headers: editorSessionHeaders(),
+        headers: { ...authHeaders(), ...editorSessionHeaders() },
         keepalive: true,
-      }, 5_000).catch(() => {});
+      }).catch(() => {});
     };
   }, [job?.campaign_id, job?.job_id, job?.status]);
 
@@ -478,6 +466,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
   const [umgSendStage, setUmgSendStage] = useState(null);
+  const [umgPreflightRequested, setUmgPreflightRequested] = useState(false);
+  const [qcFocusRequest, setQcFocusRequest] = useState(() => (
+    new URLSearchParams(location.search).has("qc_focus") ? 1 : 0
+  ));
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
   const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
   const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
@@ -495,27 +487,53 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setUmgPortals(getUmgPortals(job));
   }, [job.is_in_umg_portal, job.umg_portals]);
 
+  // Una caída breve del API (por ejemplo durante un redeploy) no debería
+  // abortar la publicación. El POST es seguro de repetir: el backend actualiza
+  // la entrega existente por job/portal y sólo avanza la revisión si cambió
+  // el render publicado.
+  const fetchUmgWithRetry = async (url, options, attempts = 3) => {
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await fetch(url, options);
+      } catch (err) {
+        lastError = err;
+        if (attempt + 1 < attempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    lastError.kind = "network";
+    throw lastError;
+  };
+
   const waitForUmgMasters = async (retryAfterSeconds = 10) => {
     const deadline = Date.now() + (10 * 60 * 1000);
     const retryMs = Math.max(1000, Number(retryAfterSeconds || 10) * 1000);
     while (Date.now() < deadline) {
-      const statusResp = await fetch(`${API}/status/${job.job_id}`, {
-        headers: authHeaders(),
-      });
-      if (statusResp.ok) {
-        const updated = await statusResp.json();
-        const ready = Boolean(
-          updated.prores_ready
-          || (
-            updated.s3_keys?.umg_master
-            && updated.s3_keys?.umg_short
-          )
-        );
-        onJobUpdate?.({ ...job, ...updated });
-        if (ready) {
-          setLocalProresReady(true);
-          return;
+      try {
+        const statusResp = await fetchUmgWithRetry(`${API}/status/${job.job_id}`, {
+          headers: authHeaders(),
+        });
+        if (statusResp.ok) {
+          const updated = await statusResp.json();
+          const ready = Boolean(
+            updated.prores_ready
+            || (
+              updated.s3_keys?.umg_master
+              && updated.s3_keys?.umg_short
+            )
+          );
+          onJobUpdate?.({ ...job, ...updated });
+          if (ready) {
+            setLocalProresReady(true);
+            return;
+          }
         }
+      } catch (err) {
+        // La preparación continúa en segundo plano; no abandonar el flujo por
+        // una caída transitoria del endpoint de estado.
+        console.warn("UMG ProRes status check failed; will retry:", err);
       }
       await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
@@ -536,13 +554,63 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       let resp;
       let result;
       let preparationRounds = 0;
+      let qcRefreshRounds = 0;
       do {
-        resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
+        resp = await fetchUmgWithRetry(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
           body: JSON.stringify({ portal_id: targetPortal }),
         });
         result = await resp.json().catch(() => ({}));
+        // Enabling ProRes changes the QC input fingerprint (delivery spec),
+        // even though the MP4 the operator reviewed is unchanged. Refresh the
+        // current report and retry automatically; the backend carries the
+        // signed visual attestation forward only when that exact artifact still
+        // matches. This avoids leaving the operator with a dead-end 409 after
+        // waiting for the masters.
+        if (!resp.ok && resp.status === 409
+            && result.detail?.code === "delivery_qc_blocked"
+            && qcRefreshRounds < 1) {
+          const gate = result.detail.delivery_qc || {};
+          if (["fresh_preflight_required", "manual_review_required", "review_required"].includes(gate.reason)) {
+            qcRefreshRounds += 1;
+            setUmgSendStage("preflight");
+            const qcResponse = await fetchUmgWithRetry(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+              method: "POST",
+              headers: { ...authHeaders(), "Content-Type": "application/json" },
+              body: JSON.stringify({ for_umg_delivery: true }),
+            });
+            const qcResult = await qcResponse.json().catch(() => ({}));
+            const refreshedReport = qcResult.delivery_qc;
+            if (qcResponse.ok && refreshedReport) {
+              onJobUpdate?.({ ...job, delivery_qc: refreshedReport });
+              setUmgPreflightRequested(true);
+              if (refreshedReport.approval?.can_approve === true) {
+                setUmgSendStage("publishing");
+                continue;
+              }
+              const failures = (refreshedReport.issues || []).filter(issue => (
+                issue.status === "OPEN" && !issue.manual_verification_required
+                && (issue.result_status === "FAIL" || issue.severity === "FAIL")
+              ));
+              setQcFocusRequest(value => value + 1);
+              alert({
+                title: failures.length ? "Hay puntos que corregir" : "Revisión pendiente",
+                description: failures.length
+                  ? `Encontramos ${failures.length} ${failures.length === 1 ? "fallo" : "fallos"} que deben corregirse antes de publicar.`
+                  : "Revisá el corte actual y confirmá la revisión para continuar.",
+                tone: "warning",
+              });
+              return;
+            }
+            alert({
+              title: "No se pudo actualizar el preflight",
+              description: qcResult.detail?.message || qcResult.detail || "Revisá la conexión y volvé a intentar publicar.",
+              tone: "error",
+            });
+            return;
+          }
+        }
         if (resp.status !== 202 || result.status !== "preparing_prores") break;
         preparationRounds += 1;
         if (preparationRounds > 2) {
@@ -583,6 +651,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // baja y tiene que volver a revisar.
       const resolved = result.resolved_change_requests?.length || 0;
       const parts = [label ? `Aparece como "${label}".` : null];
+      if (result.replaced_job_id) {
+        parts.push("Esta variante reemplazó el video anterior en la misma entrega. El pedido de cambios queda asociado a la versión corregida.");
+      }
       if (result.content_changed) {
         parts.push(
           `Es la versión ${result.revision}: el cliente la ve como pendiente de aprobar.`,
@@ -606,7 +677,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         title: "No se pudo enviar a UMG",
         description: err?.kind === "timeout"
           ? "La preparación ProRes está tardando más de lo esperado. Podés volver a intentar; el proceso continúa en segundo plano."
-          : "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+          : err?.kind === "network"
+            ? "La conexión con el portal se interrumpió y no pudimos confirmar el resultado. Revisá si el video ya aparece en UMG; si no, podés volver a enviarlo."
+            : "No pudimos completar el envío. Revisá el estado e intentá de nuevo.",
         tone: "error",
       });
     } finally {
@@ -615,10 +688,44 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
   };
 
-  const beginUmgPublish = (portalId) => {
+  const refreshUmgPreflight = async (portalId, publishWhenReady = false, jobSnapshot = job) => {
+    if (sendingUmg) return false;
+    setSendingUmg(true);
+    setUmgSendStage("preflight");
+    setUmgPreflightRequested(true);
+    let ready = false;
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ for_umg_delivery: true }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.delivery_qc) {
+        const detail = data.detail;
+        throw new Error((typeof detail === "string" ? detail : detail?.message) || "No se pudo analizar este corte.");
+      }
+      onJobUpdate?.({ ...jobSnapshot, delivery_qc: data.delivery_qc });
+      ready = data.delivery_qc.approval?.can_approve === true;
+      if (!ready) setQcFocusRequest((value) => value + 1);
+    } catch (error) {
+      alert({ title: "No se pudo revisar el video", description: error?.message || "Revisá tu conexión y probá otra vez.", tone: "error" });
+    } finally {
+      setSendingUmg(false);
+      setUmgSendStage(null);
+    }
+    if (ready && publishWhenReady) publishToUMG(portalId);
+    return ready;
+  };
+
+  const beginUmgPublish = async (portalId) => {
     setSelectedUmgPortal(portalId);
     setSendUmgPortal(portalId);
     setShowUmgPortalPicker(false);
+    setUmgPreflightRequested(true);
+    if (sendingUmg) return;
+    const isReady = await refreshUmgPreflight(portalId);
+    if (!isReady) return;
     if (!job.umg_spec) {
       setSendUmgAfterProres(true);
       setShowProResModal(true);
@@ -627,9 +734,19 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     publishToUMG(portalId);
   };
 
+  const continueUmgPublish = () => {
+    if (!job.umg_spec) {
+      setSendUmgAfterProres(true);
+      setShowProResModal(true);
+      return;
+    }
+    publishToUMG(sendUmgPortal);
+  };
+
   const handleSendToUMG = () => {
-    const nextPortal = UMG_PORTALS.find(({ id }) => !umgPortals.includes(id));
-    setSelectedUmgPortal(nextPortal?.id || "argentina");
+    // Updating an existing cut should default to its current destination,
+    // not silently highlight the OTHER country's portal.
+    setSelectedUmgPortal(umgPortals[0] || "argentina");
     setShowUmgPortalPicker(true);
   };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
@@ -696,10 +813,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       if (Object.keys(bodyPayload).length > 0) {
         fetchOpts.body = JSON.stringify(bodyPayload);
       }
-      fetchOpts.headers["Idempotency-Key"] = requestIdempotencyKey(`retry-${job.job_id}`);
-      const res = await apiFetch(`/retry/${job.job_id}`, fetchOpts, 15_000);
+      const res = await fetch(`${API}/retry/${job.job_id}`, fetchOpts);
       if (res.ok) {
-        const statusRes = await apiFetch(`/status/${job.job_id}`);
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
         if (!statusRes.ok) throw new Error(`Error ${statusRes.status}`);
         const updated = await statusRes.json();
         onJobUpdate?.(updated);
@@ -822,28 +938,20 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   useEffect(() => {
     if (!isActivelyProcessing) return;
     let cancelled = false;
-    let running = false;
-    const controller = new AbortController();
     const tick = async () => {
-      if (running || cancelled) return;
-      running = true;
       try {
-        const res = await apiFetch(`/status/${job.job_id}`, { signal: controller.signal });
+        const res = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
         if (!res.ok || cancelled) return;
         const updated = await res.json();
         if (cancelled) return;
         // Merge into existing job so we don't drop fields /status doesn't return
         // (youtube_data, etc.). onJobUpdate flows it back through App state.
         if (onJobUpdate) onJobUpdate({ ...job, ...updated });
-      } catch (error) {
-        if (error?.name !== "AbortError") { /* next tick retries */ }
-      } finally {
-        running = false;
-      }
+      } catch {}
     };
-    const iv = setInterval(() => { void tick(); }, 5000);
-    void tick(); // first tick immediately, no need to wait 5s
-    return () => { cancelled = true; controller.abort(); clearInterval(iv); };
+    const iv = setInterval(tick, 5000);
+    tick(); // first tick immediately, no need to wait 5s
+    return () => { cancelled = true; clearInterval(iv); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isActivelyProcessing, job.job_id]);
 
@@ -937,7 +1045,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     let cancelled = false;
     (async () => {
       try {
-        const res = await apiFetch(`/jobs/${job.job_id}/scenes/thumbs`);
+        const res = await fetch(`${API}/jobs/${job.job_id}/scenes/thumbs`, { headers: authHeaders() });
         if (!res.ok || cancelled) return;
         const data = await res.json();
         if (!cancelled) setSceneThumbs(data.thumbs || {});
@@ -958,7 +1066,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     return () => clearTimeout(id);
   }, [sceneBusyKey]);
 
-  const regenerateScene = useCallback(async (scene, opts = {}, allowYoutubeDrift = false, requestKey = null) => {
+  const regenerateScene = useCallback(async (scene, opts = {}, allowYoutubeDrift = false) => {
     if (!scene) return;
     const key = scene.recurrence_key;
     const apps = (scenePlan?.sections || []).filter((s) => s.recurrence_key === key).length;
@@ -972,32 +1080,23 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
     setSceneBusyKey(key);
     try {
-      const idempotencyKey = requestKey || requestIdempotencyKey(`scene-${job.job_id}-${key}`);
       const body = {};
       if (opts.prompt) body.prompt = opts.prompt;
       if (opts.hint) body.hint = opts.hint;
       if (opts.movement_style) body.movement_style = opts.movement_style;
       if (allowYoutubeDrift) body.allow_youtube_drift = true;
-      const res = await apiFetch(`/jobs/${job.job_id}/scenes/${encodeURIComponent(key)}/regenerate`, {
+      const res = await fetch(`${API}/jobs/${job.job_id}/scenes/${encodeURIComponent(key)}/regenerate`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": idempotencyKey,
-        },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(body),
-      }, 15_000);
+      });
       if (res.status === 409) {
         const detail = (await res.json()).detail || {};
         if (detail.code === "youtube_already_published") {
           setSceneBusyKey(null);
           if (window.confirm(t("edit.youtube_drift_confirm") ||
             "Este video ya fue subido a YouTube. El cambio se guardará en la plataforma pero NO va a reemplazar el archivo en YouTube. ¿Continuar?")) {
-            return regenerateScene(
-              scene,
-              opts,
-              true,
-              requestIdempotencyKey(`scene-${job.job_id}-${key}-youtube-drift`),
-            );
+            return regenerateScene(scene, opts, true);
           }
           return;
         }
@@ -1666,20 +1765,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = true;
     setApproving(true);
     try {
-      const res = await apiFetch(`/approve/${job.job_id}`, {
+      const res = await fetch(`${API}/approve/${job.job_id}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": requestIdempotencyKey(`approve-${job.job_id}`),
-        },
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
-      }, 15_000);
+      });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(translateBackendError(data.detail, t) || `${t("detail.approve_error_description")} (${res.status})`);
       }
       try {
-        const statusRes = await apiFetch(`/status/${job.job_id}`);
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
         if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
         const updated = await statusRes.json();
         onJobUpdate?.(updated);
@@ -1692,10 +1788,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         });
       }
       if (job.campaign_id) {
-        const releaseRes = await apiFetch(`/editor/${job.job_id}/lock`, {
+        const releaseRes = await fetch(`${API}/editor/${job.job_id}/lock`, {
           method: "DELETE",
-          headers: editorSessionHeaders(),
-        }, 10_000);
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
         // Approval already succeeded. If release fails, return to the queue
         // instead of claiming another song while this lock may still be held.
         if (!releaseRes.ok) {
@@ -1706,10 +1802,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         const filters = new URLSearchParams(campaignReturn?.split("?")[1] || "");
         if (filters.get("q")) nextQuery.set("search", filters.get("q"));
         if (filters.get("artist")) nextQuery.set("artist", filters.get("artist"));
-        const nextRes = await apiFetch(
-          `/batch/campaigns/${job.campaign_id}/review-queue/next?${nextQuery}`,
-          { method: "POST", headers: editorSessionHeaders() },
-          15_000,
+        const nextRes = await fetch(
+          `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?${nextQuery}`,
+          { method: "POST", headers: { ...authHeaders(), ...editorSessionHeaders() } },
         );
         const next = await nextRes.json().catch(() => ({}));
         navigate(nextRes.ok && next.job_id ? withReturn(next.open_path || `/videos/${next.job_id}`) : campaignReturn || `/campaigns/${job.campaign_id}?view=history`);
@@ -1734,14 +1829,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     approveLockRef.current = true;
     setApproving(true);
     try {
-      const res = await apiFetch(`/reject/${job.job_id}`, {
+      const res = await fetch(`${API}/reject/${job.job_id}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": requestIdempotencyKey(`reject-${job.job_id}`),
-        },
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ notes: reviewNotes }),
-      }, 15_000);
+      });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(translateBackendError(data.detail, t) || `${t("detail.reject_error_description")} (${res.status})`);
@@ -1752,7 +1844,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // intentionally can't be re-opened — better UX is to land the
       // user back on the dashboard / batch view.
       try {
-        const statusRes = await apiFetch(`/status/${job.job_id}`);
+        const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
         if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
         const updated = await statusRes.json();
         onJobUpdate?.(updated);
@@ -1979,12 +2071,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         ? "Actualizar este video en un portal UMG"
                         : "Publicar este video en un portal UMG"}
                     >
-                      {umgSendStage === "preparing"
+                      {umgSendStage === "preflight"
+                        ? "Analizando corte…"
+                        : umgSendStage === "preparing"
                         ? "Preparando masters…"
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
                           : umgPortals.length
-                            ? `${t("detail.in_umg_portal") || "✓ En UMG"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
+                            ? `${t("detail.update_umg") || "Publicar actualización"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
                             : (t("detail.send_umg") || "Enviar a UMG")}
                     </button>
                     {showUmgPortalPicker && (
@@ -1995,6 +2089,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         <p className="mb-3 text-xs text-ink-secondary">
                           {t("umg.destination_hint") || "Elegí dónde querés publicar este video."}
                         </p>
+                        {job.parent_job_id && (
+                          <p className="mb-3 text-xs text-ink-primary">
+                            Si el video original tiene un pedido de cambios pendiente en ese portal,
+                            esta variante lo reemplaza en la misma entrega y cierra el pedido.
+                            No necesitás enviarlo otra vez desde la campaña.
+                          </p>
+                        )}
                         <div className="space-y-2">
                           {UMG_PORTALS.map((portal) => {
                             const published = umgPortals.includes(portal.id);
@@ -2329,6 +2430,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           onJobUpdate={onJobUpdate}
           onSeek={seekVideo}
           onOpenEditor={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
+          forUmgDelivery={umgPreflightRequested || isUmgJob || isInUmgPortal}
+          focusRequest={qcFocusRequest}
+          onContinueToPublish={umgPreflightRequested ? continueUmgPublish : undefined}
+          onReturnToPublish={campaignReturn ? () => navigate(campaignReturn) : undefined}
         />
       )}
 
@@ -2364,7 +2469,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
-              disabled={approving || job.delivery_qc?.approval?.blocked === true}
+              // Delivery QC is informational until a report explicitly opts
+              // into enforce mode. Legacy persisted reports can carry a stale
+              // approval.blocked flag, which must not trap the editor.
+              disabled={approving || (
+                job.delivery_qc?.mode === "enforce"
+                && job.delivery_qc?.approval?.blocked === true
+              )}
               className="inline-flex items-center justify-center h-12 px-6 rounded-button text-sm font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 transition-colors"
             >
               {approving ? (
@@ -2445,9 +2556,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // Trigger un refresh del job en el próximo tick para que
             // isUmgJob flipee a true (gracias al umg_spec recién
             // persistido) y aparezca el tab de Máster ProRes.
-            onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+            const configuredJob = { ...job, umg_spec: data.umg_spec };
+            onJobUpdate?.(configuredJob);
             if (shouldContinueToUmg) {
-              publishToUMG(sendUmgPortal);
+              refreshUmgPreflight(sendUmgPortal, true, configuredJob);
             }
           }}
         />

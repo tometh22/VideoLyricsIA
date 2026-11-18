@@ -260,7 +260,7 @@ describe("Editor 2.0 stale draft recovery", () => {
 
     await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
     expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
+    fireEvent.click(screen.getByRole("button", { name: "Usar borrador local" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
@@ -277,7 +277,7 @@ describe("Editor 2.0 stale draft recovery", () => {
 
     await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
     expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
+    fireEvent.click(screen.getByRole("button", { name: "Usar borrador local" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(false);
@@ -295,7 +295,7 @@ describe("Editor 2.0 stale draft recovery", () => {
 
     await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
     expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
+    fireEvent.click(screen.getByRole("button", { name: "Usar borrador local" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
@@ -306,7 +306,7 @@ describe("Editor 2.0 stale draft recovery", () => {
     renderEditor(request);
     await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
     expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
+    fireEvent.click(screen.getByRole("button", { name: "Usar borrador local" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     expect(request.mock.calls.some(([path]) => path.endsWith("/conflicts/resolve"))).toBe(false);
@@ -334,7 +334,7 @@ describe("Editor 2.0 stale draft recovery", () => {
     expect(screen.queryByText(/revisión del equipo es la 7/i)).not.toBeInTheDocument();
   });
 
-  it("preserva cambios remotos independientes al reintentar aprobación", async () => {
+  it("preserva cambios remotos independientes y exige nueva confirmación antes de aprobarlos", async () => {
     localStorage.clear();
     const request = makeRequest({ approvalRemote: true });
     const onApprove = vi.fn()
@@ -344,6 +344,13 @@ describe("Editor 2.0 stale draft recovery", () => {
     await screen.findByDisplayValue("versión equipo");
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
 
+    fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
+    await screen.findByDisplayValue("cambio remoto independiente");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
+    // The remote correction survives reconciliation, but the first click
+    // cannot attest to content that arrived after the operator confirmed.
+    expect(onApprove).toHaveBeenCalledTimes(1);
+    expect(screen.getByDisplayValue("versión equipo")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
     await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(2));
     expect(onApprove.mock.calls[1][0]).toEqual(expect.arrayContaining([
@@ -464,6 +471,21 @@ describe("local recovery is separate from server save status", () => {
     expect(mutations(request)).toHaveLength(0);
   });
 
+  it("quarantines an empty same-revision draft without blocking the intact server song", async () => {
+    const raw = JSON.stringify({ segments: [], base_revision: 5, updated_at: "2026-11-10T12:03:15.561Z" });
+    localStorage.setItem(key, raw);
+    const request = makeRequest();
+    const view = renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(mutations(request)).toHaveLength(0);
+    view.unmount(); renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    expect(mutations(request)).toHaveLength(0);
+  });
+
   it("removes an equivalent old-revision copy with zero server mutations across reload", async () => {
     localStorage.setItem(key, JSON.stringify({ segments: SERVER, base_revision: 0 }));
     const request = makeRequest();
@@ -489,6 +511,7 @@ describe("local recovery is separate from server save status", () => {
     await waitFor(() => expect(dialog).not.toBeInTheDocument());
     expect(localStorage.getItem(key)).toBeNull();
     expect(mutations(request)).toHaveLength(0);
+    expect(localStorage.getItem(`${key}:discarded`)).not.toBeNull();
     expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
   });
 

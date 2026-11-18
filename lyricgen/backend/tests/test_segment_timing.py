@@ -148,3 +148,15 @@ def test_final_normalization_clamps_selector_breaking_same_motif_overlap():
     assert normalized[0]["timing_overlap_clamped"] is True
     # Different simultaneous lyrics can be a legitimate harmony.
     assert normalized[2]["end"] == 74.0
+
+
+def test_collision_dedupe_preserves_explicit_distinct_identities():
+    from segment_timing import canonicalize_editor_segments
+    rows = [{"segment_id": "original", "start": 1, "end": 2, "text": "misma línea"},
+            {"segment_id": "copy", "start": 1, "end": 2, "text": "misma línea"}]
+    assert len(canonicalize_editor_segments(rows)) == 2
+    rows[1]["segment_id"] = "original"
+    assert len(canonicalize_editor_segments(rows)) == 1
+    rows[0].pop("segment_id")
+    rows[1].pop("segment_id")
+    assert len(canonicalize_editor_segments(rows)) == 1
