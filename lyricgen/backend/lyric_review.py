@@ -57,6 +57,7 @@ from heard_words import (
     witness_words,
 )
 from reference_window import crop_reference
+from lyric_review_boundaries import boundary_items
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
@@ -1347,6 +1348,9 @@ def build_review(
     items.extend(_rule_phrase_structure(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
+    # Timing y fronteras de frase determinísticos: siempre sugerencias.
+    items.extend(boundary_items(segments, witness=witness, machine_evidence=machine_evidence,
+                                orphan_words=_ORPHANS))
     # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
     # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
     if same_version and official_ops:
@@ -1435,9 +1439,10 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             group_sig = (item["kind"], fix["type"], item.get("key") or sig[0])
         else:
             # Signos, uniones, cortes y timing: sólo se agrupan líneas con el
-            # mismo texto (un coro), nunca líneas distintas.
+            # mismo texto (un coro), nunca líneas distintas. Un punto con
+            # identidad propia por aparición (timing) no se agrupa.
             group_sig = (item["kind"], fix["type"], _key_text(item["_line_text"]),
-                         fix.get("mode"), fix.get("direction"))
+                         fix.get("mode"), fix.get("direction"), item.get("key"))
         key = item.get("key") or _item_key(item["kind"], fix, item["_line_text"])
         g = grouped.get(group_sig)
         if g is None:
