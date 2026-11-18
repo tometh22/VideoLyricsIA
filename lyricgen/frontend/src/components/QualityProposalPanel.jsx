@@ -122,6 +122,7 @@ export default function QualityProposalPanel({
   rejecting = false,
 }) {
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const [hiddenUnavailableKey, setHiddenUnavailableKey] = useState(null);
   const [clock, setClock] = useState(() => Date.now());
   const telemetryRoot = useReviewerCandidateTelemetry(proposal, onReviewTelemetry);
 
@@ -174,7 +175,8 @@ export default function QualityProposalPanel({
     return () => window.clearTimeout(timeout);
   }, [clock, expiry]);
 
-  if (!proposal) return null;
+  const unavailableKey = JSON.stringify([proposal?.id, proposal?.base_revision, currentRevision, status]);
+  if (!proposal || (unavailable && hiddenUnavailableKey === unavailableKey)) return null;
 
   const selectedEntries = windowEntries.filter((entry) => selectedKeys.has(entry.key));
   const busy = applying || dismissing || observing || rejecting;
@@ -202,9 +204,9 @@ export default function QualityProposalPanel({
   };
 
   const stateMessage = stale
-    ? "Esta propuesta corresponde a una versión anterior de la letra. Actualizá el análisis para continuar."
+    ? "Esta propuesta corresponde a una versión anterior de la letra y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
     : expired
-      ? "Esta propuesta venció. Solicitá un nuevo análisis antes de aplicar cambios."
+      ? "Esta propuesta venció y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
       : closed
         ? status === "applied"
           ? "Esta propuesta ya fue aplicada."
@@ -252,6 +254,11 @@ export default function QualityProposalPanel({
           role="alert"
         >
           {stateMessage}
+          {(stale || expired) && <button type="button" disabled={busy}
+            onClick={() => setHiddenUnavailableKey(unavailableKey)}
+            className="ml-3 rounded-lg border border-white/20 px-3 py-2 text-sm text-white hover:bg-white/10">
+            Ocultar propuesta
+          </button>}
         </div>
       )}
 

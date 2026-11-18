@@ -281,3 +281,16 @@ describe("QualityProposalPanel", () => {
     expect(screen.getByRole("button", { name: /Aplicar seleccionadas/i })).toBeDisabled();
   });
 });
+
+it("lets the reviewer hide a stale proposal without applying or rejecting an old revision", async () => {
+  const apply = vi.fn(); const reject = vi.fn(); const dismiss = vi.fn();
+  const { rerender } = render(<QualityProposalPanel proposal={PROPOSAL} currentRevision={13}
+    onApplySelected={apply} onRejectWindow={reject} onDismiss={dismiss} />);
+  expect(screen.getByRole("alert")).toHaveTextContent("aprobar tu letra actual sin resolverla");
+  await userEvent.click(screen.getByRole("button", { name: "Ocultar propuesta" }));
+  expect(screen.queryByTestId("quality-proposal-panel")).toBeNull();
+  expect(apply).not.toHaveBeenCalled(); expect(reject).not.toHaveBeenCalled(); expect(dismiss).not.toHaveBeenCalled();
+  rerender(<QualityProposalPanel proposal={{ ...PROPOSAL, id: "fresh", base_revision: 13 }} currentRevision={13}
+    onApplySelected={apply} />);
+  expect(screen.getByTestId("quality-proposal-panel")).toHaveAttribute("data-proposal-state", "active");
+});

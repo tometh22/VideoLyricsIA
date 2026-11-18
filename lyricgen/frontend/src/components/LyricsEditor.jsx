@@ -962,6 +962,7 @@ export default function LyricsEditor({
   // Advanced timing opens directly on the timeline; guided review is optional.
   const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("timeline"); // guided is an explicit, optional workspace
   const [previewDockOpen, setPreviewDockOpen] = useState(false);
+  const campaignPreviewVisible = requireLineReview && hideTypographyControls && !hideInternalPreview;
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
@@ -6518,7 +6519,22 @@ export default function LyricsEditor({
           {(isDirty || draftRecovery) && <span className="text-amber-300">Guardá o descartá tus cambios actuales primero.</span>}
         </div>
       )}
-      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
+      <div className={`grid gap-4 mb-4 items-start ${campaignPreviewVisible ? "grid-cols-1 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.2fr)]" : viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
+          {campaignPreviewVisible && (
+            <section aria-label="Vista previa de la canción" data-testid="campaign-video-preview"
+              className="min-w-0 space-y-2 rounded-xl bg-surface-2/40 p-3 lg:sticky lg:top-20">
+              <h3 className="text-sm font-semibold text-white">Vista previa de la canción</h3>
+              <p className="text-xs text-ink-secondary">
+                Seguí la letra con el audio. Los cambios se ven al instante.
+                {!previewBgUrl && " Fondo de referencia; el fondo final se genera después."}
+              </p>
+              <LyricVideoPreview segments={previewSegments} currentTime={currentTime}
+                isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
+                backgroundStyle={backgroundStyle || "default"}
+                font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
+                textContrast={selectedContrast} fontScale={fontScale} editable={false} />
+            </section>
+          )}
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}

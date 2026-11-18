@@ -115,3 +115,15 @@ describe("selected-line split preview", () => {
     fireEvent.click(splitButton()); expect(onSplit).not.toHaveBeenCalled();
   });
 });
+
+it("keeps a live campaign preview when typography controls are hidden", () => {
+  render(<LyricsEditor segments={[source, neighbour]} transcribeJobId={job} filename="song.wav"
+    requireLineReview hideTypographyControls textCase="original" disableAutosave disableBeforeUnload
+    onApprove={vi.fn()} onBack={vi.fn()} />);
+  const preview = screen.getByTestId("campaign-video-preview");
+  expect(within(preview).getByText(source.text)).toBeVisible();
+  fireEvent.change(input(), { target: { value: "mi letra corregida" } });
+  expect(within(preview).getByText("mi letra corregida")).toBeVisible();
+  expect(within(preview).queryByText(source.text)).toBeNull();
+  expect(documentRows()[0]).toMatchObject({ text: "mi letra corregida", start: 0, end: 4 });
+});
