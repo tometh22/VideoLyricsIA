@@ -43,6 +43,7 @@ from database import (
 from jobs import create_job
 from machine_evidence import MachineSnapshotMissing
 import storage
+import umg_metadata
 
 
 router = APIRouter(prefix="/batch", tags=["batch-campaigns"])
@@ -665,6 +666,9 @@ def patch_campaign_item(
             if attr == "technical_code" and normalized:
                 normalized = normalized.upper()
             setattr(item, attr, normalized)
+    if (body.title is not None or body.artist is not None) and item.artist and item.title:
+        canonical = umg_metadata.normalize_for_db(db, item.artist, item.title)
+        item.artist, item.title = canonical.artist, canonical.title
     if body.render_overrides is not None:
         if "creative_assignment" in (item.render_overrides or {}) or "creative_assignment" in body.render_overrides:
             raise HTTPException(409, detail="Usá Estilo y fondos para cambiar una asignación registrada")
@@ -916,6 +920,11 @@ def register_manifest(
             next_ordinal += 1
             title = (incoming.title or "").strip() or None
             artist = (incoming.artist or "").strip() or None
+            if artist and title:
+                # Nombre como lo pide UMG desde el registro: es lo que ve el
+                # operador, lo que dibuja la tarjeta y lo que llega al portal.
+                canonical = umg_metadata.normalize_for_db(db, artist, title)
+                artist, title = canonical.artist, canonical.title
             metadata_error = incoming.metadata_error
             if incoming.size_bytes > MAX_AUDIO_BYTES:
                 metadata_error = "invalid_size"

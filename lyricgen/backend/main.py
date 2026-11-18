@@ -18731,6 +18731,17 @@ def request_edit(
     if _new_title:
         job.song_title = _new_title
         edit_params["song_title"] = _new_title
+    # Una corrección de nombre en un video de UMG se recuerda: la próxima
+    # canción del mismo artista ya sale escrita como la pidió el cliente.
+    import umg_metadata as _umg_metadata
+    if _umg_metadata.applies_to_job(job):
+        for _field, _before, _after in (
+            ("artist", _pre_edit_artist, _new_artist),
+            ("song_title", _pre_edit_song_title, _new_title),
+        ):
+            if _after and (_before or "") != _after:
+                _umg_metadata.record_correction(
+                    db, job, field_name=_field, before=_before or "", after=_after)
 
     if _library_swap:
         # Resolver el asset ANTES de flipear el status: _resolve_library_
@@ -18842,6 +18853,18 @@ def request_edit(
             "change_request_proposal_id": body.change_request_proposal_id,
         },
     ))
+    # The edit worker reads artist/title from the Job row: fix the
+    # UMG-canonical name before the re-render draws the title card.
+    try:
+        _canonical = _umg_metadata.normalize_job(db, job)
+    except Exception:  # pragma: no cover - a name check never blocks an edit
+        logger.warning("[EDIT] metadata normalization skipped job=%s", job_id, exc_info=True)
+        _canonical = None
+    if _canonical is not None:
+        if "artist" in edit_params:
+            edit_params["artist"] = job.artist
+        if "song_title" in edit_params:
+            edit_params["song_title"] = job.song_title
     # Commit the publication intent in the same transaction as the Job and
     # EditorDocument mutation. An ambiguous Redis timeout must not rewind an
     # editor revision and re-open the ABA window for an old callback.
@@ -21334,6 +21357,13 @@ def admin_create_delivery_from_job(
                     "message": "Para publicar igual con pedidos abiertos, escribí el motivo.",
                 })
             _guard_override = (_guard, _reason)
+
+    # The title card already shows the artist/title this job was rendered
+    # with: a name UMG asked to write differently cannot reach the portal.
+    from umg_metadata import publication_problem as _metadata_problem
+    _metadata_block = _metadata_problem(db, job)
+    if _metadata_block:
+        raise HTTPException(status_code=409, detail=_metadata_block)
 
     # UMG has its own contractual preflight even when the general QC rollout
     # is observe/off. Check before storage calls or ProRes queue work.

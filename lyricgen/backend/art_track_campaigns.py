@@ -359,10 +359,16 @@ def register_art_manifest(
         cover_asset = cover_rows.get(("cover", matched.sha256.lower())) if matched else None
         next_ordinal += 1
         metadata_error = None if audio.title and audio.artist else "missing_metadata"
+        item_title = (audio.title or "").strip() or None
+        item_artist = (audio.artist or "").strip() or None
+        if item_title and item_artist:
+            import umg_metadata
+            canonical = umg_metadata.normalize_for_db(db, item_artist, item_title)
+            item_artist, item_title = canonical.artist, canonical.title
         row = BatchCampaignItem(
             id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id,
-            ordinal=next_ordinal, filename=audio.filename, title=(audio.title or "").strip() or None,
-            artist=(audio.artist or "").strip() or None, technical_code=(audio.technical_code or "").strip().upper() or None,
+            ordinal=next_ordinal, filename=audio.filename, title=item_title,
+            artist=item_artist, technical_code=(audio.technical_code or "").strip().upper() or None,
             size_bytes=audio.size_bytes, duration_seconds=audio.duration_seconds, sha256=digest,
             metadata_error=metadata_error, upload_state="registered", upload_key=asset.upload_key,
             cover_asset_id=cover_asset.id if cover_asset else None, cover_match_state="matched" if cover_asset else method,
@@ -1120,6 +1126,12 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     guard_failure = _publish_guard_failure(db, ddb, row, job)
                     if guard_failure:
                         row.status = "failed"; row.error_code = "change_request_newer_than_version"; row.error_detail = guard_failure; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    # A video rendered with a name UMG asked to write otherwise
+                    # (catalog or an applied correction) stays out of the portal.
+                    from umg_metadata import publication_problem
+                    metadata_problem = publication_problem(db, job)
+                    if metadata_problem:
+                        row.status = "failed"; row.error_code = "metadata_not_canonical"; row.error_detail = metadata_problem["message"][:500]; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                     if storage.is_enabled():
                         # The MP4/short/thumbnail are produced by the render.
                         missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]

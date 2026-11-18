@@ -4,6 +4,11 @@
 
 ### Fixed
 - Measure the client change-request cohort by the Universal portal (Argentina/Chile) where a lyric video was published, not by the publishing account. Lyric campaigns published by internal accounts (221 November deliveries and their requests) were excluded, so the panel under-reported the request rate. Art Tracks stay out of the lyric rate.
+## [1.1.174] - 2026-11-17
+
+### Fixed
+- Write UMG artist and song titles the way the client asked before anything is drawn or published: a versioned catalog (accents, "Los Enanitos Verdes", song corrections such as "Tuyu", "¿Dónde Estarás?" or "Coti Ft. Enrique Iglesias") plus every artist/title correction applied to a UMG video, reused for the artist's following songs. Names are normalized when campaigns are registered and before every render; a video rendered with a different name is held back from the portal (single and campaign sends) with the expected name, until it is corrected and re-rendered. `UMG_METADATA_GATE=observe|off` relaxes the hold.
+- Apply a per-portal UMG style profile in Revisión rápida: a final period, a question mark without its pair and unambiguous missing accents are required points with a one-click fix; exclamations follow the portal (Argentina without marks, Chile with ¡!); Argentina parentheses are suggested. Required style points now also block a change-request re-render, where already-reported periods and marks used to come back. Jobs outside UMG are unaffected.
 
 ## [1.1.172] - 2026-11-17
 
