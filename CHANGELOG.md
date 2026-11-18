@@ -1,9 +1,15 @@
 # Changelog
 
-## [1.1.179] - 2026-11-18
+## [1.1.181] - 2026-11-18
 
 ### Fixed
 - Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
+
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
 
 ## [1.1.178] - 2026-11-18
 
