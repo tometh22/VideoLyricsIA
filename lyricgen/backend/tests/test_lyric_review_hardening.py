@@ -160,15 +160,18 @@ def test_layout_follows_the_official_line_breaks():
     assert item["occurrences"][0]["fix"]["lines"][1]["text"] == "Quiero verte a solas otra vez"
 
 
-def test_timing_is_not_part_of_the_quick_review():
-    # 298 canciones aprobadas: 52 avisos de timing, 1 pedido real. El timing
-    # se revisa en "Ajustar tiempos".
+def test_whisper1_word_times_alone_never_raise_timing(monkeypatch):
+    # La vieja regla con los tiempos del testigo whisper-1: 298 canciones
+    # aprobadas, 52 avisos de timing, 1 pedido real. Sin WhisperX de canción
+    # entera (lyric_timing_review) no hay aviso de sincronización, ni en
+    # enforce.
+    monkeypatch.setenv("LYRIC_REVIEW_TIMING_MODE", "enforce")
     words = _words("Debo cuidarme de caer en el brasero", 60.0, step=0.4)
     screen = [_line("Debo cuidarme de caer en el brasero", 60.0, 61.8, "a"),
               _line("Otra línea", 66.0, 68.0, "b")]
     machine = [dict(screen[0], words=words), screen[1]]
     review = build_review(screen, original_segments=machine, machine_evidence=_ev(words))
-    assert not [i for i in review["items"] if i["kind"] == "timing"]
+    assert not [i for i in review["items"] if i["group"] == "timing"]
 
 
 def test_chorus_propagation_keeps_the_corrected_punctuation():

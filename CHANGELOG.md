@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.177] - 2026-11-18
+
+### Added
+- Warn in Revisión rápida when a line is out of sync with the voice: it appears before the singing starts, stays on screen without voice, enters late, or leaves before the last word ends. Times come from the stored forced-alignment words and the whole-song WhisperX words; the whisper-1 witness only confirms. Each warning moves the line start or end to the measured time with one click, never past the neighbouring line, never touching text or line breaks, and is skipped if the line was moved by hand after the server saw it. Nothing changes timing on its own. `LYRIC_REVIEW_TIMING_MODE=observe` (default) shows them as suggestions; `enforce` makes the witness-confirmed ones required; `off` disables them. Measured on 201 UMG songs: 20 % of client timing points flagged near the cited time (3 % by chance), 0.21 warnings per accepted song. Replaces the disconnected whisper-1 `_rule_timing`. Details in `docs/LYRIC_TIMING_REVIEW_2026-11-18.md`; offline measurement in `scripts/measure_lyric_timing_review.py`.
+
 ## [1.1.176] - 2026-11-18
 
 ### Fixed

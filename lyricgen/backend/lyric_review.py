@@ -56,6 +56,8 @@ from heard_words import (
     opcode_similarity,
     witness_words,
 )
+from lyric_timing_review import describe, find_timing_issues
+from lyric_timing_review import mode as timing_review_mode
 from reference_window import crop_reference
 from transcribe_postprocess import has_terminal_line_period
 
@@ -132,6 +134,8 @@ KIND_GROUP = {
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
     "timing": "timing", "phrase_structure": "layout",
+    "timing_early_start": "timing", "timing_late_start": "timing",
+    "timing_early_end": "timing", "timing_no_voice": "timing",
     "terminal_period": "style", "parentheses": "style", "accent_missing": "style",
 }
 
@@ -152,6 +156,11 @@ PORTAL_PROFILES: dict[str, dict[str, Any]] = {
     "chile": {"exclaim": "exclaim", "parentheses": False},
     # Entrega UMG sin portal conocido: sólo lo que vale para los dos.
     "umg": {"exclaim": None, "parentheses": False},
+}
+# Avisos de sincronización (lyric_timing_review) → tipo de punto.
+TIMING_KIND = {
+    "starts_before_voice": "timing_early_start", "starts_after_voice": "timing_late_start",
+    "ends_before_voice": "timing_early_end", "no_voice": "timing_no_voice",
 }
 # Puntos que dejan la letra como la pide el perfil sin tocar lo que se canta.
 STYLE_RULE_KINDS = {"terminal_period", "parentheses", "accent_missing", "question_marks"}
@@ -1394,50 +1403,28 @@ def _rule_layout_official(segments: list[dict], screen: list[dict],
     return out
 
 
-def _rule_timing(segments: list[dict], witness: list[dict], machine: list[dict]) -> list[dict]:
-    """La línea se va antes de que termine la última palabra ("alargar
-    brasero", UMG #115) o aparece mucho antes de que se cante. Sólo si la
-    máquina y el testigo coinciden en el tiempo de esa palabra."""
+def _rule_voice_timing(segments: list[dict], machine_evidence: Any, enforce: bool) -> list[dict]:
+    """La línea entra antes de la voz, entra tarde o se va antes de que
+    termine el canto, medido con los alineadores guardados (ver
+    ``lyric_timing_review``). Reemplaza a la vieja regla con los tiempos del
+    testigo whisper-1, que sobre 298 canciones aprobadas dio 52 avisos y
+    acertó 1 pedido. Obligatorio sólo lo inequívoco y sólo en ``enforce``."""
     out = []
-    for i, seg in enumerate(segments):
-        toks = [t for t in (norm_token(w) for w in str(seg.get("text") or "").split()) if t]
-        if len(toks) < 2:
-            continue
-        start, end = _f(seg.get("start")), _f(seg.get("end"))
-        nxt = segments[i + 1] if i + 1 < len(segments) else None
-        prv = segments[i - 1] if i > 0 else None
-
-        def times(tok: str, lo: float, hi: float, stream: list[dict]) -> list[dict]:
-            return [w for w in stream if lo <= w["start"] <= hi and norm_token(w["word"]) == tok]
-        last_w = times(toks[-1], end - 1.5, end + 2.5, witness)
-        last_m = times(toks[-1], end - 1.5, end + 2.5, machine)
-        if last_w and last_m:
-            we, me = max(w["end"] for w in last_w), max(w["end"] for w in last_m)
-            limit = (_f(nxt.get("start")) - 0.05) if nxt else we + 1.0
-            if abs(we - me) <= 0.4 and min(we, me) > end + 0.5 and limit > end + 0.3:
-                new_end = round(min(max(we, me) + 0.1, limit), 2)
-                out.append({
-                    "kind": "timing", "line": i, "required": False,
-                    "title": "Timing",
-                    "why": f"Se va {min(we, me) - end:.1f} s antes de que termine «{toks[-1]}»",
-                    "fix": {"type": "timing", "end": new_end},
-                    "preview_after": f"Termina en {new_end:.1f} s", "action": "Alargar",
-                })
-                continue
-        first_w = times(toks[0], start - 1.0, start + 2.5, witness)
-        first_m = times(toks[0], start - 1.0, start + 2.5, machine)
-        if first_w and first_m:
-            ws, ms = min(w["start"] for w in first_w), min(w["start"] for w in first_m)
-            floor = (_f(prv.get("end")) + 0.05) if prv else 0.0
-            if abs(ws - ms) <= 0.4 and min(ws, ms) > start + 0.7:
-                new_start = round(max(min(ws, ms) - 0.1, floor), 2)
-                out.append({
-                    "kind": "timing", "line": i, "required": False,
-                    "title": "Timing",
-                    "why": f"Aparece {min(ws, ms) - start:.1f} s antes de que se cante",
-                    "fix": {"type": "timing", "start": new_start},
-                    "preview_after": f"Aparece en {new_start:.1f} s", "action": "Ajustar",
-                })
+    for finding in find_timing_issues(segments, machine_evidence):
+        text = describe(finding)
+        line_text = str(segments[finding["line"]].get("text") or "")
+        fix = {"type": "timing", finding["field"]: finding["proposed"],
+               # El editor no aplica el arreglo si la línea ya no está donde
+               # la vio el servidor (la movieron a mano después).
+               f"expect_{finding['field']}": finding["current"]}
+        out.append({
+            "kind": TIMING_KIND[finding["kind"]], "line": finding["line"],
+            "required": bool(enforce and finding["required"]),
+            "title": text["title"], "why": text["why"],
+            "sources": set(finding["sources"]), "fix": fix,
+            "preview_before": line_text, "preview_after": line_text,
+            "action": text["action"], "dismiss": "Está bien así",
+        })
     return out
 
 
@@ -1674,8 +1661,10 @@ def build_review(
     items.extend(_rule_phrase_structure(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
-    # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
-    # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
+    # Sincronización: detrás de LYRIC_REVIEW_TIMING_MODE (observe por defecto).
+    timing_mode = timing_review_mode()
+    if timing_mode != "off":
+        items.extend(_rule_voice_timing(segments, machine_evidence, timing_mode == "enforce"))
     if same_version and official_ops:
         items.extend(_rule_layout_official(segments, screen, official_tokens, official_ops))
 
