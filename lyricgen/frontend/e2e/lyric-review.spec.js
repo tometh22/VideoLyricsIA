@@ -2,8 +2,7 @@ import { expect, test } from "@playwright/test";
 import { installEditorHarness } from "./editor-harness.js";
 
 // Revisión rápida (pedidos UMG #112-#131, 29-09-2026): los puntos llegan con
-// su arreglo y el revisor los resuelve de a uno, con el teclado, antes de
-// que "Aprobar" deje avanzar.
+// su arreglo y el revisor puede consultarlos sin condicionar la aprobación.
 const SEGMENTS = [
   { _id: "line-a", segment_id: "seg-a", start: 0.4, end: 1.0, text: "¿Cuando vuelva?" },
   { _id: "line-b", segment_id: "seg-b", start: 1.2, end: 1.8, text: "Tu garantía de reloco se fundió" },
@@ -55,15 +54,16 @@ function lyricReview(segments, official) {
   };
 }
 
-test("quick review is resolved from the keyboard before approval", async ({ page }) => {
+test("optional suggestions can still be applied, undone and dismissed from the keyboard", async ({ page }) => {
   const harness = await installEditorHarness(page, { editorV2: true, segments: SEGMENTS, lyricReview });
   await harness.open();
 
   const panel = page.getByTestId("lyric-review-panel");
   const approve = page.getByRole("button", { name: /Aprobar cambios y generar video/i });
-  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Faltan 3 para aprobar");
-  await expect(page.locator('[data-lyric-review-blocked="true"]')).toContainText("Faltan para aprobar");
-  await expect(panel).toContainText("Ver 1 sugerencia (no bloquean)");
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("4 sugerencias opcionales");
+  await expect(approve).toContainText("Aprobar");
+  await expect(panel).not.toBeFocused();
+  await expect(panel).toContainText("Ver 4 sugerencias");
   await panel.screenshot({ path: "test-results/lyric-review-panel.png" });
   await page.screenshot({ path: "test-results/lyric-review-editor.png" });
 
@@ -73,11 +73,9 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await panel.screenshot({ path: "test-results/lyric-review-mobile.png" });
   await page.setViewportSize({ width: 1440, height: 1000 });
 
-  // "Aprobar" no avanza: lleva al panel y dice qué falta.
-  await approve.click();
-  await expect(panel).toBeFocused();
-  await expect(panel.getByTestId("lyric-review-status")).toContainText("resolvé estos 3 puntos");
-  expect(harness.approvals).toHaveLength(0);
+  // Sólo una acción explícita abre las sugerencias y habilita sus atajos.
+  await panel.getByRole("button", { name: "Ver 4 sugerencias" }).click();
+  await panel.focus();
 
   // Enter aplica, la línea queda marcada y el panel pasa al siguiente.
   await panel.press("Enter");
@@ -98,11 +96,12 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await panel.press("Backspace");
   await expect.poll(() => (harness.saves.at(-1)?.segments || [])
     .flatMap((segment) => segment.qa_dismissed || [])).toEqual(["tres"]);
-  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Sin observaciones pendientes");
-
-  // Las sugerencias quedan a mano, sin bloquear ni ocupar la tarjeta.
-  await expect(page.getByTestId("lyric-review-active")).toHaveCount(0);
-  await panel.getByRole("button", { name: "Ver 1 sugerencia (opcional)" }).click();
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("1 sugerencia opcional");
+  // La decisión humana sobrevive a recargar; no hay que rechazarla otra vez.
+  await harness.open();
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("1 sugerencia opcional");
+  await expect(page.locator('input[aria-label="Letra de la línea 4"]')).toHaveValue("Con tus pasos");
+  await panel.getByRole("button", { name: "Ver 1 sugerencia" }).click();
   await panel.focus();
   await page.waitForTimeout(300);
   await panel.press("1");
@@ -124,3 +123,32 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await approve.click();
   await expect.poll(() => harness.approvals.length).toBe(1);
 });
+
+for (const mobile of [false, true]) {
+  test(`approval preserves the current lyrics with unreviewed AI suggestions (${mobile ? "mobile" : "desktop"})`, async ({ page }, testInfo) => {
+    // Legacy enforce/required payloads must also stay optional, including
+    // the review returned by the final save immediately before approval.
+    const harness = await installEditorHarness(page, { editorV2: true, segments: SEGMENTS, lyricReview });
+    await harness.open();
+    await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
+    // The re-render screen submits only when the operator has made a change.
+    // Keep the disagreement pending while testing that exact current text.
+    await page.getByLabel("Letra de la línea 1", { exact: true }).fill("¿Cuando vuelvas?");
+    const current = SEGMENTS.map((segment, index) => index === 0
+      ? { ...segment, text: "¿Cuando vuelvas?" } : segment);
+    const panel = page.getByTestId("lyric-review-panel");
+    await expect(panel.getByTestId("lyric-review-heading")).toHaveText("4 sugerencias opcionales");
+    await expect(panel).not.toBeFocused();
+    await expect(page.getByTestId("lyric-review-active")).toHaveCount(0);
+    const approve = page.getByRole("button", { name: /Aprobar cambios y generar video/i });
+    await expect(approve).toContainText("Aprobar");
+    await expect(approve).not.toContainText("Faltan");
+    await panel.screenshot({ path: testInfo.outputPath("optional-suggestions.png") });
+    await approve.click();
+    await expect.poll(() => harness.approvals.length).toBe(1);
+    const saved = harness.saves.at(-1).segments;
+    expect(saved.map(({ text, start, end }) => ({ text, start, end })))
+      .toEqual(current.map(({ text, start, end }) => ({ text, start, end })));
+    expect(saved.flatMap(segment => segment.qa_dismissed || [])).toEqual([]);
+  });
+}

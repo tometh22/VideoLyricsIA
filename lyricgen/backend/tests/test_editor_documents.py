@@ -1703,6 +1703,32 @@ def test_transaction_rollback_never_leaves_partial_editor_state():
         verify.close()
 
 
+def test_approval_keeps_lyrics_with_pending_suggestions_under_legacy_enforce(monkeypatch):
+    from copy import deepcopy
+    from lyric_review_sources import review_for_document
+
+    monkeypatch.setenv("LYRIC_REVIEW_MODE", "enforce")
+    first, _, job_id = _users_and_job("approval_optional_suggestions")
+    rows = [{"start": 0.4, "end": 1.8, "text": "¿Cuando vuelvas?", "locked": True}]
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        job.workload_class = "batch"
+        monkeypatch.setenv("LYRIC_REVIEW_ENFORCE_TENANTS", job.tenant_id)
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, rows, "manual")
+        db.commit()
+        before = deepcopy(document.current_segments)
+        review = review_for_document(db, document, job)
+        assert review["required_count"] > 0
+        assert review["mode"] == "observe"
+        approved, frozen = approve_document(
+            db, job, first.id, editor_revision=version.revision, editor_version_id=version.id,
+        )
+        db.commit()
+        assert approved.current_segments == frozen.segments == job.segments_json == before
+        assert not any(line.get("qa_dismissed") for line in frozen.segments)
+
+
 def test_approval_preserves_historical_forty_ms_edges_including_locked():
     from copy import deepcopy
     first, _, job_id = _users_and_job('approval_no_implicit_trim')

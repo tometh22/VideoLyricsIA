@@ -6386,6 +6386,7 @@ export default function App() {
             sourceReference={currentReview.sourceReference || null}
             referenceUnavailable={!!currentReview.referenceUnavailable}
             requireLineReview={!!currentReview.campaignId}
+            previewBgUrl={currentReview.bgUrl || null}
             preferApprovedVersion={!!currentReview.editingJobId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
@@ -6492,6 +6493,7 @@ export default function App() {
             // animation/contrast. Layout colapsa a 1 columna (timeline +
             // lista a ancho completo).
             hideTypographyControls={true}
+            startAtWorkspace={dedicatedCampaignReview}
             // Phase C 2026-05-25: callback que sincroniza el preview central
             // con la línea que está sonando ahora. Actualiza un ref para no
             // disparar re-renders a 60fps.
