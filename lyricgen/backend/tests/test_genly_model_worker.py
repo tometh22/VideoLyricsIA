@@ -2,7 +2,11 @@
 import hashlib
 import base64
 import json
+import io
 from pathlib import Path
+import runpy
+import sys
+from contextlib import redirect_stdout
 import tempfile
 import threading
 import unittest
@@ -39,6 +43,27 @@ class Heartbeat:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_cli_preserves_virtualenv_python_symlink(self):
+        interpreter = self.root / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.symlink_to(sys.executable)
+        checkpoint = self.root / "checkpoint"
+        checkpoint.mkdir()
+        selector = self.root / "selector.json"
+        selector.write_text("{}")
+        script = Path(__file__).resolve().parents[1] / "scripts/run_genly_model_worker.py"
+        arguments = [str(script), "--auth-file", str(self.auth), "--selector", str(selector),
+                     "--model", "qwen", "--qwen-python", str(interpreter), "--qwen-checkpoint", str(checkpoint),
+                     "--output", str(self.root / "output"), "--once"]
+        with patch("sys.argv", arguments), patch("genly_model_worker.StagingClient") as client, \
+                patch("genly_model_worker.run_claim", return_value={}) as execute, redirect_stdout(io.StringIO()):
+            client.return_value.request.return_value = {"request": self.claim}
+            with self.assertRaises(SystemExit) as result:
+                runpy.run_path(str(script), run_name="__main__")
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(execute.call_args.kwargs["qwen_python"], interpreter.absolute())
+        self.assertNotEqual(execute.call_args.kwargs["qwen_python"], interpreter.resolve())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

@@ -57,7 +57,9 @@ def main():
                                    selector=args.selector.resolve(),
                                    adapter=args.adapter.resolve() if args.adapter else None,
                                    model=args.model, device=args.device,
-                                   qwen_python=args.qwen_python.resolve() if args.qwen_python else None,
+                                   # Keep the venv entry point: resolving this symlink
+                                   # would launch the base Python without MLX installed.
+                                   qwen_python=args.qwen_python.absolute() if args.qwen_python else None,
                                    qwen_checkpoint=args.qwen_checkpoint.resolve() if args.qwen_checkpoint else None,
                                    qwen_model_name=args.qwen_model_name, qwen_memory_limit_gib=args.qwen_memory_limit_gib,
                                    separate_vocals=args.separate_vocals,
