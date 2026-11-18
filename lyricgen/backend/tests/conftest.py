@@ -63,6 +63,10 @@ os.environ["CORS_ORIGINS"] = "http://localhost:3000,http://localhost:5173"
 # La revisión rápida busca la letra oficial en lrclib en segundo plano; los
 # tests nunca salen a la red.
 os.environ.setdefault("LYRIC_REVIEW_FETCH_OFFICIAL", "0")
+# El QC extendido de fondos hace una llamada Vision aparte (default observe en
+# producción). Los tests que no lo ejercitan no deben intentar crear un cliente
+# Vertex; test_background_extended_qc fija el modo explícitamente.
+os.environ.setdefault("BACKGROUND_EXTENDED_QC_MODE", "off")
 os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
 os.environ.setdefault(
     "QUALITY_LEARNING_HMAC_KEY", "quality-test-key-0123456789-ABCDEF",

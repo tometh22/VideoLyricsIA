@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.179] - 2026-11-18
+
+### Added
+- Check AI backgrounds for what UMG rejected in its September–November change requests: guns and knives, blood or raw meat, human body parts without a face, burned-in overlays such as a "16:9" label, and black letterbox bars. Weapons, gore, body parts and overlays use a separate, capped Vision call (at most 8 frames per background) that leaves the existing people/brand/anatomy request untouched; letterbox bars are measured without AI from the effective aspect ratio of the picture. Any error, timeout or quota response from the new call counts as "not evaluated" and never fails a job. `BACKGROUND_EXTENDED_QC_MODE` defaults to `observe` (findings are recorded, nothing is rejected); `enforce` sends the categories in `BACKGROUND_EXTENDED_QC_ENFORCE` (default `weapon,gore,overlay,letterbox`) through the existing regenerate-once → safe-gradient recovery before the final render, with letterbox rejected before any Vision call is paid; `off` disables it.
+- Show background findings in the delivery review before publishing: what the validator observed on the current background and its scene clips (weapon, gore, body parts, people, malformed anatomy, brand, overlay, letterbox) plus a letterbox scan of the encoded video, as "review" items with a "Revisado" action and two new checks. `DELIVERY_QC_BACKGROUND_MODE` defaults to `observe` (never blocks); `enforce` requires a reviewer to acknowledge them before an UMG publication; `off` hides them.
+
 ## [1.1.176] - 2026-11-18
 
 ### Fixed
