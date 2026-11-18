@@ -2901,6 +2901,7 @@ export default function LyricsEditor({
       if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
       return;
     }
+    if (requireLineReview && viewMode === "basic") return;
     if (!isPlaying || activeId === null) return;
     if (lastScrolledIdRef.current === activeId) return;
     // Auditoría 2026-06-10 ("se mueve y no me deja hacer cambios"): este
@@ -2914,7 +2915,7 @@ export default function LyricsEditor({
     lastScrolledIdRef.current = activeId;
     const el = rowRefs.current[activeId];
     if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [activeId, isPlaying, syncMode, syncCursor, edited]);
+  }, [activeId, isPlaying, syncMode, syncCursor, edited, requireLineReview, viewMode]);
 
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
@@ -6860,8 +6861,9 @@ export default function LyricsEditor({
             ) : requireLineReview && !syncMode ? (
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
+                activeId={activeId} isPlaying={isPlaying}
                 audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
-                onSelect={(line) => { setFocusedSegId(line._id); seekTo(line.start, false, line); }}
+                onSelect={(line) => { setFocusedSegId(line._id); if (audioUrl && !audioError && audioMetadataReady) seekTo(line.start, true, line); }}
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}
                 onAdvanced={(line) => { setFocusedSegId(line._id); setTimingWorkspaceMode("timeline"); setViewMode("advanced"); }}
                 onDuplicate={duplicateSeg} onMerge={mergeSeg} onDelete={deleteSeg} onAdd={addLineSmart} onSplit={splitSegAt}
