@@ -12,11 +12,14 @@ import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import CampaignLyricsReview from "./CampaignLyricsReview";
+import { placeLineAt } from "../lib/linePlacement";
 import RepeatOccurrencesList, { repeatApplyLabel, selectedRepeatIds } from "./RepeatOccurrencesList";
 import LocalDraftRecovery from "./LocalDraftRecovery";
 import ReanchorProgressDialog from "./ReanchorProgressDialog";
 import { reanchorFailureMessage, shouldRecoverReanchor } from "../lib/reanchorResult";
 import LyricVideoPreview from "./LyricVideoPreview";
+import NativeLyricPreview from "./NativeLyricPreview";
+import { buildResolveBody } from "../lib/lyricLookVariants";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
@@ -4107,28 +4110,9 @@ export default function LyricsEditor({
     if (idx < 0 || idx >= edited.length) return;
     const nextId = edited.reduce((m, row) => Math.max(m, row._id), -1) + 1;
     pushEditHistory();
-    setEdited((prev) => {
-      const cur = prev[idx];
-      const nxt = prev[idx + 1];
-      const gapStart = cur ? cur.end : (prev[0] ? prev[0].start : 0);
-      const gapEnd = nxt ? nxt.start : (duration || gapStart + 3);
-      const gap = Math.max(0, gapEnd - gapStart);
-      let s = gapStart + (gap > 0.6 ? gap / 3 : 0.1);
-      let e = s + (gap > 0.6 ? gap / 3 : 1.0);
-      if (!(e > s) || e > gapEnd) {
-        s = gapStart + 0.1;
-        e = Math.min(gapEnd > s ? gapEnd - 0.05 : s + 1.0, s + 1.0);
-        if (e <= s) e = s + 0.5;
-      }
-      if (duration > 0) {
-        s = Math.max(0, Math.min(s, duration - 0.1));
-        e = Math.min(duration, Math.max(e, s + 0.1));
-      }
-      const inserted = {
-        _id: nextId, segment_id: mintSegmentId(), start: s, end: e, text: "",
-      };
-      return [...prev, inserted].sort((a, b) => a.start - b.start);
-    });
+    setEdited((prev) => placeLineAt(prev, {
+      _id: nextId, segment_id: mintSegmentId(), text: "",
+    }, idx + 1, duration));
     setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
   };
@@ -4139,15 +4123,31 @@ export default function LyricsEditor({
   // the playhead/end behaviour (addBlankLine) when nothing is focused yet
   // (fresh job, before touching any row). focusedSegId persists as the
   // last-focused row, so clicking the bottom button doesn't lose the target.
-  const addLineSmart = () => {
-    if (focusedSegId != null) {
-      const selIdx = edited.findIndex((s) => s._id === focusedSegId);
+  const addLineSmart = (afterId = focusedSegId) => {
+    if (afterId != null) {
+      const selIdx = edited.findIndex((s) => s._id === afterId);
       if (selIdx !== -1) {
         insertLineAfter(selIdx);
         return;
       }
     }
     addBlankLine();
+  };
+
+  const moveReviewLine = (id, targetId, after = false) => {
+    const rows = editedRef.current;
+    const line = rows.find(row => row._id === id);
+    if (!line || id === targetId) return;
+    const rest = rows.filter(row => row._id !== id);
+    const target = rest.findIndex(row => row._id === targetId);
+    if (target < 0) return;
+    const index = target + (after ? 1 : 0);
+    if (rows.findIndex(row => row._id === id) === index) return;
+    pushEditHistory();
+    setEdited(placeLineAt(rows, line, index, duration));
+    setFocusedSegId(id);
+    setFlushCounter(value => value + 1);
+    trackEditorEvent("editor_timing_changed", { count: 1, operation: "reorder", duration_ms: 0 });
   };
 
   // Operator-friendly title: strip extension + collapse underscores/dashes
@@ -6873,16 +6873,34 @@ export default function LyricsEditor({
                 preview={!hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
                   <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
                   {!previewBgUrl && <p className="mb-2 text-xs text-ink-secondary">Fondo de referencia; el fondo final se genera después.</p>}
+                  {editorRequest && transcribeJobId ? <NativeLyricPreview
+                    segments={previewSegments}
+                    currentTime={isPlaying ? currentTime : (selectedPreviewSegment ? selectedPreviewSegment.start + Math.min(0.5, (selectedPreviewSegment.end - selectedPreviewSegment.start) / 2) : currentTime)}
+                    isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
+                    jobId={transcribeJobId} request={editorRequest}
+                    settings={{ ...buildResolveBody({ look: selectedLook,
+                      genre: variantValues.lyricGenre, variant: variantValues.lyricVariant,
+                      fontMain: variantValues.lyricFontMain, fontKey: variantValues.lyricFontKey,
+                      color: variantValues.lyricColor, altColor: variantValues.lyricAltColor,
+                      accentColor: variantValues.lyricAccentColor }),
+                      font: selectedFont, text_case: selectedCase, text_contrast: selectedContrast,
+                      font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
+                    }}
+                    onFontResolved={(code) => { if (!selectedFont) { setSelectedFont(code); onFontChange?.(code); } }}
+                  /> : <>
                   <LyricVideoPreview segments={isPlaying ? previewSegments : (selectedPreviewSegment ? [selectedPreviewSegment] : [])} currentTime={isPlaying ? currentTime : (selectedPreviewSegment?.start ?? currentTime)} isPlaying={isPlaying}
                     backgroundUrl={previewBgUrl || null} backgroundStyle={backgroundStyle || "default"}
                     font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
                     textContrast={selectedContrast} fontScale={fontScale} editable={false} t={t} />
+                    <p className="mt-1 text-xs text-ink-secondary">{t("review_workspace.preview_approximate") || "Vista orientativa: conectá el editor para comprobar los cortes del video."}</p>
+                  </>}
+
                 </div>}
                 audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                 onSelect={(line) => { setFocusedSegId(line._id); if (audioUrl && !audioError && audioMetadataReady) seekTo(line.start, true, line); }}
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}
                 onAdvanced={(line) => { setFocusedSegId(line._id); setTimingWorkspaceMode("timeline"); setViewMode("advanced"); }}
-                onDuplicate={duplicateSeg} onMerge={mergeSeg} onDelete={deleteSeg} onAdd={addLineSmart} onSplit={splitSegAt}
+                onDuplicate={duplicateSeg} onMerge={mergeSeg} onDelete={deleteSeg} onAdd={addLineSmart} onMove={moveReviewLine} onSplit={splitSegAt}
                 getSplitPlan={(id, charOffset) => planEditorSplit(edited.find(line => line._id === id), charOffset)}
                 onUndo={undoEdit} canUndo={hasUndo} rowRefs={rowRefs}
                 onTextFocus={(line) => { setFocusedSegId(line._id); setTextEditStart({ id: line._id, text: line.text }); }}

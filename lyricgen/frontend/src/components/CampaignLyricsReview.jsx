@@ -10,13 +10,33 @@ const timestamp = value => {
 
 /** One selected line owns the text, playback and timing actions. */
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable, activeId = null, isPlaying = false,
-  preview = null, startAtWorkspace = false, onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
+  preview = null, startAtWorkspace = false, onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onMove, onSplit,
   getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
   suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation, onTogglePropagation }) {
   const { t } = useI18n();
   const [markedOnly, setMarkedOnly] = useState(false);
   const [follow, setFollow] = useState(true);
   const inputRef = useRef(null);
+  const dragId = useRef(null);
+  const dropRef = useRef(null);
+  const [dropTarget, setDropTarget] = useState(null);
+  const [moveAnnouncement, setMoveAnnouncement] = useState("");
+  const setDrop = (value) => { dropRef.current = value; setDropTarget(value); };
+  const cancelDrag = () => { dragId.current = null; setDrop(null); };
+  const move = (id, targetId, after) => {
+    onMove?.(id, targetId, after);
+    setFollow(false);
+    setMoveAnnouncement(t("review_workspace.moved") || "Línea movida. Revisá su tiempo contra el audio.");
+  };
+  const drop = () => {
+    const target = dropRef.current;
+    if (dragId.current != null && target) move(dragId.current, target.id, target.after);
+    cancelDrag();
+  };
+  const targetAt = (line, y, node) => {
+    const rect = node.getBoundingClientRect();
+    setDrop({ id: line._id, after: y >= rect.top + rect.height / 2 });
+  };
   const workspaceRef = useRef(null);
   const openedAtWorkspace = useRef(false);
   const listRef = useRef(null);
@@ -65,7 +85,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?._id, rowRefs]);
   useEffect(() => {
-    if (!follow || !isPlaying || activeId == null) return;
+    if (!follow || !isPlaying || activeId == null || dragId.current != null) return;
     const row = rowRefs.current[activeId];
     const list = listRef.current;
     if (!row || !list) return;
@@ -102,7 +122,47 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
         <button type="button" aria-pressed={follow} onClick={() => setFollow(value => !value)} className={`min-h-9 rounded-lg px-2 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-brand-light ${follow ? "bg-emerald-300/10 text-emerald-200 ring-1 ring-emerald-300/30" : "text-ink-secondary"}`}>{t("review_workspace.follow_audio") || "Seguir reproducción"}</button>
       </div>
       <div ref={listRef} data-testid="review-line-list" className="relative max-h-[min(52dvh,560px)] overflow-y-auto overscroll-contain p-2" aria-label={t("review_workspace.lines") || "Líneas"}>
-        {visible.map((line) => <button type="button" key={line._id} ref={(node) => { rowRefs.current[line._id] = node; }}
+        {visible.map((line) => <div key={line._id} data-review-row={line._id}
+          onDragOver={(event) => {
+            if (dragId.current == null || !onMove) return;
+            event.preventDefault(); event.dataTransfer.dropEffect = "move";
+            targetAt(line, event.clientY, event.currentTarget);
+          }}
+          onDrop={(event) => { if (dragId.current == null) return; event.preventDefault(); drop(); }}
+          className={`flex items-center gap-1 rounded-xl ${dropTarget?.id === line._id ? (dropTarget.after ? "border-b-2 border-brand-light" : "border-t-2 border-brand-light") : ""}`}>
+          {onMove && <button type="button" draggable
+            aria-label={(t("review_workspace.move_line") || "Mover línea {n}").replace("{n}", segments.indexOf(line) + 1)}
+            title={t("review_workspace.move_hint") || "Arrastrá para mover. Con teclado: flechas arriba y abajo."}
+            className="shrink-0 touch-none rounded-lg px-1 py-3 text-ink-secondary hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-brand-light cursor-grab active:cursor-grabbing"
+            onDragStart={(event) => { dragId.current = line._id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(line._id)); }}
+            onDragEnd={cancelDrag}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") { cancelDrag(); return; }
+              if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+              event.preventDefault(); event.stopPropagation();
+              const direction = event.key === "ArrowDown" ? 1 : -1;
+              const target = visible[visible.indexOf(line) + direction];
+              if (target) move(line._id, target._id, direction > 0);
+            }}
+            onPointerDown={(event) => {
+              if (event.pointerType !== "touch") return;
+              dragId.current = line._id; event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            onPointerMove={(event) => {
+              if (event.pointerType !== "touch" || dragId.current == null) return;
+              const node = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-review-row]");
+              const target = visible.find(row => String(row._id) === node?.dataset.reviewRow);
+              if (target) targetAt(target, event.clientY, node);
+              const list = listRef.current;
+              if (list) {
+                const rect = list.getBoundingClientRect();
+                if (event.clientY < rect.top + 36) list.scrollTop -= 12;
+                if (event.clientY > rect.bottom - 36) list.scrollTop += 12;
+              }
+            }}
+            onPointerUp={(event) => { if (event.pointerType === "touch") drop(); }}
+            onPointerCancel={cancelDrag}><span aria-hidden="true">⠿</span></button>}
+          <button type="button" ref={(node) => { rowRefs.current[line._id] = node; }}
           data-testid={`review-line-${segments.indexOf(line) + 1}`} data-playing={isPlaying && line._id === activeId ? "true" : undefined} aria-current={selected?._id === line._id ? "true" : undefined}
           onClick={() => navigate(line)} onKeyDown={(event) => {
             if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
@@ -110,7 +170,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
             const next = visible[visible.indexOf(line) + (event.key === "ArrowDown" ? 1 : -1)];
             if (next) { navigate(next); rowRefs.current[next._id]?.focus(); }
           }}
-          className={`mb-1 flex w-full items-start gap-3 rounded-xl px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${selected?._id === line._id ? "bg-brand/20 ring-1 ring-brand/50" : "hover:bg-white/5"} ${isPlaying && line._id === activeId ? "border-l-4 border-emerald-300 bg-emerald-300/10" : "border-l-4 border-transparent"}`}>
+          className={`mb-1 flex min-w-0 flex-1 items-start gap-3 rounded-xl px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${selected?._id === line._id ? "bg-brand/20 ring-1 ring-brand/50" : "hover:bg-white/5"} ${isPlaying && line._id === activeId ? "border-l-4 border-emerald-300 bg-emerald-300/10" : "border-l-4 border-transparent"}`}>
           <span className="w-6 shrink-0 pt-0.5 text-xs tabular-nums text-ink-secondary">{segments.indexOf(line) + 1}</span>
           <span className="min-w-0 flex-1">
             <span className="block break-words text-base leading-snug">{line.text || (t("review_workspace.empty_line") || "Línea sin texto")}</span>
@@ -120,10 +180,17 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
             </span>
           </span>
           {marked(line) && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-amber-300" aria-label={t("review_workspace.marked") || "Marcada para revisar"} />}
-        </button>)}
+          </button>
+          <button type="button" aria-label={(t("review_workspace.delete_row") || "Eliminar línea {n}").replace("{n}", segments.indexOf(line) + 1)}
+            className="shrink-0 rounded-lg px-2 py-3 text-red-200 hover:bg-red-400/10 focus-visible:ring-2 focus-visible:ring-brand-light"
+            onClick={() => { cancelDrag(); onDelete(line._id); }}>
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 24 24"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7" /></svg>
+          </button>
+        </div>)}
         {!visible.length && <p className="p-4 text-sm text-ink-secondary">{t("review_workspace.no_marks") || "No hay líneas marcadas."}</p>}
       </div>
-      <div className="border-t border-white/10 p-3"><button className={`${button} w-full`} onClick={() => { focusAfterChange.current = true; onAdd(); }}>{t("editor.add_line") || "Agregar línea"}</button></div>
+      <p aria-live="polite" aria-atomic="true" className="sr-only">{moveAnnouncement}</p>
+      <div className="border-t border-white/10 p-3"><button className={`${button} w-full`} onClick={() => { focusAfterChange.current = true; onAdd(selected?._id); }}>{t("editor.add_line") || "Agregar línea"}</button></div>
     </div>
     <div className="order-first min-w-0 self-start rounded-2xl bg-surface-2 p-4 ring-1 ring-white/10 lg:sticky lg:top-36 lg:order-none lg:max-h-[calc(100dvh-232px)] lg:overflow-y-auto" data-testid="selected-line-panel">
       {selected ? <>
@@ -134,6 +201,8 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
         {selected.timing_validation?.status === "unvalidated" && <p className="mb-3 text-sm text-amber-200">
           {selected.timing_validation.reason === "estimated_split"
             ? (t("review_workspace.split_review") || "Corte estimado · escuchá y revisá los tiempos de esta frase.")
+            : selected.timing_validation.reason === "estimated_placement"
+            ? (t("review_workspace.placement_review") || "Tiempo estimado al ubicar esta línea · escuchá y ajustá su inicio y final.")
             : (t("review_workspace.timing_unvalidated") || "Timing no validado · revisá este tramo contra el audio. No se cambiaron sus tiempos.")}
         </p>}
         {marked(selected) && <p className="mb-3 text-xs text-amber-200">{t("review_workspace.marked") || "Marcada para revisar"}</p>}
