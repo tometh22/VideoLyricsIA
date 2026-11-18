@@ -29,7 +29,7 @@ for (const mobile of [false, true]) {
     });
     await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 });
     await page.goto(`/review/${jobId}`);
-    const preview = page.getByTestId("campaign-video-preview");
+    const preview = page.getByTestId("review-live-preview");
     await expect(preview).toBeVisible();
     await expect(preview.getByText(segments[0].text.toUpperCase(), { exact: true })).toBeVisible();
     await page.getByTestId("review-line-2").click();
@@ -37,7 +37,11 @@ for (const mobile of [false, true]) {
     await page.getByTestId("review-line-1").click();
     const stale = page.getByTestId("quality-proposal-panel");
     await expect(stale).toHaveAttribute("data-proposal-state", "stale");
+    const disclosure = stale.getByTestId("quality-proposal-disclosure");
+    await expect(disclosure).not.toHaveAttribute("open");
+    await disclosure.locator(":scope > summary").click();
     await expect(stale.getByRole("button", { name: "Aceptar", exact: true })).toBeDisabled();
+    await disclosure.locator(":scope > summary").click();
     await stale.getByRole("button", { name: "Ocultar propuesta" }).click();
     await expect(stale).toHaveCount(0);
     await page.getByLabel("Letra de esta línea", { exact: true }).fill("Esta es mi letra revisada");

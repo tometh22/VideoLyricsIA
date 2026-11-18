@@ -808,6 +808,7 @@ export default function LyricsEditor({
   // siempre.
   hideTypographyControls = false,
   hideInternalPreview = false,
+  startAtWorkspace = false,
   // Phase C 2026-05-25: callback que publica el tick de playback hacia
   // el padre (App.jsx). El padre típicamente escribe en un ref para
   // que el WizardLivePreview central pueda leerlo sin pasar por
@@ -964,7 +965,6 @@ export default function LyricsEditor({
   // Advanced timing opens directly on the timeline; guided review is optional.
   const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("timeline"); // guided is an explicit, optional workspace
   const [previewDockOpen, setPreviewDockOpen] = useState(false);
-  const campaignPreviewVisible = requireLineReview && hideTypographyControls && !hideInternalPreview;
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
   // segments por video estaba scrolleando constante. localStorage usa
@@ -3535,7 +3535,7 @@ export default function LyricsEditor({
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing || tag === "SELECT") return;
-      if ((tag === "BUTTON" || tag === "A") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
+      if ((tag === "BUTTON" || tag === "A" || tag === "SUMMARY") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
         // doesn't anchor 3 lines from one apparent tap. Native autorepeat
@@ -4341,6 +4341,8 @@ export default function LyricsEditor({
       }
       : segment
   )), [maskedCandidateSegmentIds, sanitizedEdited, t]);
+
+  const selectedPreviewSegment = previewSegments.find(segment => segment._id === focusedSegId) || previewSegments[0];
 
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
@@ -6538,22 +6540,7 @@ export default function LyricsEditor({
           {(isDirty || draftRecovery) && <span className="text-amber-300">Guardá o descartá tus cambios actuales primero.</span>}
         </div>
       )}
-      <div className={`grid gap-4 mb-4 items-start ${campaignPreviewVisible ? "grid-cols-1 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.2fr)]" : viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
-          {campaignPreviewVisible && (
-            <section aria-label="Vista previa de la canción" data-testid="campaign-video-preview"
-              className="min-w-0 space-y-2 rounded-xl bg-surface-2/40 p-3 lg:sticky lg:top-20">
-              <h3 className="text-sm font-semibold text-white">Vista previa de la canción</h3>
-              <p className="text-xs text-ink-secondary">
-                Seguí la letra con el audio. Los cambios se ven al instante.
-                {!previewBgUrl && " Fondo de referencia; el fondo final se genera después."}
-              </p>
-              <LyricVideoPreview segments={previewSegments} currentTime={currentTime}
-                isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
-                backgroundStyle={backgroundStyle || "default"}
-                font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
-                textContrast={selectedContrast} fontScale={fontScale} editable={false} />
-            </section>
-          )}
+      <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
@@ -6886,6 +6873,15 @@ export default function LyricsEditor({
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
                 activeId={activeId} isPlaying={isPlaying}
+                startAtWorkspace={startAtWorkspace && (!editorV2Enabled || durableHydrated)}
+                preview={!hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
+                  <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
+                  {!previewBgUrl && <p className="mb-2 text-xs text-ink-secondary">Fondo de referencia; el fondo final se genera después.</p>}
+                  <LyricVideoPreview segments={isPlaying ? previewSegments : (selectedPreviewSegment ? [selectedPreviewSegment] : [])} currentTime={isPlaying ? currentTime : (selectedPreviewSegment?.start ?? currentTime)} isPlaying={isPlaying}
+                    backgroundUrl={previewBgUrl || null} backgroundStyle={backgroundStyle || "default"}
+                    font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
+                    textContrast={selectedContrast} fontScale={fontScale} editable={false} t={t} />
+                </div>}
                 audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                 onSelect={(line) => { setFocusedSegId(line._id); if (audioUrl && !audioError && audioMetadataReady) seekTo(line.start, true, line); }}
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}

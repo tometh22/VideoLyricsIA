@@ -262,7 +262,7 @@ export default function LyricVideoPreview({
         aspectRatio: "16 / 9",
         background: bg || "#0a0910",
         containerType: "inline-size",
-        touchAction: "none",
+        touchAction: editable ? "none" : "auto",
       }}
       onPointerMove={onPointerMove}
       onPointerCancel={cancelLayoutDrag}
@@ -321,7 +321,7 @@ export default function LyricVideoPreview({
             left: `${l.pos.x * 100}%`,
             top: `${l.pos.y * 100}%`,
             transform: `translate(-50%,-50%) rotate(${l.rot}deg)`,
-            touchAction: "none",
+            touchAction: editable ? "none" : "auto",
           }}
           onPointerDown={editable ? (e) => onPointerDown(e, activeSeg, "move") : undefined}
           onPointerUp={editable ? (e) => onPointerUp(e, activeSeg) : undefined}

@@ -10,13 +10,15 @@ const timestamp = value => {
 
 /** One selected line owns the text, playback and timing actions. */
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable, activeId = null, isPlaying = false,
-  onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
+  preview = null, startAtWorkspace = false, onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
   getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
   suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation, onTogglePropagation }) {
   const { t } = useI18n();
   const [markedOnly, setMarkedOnly] = useState(false);
   const [follow, setFollow] = useState(true);
   const inputRef = useRef(null);
+  const workspaceRef = useRef(null);
+  const openedAtWorkspace = useRef(false);
   const listRef = useRef(null);
   const splitButtonRef = useRef(null);
   const [selection, setSelection] = useState(null);
@@ -70,12 +72,26 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
     // Follow only inside the list. Never move the document or the text caret.
     list.scrollTop = Math.max(0, row.offsetTop - (list.clientHeight - row.offsetHeight) / 2);
   }, [activeId, isPlaying, follow, markedOnly, rowRefs]);
+  useEffect(() => {
+    if (!startAtWorkspace || openedAtWorkspace.current) return;
+    const frame = requestAnimationFrame(() => {
+      const workspace = workspaceRef.current;
+      if (!workspace) return;
+      openedAtWorkspace.current = true;
+      // One entry adjustment after hydration; selection/playback never move
+      // the page. Keep the single player below the app header in view.
+      const player = document.querySelector('[data-tour="editor-playbar"]');
+      const top = 72 + (player?.getBoundingClientRect().height || 64) + 12;
+      window.scrollBy({ top: workspace.getBoundingClientRect().top - top, behavior: "instant" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [startAtWorkspace]);
   const button = "min-h-10 rounded-xl px-3 py-2 text-sm ring-1 ring-white/15 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:opacity-40";
   const selectedIndex = segments.indexOf(selected);
   const previous = [...visible].reverse().find(line => segments.indexOf(line) < selectedIndex);
   const next = visible.find(line => segments.indexOf(line) > selectedIndex);
   const navigate = (line) => { if (line) onSelect(line); };
-  return <section data-testid="campaign-line-workspace" className="grid min-w-0 gap-4 lg:grid-cols-[minmax(300px,400px)_minmax(0,1fr)] lg:items-start">
+  return <section ref={workspaceRef} data-testid="campaign-line-workspace" className="grid min-w-0 gap-4 lg:grid-cols-[minmax(300px,400px)_minmax(0,1fr)] lg:items-start">
     <div className="min-w-0 rounded-2xl bg-surface-2 ring-1 ring-white/10">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 p-3">
         <h2 className="text-sm font-semibold">{t("review_workspace.lines") || "Líneas"} ({segments.length})</h2>
@@ -109,7 +125,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
       </div>
       <div className="border-t border-white/10 p-3"><button className={`${button} w-full`} onClick={() => { focusAfterChange.current = true; onAdd(); }}>{t("editor.add_line") || "Agregar línea"}</button></div>
     </div>
-    <div className="order-first min-w-0 self-start rounded-2xl bg-surface-2 p-4 ring-1 ring-white/10 lg:sticky lg:top-36 lg:order-none" data-testid="selected-line-panel">
+    <div className="order-first min-w-0 self-start rounded-2xl bg-surface-2 p-4 ring-1 ring-white/10 lg:sticky lg:top-36 lg:order-none lg:max-h-[calc(100dvh-232px)] lg:overflow-y-auto" data-testid="selected-line-panel">
       {selected ? <>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-base font-semibold">{(t("review_workspace.selected") || "Línea {n}").replace("{n}", segments.indexOf(selected) + 1)}</h2>
@@ -147,6 +163,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
           } }}
           className="min-h-12 w-full rounded-xl border border-white/15 bg-surface-1 px-3 py-3 text-base text-white focus:border-brand-light focus:outline-none" />
         <p className="mt-2 text-xs text-ink-secondary">{t("review_workspace.autosave") || "Los cambios se guardan automáticamente."}</p>
+        {preview && <div className="mt-3" data-testid="review-live-preview">{preview}</div>}
         <div className="mt-3 rounded-xl border border-white/10 p-3">
           <div className="flex flex-wrap items-center gap-3">
             <button type="button" ref={splitButtonRef} className={`${button} shrink-0 bg-brand/15 text-brand-light`}

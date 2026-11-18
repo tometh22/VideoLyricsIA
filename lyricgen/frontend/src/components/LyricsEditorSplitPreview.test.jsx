@@ -120,7 +120,7 @@ it("keeps a live campaign preview when typography controls are hidden", () => {
   render(<LyricsEditor segments={[source, neighbour]} transcribeJobId={job} filename="song.wav"
     requireLineReview hideTypographyControls textCase="original" disableAutosave disableBeforeUnload
     onApprove={vi.fn()} onBack={vi.fn()} />);
-  const preview = screen.getByTestId("campaign-video-preview");
+  const preview = screen.getByTestId("review-live-preview");
   expect(within(preview).getByText(source.text)).toBeVisible();
   fireEvent.change(input(), { target: { value: "mi letra corregida" } });
   expect(within(preview).getByText("mi letra corregida")).toBeVisible();
