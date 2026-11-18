@@ -2029,14 +2029,12 @@ export default function LyricsEditor({
     });
   }, [edited]);
   const undoEdit = useCallback(() => {
-    setEditHistory((prev) => {
-      if (!prev.length) return prev;
-      const snapshot = prev[prev.length - 1];
-      setEdited(snapshot);
-      trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
-      return prev.slice(0, -1);
-    });
-  }, [trackEditorEvent]);
+    if (!editHistory.length) return;
+    setEdited(editHistory[editHistory.length - 1]);
+    setEditHistory(editHistory.slice(0, -1));
+    setIsDirty(true);
+    trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
+  }, [editHistory, trackEditorEvent]);
 
   // ─── Visual timeline (Timings view) handlers ────────────────────────
   // A drag commits here. We stamp `locked: true` so the render
@@ -3256,10 +3254,14 @@ export default function LyricsEditor({
     return referenceLyrics.split("\n").filter((l) => l.trim());
   }, [referenceLyrics]);
 
-  const suggestionsById = useMemo(
-    () => referenceSuggestionsById(edited, refLines),
-    [edited, refLines],
-  );
+  const suggestionsById = useMemo(() => {
+    const suggestions = referenceSuggestionsById(edited, refLines);
+    const originalText = new Map(segments.map((line, index) => [line._id ?? index, line.text]));
+    for (const line of edited) {
+      if (originalText.get(line._id) !== line.text) delete suggestions[line._id];
+    }
+    return suggestions;
+  }, [edited, refLines, segments]);
 
   // Detección de segments mergeados (2 lyric lines en 1 segment) usando
   // lrclib plain como oracle. Caso real motivador: Whisper agrupa
@@ -3272,19 +3274,21 @@ export default function LyricsEditor({
     const out = [];
     edited.forEach((seg) => {
       if (!seg.text || !seg.text.trim()) return;
+      const original = segments.find((line, index) => (line._id ?? index) === seg._id);
+      if (!original || original.text !== seg.text) return;
       const pair = findReferenceSplitLines(seg.text, refLines);
       if (pair) out.push({ _id: seg._id, splitLines: pair });
     });
     return out;
-  }, [edited, refLines]);
+  }, [edited, refLines, segments]);
 
   // Auto-dividir TODOS los segments mergeados usando reference como
   // oracle. Para cada uno: timestamp split proporcional al char-count
   // de cada línea (lineA más larga = más tiempo). Reverse-order para
   // no romper índices durante la mutación.
-  const autoSplitAllFromReference = () => {
+  const autoSplitAllFromReference = (recordHistory = true) => {
     if (mergeableSegments.length === 0) return;
-    pushEditHistory();
+    if (recordHistory !== false) pushEditHistory();
     setEdited((prev) => {
       // Map id → splitLines para lookup rápido
       const byId = new Map(
@@ -3382,8 +3386,8 @@ export default function LyricsEditor({
     if (suggestion) updateText(id, suggestion);
   };
 
-  const applyAllSuggestions = () => {
-    pushEditHistory();
+  const applyAllSuggestions = (recordHistory = true) => {
+    if (recordHistory !== false) pushEditHistory();
     markLinesReviewedByEdit(edited
       .filter((segment) => suggestionsById[segment._id])
       .map((segment) => segment._id));
@@ -3440,8 +3444,8 @@ export default function LyricsEditor({
   /** Bulk: trim every segment whose duration exceeds the cap. Each
    * segment is trimmed independently — only its own `end` is modified
    * based on its own text length and start. No cross-segment effect. */
-  const trimAllLongSegs = ({ confirmReview = true } = {}) => {
-    pushEditHistory();
+  const trimAllLongSegs = ({ confirmReview = true, recordHistory = true } = {}) => {
+    if (recordHistory) pushEditHistory();
     if (confirmReview) {
       markLinesReviewedByEdit(edited
         .filter((segment) => segment.end - segment.start > estimateVoiceEndDuration(segment.text))
@@ -4283,12 +4287,13 @@ export default function LyricsEditor({
   const fixCount = (splitAvailable ? 1 : 0) + (hasSuggestions ? 1 : 0) + (trimAvailable ? 1 : 0);
   const hasUndo = editHistory.length > 0;
   const applyAllFixes = () => {
-    // Orden: split (cambia el nº de segmentos), luego suggestions (texto
-    // por segmento), luego trim (end por segmento). Cada handler llama a
-    // pushEditHistory así Cmd-Z los deshace paso a paso.
-    if (splitAvailable) autoSplitAllFromReference();
-    if (hasSuggestions) applyAllSuggestions();
-    if (trimAvailable) trimAllLongSegs();
+    if (!hasAutoFix) return;
+    // One user action, one undo entry. React batches these mutations, so
+    // snapshots inside each handler would all capture the same old state.
+    pushEditHistory();
+    if (splitAvailable) autoSplitAllFromReference(false);
+    if (hasSuggestions) applyAllSuggestions(false);
+    if (trimAvailable) trimAllLongSegs({ recordHistory: false });
     setFixPopoverOpen(false);
   };
   // "Ajustes del video" (disclosure) — concerns informativos del render:
@@ -5202,18 +5207,17 @@ export default function LyricsEditor({
         </div>
       ); return playerSlot ? createPortal(_conf, playerSlot) : _conf; })()}
 
-      {/* (2) Fila de chips (máx 2). Cada chip = icono + verbo + número (no
-          oraciones). Wrap en narrow. */}
-      {(fixCount > 0 || showReviewBanner) && (
+      {/* Correction preview, review navigation and persistent undo. */}
+      {(fixCount > 0 || showReviewBanner || hasUndo) && (
         <div className="mb-3 flex flex-wrap items-center gap-2" data-testid="editor-chip-row">
-          {/* Chip ghost "Aplicar corrección · N": aplica inline; el caret ▾
-              abre popover con el detalle (ver-diff) + Deshacer. N=0 → no
-              renderiza. */}
+          {/* Both correction controls open the summary before applying. */}
           {fixCount > 0 && (
             <div className="relative inline-flex">
               <button
                 type="button"
-                onClick={applyAllFixes}
+                onClick={() => setFixPopoverOpen((open) => !open)}
+                aria-haspopup="menu"
+                aria-expanded={fixPopoverOpen}
                 data-testid="apply-fix-chip"
                 title={t("editor.autofix_apply_all_short") || "Aplicar todo"}
                 className="inline-flex items-center gap-1.5 h-8 pl-3 pr-2.5 rounded-l-lg text-[12px] font-medium
@@ -5275,6 +5279,15 @@ export default function LyricsEditor({
                         </li>
                       )}
                     </ul>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={applyAllFixes}
+                      data-testid="confirm-apply-fixes"
+                      className="w-full rounded-md px-2 py-2 text-left text-xs text-brand-light hover:bg-white/[0.05]"
+                    >
+                      {t("editor.autofix_apply_all_short") || "Aplicar todo"}
+                    </button>
                     {hasUndo && (
                       <div className="mt-1.5 pt-1.5 border-t border-white/[0.06]">
                         <button
@@ -5295,6 +5308,17 @@ export default function LyricsEditor({
                 </>
               )}
             </div>
+          )}
+          {hasUndo && (
+            <button
+              type="button"
+              onClick={undoEdit}
+              data-testid="editor-undo-button"
+              title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
+              className="h-8 rounded-lg px-3 text-xs text-gray-300 ring-1 ring-white/[0.08] hover:bg-white/[0.05]"
+            >
+              {t("editor.undo") || "Deshacer"}
+            </button>
           )}
           {/* Chip PRIMARIO "Revisar · •N →": navegador secuencial. Punto
               ámbar 6px en el número (único ámbar del header, match con las
