@@ -34,7 +34,7 @@ import {
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
-import { mergeLineRows, planSegmentSplit, tokenSpans } from "../lib/splitWords";
+import { mergeLineRows, planSegmentSplit, planReviewedSegmentSplit, tokenSpans } from "../lib/splitWords";
 import { applyDisplaySuggestions, resolveDisplaySuggestions } from "../lib/displaySegmentationSuggestions";
 import DisplaySegmentationSuggestions from "./DisplaySegmentationSuggestions";
 import { lineStructureProperties, mergeTimingMode, splitTimingMode } from "../lib/lineStructureEvent";
@@ -3898,14 +3898,17 @@ export default function LyricsEditor({
     const properties = lineStructureProperties(structureOp, trigger, items);
     if (properties) trackEditorEvent("editor_line_structure_changed", properties);
   };
+  const planEditorSplit = (segment, charOffset) => requireLineReview
+    ? planReviewedSegmentSplit(segment, { charOffset })
+    : planSegmentSplit(segment, { charOffset });
   const splitTelemetryItem = (id, charOffset) => {
     const seg = edited.find((s) => s._id === id);
     if (!seg) return null;
-    return { mode: splitTimingMode(seg, planSegmentSplit(seg, { charOffset })), start: seg.start, end: seg.end };
+    return { mode: splitTimingMode(seg, planEditorSplit(seg, charOffset)), start: seg.start, end: seg.end };
   };
   const splitSegAt = (id, charOffset, trigger = "caret", recordHistory = true) => {
     const source = edited.find(segment => segment._id === id);
-    if (!source || !planSegmentSplit(source, { charOffset })) return;
+    if (!source || !planEditorSplit(source, charOffset)) return;
     const firstNewId = edited.reduce((m, row) => Math.max(m, row._id), -1) + 1;
     const nextFocus = trigger === "caret" ? firstNewId + 1
       : trigger === "button" && focusedSegId === id ? firstNewId : null;
@@ -3915,13 +3918,17 @@ export default function LyricsEditor({
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
       const seg = prev[idx];
-      const plan = planSegmentSplit(seg, { charOffset });
+      const plan = planEditorSplit(seg, charOffset);
       if (!plan) return prev; // never create an empty line
       const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
       const { words: _parentWords, ...segNoWords } = seg;
       const half = (newId, part) => ({
         ...segNoWords, _id: newId, segment_id: mintSegmentId(),
         text: part.text, start: part.start, end: part.end,
+        ...(requireLineReview && plan.timing !== "words" ? {
+          review: true,
+          timing_validation: { status: "unvalidated", reason: "estimated_split" },
+        } : {}),
         ...(part.words ? { words: part.words } : {}),
       });
       return [
@@ -6890,6 +6897,7 @@ export default function LyricsEditor({
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}
                 onAdvanced={(line) => { setFocusedSegId(line._id); setTimingWorkspaceMode("timeline"); setViewMode("advanced"); }}
                 onDuplicate={duplicateSeg} onMerge={mergeSeg} onDelete={deleteSeg} onAdd={addLineSmart} onSplit={splitSegAt}
+                getSplitPlan={(id, charOffset) => planEditorSplit(edited.find(line => line._id === id), charOffset)}
                 onUndo={undoEdit} canUndo={hasUndo} rowRefs={rowRefs}
                 onTextFocus={(line) => { setFocusedSegId(line._id); setTextEditStart({ id: line._id, text: line.text }); }}
                 onTextBlur={handleTextBlur}
