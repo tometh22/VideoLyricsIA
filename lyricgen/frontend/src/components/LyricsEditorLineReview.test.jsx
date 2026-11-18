@@ -155,3 +155,19 @@ describe("LyricsEditor — aprobación por canción", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 });
+
+ it("previews the selected paused line when two lines share their start", async () => {
+   const user = userEvent.setup();
+   render(<LyricsEditor {...props({segments:[
+     {segment_id:"tie-a",start:1,end:2,text:"Primera frase empatada"},
+     {segment_id:"tie-b",start:1,end:3,text:"Segunda frase empatada"},
+   ]})} />);
+   await user.click(screen.getByTestId("review-line-2"));
+   const preview = screen.getByTestId("review-live-preview");
+   expect(preview).toHaveTextContent(/Segunda frase empatada/i);
+   expect(preview).not.toHaveTextContent(/Primera frase empatada/i);
+   const input = screen.getByLabelText("Letra de esta línea",{exact:true});
+   await user.clear(input);
+   await user.type(input,"Segunda corregida en pausa");
+   expect(preview).toHaveTextContent(/Segunda corregida en pausa/i);
+ });
