@@ -333,10 +333,14 @@ def record_correction(db, job, *, field_name: str, before: str, after: str) -> N
 
 def applies_to_job(job) -> bool:
     """Videos de campañas o con entrega UMG; el resto de los tenants no."""
+    def text(name: str) -> str:
+        value = getattr(job, name, None)
+        return value if isinstance(value, str) else ""
+
     return bool(
-        getattr(job, "campaign_id", None)
-        or str(getattr(job, "workload_class", "") or "") == "batch"
-        or str(getattr(job, "delivery_profile", "") or "").lower() in {"umg", "both"}
+        text("campaign_id")
+        or text("workload_class") == "batch"
+        or text("delivery_profile").lower() in {"umg", "both"}
     )
 
 
@@ -347,7 +351,7 @@ def normalize_for_db(db, artist: Any, title: Any) -> MetadataResult:
 def normalize_job(db, job) -> MetadataResult | None:
     """Pone en el Job el nombre canónico antes de renderizar. Devuelve el
     resultado si cambió algo."""
-    if not applies_to_job(job):
+    if not applies_to_job(job) or not isinstance(getattr(job, "artist", None), str):
         return None
     result = normalize_for_db(db, getattr(job, "artist", ""), getattr(job, "song_title", ""))
     if not result.changed:
@@ -369,7 +373,7 @@ def publication_problem(db, job) -> dict | None:
     no, el detalle para frenar la publicación (el video ya tiene dibujado el
     nombre viejo en la tarjeta: hay que corregir y volver a renderizar)."""
     mode = gate_mode()
-    if mode == "off":
+    if mode == "off" or not isinstance(getattr(job, "artist", None), str):
         return None
     result = normalize_for_db(db, getattr(job, "artist", ""), getattr(job, "song_title", ""))
     # Espacios de más o sólo mayúsculas: se corrigen en el próximo render,
