@@ -2165,6 +2165,7 @@ export default function LyricsEditor({
     setTextEditStart(null);
     setEditHistory(editHistory.slice(0, -1));
     setIsDirty(true);
+    setFlushCounter((count) => count + 1);
     trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
   }, [editHistory, trackEditorEvent]);
 
