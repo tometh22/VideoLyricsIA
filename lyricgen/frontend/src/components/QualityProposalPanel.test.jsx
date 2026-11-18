@@ -312,3 +312,10 @@ it("lets the reviewer hide a stale proposal without applying or rejecting an old
    expect(screen.getByRole("alert")).toBeVisible();
    expect(screen.getByRole("alert")).toHaveTextContent("versión anterior");
  });
+
+it("announces one busy status while the proposal disclosure stays closed", () => {
+  rtlRender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={12} applying />);
+  expect(screen.getByTestId("quality-proposal-disclosure")).not.toHaveAttribute("open");
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+  expect(screen.getByRole("status")).toHaveTextContent("Aplicando cambios");
+});

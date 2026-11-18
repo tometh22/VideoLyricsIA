@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.178] - 2026-11-18
+
+### Fixed
+- Restore a single live lyric preview beside campaign editing, selecting paused lines by identity, preserving unconfirmed-text masking and following existing audio playback. Keep read-only touch scrolling, bounded detail scrolling and native disclosure keyboard actions.
+- Start quality proposals collapsed; keep stale/expired warnings and a local hide action accessible outside the disclosure. Prevent applying outdated proposals and announce in-flight decisions once.
+- Make lyric-review suggestions advisory across campaigns, individual jobs and re-renders, including missing-text and portal-style suggestions. Preserve snapshot, revision, language and structural approval controls. Legacy `LYRIC_REVIEW_MODE=enforce` now behaves as `observe`; `LYRIC_REVIEW_ENFORCE_TENANTS` no longer enables blocking. Deploy compatible API and frontend before verifying approval.
+
 ## [1.1.176] - 2026-11-18
 
 ### Fixed
