@@ -1559,6 +1559,7 @@ def run_transcription_job(
     source_audio_revision = 0
     source_segments_revision = 0
     fresh_transcription = False
+    language_forced = False
     # Establish the immutable source identity before the expensive pipeline.
     # Direct browser PUTs necessarily start at a mutable upload key because
     # the server does not see their bytes; the first worker materialization
@@ -1608,6 +1609,19 @@ def run_transcription_job(
         source_segments_revision = int(_identity_row.segments_revision or 0)
         from display_segmentation_policy import fresh_job
         fresh_transcription = fresh_job(_identity_db, _identity_row)
+        # A reviewer asked to hear the song again in an explicit language
+        # (editor_retranscription). The choice is a human decision about this
+        # recording, so a mixed reference must not demote it to auto-LID.
+        from editor_retranscription import for_attempt as _retranscription_for_attempt
+        from jobs import current_job_attempt_id
+        _retranscription_row = _retranscription_for_attempt(
+            _identity_db, job_id, current_job_attempt_id("transcription"),
+        )
+        language_forced = bool(
+            _retranscription_row is not None
+            and _retranscription_row.status in {"pending", "failed"}
+            and str(language or "").strip()
+        )
         _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
@@ -1682,6 +1696,7 @@ def run_transcription_job(
                     "segments_revision": source_segments_revision,
                     "fresh": fresh_transcription,
                 },
+                **({"force_language": True} if language_forced else {}),
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -1934,6 +1949,38 @@ def run_transcription_job(
                 row.input_audio_etag = source_audio_sha256
                 row.audio_revision = max(1, int(row.audio_revision or 0))
             current_revision = int(row.segments_revision or 0)
+            # Reviewer-requested re-transcription (editor_retranscription).
+            # Only the attempt the archive row names, and only while it is
+            # still the job's active attempt, may replace the frozen machine
+            # snapshot; a human edit made meanwhile always wins.
+            from editor_retranscription import (
+                for_attempt as _retranscription_for_attempt,
+                install_baseline as _install_retranscription_baseline,
+                mark_applied as _mark_retranscription_applied,
+                mark_discarded as _mark_retranscription_discarded,
+            )
+            from jobs import current_job_attempt_id
+            _attempt_id = current_job_attempt_id("transcription")
+            retranscription = _retranscription_for_attempt(
+                _persist_db, job_id, _attempt_id, lock=True,
+            )
+            if retranscription is not None:
+                _discard_reason = None
+                if retranscription.status == "applied":
+                    _discard_reason = "retranscription_already_applied"
+                elif str(row.active_transcription_attempt_id or "") != str(_attempt_id):
+                    _discard_reason = "retranscription_superseded"
+                elif current_revision != int(retranscription.base_revision):
+                    _discard_reason = "edited_during_retranscription"
+                    _mark_retranscription_discarded(row, retranscription, _discard_reason)
+                if _discard_reason:
+                    logger.warning(
+                        "[retranscribe] result discarded job=%s reason=%s",
+                        job_id, _discard_reason,
+                    )
+                    _persist_db.commit()
+                    return {"job_id": job_id, "status": "discarded",
+                            "reason": _discard_reason}
             auto_trace = (
                 result.get("transcription_quality", {}).get("auto_repair", {})
                 if isinstance(result, dict)
@@ -1956,13 +2003,19 @@ def run_transcription_job(
                 }
             display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
             continuity_trace = (result.get("transcription_quality") or {}).get("vocal_continuity") or {}
-            if display_trace.get("applied_count") or continuity_trace.get("applied_count"):
+            if (
+                retranscription is None
+                and (display_trace.get("applied_count") or continuity_trace.get("applied_count"))
+            ):
                 from display_segmentation_policy import fresh_job
                 if current_revision != source_segments_revision or not fresh_job(_persist_db, row):
                     _persist_db.rollback()
                     return {"job_id": job_id, "status": "discarded",
                             "reason": "display_segmentation_source_changed"}
-            if current_revision > 0 and segments != row.segments_json:
+            if (
+                retranscription is None
+                and current_revision > 0 and segments != row.segments_json
+            ):
                 # An operator edited while the ASR was running. Preserve the
                 # human version and do not attach a verdict for discarded data.
                 logger.warning(
@@ -1974,6 +2027,12 @@ def run_transcription_job(
                 if not isinstance(segments, list):
                     raise RuntimeError("transcription_segments_missing")
                 row.segments_json = segments
+                if retranscription is not None:
+                    # The previous baseline and human text were archived when
+                    # the reviewer asked; install the new one as a NEW revision.
+                    current_revision = _install_retranscription_baseline(
+                        _persist_db, row, retranscription, segments,
+                    )
                 # Freeze the exact machine snapshot before the editor can
                 # autosave. Lazy creation was too late for legacy clients:
                 # their first save could become `original_segments`.
@@ -1995,6 +2054,13 @@ def run_transcription_job(
                     quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
                     quality["timing_source"] = row.timing_source or "unknown"
+                    if retranscription is not None:
+                        quality["forced_language"] = {
+                            "language": retranscription.requested_language,
+                            "previous_language": retranscription.previous_language,
+                            "source": "reviewer_retranscription",
+                            "retranscription_id": retranscription.id,
+                        }
                     try:
                         from quality_learning_model import shadow_prediction_for_quality
                         quality["learning_shadow"] = shadow_prediction_for_quality(
@@ -2025,6 +2091,7 @@ def run_transcription_job(
                     attach_machine_provenance(
                         _persist_db, job_id,
                         machine_snapshot_provenance(row, quality),
+                        **({"revision": current_revision} if retranscription is not None else {}),
                     )
                     from quality_shadow import record_shadow_decision
                     record_shadow_decision(
@@ -2069,6 +2136,8 @@ def run_transcription_job(
                 require_machine_snapshot(row, document)
                 row.status = "transcribed_pending"
                 row.current_step = "editing"
+                if retranscription is not None:
+                    _mark_retranscription_applied(retranscription, current_revision)
                 if str(row.workload_class or workload_class) == "batch":
                     # The review queue must be ordered before a human opens
                     # it. Persist the blind v2 verdict atomically with the
@@ -2080,7 +2149,9 @@ def run_transcription_job(
                         ).order_by(AuditLog.id.desc()).limit(1000).all()
                         if str((log.detail or {}).get("job_id") or "") == job_id
                     ), None)
-                    if existing_verdict is None:
+                    # A forced-language re-transcription replaces the text the
+                    # previous verdict was computed for.
+                    if existing_verdict is None or retranscription is not None:
                         verdict = song_verdict(quality, segments=segments)
                         _persist_db.add(AuditLog(
                             user_id=None,
@@ -2245,4 +2316,29 @@ def _fail(job_id: str, error_msg: str, tb: str = "",
             "[TRANSCRIBE-WORKER] failed to persist error job=%s error_type=%s",
             job_id, _safe_exception_code(exc),
         )
+    _settle_failed_retranscription(job_id)
     return {"job_id": job_id, "status": "transcription_failed", "error": error_msg}
+
+
+def _settle_failed_retranscription(job_id: str) -> None:
+    """A failed forced-language attempt leaves the previous text in review.
+
+    Best effort: the status endpoint settles it lazily too (RQ kill/reaper).
+    """
+    try:
+        from database import Job, SessionLocal
+        from editor_retranscription import settle_failed
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+            if job is not None and settle_failed(db, job):
+                db.commit()
+            else:
+                db.rollback()
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "[retranscribe] could not settle failed attempt job=%s error_type=%s",
+            job_id, _safe_exception_code(exc),
+        )
