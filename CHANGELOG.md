@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.173] - 2026-11-18
+## [1.1.174] - 2026-11-18
 
 ### Fixed
 - Measure the client change-request cohort by the Universal portal (Argentina/Chile) where a lyric video was published, not by the publishing account. Lyric campaigns published by internal accounts (221 November deliveries and their requests) were excluded, so the panel under-reported the request rate. Art Tracks stay out of the lyric rate.
@@ -11,6 +11,13 @@
 - Propose the same correction on the other repetitions of a corrected line when a change request is analysed: each identical repetition becomes its own operation, never auto-applied, and can be unticked. Operator adjustments of the requested line follow to its repetitions.
 - List each repetition with its time in the editor's "apply to all repetitions" prompt so one can be left out.
 - Add `scripts/backtest_change_request_verification.py`, an offline backtest of the verification over exported requests and editor versions.
+
+## [1.1.173] - 2026-11-17
+
+### Fixed
+- Restore click-to-play in lyric review and follow the playing line without changing the editing selection or text focus. Keep playback controls visible below the app header.
+- Show compact horizontal time ranges, separate playback from selection, respect the marked filter during previous/next navigation and expose stale/failed phrase analysis in a compact disclosure.
+- Correct timestamp rounding at minute boundaries and the active navigation item during lyric review.
 
 ## [1.1.172] - 2026-11-17
 
