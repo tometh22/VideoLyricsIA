@@ -3556,7 +3556,7 @@ export default function LyricsEditor({
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing || tag === "SELECT") return;
-      if ((tag === "BUTTON" || tag === "A") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
+      if ((tag === "BUTTON" || tag === "A" || tag === "SUMMARY") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
         // doesn't anchor 3 lines from one apparent tap. Native autorepeat
