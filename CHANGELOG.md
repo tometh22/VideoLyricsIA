@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.185] - 2026-11-18
+
+### Added
+- Let a campaign reviewer re-transcribe a song from its audio in a chosen language (Spanish, English, Portuguese, French, Italian, German) from the editor's language alerts or the Tools menu. The current text stays in the version history ("Antes de volver a transcribir"), the previous pre-human machine snapshot, evidence and quality verdict are archived in the new append-only `editor_retranscriptions` table, and the new lyrics arrive as a new revision for review. No editor version or correction observation is deleted. The forced language reaches WhisperX and every post-pass, a mixed audio reference no longer demotes it to auto-detection, and a previous language attestation does not carry over to the new text.
+- Refuse the request with "Genly se está actualizando, probá en unos minutos" while any worker serving the target queue runs different backend code, and return any attempt that ends without a result (failure, reaper timeout, a worker on older code discarding it) to review with the previous text intact.
+
 ## [1.1.180] - 2026-11-18
 
 ### Fixed
