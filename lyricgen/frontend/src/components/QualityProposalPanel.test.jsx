@@ -1,7 +1,14 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render as rtlRender, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import QualityProposalPanel from "./QualityProposalPanel";
+
+function render(ui) {
+  const view = rtlRender(ui);
+  const summary = view.container.querySelector('details[data-testid="quality-proposal-disclosure"] > summary');
+  if (summary) fireEvent.click(summary);
+  return view;
+}
 
 const PROPOSAL = {
   id: "proposal-v6-1",
@@ -281,3 +288,14 @@ describe("QualityProposalPanel", () => {
     expect(screen.getByRole("button", { name: /Aplicar seleccionadas/i })).toBeDisabled();
   });
 });
+
+ it("starts compact without exposing or applying suggestions, and preserves stale warnings", () => {
+   const apply = vi.fn();
+   const view = rtlRender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={12} onApplySelected={apply} />);
+   expect(screen.getByTestId("quality-proposal-disclosure")).not.toHaveAttribute("open");
+   expect(screen.getByTestId("quality-proposal-window-outro-a")).not.toBeVisible();
+   expect(apply).not.toHaveBeenCalled();
+   view.rerender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={13} onApplySelected={apply} />);
+   expect(screen.getByRole("alert")).toBeVisible();
+   expect(screen.getByRole("alert")).toHaveTextContent("versión anterior");
+ });

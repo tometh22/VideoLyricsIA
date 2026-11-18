@@ -6912,6 +6912,13 @@ export default function LyricsEditor({
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
                 activeId={activeId} isPlaying={isPlaying}
+                preview={<div className="mx-auto w-full max-w-[320px]">
+                  <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
+                  <LyricVideoPreview segments={previewSegments} currentTime={isPlaying ? currentTime : ((sanitizedEdited.find(line => line._id === focusedSegId) || sanitizedEdited[0])?.start ?? currentTime)} isPlaying={isPlaying}
+                    backgroundUrl={previewBgUrl || null} backgroundStyle={backgroundStyle || "default"}
+                    font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
+                    textContrast={selectedContrast} fontScale={fontScale} editable={false} t={t} />
+                </div>}
                 audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                 onSelect={(line) => { setFocusedSegId(line._id); if (audioUrl && !audioError && audioMetadataReady) seekTo(line.start, true, line); }}
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}

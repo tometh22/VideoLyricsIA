@@ -10,7 +10,7 @@ const timestamp = value => {
 
 /** One selected line owns the text, playback and timing actions. */
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable, activeId = null, isPlaying = false,
-  onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
+  preview = null, onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
   getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
   suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation, onTogglePropagation }) {
   const { t } = useI18n();
@@ -109,7 +109,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
       </div>
       <div className="border-t border-white/10 p-3"><button className={`${button} w-full`} onClick={() => { focusAfterChange.current = true; onAdd(); }}>{t("editor.add_line") || "Agregar línea"}</button></div>
     </div>
-    <div className="order-first min-w-0 self-start rounded-2xl bg-surface-2 p-4 ring-1 ring-white/10 lg:sticky lg:top-36 lg:order-none" data-testid="selected-line-panel">
+    <div className="order-first min-w-0 self-start rounded-2xl bg-surface-2 p-4 ring-1 ring-white/10 lg:sticky lg:top-36 lg:order-none lg:max-h-[calc(100dvh-232px)] lg:overflow-y-auto" data-testid="selected-line-panel">
       {selected ? <>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-base font-semibold">{(t("review_workspace.selected") || "Línea {n}").replace("{n}", segments.indexOf(selected) + 1)}</h2>
@@ -147,6 +147,7 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
           } }}
           className="min-h-12 w-full rounded-xl border border-white/15 bg-surface-1 px-3 py-3 text-base text-white focus:border-brand-light focus:outline-none" />
         <p className="mt-2 text-xs text-ink-secondary">{t("review_workspace.autosave") || "Los cambios se guardan automáticamente."}</p>
+        {preview && <div className="mt-3" data-testid="review-live-preview">{preview}</div>}
         <div className="mt-3 rounded-xl border border-white/10 p-3">
           <div className="flex flex-wrap items-center gap-3">
             <button type="button" ref={splitButtonRef} className={`${button} shrink-0 bg-brand/15 text-brand-light`}
