@@ -47,7 +47,19 @@ La Revisión rápida sabe a qué portal va la canción (el destino de la
 campaña; "umg" si es una entrega UMG sin portal fijo) y aplica sus reglas.
 Lo que no se puede decidir sin escuchar queda afuera: preguntas de sí/no sin
 signo de duda ("¿Llegas a la ciudad?"), "¿Cuánto…?" que exclama o pregunta,
-el voseo "quedés/quedes", las comas.
+las comas.
+
+**Voseo (sólo Argentina).** La máquina pasa el voseo a tuteo ("querés" →
+"quieres", "vení" → "ven", "anotate" → "anótate", "No te quedés" → "No te
+quedes", "Te llevás" → "Te llevas"). La Revisión rápida propone la forma de
+vos con un clic sólo con evidencia: es obligatoria si la oyeron dos oídos
+(testigo, Gemini, letra oficial), o uno y la canción ya vosea en otra línea;
+es sugerencia si la oyó un solo oído o si sólo vosea la canción. Sin
+evidencia no toca nada: baladas, folklore y artistas extranjeros tutean de
+verdad. Si la letra oficial dice la forma de tú, gana la letra oficial.
+"Ven", "mira" o "ganas" (que también son otras palabras) sólo se corrigen si
+un oído oyó "vení", "mirá", "ganás". En Chile no corre nunca: allá se canta
+"querís", "sabís", "estái" y también hay tuteo legítimo.
 
 ## Artista y título
 

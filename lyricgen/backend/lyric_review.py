@@ -58,6 +58,7 @@ from heard_words import (
 )
 from reference_window import crop_reference
 from transcribe_postprocess import has_terminal_line_period
+from voseo_lexicon import TU_MARKERS, is_determiner, is_vos_marker, lookup as voseo_pair
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
@@ -133,6 +134,7 @@ KIND_GROUP = {
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
     "timing": "timing", "phrase_structure": "layout",
     "terminal_period": "style", "parentheses": "style", "accent_missing": "style",
+    "voseo": "text",
 }
 
 # --------------------------------------------------------------------------
@@ -1270,6 +1272,172 @@ def _rule_memory(segments: list[dict], pairs: dict[str, str],
     return out
 
 
+# --------------------------------------------------------------------------
+# Voseo (sólo portal Argentina).
+#
+# La máquina normaliza al español neutro ("querés" → "quieres", "vení" →
+# "ven", "anotate" → "anótate", "Te llevás" → "Te llevas") y los oídos no lo
+# ven: comparan sin tildes, así que "llevas"/"llevás" les parecen iguales y
+# "quieres"/"queres" se descarta como diferencia de escritura. La regla mira
+# palabra por palabra, CON tildes, qué escribió cada oído en esa posición.
+#
+# Nunca vosea a ciegas: una balada, un folklore o un artista extranjero
+# tutean de verdad. Sólo propone con evidencia:
+# - obligatorio: dos oídos oyeron la forma de vos, o uno la oyó y la canción
+#   ya vosea en otra línea;
+# - sugerencia: un solo oído, o sólo el voseo de la propia canción (y nunca
+#   para formas que también son otra palabra: "ven", "mira", "ganas").
+# La letra oficial que dice la forma de tú veta la inferencia.
+# --------------------------------------------------------------------------
+
+VOSEO_PORTALS = {"argentina"}
+
+
+def _heard_form(raw: str) -> str:
+    return unicodedata.normalize("NFC", _split_punct(str(raw or ""))[1]).lower()
+
+
+def _ear_says(heard: str, form: str, other: str) -> bool:
+    """``heard`` es ``form`` y no ``other``. Sin tildes alcanza sólo si las dos
+    formas se escriben distinto ("queres" es vos; "llevas" no dice nada)."""
+    if heard == form:
+        return True
+    return fold(heard) == fold(form) and fold(form) != fold(other)
+
+
+def _ear_word_map(screen: list[dict], tokens: list[dict]) -> dict[int, dict]:
+    """Palabra del oído en la misma posición que cada palabra de la pantalla
+    (tramos iguales y reemplazos uno a uno)."""
+    if not screen or not tokens:
+        return {}
+    out: dict[int, dict] = {}
+    for tag, i1, i2, j1, j2 in aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens]):
+        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+            for k in range(i2 - i1):
+                out[i1 + k] = tokens[j1 + k]
+    return out
+
+
+def _timed_witness_tokens(witness: list[dict]) -> list[dict]:
+    out = []
+    for w in witness:
+        raw = str(w.get("word") or "")
+        tok = norm_token(raw)
+        if tok and tok not in _FILLERS and not _NON_LATIN.search(raw):
+            out.append({"tok": tok, "raw": raw, "start": _f(w.get("start"))})
+    return out
+
+
+def _rule_voseo(segments: list[dict], screen: list[dict], ears: dict[str, list[dict]],
+                human_edited: dict[int, set[str]]) -> list[dict]:
+    maps = {src: _ear_word_map(screen, toks) for src, toks in ears.items() if toks}
+
+    def heard_at(src: str, idx: int) -> str | None:
+        tok = maps.get(src, {}).get(idx)
+        if tok is None:
+            return None
+        if "start" in tok:
+            seg = segments[screen[idx]["line"]]
+            if not (_f(seg.get("start")) - 2.0 <= tok["start"] <= _f(seg.get("end")) + 2.0):
+                return None  # el testigo lo oyó en otra repetición
+        return _heard_form(tok["raw"])
+
+    # Un oído que en esa línea escribió tú ("quiereme", "Ámame") no sabe
+    # nada de tildes ahí: su "besame" sin tilde no es un voseo.
+    tu_lines: set[tuple[str, int]] = set()
+    for idx, s in enumerate(screen):
+        pair = voseo_pair(_split_punct(s["raw"])[1])
+        if pair is None:
+            continue
+        for src in maps:
+            h = heard_at(src, idx)
+            if h and _ear_says(h, pair.tu, pair.vos) and not _ear_says(h, pair.vos, pair.tu):
+                tu_lines.add((src, s["line"]))
+
+    def says_vos(src: str, idx: int, pair) -> bool:
+        h = heard_at(src, idx)
+        if not h or not _ear_says(h, pair.vos, pair.tu):
+            return False
+        accent_only = fold(pair.tu) == fold(pair.vos)
+        return not (accent_only and (src, screen[idx]["line"]) in tu_lines)
+
+    marker_lines = {s["line"] for s in screen if is_vos_marker(_split_punct(s["raw"])[1])}
+    ear_marker_lines = {
+        screen[idx]["line"] for src in maps for idx in maps[src]
+        if (h := heard_at(src, idx)) and is_vos_marker(h)
+    }
+    out = []
+    for idx, s in enumerate(screen):
+        word = _split_punct(s["raw"])[1]
+        pair = voseo_pair(word)
+        if pair is None:
+            continue
+        seg = segments[s["line"]]
+        line_words = _words(seg.get("text"))
+        if _looks_english(line_words):
+            continue
+        heard = {src for src in maps if says_vos(src, idx, pair)}
+        official = heard_at("official", idx) if "official" in maps else None
+        official_tu = official is not None and _ear_says(official, pair.tu, pair.vos)
+        song_vos = bool((marker_lines | ear_marker_lines) - {s["line"]})
+        edited = any(s["tok"] in span.split() for span in human_edited.get(s["line"], ()))
+        if heard:
+            if official_tu and len(heard) < 2:
+                continue
+            required = (len(heard) >= 2 or song_vos) and not official_tu and not edited
+        else:
+            prev = screen[idx - 1] if idx > 0 and screen[idx - 1]["line"] == s["line"] else None
+            explicit_tu = any(w.lower() in TU_MARKERS for w in line_words if w.lower() != pair.tu)
+            if (not song_vos or pair.ambiguous or official_tu or edited or explicit_tu
+                    or (prev is not None and is_determiner(prev["tok"]))):
+                continue
+            required = False
+        sources = set(heard)
+        if heard:
+            why = f"En Argentina va «{pair.vos}». {_why(sources)}"
+        else:
+            why = f"La canción usa voseo en otras líneas: en Argentina va «{pair.vos}»"
+        out.append({
+            "kind": "voseo", "line": s["line"], "required": required,
+            "title": "Voseo", "why": why, "sources": sources,
+            "fix": {"type": "replace", "find": word, "replace": _match_case(word, pair.vos),
+                    "at_word": s["pos"], "scope": "one"},
+            "action": "Corregir", "dismiss": "Se canta así",
+            "_tu": norm_token(pair.tu), "_vos": norm_token(pair.vos), "_form": pair.vos,
+            "_can_require": not official_tu and not edited,
+        })
+    return out
+
+
+def _absorb_voseo_ear_items(items: list[dict], voseo: list[dict]) -> list[dict]:
+    """Un oído que propone lo mismo que el voseo ("ven" → "vení", "Tú eres"
+    → "Vos sos") no es otro punto: suma su fuente a los puntos de voseo."""
+    if not voseo:
+        return items
+    by_line: dict[int, list[dict]] = defaultdict(list)
+    for v in voseo:
+        by_line[v["line"]].append(v)
+    kept = []
+    for item in items:
+        fix = item.get("fix") or {}
+        if item.get("kind") == "heard_different" and fix.get("type") == "replace":
+            find, repl = _key_text(fix.get("find")).split(), _key_text(fix.get("replace")).split()
+            covering = [v for v in by_line.get(item.get("line"), ()) if v["_tu"] in find]
+            swap = {v["_tu"]: v["_vos"] for v in covering}
+            if covering and [swap.get(t, t) for t in find] == repl:
+                for v in covering:
+                    v["sources"] |= set(item.get("sources") or ())
+                continue
+        kept.append(item)
+    for v in voseo:
+        if v["sources"]:
+            v["required"] = v["required"] or (len(v["sources"]) >= 2 and v["_can_require"])
+            v["why"] = f"En Argentina va «{v['_form']}». {_why(v['sources'])}"
+        for key in ("_tu", "_vos", "_form", "_can_require"):
+            v.pop(key, None)
+    return kept
+
+
 def _map_to_current(segments: list[dict], orig: dict) -> int | None:
     """Línea actual que corresponde a una línea de la máquina: por identidad
     si se conservó, si no por solapamiento en el tiempo."""
@@ -1583,6 +1751,7 @@ def build_review(
     official_tokens, official_window = _official_ear(screen, official_clean)
     official_ops: list[tuple] = []
     witness_text = " ".join(w["word"] for w in witness)
+    voseo_ears: dict[str, list[dict]] = {}
     for source, tokens, timed in (
         ("witness", _ear_tokens(witness_text), witness),
         ("gemini", _ear_tokens(gemini), None),
@@ -1596,6 +1765,7 @@ def build_review(
         # alucinación: no aporta.
         if sim >= (EAR_MIN_SIMILARITY if source != "witness" else WITNESS_MIN_SIMILARITY):
             blocks.extend(found)
+            voseo_ears[source] = _timed_witness_tokens(witness) if source == "witness" else tokens
         if source == "official":
             confirmed_by_official = confirmed
             if tokens:
@@ -1656,7 +1826,13 @@ def build_review(
             "action": "Corregir" if kind == "heard_different" else "Agregar",
             "dismiss": "Está bien así" if kind == "heard_different" else "No se canta",
         }, (i1, i2)))
-    items.extend(_one_click_guard(ear_items, withheld))
+    ear_review = _one_click_guard(ear_items, withheld)
+    voseo: list[dict] = []
+    if str(portal or "").strip().lower() in VOSEO_PORTALS:
+        voseo = _rule_voseo(segments, screen, voseo_ears, human_edited)
+        ear_review = _absorb_voseo_ear_items(ear_review, voseo)
+    items.extend(ear_review)
+    items.extend(voseo)
 
     vocabulary = {norm_token(w["word"]) for w in witness} | {
         t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in official_tokens}

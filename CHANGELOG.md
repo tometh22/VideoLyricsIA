@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.177] - 2026-11-18
+
+### Fixed
+- Keep Argentine voseo in Revisión rápida (Argentina portal only): when the machine normalised "querés", "vení", "anotate", "No te quedés" or "Te llevás" to tú, propose the vos form with one click. Required when two independent ears (witness, Gemini, official lyrics) wrote the vos form, or one did and the song already uses voseo in another line; a suggestion with a single ear or with only the song's own voseo. Ears are now compared with accents, so "llevas"/"llevás" is no longer invisible. Songs that really use tú (ballads, folklore, foreign artists) are left alone without evidence, official lyrics in tú win, forms that are also other words ("ven", "mira", "ganas") need an ear, and an ear that matches the voseo point is merged into it instead of showing a second card. Chile and portal-less UMG deliveries are never touched.
+- Add `scripts/measure_umg_voseo_bank.py`, an offline measurement of the voseo rule over exported UMG requests, delivered and final lyrics.
+
 ## [1.1.176] - 2026-11-18
 
 ### Fixed
