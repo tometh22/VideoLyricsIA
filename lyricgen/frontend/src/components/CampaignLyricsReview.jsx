@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { planReviewedSegmentSplit } from "../lib/splitWords";
 import { useI18n } from "../i18n";
 
 const timestamp = (value) => `${Math.floor(value / 60)}:${(value % 60).toFixed(1).padStart(4, "0")}`;
@@ -6,14 +7,36 @@ const timestamp = (value) => `${Math.floor(value / 60)}:${(value % 60).toFixed(1
 /** One selected line owns the text, playback and timing actions. */
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable,
   onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onSplit,
-  onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
+  getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
   suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation }) {
   const { t } = useI18n();
   const [markedOnly, setMarkedOnly] = useState(false);
   const inputRef = useRef(null);
   const listRef = useRef(null);
+  const splitButtonRef = useRef(null);
+  const [selection, setSelection] = useState(null);
+  const [composing, setComposing] = useState(false);
   const focusAfterChange = useRef(false);
   const selected = segments.find((line) => line._id === focusedId) || segments[0];
+  const captureSelection = (input) => setSelection({
+    id: selected?._id, text: input.value,
+    start: input.selectionStart, end: input.selectionEnd,
+  });
+  const planAtSelection = (cursor) => {
+    if (!onSplit || composing || !selected || cursor?.id !== selected._id || cursor.text !== selected.text
+      || cursor.start == null || cursor.start !== cursor.end
+      || !cursor.text.slice(0, cursor.start).trim() || !cursor.text.slice(cursor.start).trim()) return null;
+    return getSplitPlan ? getSplitPlan(selected._id, cursor.start)
+      : planReviewedSegmentSplit(selected, { charOffset: cursor.start });
+  };
+  const splitPlan = planAtSelection(selection);
+  const splitHere = (cursor) => {
+    // Recompute from the current line: never apply an old preview after sync.
+    if (!planAtSelection(cursor)) return;
+    focusAfterChange.current = true;
+    onSplit(selected._id, cursor.start);
+    setSelection(null);
+  };
   const marked = (line) => line.review || markedIds.has(line._id);
   const visible = useMemo(() => segments.filter((line) => !markedOnly || line.review || markedIds.has(line._id)), [segments, markedOnly, markedIds]);
   useEffect(() => {
@@ -71,23 +94,58 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
           <span className="font-mono text-sm text-ink-secondary">{timestamp(selected.start)} → {timestamp(selected.end)}</span>
         </div>
         {selected.timing_validation?.status === "unvalidated" && <p className="mb-3 text-sm text-amber-200">
-          {t("review_workspace.timing_unvalidated") || "Timing no validado · revisá este tramo contra el audio. No se cambiaron sus tiempos."}
+          {selected.timing_validation.reason === "estimated_split"
+            ? (t("review_workspace.split_review") || "Corte estimado · escuchá y revisá los tiempos de esta frase.")
+            : (t("review_workspace.timing_unvalidated") || "Timing no validado · revisá este tramo contra el audio. No se cambiaron sus tiempos.")}
         </p>}
         {marked(selected) && <p className="mb-3 text-sm text-amber-200">{t("review_workspace.mark_hint") || "Escuchá esta parte y corregí lo que haga falta. La aprobación es por canción."}</p>}
         <label className="mb-2 block text-sm font-medium" htmlFor="selected-lyric-text">{t("review_workspace.text") || "Letra de esta línea"}</label>
-        <input id="selected-lyric-text" ref={inputRef} value={selected.text || ""} onChange={(event) => onTextChange(selected._id, event.target.value)}
-          onFocus={() => onTextFocus?.(selected)} onBlur={(event) => onTextBlur?.(selected._id, event.target.value)}
-          onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault();
-            const caret = event.currentTarget.selectionStart ?? event.currentTarget.value.length;
-            if (!event.currentTarget.value.slice(0, caret).trim() || !event.currentTarget.value.slice(caret).trim()) { event.currentTarget.blur(); return; }
-            focusAfterChange.current = true;
-            onSplit?.(selected._id, caret);
-          } else if (event.key === "Backspace" && !event.nativeEvent.isComposing
+        <input id="selected-lyric-text" ref={inputRef} value={selected.text || ""}
+          aria-describedby="line-split-guidance"
+          onChange={(event) => { captureSelection(event.currentTarget); onTextChange(selected._id, event.target.value); }}
+          onSelect={(event) => captureSelection(event.currentTarget)}
+          onCompositionStart={() => setComposing(true)}
+          onCompositionEnd={(event) => { setComposing(false); captureSelection(event.currentTarget); }}
+          onFocus={(event) => { captureSelection(event.currentTarget); onTextFocus?.(selected); }}
+          onBlur={(event) => { if (event.relatedTarget !== splitButtonRef.current) onTextBlur?.(selected._id, event.target.value); }}
+          onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing && !composing) {
+            event.preventDefault();
+            if (event.repeat) return;
+            splitHere({ id: selected._id, text: event.currentTarget.value,
+              start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd });
+          } else if (event.key === "Backspace" && !event.nativeEvent.isComposing && !composing
             && event.currentTarget.value === "" && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) {
             event.preventDefault(); focusAfterChange.current = true; onMergePrevious?.(selected._id);
           } }}
           className="min-h-12 w-full rounded-xl border border-white/15 bg-surface-1 px-3 py-3 text-base text-white focus:border-brand-light focus:outline-none" />
-        <p className="mt-2 text-xs text-ink-secondary">{t("review_workspace.autosave") || "Los cambios se guardan automáticamente. Enter divide la línea donde está el cursor."}</p>
+        <p className="mt-2 text-xs text-ink-secondary">{t("review_workspace.autosave") || "Los cambios se guardan automáticamente."}</p>
+        <div className="mt-3 rounded-xl border border-white/10 p-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <button type="button" ref={splitButtonRef} className={`${button} shrink-0 bg-brand/15 text-brand-light`}
+              disabled={!splitPlan} aria-describedby="line-split-guidance"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => splitHere(selection)}>
+              {t("review_workspace.split_here") || "Dividir aquí"}
+            </button>
+            <p id="line-split-guidance" className="min-w-0 flex-1 text-xs text-ink-secondary">
+              {t("review_workspace.split_guidance") || "Colocá el cursor donde querés cortar. Revisá las dos frases y pulsá Dividir aquí o Enter."}
+            </p>
+          </div>
+          <p role="status" aria-atomic="true" className={`mt-2 text-xs ${splitPlan?.timing === "char_ratio" ? "text-amber-200" : "text-ink-secondary"}`}>
+            {splitPlan ? (splitPlan.timing === "words"
+              ? (t("review_workspace.split_words") || "Usa los tiempos por palabra disponibles; conserva el inicio y el final de la línea.")
+              : (t("review_workspace.split_estimated") || "Timing estimado: escuchá el corte y ajustalo si hace falta. Ambas frases quedarán marcadas para revisar."))
+              : (t("review_workspace.split_invalid") || "Elegí un punto con texto a ambos lados, sin seleccionar un fragmento.")}
+          </p>
+          {splitPlan && <div role="group" aria-label={t("review_workspace.split_preview") || "Vista previa de la división"}
+            className="mt-3 grid min-w-0 gap-2 sm:grid-cols-2">
+            {[splitPlan.a, splitPlan.b].map((part, index) => <div key={index} className="min-w-0 rounded-lg bg-surface-1 p-3">
+              <p className="text-xs font-medium text-ink-secondary">{(t("review_workspace.split_part") || "Frase {n}").replace("{n}", index + 1)}</p>
+              <p className="mt-1 break-words text-sm">{part.text}</p>
+              <p className="mt-2 font-mono text-xs text-ink-secondary">{timestamp(part.start)} → {timestamp(part.end)}</p>
+            </div>)}
+          </div>}
+        </div>
         {suggestionsById[selected._id] && suggestionsById[selected._id] !== selected.text && <button
           type="button" className={`${button} mt-3`} onClick={() => onApplySuggestion?.(selected._id)}>
           {t("review_workspace.apply_suggestion") || "Aplicar sugerencia"}: {suggestionsById[selected._id]}

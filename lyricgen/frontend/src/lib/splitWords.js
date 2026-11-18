@@ -312,6 +312,14 @@ export function planSegmentSplit(seg, { charOffset = null, splitTokenIndex = nul
   };
 }
 
+/** Reviewed cuts never label clocks from an earlier text as word timing.
+ * Share this planner between the selected-line preview and the committed split.
+ * Valid recognizer evidence can recover missing clocks; otherwise estimate.
+ */
+export function planReviewedSegmentSplit(segment, options = {}) {
+  return planSegmentSplit({ ...segment, words: lineWords(segment) }, options);
+}
+
 // ─── Word clocks that survive split / merge ─────────────────────────────────
 //
 // Demos 28-oct-2026: 28 of 94 approved lines ended with `words: []`. Rows that
