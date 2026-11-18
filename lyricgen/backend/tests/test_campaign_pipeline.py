@@ -413,7 +413,8 @@ def test_detail_pipeline_never_loads_lyrics_or_quality_blobs(db, setup, monkeypa
             row = fresh.query(BatchCampaign).filter_by(id=campaign_id).one()
             # Compare the loaded projection's fingerprint to the full job to
             # ensure a changed render still gets marked for resending.
-            loaded = pipeline._load_lineage(fresh, [row], full=True)[campaign_id][0]
+            loaded = pipeline._load_lineage(fresh, [row], full=True,
+                                             columns=pipeline._DETAIL_JOB_COLUMNS)[campaign_id][0]
             assert render_fingerprint(loaded) == render_fingerprint(job)
             monkeypatch.setattr(pipeline, "_publications", lambda ids, tenant: ({job_id: {
                 "umg_portals": ["argentina"], "published_fingerprints": ["older-render"],

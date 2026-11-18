@@ -104,7 +104,7 @@ def _load_items(db: Session, campaign_ids: list[str]) -> dict[str, list[BatchCam
     return items
 
 
-def _load_lineage(db: Session, campaigns: list[BatchCampaign], *, full: bool) -> dict[str, list[Job]]:
+def _load_lineage(db: Session, campaigns: list[BatchCampaign], *, full: bool, columns=None) -> dict[str, list[Job]]:
     """Principal jobs plus every same-tenant descendant (variants), per campaign.
 
     One recursive query for all campaigns. Pilot test copies (``pilot_id``)
@@ -129,7 +129,12 @@ def _load_lineage(db: Session, campaigns: list[BatchCampaign], *, full: bool) ->
     if not wanted:
         return result
     query = db.query(Job).filter(Job.job_id.in_(list(wanted)), Job.pilot_id.is_(None))
-    query = query.options(load_only(*(_DETAIL_JOB_COLUMNS if full else _JOB_COLUMNS), raiseload=True))
+    # Other workflows (notably change-request closure) use full=True to
+    # inspect editor/render evidence. Only the pipeline opts into its compact
+    # projection; keep the full-row contract for those callers.
+    selected_columns = columns if full else _JOB_COLUMNS
+    if selected_columns is not None:
+        query = query.options(load_only(*selected_columns, raiseload=True))
     for job in query.all():
         campaign_id = wanted.get(job.job_id)
         if campaign_id and job.tenant_id == tenant_of[campaign_id]:
@@ -365,7 +370,8 @@ def _snapshot(
 
 def build_pipeline(db: Session, campaign: BatchCampaign, *, include_items: bool = True) -> dict[str, Any]:
     items = _load_items(db, [campaign.id])[campaign.id]
-    jobs = _load_lineage(db, [campaign], full=include_items)[campaign.id]
+    jobs = _load_lineage(db, [campaign], full=include_items,
+                         columns=_DETAIL_JOB_COLUMNS if include_items else None)[campaign.id]
     publications, portal_available = _publications([job.job_id for job in jobs], campaign.tenant_id)
     approver_ids = {int(job.approved_by) for job in jobs if job.approved_by is not None} if include_items else set()
     approvers = {
