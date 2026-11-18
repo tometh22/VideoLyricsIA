@@ -469,10 +469,11 @@ def extract_points(comment: str) -> list[dict]:
         if pair:
             current = _unquote(pair.group("a") or pair.group("c"))
             expected = _unquote(pair.group("b") or pair.group("d"))
-            scope = "all" if _ALL.search(body) or not times else "near"
+            repeat = bool(_ALL.search(body))
+            scope = "all" if repeat or not times else "near"
             for at in times or [None]:
                 points.append(_point(index, "text", chunk, [at] if at is not None else [], expected=expected,
-                                     current=current, scope=scope))
+                                     current=current, scope=scope, all_repetitions=repeat or not times))
             continue
 
         quoted, current = [], None
@@ -679,6 +680,13 @@ def _check_text(point: dict, after: list[dict], before: list[dict] | None = None
         used.add(near[0][0])
     if near:
         line = _brief(after, near[0])
+        if current and not _contains(current, wanted) and (point.get("all_repetitions") or point.get("scope") == "all"):
+            # 'cambiar "X" por "Y" en todas las apariciones' (o sin tiempo):
+            # ninguna aparición de X puede quedar, no sólo la primera.
+            remaining, _ = _find(after, current, None, strict=True)
+            if remaining:
+                return {"status": FAIL, "reason": "repetitions_not_fixed", "line": line,
+                        "repetitions_pending": [_brief(after, lines) for lines in remaining[:5]]}
         if current and not _contains(current, wanted):
             # Lo que había que sacar no puede seguir en la línea corregida.
             matched = tokens(" ".join(after[i]["text"] for i in near[0]))
@@ -742,6 +750,19 @@ def _locate_for_timing(segments: list[dict], point: dict) -> list[int]:
 
 
 def _check_timing(point: dict, after: list[dict], before: list[dict] | None) -> dict:
+    if point.get("direction") == "interval" and tokens(point.get("expected") or ""):
+        # "Desde 0:10 hasta 0:13: Quiero soñar contigo": la letra citada es
+        # parte del pedido. Si en ese tramo sigue la letra vieja, que los
+        # tiempos coincidan no alcanza (antes caía en la línea de ese momento
+        # y daba OK con el texto sin corregir).
+        times = [t for t in point.get("times") or [] if t is not None]
+        window = times + ([point["requested_end"]] if point.get("requested_end") is not None else [])
+        near, far = _find(after, tokens(point["expected"]), window or None)
+        if not near:
+            at = _lines_at(after, times[0]) if times else []
+            return {"status": FAIL, "reason": "found_only_elsewhere" if far else "expected_text_missing",
+                    "line": _brief(after, at) if at else None,
+                    **({"elsewhere": _brief(after, far[0])} if far else {})}
     lines = _locate_for_timing(after, point)
     if not lines:
         return {"status": FAIL, "reason": "timing_line_not_found"}

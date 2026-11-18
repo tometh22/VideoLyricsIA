@@ -221,3 +221,28 @@ def test_the_kill_switch(monkeypatch):
     assert v.enabled() is True
     monkeypatch.setenv("CHANGE_REQUEST_CLOSE_VERIFICATION", "0")
     assert v.enabled() is False
+
+
+def test_interval_with_lyric_fails_when_the_text_was_not_corrected():
+    """Revisión #1620 (P1): un tramo que coincide no tapa una letra sin corregir."""
+    before = [seg(10.0, 13.0, "Quiero vivir contigo")]
+    result = v.verify("Desde 0:10 hasta 0:13: Quiero soñar contigo", before, before_segments=before)
+    assert statuses(result) == [("timing", "fail")]
+    assert result["points"][0]["reason"] == "expected_text_missing"
+    fixed = [seg(10.0, 13.0, "Quiero soñar contigo")]
+    assert statuses(v.verify("Desde 0:10 hasta 0:13: Quiero soñar contigo", fixed, before_segments=before)) == [("timing", "ok")]
+
+
+def test_global_replacement_requires_every_occurrence():
+    """Revisión #1620 (P2): 'en todas las apariciones' no se cumple con una sola."""
+    before = [seg(10.0, 13.0, "Quiero vivir contigo"), seg(30.0, 33.0, "Quiero vivir contigo")]
+    half = [seg(10.0, 13.0, "Quiero soñar contigo"), seg(30.0, 33.0, "Quiero vivir contigo")]
+    comment = '0:10 cambiar "Quiero vivir contigo" por "Quiero soñar contigo" en todas las apariciones'
+    result = v.verify(comment, half, before_segments=before)
+    assert statuses(result) == [("text", "fail")]
+    assert result["points"][0]["reason"] == "repetitions_not_fixed"
+    untimed = 'cambiar "Quiero vivir contigo" por "Quiero soñar contigo"'
+    assert statuses(v.verify(untimed, half, before_segments=before)) == [("text", "fail")]
+    full = [seg(10.0, 13.0, "Quiero soñar contigo"), seg(30.0, 33.0, "Quiero soñar contigo")]
+    assert statuses(v.verify(comment, full, before_segments=before)) == [("text", "ok")]
+    assert statuses(v.verify(untimed, full, before_segments=before)) == [("text", "ok")]
