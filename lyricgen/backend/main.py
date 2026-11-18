@@ -24471,3 +24471,12 @@ async def admin_reopen_change_request(
     ))
     db.commit()
     return {"ok": True, "updated_at": cr.updated_at.isoformat()}
+
+
+# Local inference remains outside the API/quality-worker. These staging-only
+# routes expose source-bound requests and human-reviewed model candidates.
+from genly_model_candidate_api import register_routes as register_genly_model_routes
+register_genly_model_routes(
+    app, get_current_user=get_current_user, get_db=get_db,
+    authorize_editor=_editor_document_or_404,
+)

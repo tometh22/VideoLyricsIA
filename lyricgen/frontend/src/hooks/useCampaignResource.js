@@ -14,7 +14,7 @@ const EMPTY = Object.freeze({ data: undefined, error: null, at: 0, inflight: fal
 function entryFor(key) {
   let entry = entries.get(key);
   if (!entry) {
-    entry = { snapshot: EMPTY, listeners: new Set(), seq: 0, controller: null, fetcher: null };
+    entry = { snapshot: EMPTY, listeners: new Set(), seq: 0, controller: null, fetcher: null, pending: null, invalidated: false };
     entries.set(key, entry);
   }
   return entry;
@@ -25,30 +25,45 @@ function publish(entry, patch) {
   entry.listeners.forEach((listener) => listener());
 }
 
-function revalidate(key) {
+function revalidate(key, { invalidate = false } = {}) {
   const entry = entries.get(key);
   if (!entry?.fetcher) return Promise.resolve(undefined);
-  entry.controller?.abort();
+  if (entry.pending) {
+    // Mutations need a snapshot requested AFTER they settled. Collapse any
+    // number of invalidations into one trailing read; ordinary refreshes
+    // share the current read instead of aborting expensive server work.
+    if (invalidate) entry.invalidated = true;
+    return entry.pending;
+  }
   const controller = new AbortController();
   const seq = ++entry.seq;
   entry.controller = controller;
   publish(entry, { inflight: true });
-  return Promise.resolve()
+  entry.pending = Promise.resolve()
     .then(() => entry.fetcher({ signal: controller.signal }))
     .then((data) => {
-      if (entry.seq !== seq) return entry.snapshot.data;
+      if (entry.seq !== seq || entry.invalidated) return entry.snapshot.data;
       entry.controller = null;
       publish(entry, { data, error: null, at: Date.now(), inflight: false });
       return data;
     }, (error) => {
-      if (entry.seq !== seq || error?.name === "AbortError") return entry.snapshot.data;
+      if (entry.seq !== seq || entry.invalidated || error?.name === "AbortError") return entry.snapshot.data;
       entry.controller = null;
       // Lost access (logout, another account, removed scope): never keep
       // showing data the current user may not be allowed to see.
       const denied = [401, 403, 404].includes(error?.status);
       publish(entry, { error, inflight: false, at: Date.now(), ...(denied ? { data: undefined } : {}) });
       return entry.snapshot.data;
+    }).then(async (data) => {
+      if (entry.seq !== seq) return entry.snapshot.data;
+      entry.pending = null;
+      if (entry.invalidated) {
+        entry.invalidated = false;
+        return revalidate(key);
+      }
+      return data;
     });
+  return entry.pending;
 }
 
 /** Refresh every mounted resource whose key starts with `prefix`. */
@@ -56,7 +71,7 @@ export function invalidateCampaignResources(prefix) {
   const pending = [];
   for (const [key, entry] of entries) {
     if (!key.startsWith(prefix)) continue;
-    if (entry.listeners.size) pending.push(revalidate(key));
+    if (entry.listeners.size) pending.push(revalidate(key, { invalidate: true }));
     else entry.snapshot = { ...entry.snapshot, at: 0 };
   }
   return Promise.all(pending);
@@ -70,7 +85,11 @@ export function mutateCampaignResource(key, updater) {
 }
 
 export function clearCampaignResourceCache() {
-  for (const entry of entries.values()) entry.controller?.abort();
+  for (const entry of entries.values()) {
+    entry.controller?.abort();
+    entry.seq += 1;
+    entry.invalidated = false;
+  }
   entries.clear();
 }
 
@@ -88,6 +107,8 @@ export default function useCampaignResource(key, fetcher, { enabled = true, stal
       if (!entry.listeners.size && entry.controller) {
         entry.controller.abort();
         entry.controller = null;
+        entry.pending = null;
+        entry.invalidated = false;
         entry.seq += 1;
         entry.snapshot = { ...entry.snapshot, inflight: false };
       }
@@ -104,7 +125,7 @@ export default function useCampaignResource(key, fetcher, { enabled = true, stal
       void revalidate(activeKey);
     }
     const refresh = () => {
-      if (document.visibilityState === "visible" && !entry.snapshot.inflight) void revalidate(activeKey);
+      if (document.visibilityState === "visible" && !entry.snapshot.inflight && Date.now() - entry.snapshot.at >= staleMs) void revalidate(activeKey);
     };
     window.addEventListener("pageshow", refresh);
     document.addEventListener("visibilitychange", refresh);

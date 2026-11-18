@@ -125,7 +125,7 @@ export default function CampaignDetailPage({ id }) {
   const base = `/batch/campaigns/${encodeURIComponent(id)}`;
   const prefix = `campaign:${id}:`;
 
-  const head = useCampaignResource(`${prefix}head`, ({ signal }) => campaignRequest(base, { signal }));
+  const head = useCampaignResource(`${prefix}head`, ({ signal }) => campaignRequest(base, { signal }), { staleMs: 60000, pollMs: 60000 });
   const pipe = useCampaignResource(`${prefix}pipeline`, ({ signal }) => campaignRequest(`${base}/pipeline`, { signal }));
   const campaign = head.data;
   const kind = campaign?.kind || pipe.data?.kind || "lyric_video";
@@ -145,9 +145,13 @@ export default function CampaignDetailPage({ id }) {
   const [styleBusy, setStyleBusy] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
   const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
-  const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
-  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) || Boolean(promptTargets) });
-  const report = useCampaignResource(`${prefix}report`, ({ signal }) => campaignRequest(`${base}/creative/report`, { signal }), { enabled: needs(["all", "qc", "approved", "delivered"], ["contract"]) });
+  const drawerItem = pipe.data?.items?.find(item => item.item_id === params.get("song"));
+  const drawerNeedsLyrics = drawerItem && ["lyrics", "discarded", "attention"].includes(drawerItem.stage);
+  const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["lyrics", "discarded"], ["activity"]) || Boolean(drawerNeedsLyrics) || Boolean(params.get("discard")), staleMs: 30000, pollMs: 60000 });
+  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["ready"], ["style", "contract"]) || Boolean(styleTargets) || Boolean(promptTargets), staleMs: 60000, pollMs: 0 });
+  const fullReport = needs([], ["contract"]);
+  const reportJob = drawerItem?.has_video ? drawerItem.current_job_id : null;
+  const report = useCampaignResource(`${prefix}report:${fullReport ? "full" : reportJob}`, ({ signal }) => campaignRequest(`${base}/creative/report${fullReport ? "?history_limit=50" : `?job_id=${encodeURIComponent(reportJob)}&history_limit=0`}`, { signal }), { enabled: fullReport || Boolean(reportJob), staleMs: 30000, pollMs: 0 });
 
   const canManage = Boolean(pipe.data?.can_manage);
   // Art-track campaigns delivered as files have no portal to send to.
@@ -248,6 +252,24 @@ export default function CampaignDetailPage({ id }) {
   }, [navigate, returnPath]);
 
   const videosFor = (list) => list.map((song) => ({ item_id: song.id, job_id: song.current_job_id, title: song.title, artist: song.artist }));
+  const prepareGeneration = useCallback(async (list) => {
+    setBusyIds(new Set(list.map(song => song.id)));
+    try {
+      // The overview intentionally has no creative payload. Read the current
+      // settings when the operator asks to generate, then recheck eligibility.
+      const fresh = await campaignRequest(`${base}/creative`);
+      const targets = new Set(list.map(song => song.id));
+      const eligible = fresh.items.filter(item => targets.has(item.id) && canGenerate({
+        stage: "ready", creative: { ...item, requires_background_assignment: fresh.requires_background_assignment },
+      }));
+      if (!eligible.length) throw new Error("Estas canciones ya no están listas para generar o les falta asignar un fondo.");
+      setDialog({ type: "generate", items: eligible });
+    } catch (error) {
+      setFlash({ tone: "warning", text: error.message });
+    } finally {
+      setBusyIds(new Set());
+    }
+  }, [base]);
   const runRetry = async (list) => {
     setBusyIds(new Set(list.map((song) => song.id)));
     const failed = [];
@@ -269,9 +291,7 @@ export default function CampaignDetailPage({ id }) {
         break;
       }
       case "generate":
-        if (!song.creative) { setFlash({ tone: "warning", text: "Cargando el estilo de la canción; probá de nuevo en un instante." }); break; }
-        if (!canGenerate(song)) { setFlash({ tone: "warning", text: "Esta canción ya no está lista para generar." }); break; }
-        setDialog({ type: "generate", items: [song.creative] });
+        void prepareGeneration([song]);
         break;
       case "send": setDialog({ type: "send", songs: [song] }); break;
       case "record-delivery": setDialog({ type: "record", song }); break;
@@ -282,7 +302,7 @@ export default function CampaignDetailPage({ id }) {
       case "detail": updateParams({ song: song.id }, { push: true }); break;
       default: break;
     }
-  }, [openEditLyrics, openReview, updateParams, visible]);
+  }, [openEditLyrics, openReview, prepareGeneration, updateParams, visible]);
 
   const next = campaignNextStep(counts, kind, { portalSends });
   const runNextStep = useCallback(() => {
@@ -299,8 +319,8 @@ export default function CampaignDetailPage({ id }) {
       return;
     }
     if (next.stage === "ready") {
-      const items = songs.filter(canGenerate).map((song) => song.creative);
-      if (items.length) setDialog({ type: "generate", items }); else setView("ready");
+      const candidates = songs.filter(song => song.stage === "ready");
+      if (candidates.length) void prepareGeneration(candidates); else setView("ready");
       return;
     }
     if (next.stage === "approved" && canManage && portalSends) {
@@ -309,7 +329,7 @@ export default function CampaignDetailPage({ id }) {
       return;
     }
     setView(next.stage);
-  }, [canManage, lyricSongs, next, openReview, setView, songs, view, visible]);
+  }, [canManage, lyricSongs, next, openReview, prepareGeneration, setView, songs, view, visible]);
 
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
@@ -350,7 +370,7 @@ export default function CampaignDetailPage({ id }) {
   const selectedVisible = visible.filter((song) => selected.has(song.id));
   const hiddenSelected = selected.size - selectedVisible.length;
   const onBulk = (action, list) => {
-    if (action === "generate") setDialog({ type: "generate", items: list.map((song) => song.creative) });
+    if (action === "generate") void prepareGeneration(list);
     else if (action === "approve") setDialog({ type: "approve", songs: list });
     else if (action === "send") setDialog({ type: "send", songs: list });
     else if (action === "discard" || action === "restore") setDialog({ type: "discard", songs: list, mode: action });
@@ -470,7 +490,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} canEditPrompts={Boolean(creative.data?.features?.bulk_prompts)} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} canEditPrompts={Boolean(pipe.data?.features?.bulk_prompts || creative.data?.features?.bulk_prompts)} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}
