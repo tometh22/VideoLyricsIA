@@ -2233,9 +2233,8 @@ def approve_document(
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
 
-    ``review_scope`` decides which Revisión rápida points block: ``full``
-    (editor and campaign approval), ``missing_only`` (change-request renders:
-    only sung words that were lost) or ``none``.
+    ``review_scope`` is retained for caller compatibility. Lyric suggestions
+    are advisory; snapshot identity and structural validation still apply.
     """
     if getattr(job, "pilot_id", None):
         raise ValueError("pilot_copy_cannot_be_approved")

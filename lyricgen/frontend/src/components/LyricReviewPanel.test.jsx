@@ -20,11 +20,12 @@ const review = (items, extra = {}) => ({
   mode: "enforce", items, sources: { witness: true, gemini: true, official: false }, risk: { level: "normal", reasons: [] }, ...extra,
 });
 
-function renderPanel(items, extra = {}, props = {}) {
+function renderPanel(items, extra = {}, props = {}, expand = true) {
   const all = { review: review(items, extra), items, failedIds: new Set(), playingId: null,
     onPlay: vi.fn(), onApply: vi.fn(), onDismiss: vi.fn(), onEdit: vi.fn(), onUndo: vi.fn(),
     onActivate: vi.fn(), onOpenOfficial: vi.fn(), ...props };
   render(<LyricReviewPanel {...all} />);
+  if (expand && items.length) fireEvent.click(screen.getByRole("button", { name: /^Ver \d+ sugerencia/ }));
   return all;
 }
 
@@ -37,13 +38,21 @@ describe("LyricReviewPanel", () => {
     expect(screen.getByText(/Recuperá una versión anterior/)).toBeInTheDocument();
   });
 
-  it("shows one active card with the change, and hides suggestions until asked", () => {
-    renderPanel([missing, suggestion]);
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Faltan 1 para aprobar");
+  it("keeps all suggestions optional and collapsed, including legacy required items", () => {
+    const props = renderPanel([missing, suggestion], {}, {}, false);
+    expect(screen.getByTestId("lyric-review-heading")).toHaveTextContent("2 sugerencias opcionales");
+    expect(screen.getByText(/Podés aprobar con tu letra actual/)).toBeInTheDocument();
+    expect(screen.queryByTestId("lyric-review-active")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("lyric-review-panel"), { key: "Enter" });
+    expect(props.onApply).not.toHaveBeenCalled();
+    const toggle = screen.getByRole("button", { name: "Ver 2 sugerencias" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("dormite ya").tagName).toBe("INS");
-    expect(screen.queryByText(/Vos sos/)).toBeNull();
-    fireEvent.click(screen.getByText("Ver 1 sugerencia (no bloquean)"));
-    expect(screen.getByText("Vos sos lo más")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Conservar mi letra/ })).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.queryByTestId("lyric-review-active")).toBeNull();
   });
 
   it("decides from the keyboard without leaking keys to the editor", () => {
@@ -79,9 +88,7 @@ describe("LyricReviewPanel", () => {
 
   it("picks another option with its number", () => {
     const props = renderPanel([suggestion]);
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Sin observaciones pendientes");
-    expect(screen.queryByTestId("lyric-review-active")).toBeNull();
-    fireEvent.click(screen.getByText("Ver 1 sugerencia (opcional)"));
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("1 sugerencia opcional");
     fireEvent.keyDown(screen.getByTestId("lyric-review-panel"), { key: "1" });
     expect(props.onApply).toHaveBeenCalledWith(suggestion, suggestion.alternatives[0]);
   });
@@ -100,7 +107,6 @@ describe("LyricReviewPanel", () => {
         "Lo más cierto es que no pido", { type: "replace", find: "pito", replace: "pido" })] };
     const props = renderPanel([missing, listen]);
     const panel = screen.getByTestId("lyric-review-panel");
-    fireEvent.click(screen.getByText("Ver 1 sugerencia (no bloquean)"));
     fireEvent.click(screen.getByText("Lo más cierto es que no pito"));
     expect(screen.getByTestId("lyric-review-active").textContent).not.toMatch(/pido\s*$/);
     expect(screen.queryByText("pido")).toBeNull();
@@ -121,13 +127,13 @@ describe("LyricReviewPanel", () => {
 
   it("shows the all-set state, the difficult-song warning and survives partial data", () => {
     renderPanel([], { risk: { level: "high" } });
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Sin observaciones pendientes");
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Sin sugerencias pendientes");
     expect(screen.queryByTestId("lyric-review-risk")).toBeNull();
   });
 
   it("does not claim approval is blocked in observe mode", () => {
     renderPanel([missing], { mode: "observe" });
-    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("1 para revisar");
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("1 sugerencia opcional");
   });
 
   it("opens the shared official-lyrics dialog and keeps the guide behind help", () => {

@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from lyric_review import LyricReviewPending, build_review
-from lyric_review_sources import mine_correction_pairs, require_resolved
+from lyric_review import build_review, mode
+from lyric_review_sources import effective_mode, mine_correction_pairs, require_resolved, review_for_document
 
 
 def _line(text, start, end, segment_id=None, words=None, **extra):
@@ -220,27 +220,32 @@ def _gate_fixture(workload_class="batch", tenant="umg"):
     return SimpleNamespace(query=lambda *a, **k: _Query()), document, job
 
 
-def test_approval_gate_blocks_umg_campaigns(monkeypatch):
-    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
-    monkeypatch.delenv("LYRIC_REVIEW_ENFORCE_TENANTS", raising=False)
-    db, document, job = _gate_fixture()
-    with pytest.raises(LyricReviewPending) as exc:
-        require_resolved(db, document, job)
-    assert exc.value.review["required_count"] == 1
-    # Un re-render por pedido de cambio sólo frena por letra perdida.
-    require_resolved(db, document, job, scope="missing_only")
-    monkeypatch.setenv("LYRIC_REVIEW_MODE", "observe")
-    require_resolved(db, document, job)
-
-
-def test_approval_gate_scope_by_tenant(monkeypatch):
-    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
-    db, document, job = _gate_fixture(workload_class="single", tenant="b2c")
-    monkeypatch.delenv("LYRIC_REVIEW_ENFORCE_TENANTS", raising=False)
-    require_resolved(db, document, job)  # fuera de campañas: sólo se muestra
+@pytest.mark.parametrize("configured_mode", [None, "enforce", "observe", "invalid"])
+@pytest.mark.parametrize("workload,tenant", [("batch", "umg"), ("single", "b2c")])
+def test_editorial_suggestions_never_gate_approval(monkeypatch, configured_mode, workload, tenant):
+    if configured_mode is None:
+        monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
+    else:
+        monkeypatch.setenv("LYRIC_REVIEW_MODE", configured_mode)
     monkeypatch.setenv("LYRIC_REVIEW_ENFORCE_TENANTS", "b2c,umg")
-    with pytest.raises(LyricReviewPending):
-        require_resolved(db, document, job)
+    db, document, job = _gate_fixture(workload_class=workload, tenant=tenant)
+    assert mode() == effective_mode(job) == "observe"
+    # Suggestions remain available, including their legacy priority metadata.
+    review = review_for_document(db, document, job)
+    assert review["mode"] == "observe"
+    assert review["required_count"] == 1
+    before = [dict(line) for line in document.current_segments]
+    for scope in ("full", "missing_only", "none"):
+        require_resolved(db, document, job, scope=scope)
+    assert document.current_segments == before
+
+
+def test_review_can_still_be_disabled(monkeypatch):
+    monkeypatch.setenv("LYRIC_REVIEW_MODE", "off")
+    db, document, job = _gate_fixture()
+    assert mode() == effective_mode(job) == "off"
+    assert review_for_document(db, document, job)["items"] == []
+    require_resolved(db, document, job)
 
 
 def test_chorus_fixed_in_one_repetition_suggests_the_others():

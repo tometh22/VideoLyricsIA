@@ -97,10 +97,9 @@ def _external_lyrics_allowed(job) -> bool:
     la transcripción del lote sigue siendo sólo audio
     (``reference_hypothesis.audio_only_batch_mode`` no cambia). Los mismos
     resguardos de siempre: similitud mínima o ventana del fragmento, letra
-    corrupta descartada, lo que trae sólo la letra oficial es sugerencia (no
-    bloquea; si coincide con el testigo es obligatorio y, con
-    ``LYRIC_REVIEW_MODE=enforce``, frena la aprobación) y la búsqueda en
-    lrclib es gratuita, en segundo plano y se apaga con
+    corrupta descartada; las coincidencias entre fuentes ordenan las
+    sugerencias sin bloquear la aprobación. La búsqueda en lrclib es
+    gratuita, en segundo plano y se apaga con
     ``LYRIC_REVIEW_FETCH_OFFICIAL=0``.
     """
     if str(getattr(job, "workload_class", "") or "").lower() != "batch":
@@ -298,17 +297,12 @@ def memory_pairs(db, job) -> dict[str, str]:
 
 
 def effective_mode(job) -> str:
-    """``enforce`` sólo donde corresponde. Con ``LYRIC_REVIEW_ENFORCE_TENANTS``
-    (lista separada por comas) se bloquea en esos tenants; sin esa variable,
-    en las campañas batch (UMG). En el resto el panel se muestra sin
-    bloquear."""
-    base = mode()
-    if base != "enforce" or job is None:
-        return base
-    tenants = {t.strip() for t in os.environ.get("LYRIC_REVIEW_ENFORCE_TENANTS", "").split(",") if t.strip()}
-    if tenants:
-        return "enforce" if str(getattr(job, "tenant_id", "")) in tenants else "observe"
-    return "enforce" if str(getattr(job, "workload_class", "") or "").lower() == "batch" else "observe"
+    """Misma política orientativa para campañas y trabajos individuales.
+
+    LYRIC_REVIEW_ENFORCE_TENANTS queda obsoleta: el tenant no cambia el
+    derecho del revisor a conservar su letra.
+    """
+    return mode()
 
 
 def _content_key(document, job, official: str, pairs: dict) -> str:
@@ -379,7 +373,9 @@ def review_for_document(db, document, job=None) -> dict:
 
 
 def pending_for(db, document, job=None, *, scope: str = "full") -> LyricReviewPending | None:
-    """El error a levantar si la aprobación debe esperar; ``None`` si no."""
+    """Compatibilidad con los callers de aprobación: en modo orientativo
+    devuelve ``None`` sin calcular propuestas ni modificar la letra.
+    """
     if scope == "none" or effective_mode(job) != "enforce":
         return None
     review = review_for_document(db, document, job)

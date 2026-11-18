@@ -3073,7 +3073,7 @@ export default function LyricsEditor({
   // se ocultan al instante los puntos que el revisor ya resolvió hasta que el
   // servidor confirme la letra nueva.
   const lyricReview = durableEditor.document?.lyric_review || null;
-  const lyricReviewMode = lyricReview?.mode || "enforce";
+  const lyricReviewMode = lyricReview?.mode || "observe";
   const [reviewResolvedIds, setReviewResolvedIds] = useState(() => new Set());
   const [reviewFailedIds, setReviewFailedIds] = useState(() => new Set());
   const [reviewDecisions, setReviewDecisions] = useState([]);
@@ -3106,27 +3106,6 @@ export default function LyricsEditor({
     lyricReviewMode === "off" ? []
       : validItems(lyricReview?.items).filter((item) => !reviewResolvedIds.has(item.id))
   ), [lyricReview, lyricReviewMode, reviewResolvedIds]);
-  const pendingRequiredReview = pendingReviewItems.filter((item) => item.required).length;
-  const reviewBlocksApproval = lyricReviewMode === "enforce" && pendingRequiredReview > 0;
-  const focusLyricReview = useCallback((scroll = true) => {
-    const panel = reviewPanelRef.current;
-    if (!panel) return;
-    // Validation owns the next focus target. Approval may still have the
-    // editor inert here; focus this panel after unlocking, not the submitter.
-    if (approveInFlightRef.current) approvalReturnFocusRef.current = panel;
-    if (scroll) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    panel.focus({ preventScroll: true });
-  }, []);
-  // Con puntos obligatorios, el panel toma el teclado al abrir la canción
-  // (sin mover la página ni robar el foco de un campo en el que se escribe).
-  const reviewAutoFocused = useRef(false);
-  useEffect(() => {
-    if (reviewAutoFocused.current || !reviewBlocksApproval) return;
-    const tag = (document.activeElement?.tagName || "").toUpperCase();
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
-    reviewAutoFocused.current = true;
-    window.requestAnimationFrame(() => focusLyricReview(false));
-  }, [focusLyricReview, reviewBlocksApproval]);
   const lineIdForReviewItem = useCallback((item, segments = editedRef.current) => {
     const occurrence = item?.occurrences?.[0];
     if (!occurrence) return null;
@@ -3183,7 +3162,7 @@ export default function LyricsEditor({
   }, [recordReviewDecision, trackEditorEvent]);
   const dismissLyricReview = useCallback((item) => {
     recordReviewDecision(item, "dismiss", dismissReviewItem(editedRef.current, item));
-    setReviewStatus(`${item.dismiss || "Está bien así"} · Z para deshacer`);
+    setReviewStatus("Letra conservada · Z para deshacer");
   }, [recordReviewDecision]);
   const undoLyricReview = useCallback(() => {
     const last = reviewDecisions[reviewDecisions.length - 1];
@@ -4481,11 +4460,6 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
-    if (reviewBlocksApproval) {
-      focusLyricReview();
-      setReviewStatus(`Para aprobar, resolvé ${pendingRequiredReview === 1 ? "este punto" : `estos ${pendingRequiredReview} puntos`}.`);
-      return;
-    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -4627,15 +4601,6 @@ export default function LyricsEditor({
         return;
       }
       if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
-      // El guardado recién hecho es la verdad: si la letra que se va a
-      // aprobar todavía tiene puntos obligatorios, se deciden antes.
-      if (saveResult?.lyricReview?.mode === "enforce"
-        && validItems(saveResult.lyricReview.items).some((item) => item.required)) {
-        setReviewResolvedIds(new Set());
-        focusLyricReview();
-        setReviewStatus("Para aprobar, resolvé los puntos de la revisión rápida.");
-        return;
-      }
       // Derive both payload and attestation identities from the successful
       // write, including equivalent identity/renderer metadata replacements.
       // Non-campaign reviews retain only the originally reviewed occurrences.
@@ -5293,20 +5258,13 @@ export default function LyricsEditor({
             data-quality-review-required={campaignQualityReview ? "true" : "false"}
             data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
-            data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
-            title={!hasLyrics ? "Agregá o recuperá la letra antes de aprobar" : reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
-            className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
-              ? "bg-surface-2 text-white ring-1 ring-white/15 hover:bg-surface-3"
-              : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
+            data-lyric-review-blocked="false"
+            title={!hasLyrics ? "Agregá o recuperá la letra antes de aprobar" : undefined}
+            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {reviewBlocksApproval && !isApproving && (
-              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-300/15 px-1.5 text-[11px] font-bold tabular-nums text-amber-200">{pendingRequiredReview}</span>
-            )}
             {isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
-              : reviewBlocksApproval
-                ? "Faltan para aprobar · Revisar"
-                : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>

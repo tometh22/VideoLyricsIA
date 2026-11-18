@@ -40,16 +40,17 @@ revisor.
 
 ## Cómo se usa en el editor
 
-1. Abrí la canción: arriba de la letra está **Revisión rápida**, con una
-   tarjeta a la vez. La línea de la letra correspondiente queda marcada.
+1. Abrí **Sugerencias de letra** con **Ver sugerencias** si querés consultar
+   las propuestas. Son opcionales y pueden equivocarse, aunque coincidan
+   varias fuentes. La línea de la tarjeta activa queda marcada.
 2. Cada tarjeta muestra la línea como va a quedar: en verde lo que entra,
    tachado lo que sale (en un cambio de signos, sólo el signo).
-3. Teclado (el panel toma el teclado al abrir la canción):
+3. Teclado (sólo cuando abrís el panel y le das foco):
 
    | Tecla | Qué hace |
    |---|---|
    | **Enter** | aplica el arreglo y pasa al siguiente |
-   | **⌫** | "está bien así" / "no se canta" |
+   | **⌫** | "conservar mi letra" |
    | **1–3** | elige otra opción cuando los oídos no coinciden |
    | **E** | escucha el tramo (con "Reproducir al avanzar" suena solo al pasar de punto) |
    | **J / K** | siguiente / anterior |
@@ -57,8 +58,9 @@ revisor.
    | **Z** | deshace la última decisión |
    | **?** | muestra los atajos, las fuentes comparadas y esta guía |
 
-4. "Aprobar" dice **Faltan N · Revisar** mientras quede algo obligatorio;
-   al tocarlo te lleva al panel. Las sugerencias no bloquean.
+4. **Aprobar** conserva la letra actual aunque queden sugerencias sin revisar.
+   **Conservar mi letra** descarta una sugerencia y guarda esa decisión;
+   **Aplicar sugerencia** cambia el texto y permite deshacer.
 5. Si tenés la letra oficial (Google, planilla de UMG), pegala **apenas abrís
    la canción**, antes de pasar las tarjetas: **Comparar con letra oficial**
    (abajo del panel) o **Pegar letra oficial** (barra de la letra) abren la
@@ -69,11 +71,15 @@ revisor.
    oídos automáticos no coinciden), escuchala entera o pedí una segunda
    revisión.
 
-## Qué bloquea y dónde
+## Política de aprobación
 
-- Bloquea la aprobación en las campañas batch (UMG) o en los tenants de
-  `LYRIC_REVIEW_ENFORCE_TENANTS`; en el resto el panel se muestra sin frenar.
-- Un re-render por pedido de cambio sólo frena si se perdió letra cantada.
-- Un cambio de fondo o tipografía nunca frena por la letra.
+- Las sugerencias de letra no bloquean campañas, trabajos individuales ni
+  re-renders. Siguen vigentes las validaciones de letra vacía, conflictos
+  de edición y errores de guardado.
+- `LYRIC_REVIEW_MODE` usa `observe` por defecto; `off` desactiva el análisis.
+  El valor legado `enforce` equivale a `observe` y
+  `LYRIC_REVIEW_ENFORCE_TENANTS` ya no activa bloqueos.
+- `required` en la respuesta es metadata legada de prioridad, no una
+  obligación de aplicar o descartar. No se modifican las decisiones previas.
 - Las campañas batch son "sólo audio": nunca se busca letra en lrclib para
   ellas; la letra oficial entra por la planilla o pegada por el operador.
