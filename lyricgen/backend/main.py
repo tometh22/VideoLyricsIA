@@ -16625,9 +16625,12 @@ class LanguageRetranscriptionRequest(BaseModel):
     base_revision: int = Field(..., ge=0)
 
 
-def _retranscription_job_or_404(db, job_id: str, current_user: dict):
+def _retranscription_job_or_404(db, job_id: str, current_user: dict, *, lock: bool = True):
     """Same grant as /language-resolution: platform admin or campaign reviewer."""
-    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    query = db.query(Job).filter(Job.job_id == job_id)
+    if lock:
+        query = query.populate_existing().with_for_update()
+    job = query.first()
     if (not job or (not _is_platform_admin_user(current_user)
                     and not can_review_campaign_job(db, job, current_user))):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -16727,8 +16730,12 @@ async def retranscribe_job_language_status(
     """Poll target for the editor while the forced-language attempt runs."""
     import editor_retranscription as retranscription
     try:
-        job = _retranscription_job_or_404(db, job_id, current_user)
-        retranscription.settle_failed(db, job)
+        # Polled every few seconds: only lock the row when a failed attempt
+        # has to be returned to review.
+        job = _retranscription_job_or_404(db, job_id, current_user, lock=False)
+        if job.status == "transcription_failed":
+            job = _retranscription_job_or_404(db, job_id, current_user)
+            retranscription.settle_failed(db, job)
         payload = retranscription.status_payload(job, retranscription.latest(db, job_id))
         db.commit()
         return payload
