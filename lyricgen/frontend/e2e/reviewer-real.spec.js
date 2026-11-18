@@ -65,7 +65,7 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
 
       const proposals = page.getByTestId("quality-proposal-disclosure");
       await expect(proposals).not.toHaveAttribute("open");
-      await proposals.locator("summary").click();
+      await proposals.locator(":scope > summary").click();
       const applyResponse = page.waitForResponse(response => response.url().includes(`/editor/${JOB}/quality-proposals/`)
         && response.url().endsWith("/apply") && response.request().method() === "POST");
       await page.getByRole("button", { name: "Usar candidata completa para revisar", exact: true }).click();

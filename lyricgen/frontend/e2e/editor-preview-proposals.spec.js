@@ -17,10 +17,10 @@ test('many quality proposals stay compact and a live lyric preview remains next 
  expect((await page.getByTestId('quality-proposal-panel').boundingBox()).height).toBeLessThan(110);
  expect(api.saves).toHaveLength(0);
  await expect(page.getByLabel("Letra de esta línea",{exact:true})).toBeInViewport();
- await disclosure.locator('summary').click();
+ await disclosure.locator(':scope > summary').click();
  await expect(page.getByRole('button',{name:'Aceptar',exact:true})).toHaveCount(40);
  expect((await page.getByTestId('quality-proposal-scroll').boundingBox()).height).toBeLessThan(500);
- await disclosure.locator('summary').click();
+ await disclosure.locator(':scope > summary').click();
  const field=page.getByLabel('Letra de esta línea',{exact:true});
  await page.getByTestId('campaign-line-workspace').evaluate(el=>window.scrollTo(0,el.getBoundingClientRect().top+window.scrollY-150));
  await expect(field).toBeInViewport();
