@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.173] - 2026-11-17
+
+### Fixed
+- Restore click-to-play in lyric review and follow the playing line without changing the editing selection or text focus. Keep playback controls visible below the app header.
+- Show compact horizontal time ranges, separate playback from selection, respect the marked filter during previous/next navigation and expose stale/failed phrase analysis in a compact disclosure.
+- Correct timestamp rounding at minute boundaries and the active navigation item during lyric review.
+
 ## [1.1.172] - 2026-11-17
 
 ### Added

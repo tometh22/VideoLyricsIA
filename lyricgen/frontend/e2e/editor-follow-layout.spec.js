@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { installEditorHarness } from './editor-harness';
-test('click plays and playback follows without changing the edit selection', async ({ page }) => {
+test('click plays and playback follows without changing the edit selection', async ({ page }, testInfo) => {
  const jobId='follow-layout';
  const segments=Array.from({length:36},(_,i)=>({segment_id:`row-${i}`,start:i*.1,end:i*.1+.08,text:`Línea ${i+1} para escuchar y corregir`,review:i%4===0}));
  const api=await installEditorHarness(page,{jobId,role:'admin',editorV2:true,segments});
@@ -29,6 +29,6 @@ test('click plays and playback follows without changing the edit selection', asy
   const bar=page.locator('[data-tour="editor-playbar"]');
   await expect(bar).toBeInViewport();
   expect((await bar.boundingBox()).y).toBeGreaterThanOrEqual(64);
-  await page.screenshot({path:`/Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/editor-layout-${width}.png`});
+  await page.screenshot({path:testInfo.outputPath(`editor-layout-${width}.png`)});
  }
 });
