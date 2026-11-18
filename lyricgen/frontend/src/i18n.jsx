@@ -5,6 +5,14 @@ import { createContext, useContext, useState, useCallback } from "react";
 // dictionary via I18nProvider below — exporting is read-only.
 export const translations = {
   es: {
+    "review_workspace.split_here": "Dividir aquí",
+    "review_workspace.split_guidance": "Colocá el cursor donde querés cortar. Revisá las dos frases y pulsá Dividir aquí o Enter.",
+    "review_workspace.split_words": "Usa los tiempos por palabra disponibles; conserva el inicio y el final de la línea.",
+    "review_workspace.split_estimated": "Timing estimado: escuchá el corte y ajustalo si hace falta. Ambas frases quedarán marcadas para revisar.",
+    "review_workspace.split_invalid": "Elegí un punto con texto a ambos lados, sin seleccionar un fragmento.",
+    "review_workspace.split_preview": "Vista previa de la división",
+    "review_workspace.split_part": "Frase {n}",
+    "review_workspace.split_review": "Corte estimado · escuchá y revisá los tiempos de esta frase.",
     "editor.listen_context": "Escuchar 2 s antes",
     "editor.listen_context_line": "Escuchar 2 s antes de la línea {n}",
     // Login
@@ -278,7 +286,7 @@ export const translations = {
     "review_workspace.selected": "Línea {n}",
     "review_workspace.mark_hint": "Escuchá esta parte y corregí lo que haga falta. La aprobación es por canción.",
     "review_workspace.text": "Letra de esta línea",
-    "review_workspace.autosave": "Los cambios se guardan automáticamente. Enter divide la línea donde está el cursor.",
+    "review_workspace.autosave": "Los cambios se guardan automáticamente.",
     "review_workspace.listen": "Escuchar 2 s antes",
     "review_workspace.timing": "Ajustar esta línea en la timeline",
     "review_workspace.undo": "Deshacer",
@@ -2522,6 +2530,14 @@ export const translations = {
   },
 
   en: {
+    "review_workspace.split_here": "Split here",
+    "review_workspace.split_guidance": "Place the cursor where you want to split. Review both phrases, then press Split here or Enter.",
+    "review_workspace.split_words": "Uses the available word timings; keeps the line’s start and end.",
+    "review_workspace.split_estimated": "Estimated timing: listen to the split and adjust if needed. Both phrases will be marked for review.",
+    "review_workspace.split_invalid": "Choose a point with text on both sides, without selecting a range.",
+    "review_workspace.split_preview": "Split preview",
+    "review_workspace.split_part": "Phrase {n}",
+    "review_workspace.split_review": "Estimated split · listen and check this phrase’s timing.",
     "editor.listen_context": "Listen 2 s before",
     "editor.listen_context_line": "Listen 2 s before line {n}",
     "login.title": "Sign in",
@@ -2921,7 +2937,7 @@ export const translations = {
     "review_workspace.selected": "Line {n}",
     "review_workspace.mark_hint": "Listen to this part and correct what needs changing. Approval covers the whole song.",
     "review_workspace.text": "Lyrics for this line",
-    "review_workspace.autosave": "Changes save automatically. Enter splits the line at the cursor.",
+    "review_workspace.autosave": "Changes save automatically.",
     "review_workspace.listen": "Listen from 2 s before",
     "review_workspace.timing": "Adjust this line in the timeline",
     "review_workspace.undo": "Undo",
@@ -4951,6 +4967,14 @@ export const translations = {
   },
 
   pt: {
+    "review_workspace.split_here": "Dividir aqui",
+    "review_workspace.split_guidance": "Posicione o cursor onde quer dividir. Revise as duas frases e pressione Dividir aqui ou Enter.",
+    "review_workspace.split_words": "Usa os tempos disponíveis por palavra; mantém o início e o fim da linha.",
+    "review_workspace.split_estimated": "Timing estimado: ouça o corte e ajuste se necessário. As duas frases ficarão marcadas para revisão.",
+    "review_workspace.split_invalid": "Escolha um ponto com texto dos dois lados, sem selecionar um trecho.",
+    "review_workspace.split_preview": "Prévia da divisão",
+    "review_workspace.split_part": "Frase {n}",
+    "review_workspace.split_review": "Corte estimado · ouça e revise os tempos desta frase.",
     "editor.listen_context": "Ouvir 2 s antes",
     "editor.listen_context_line": "Ouvir 2 s antes da linha {n}",
     "login.title": "Entrar",
@@ -5350,7 +5374,7 @@ export const translations = {
     "review_workspace.selected": "Linha {n}",
     "review_workspace.mark_hint": "Ouça este trecho e corrija o que for necessário. A aprovação é por música.",
     "review_workspace.text": "Letra desta linha",
-    "review_workspace.autosave": "As alterações são salvas automaticamente. Enter divide a linha na posição do cursor.",
+    "review_workspace.autosave": "As alterações são salvas automaticamente.",
     "review_workspace.listen": "Ouvir desde 2 s antes",
     "review_workspace.timing": "Ajustar esta linha na timeline",
     "review_workspace.undo": "Desfazer",
