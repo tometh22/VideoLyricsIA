@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.173] - 2026-11-17
+
+### Fixed
+- Measure the client change-request cohort by the Universal portal (Argentina/Chile) where a lyric video was published, not by the publishing account. Lyric campaigns published by internal accounts (221 November deliveries and their requests) were excluded, so the panel under-reported the request rate. Art Tracks stay out of the lyric rate.
+
 ## [1.1.172] - 2026-11-17
 
 ### Added

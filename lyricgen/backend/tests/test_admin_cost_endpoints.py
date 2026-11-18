@@ -510,6 +510,60 @@ def test_change_requests_endpoint_shape(client, admin_token):
     assert body["delivery_cohort"]["followup_days"] == 30
 
 
+def test_change_request_cohort_counts_portal_deliveries_from_any_account(
+    client, admin_token, db,
+):
+    """La cohorte se define por el portal de Universal, no por la cuenta.
+
+    En noviembre de 2026 el equipo publicó 221 videos de letra en el portal
+    de UMG con una cuenta interna; el filtro por `tenant_snapshot` los dejaba
+    afuera y el panel mostraba una tasa de pedidos que no era la real. Los
+    Art Tracks no entran en la tasa de letra.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from database import AuditLog, Delivery, DeliveryChangeRequest
+
+    published = datetime.now(timezone.utc) - timedelta(days=45)
+    rows = [("cohort-own", "argentina", "Campaña"),
+            ("cohort-cl", "chile", "Campaña"),
+            ("cohort-art", "chile", "Art Track")]
+    created = []
+    try:
+        for job_id, portal, label in rows:
+            delivery = Delivery(
+                job_id=job_id, label=label, file_types=["video"],
+                artist_snapshot="A", song_title_snapshot="S",
+                tenant_snapshot="equipo-interno@example.com", added_by_user_id=1,
+                portal_id=portal, added_at=published,
+            )
+            db.add(delivery)
+            db.flush()
+            created.append(delivery)
+            db.add(AuditLog(user_id=1, action="delivery.create", created_at=published,
+                            detail={"job_id": job_id, "portal_id": portal}))
+        db.add(DeliveryChangeRequest(
+            delivery_id=created[0].id, comment="0:14 corregir: déjame que me vaya",
+            submitted_at=published + timedelta(days=3)))
+        db.commit()
+
+        res = client.get("/admin/quality/change-requests", headers=auth(admin_token))
+        assert res.status_code == 200
+        cohort = res.json()["delivery_cohort"]
+        assert cohort["status"] == "ready"
+        assert cohort["eligible_videos"] >= 2
+        assert cohort["videos_with_lyric_or_timing_request"] >= 1
+    finally:
+        db.rollback()
+        for delivery in created:
+            db.query(DeliveryChangeRequest).filter(
+                DeliveryChangeRequest.delivery_id == delivery.id).delete()
+            db.query(Delivery).filter(Delivery.id == delivery.id).delete()
+        db.query(AuditLog).filter(AuditLog.action == "delivery.create",
+                                  AuditLog.created_at == published).delete()
+        db.commit()
+
+
 def test_change_requests_rejects_malformed_period(client, admin_token):
     res = client.get("/admin/quality/change-requests?period=2026-13",
                      headers=auth(admin_token))

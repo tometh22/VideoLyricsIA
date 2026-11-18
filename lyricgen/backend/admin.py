@@ -2087,17 +2087,28 @@ def admin_change_requests(
                 Delivery.product_category.is_(None),
                 Delivery.product_category.in_(lyric_products),
             )
+            # El portal es de Universal: lo que define la cohorte es en qué
+            # portal se publicó, no qué cuenta lo publicó. Filtrar por
+            # `tenant_snapshot ILIKE '%universal%'` dejaba afuera las campañas
+            # que el equipo publica con su propia cuenta (221 entregas de
+            # noviembre de 2026 y sus pedidos).
+            from delivery_plan import PORTALS
+            client_portal_filter = or_(
+                Delivery.portal_id.in_(tuple(PORTALS.keys())),
+                Delivery.portal_id.is_(None),
+            )
+            not_art_track = or_(Delivery.label.is_(None), Delivery.label != "Art Track")
             all_deliveries = ddb.query(Delivery).filter(
-                Delivery.tenant_snapshot.ilike("%universal%"),
+                client_portal_filter,
                 lyric_product_filter,
+                not_art_track,
             ).all()
             request_rows = (
                 ddb.query(Delivery.job_id, Delivery.portal_id,
                           DeliveryChangeRequest.submitted_at,
                           DeliveryChangeRequest.comment)
                 .join(Delivery, Delivery.id == DeliveryChangeRequest.delivery_id)
-                .filter(Delivery.tenant_snapshot.ilike("%universal%"),
-                        lyric_product_filter)
+                .filter(client_portal_filter, lyric_product_filter, not_art_track)
                 .all()
             )
             publication_events = work_db.query(
