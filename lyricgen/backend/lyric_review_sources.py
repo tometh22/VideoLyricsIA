@@ -305,7 +305,30 @@ def effective_mode(job) -> str:
     return mode()
 
 
-def _content_key(document, job, official: str, pairs: dict) -> str:
+def review_portal(db, job) -> str | None:
+    """Perfil de estilo de la Revisión rápida: el portal de UMG al que va la
+    campaña (``argentina``/``chile``); ``umg`` si es una entrega UMG sin
+    portal fijo; ``None`` fuera de UMG (sin reglas de perfil)."""
+    if job is None:
+        return None
+    campaign_id = getattr(job, "campaign_id", None)
+    if campaign_id:
+        try:
+            from database import BatchCampaign
+
+            row = db.query(BatchCampaign.destination_portal).filter(
+                BatchCampaign.id == campaign_id).first()
+        except Exception:  # pragma: no cover - sin portal, perfil genérico
+            row = None
+        portal = str((row[0] if row else "") or "").strip().lower()
+        return portal if portal in {"argentina", "chile"} else "umg"
+    if str(getattr(job, "workload_class", "") or "").lower() == "batch" or str(
+            getattr(job, "delivery_profile", "") or "").lower() in {"umg", "both"}:
+        return "umg"
+    return None
+
+
+def _content_key(document, job, official: str, pairs: dict, portal: str | None = None) -> str:
     payload = json.dumps({
         "s": [(s.get("text"), s.get("start"), s.get("end"), s.get("segment_id"), s.get("qa_dismissed"))
               for s in (document.current_segments or []) if isinstance(s, dict)],
@@ -315,6 +338,7 @@ def _content_key(document, job, official: str, pairs: dict) -> str:
         "m": sorted(pairs.items()),
         "t": str(getattr(job, "song_title", "") or ""),
         "n": len(document.original_segments or []),
+        "p": portal,
     }, sort_keys=True, default=str)
     return hashlib.sha1(payload.encode()).hexdigest()
 
@@ -335,6 +359,7 @@ def review_for_document(db, document, job=None) -> dict:
         try:
             text, origin = official_text(db, job) if job is not None else ("", "")
             pairs = memory_pairs(db, job) if job is not None else {}
+            portal = review_portal(db, job)
         except Exception:
             if nested is not None and nested.is_active:
                 nested.rollback()
@@ -343,7 +368,7 @@ def review_for_document(db, document, job=None) -> dict:
             nested.commit()
         if job is not None and not text:
             schedule_official_fetch(job)
-        key = _content_key(document, job, text, pairs)
+        key = _content_key(document, job, text, pairs, portal)
         cached = _review_cache.get_fresh(key)
         if cached is None:
             cached = build_review(
@@ -353,6 +378,7 @@ def review_for_document(db, document, job=None) -> dict:
                 title=str(getattr(job, "song_title", "") or ""),
                 official_text=text,
                 memory_pairs=pairs,
+                portal=portal,
             )
             cached["sources"]["official_origin"] = origin
             _review_cache.put(key, cached)

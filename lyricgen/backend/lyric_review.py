@@ -57,6 +57,7 @@ from heard_words import (
     witness_words,
 )
 from reference_window import crop_reference
+from transcribe_postprocess import has_terminal_line_period
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
@@ -131,7 +132,36 @@ KIND_GROUP = {
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
     "timing": "timing", "phrase_structure": "layout",
+    "terminal_period": "style", "parentheses": "style", "accent_missing": "style",
 }
+
+# --------------------------------------------------------------------------
+# Perfiles de estilo por portal de UMG.
+#
+# Medido sobre 310 pedidos de sep-nov 2026: los dos portales piden quitar ¿?
+# de frases que no preguntan y nunca quieren punto final; Argentina prefiere
+# sin signos las exclamaciones ("¿Qué lindo añorar…?" → sin signos) y a veces
+# saca los paréntesis (sugerencia: en versiones finales aceptó otros 22);
+# Chile las quiere con ¡! ("¡Cuánto me hiciste llorar!"); los dos piden las
+# tildes que faltan. Con perfil, los puntos obligatorios de estilo frenan
+# también un re-render por pedido de cambio (ahí volvían a aparecer: "Para
+# no volver.", "Lejos de vos.").
+# --------------------------------------------------------------------------
+PORTAL_PROFILES: dict[str, dict[str, Any]] = {
+    "argentina": {"exclaim": "remove_question", "parentheses": True},
+    "chile": {"exclaim": "exclaim", "parentheses": False},
+    # Entrega UMG sin portal conocido: sólo lo que vale para los dos.
+    "umg": {"exclaim": None, "parentheses": False},
+}
+# Puntos que dejan la letra como la pide el perfil sin tocar lo que se canta.
+STYLE_RULE_KINDS = {"terminal_period", "parentheses", "accent_missing", "question_marks"}
+# Un solo punto con todas las líneas: "Quitar el punto final (7 líneas)".
+_GROUP_ACROSS_LINES = {"terminal_period", "parentheses"}
+
+
+def style_profile(portal: str | None) -> dict[str, Any] | None:
+    key = str(portal or "").strip().lower()
+    return PORTAL_PROFILES.get(key)
 
 
 def mode() -> str:
@@ -650,13 +680,121 @@ def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
 # Reglas deterministas (medidas sobre los pedidos #112-#131).
 # --------------------------------------------------------------------------
 
-def _rule_question_marks(segments: list[dict]) -> list[dict]:
+def _question_balance_broken(text: str) -> bool:
+    """¿ sin su ?, ? sin su ¿, o un ¿ que se abre antes de cerrar el anterior."""
+    open_ = False
+    for ch in text:
+        if ch == "¿":
+            if open_:
+                return True
+            open_ = True
+        elif ch == "?":
+            if not open_:
+                return True
+            open_ = False
+    return open_
+
+
+def _strip_question_marks(text: str) -> str:
+    out = re.sub(r"\s*¿\s*", " ", text)
+    out = re.sub(r"\s*\?", "", out)
+    out = re.sub(r"\s+([,.;:!])", r"\1", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+_CLOSERS = "\"”»'"
+_INTERROGATIVE_RE = re.compile(
+    r"\b(?:a\s+d[oó]nde|por\s+qu[eé]|qu[eé]|c[oó]mo|cu[aá]ndo|d[oó]nde|ad[oó]nde|"
+    r"qui[eé]n(?:es)?|cu[aá]l(?:es)?|cu[aá]nt[oa]s?)\b", re.I)
+
+
+def _interrogative_at(clause: str) -> int | None:
+    """Posición del primer interrogativo CON tilde de la frase ("qué",
+    "a dónde", "por qué"); sin tilde no cuenta: "cuando vuelvas" no pregunta."""
+    for m in _INTERROGATIVE_RE.finditer(clause):
+        if fold(m.group(0)) != m.group(0).lower():
+            return m.start()
+    return None
+
+
+def _close_at_end(body: str) -> str:
+    m = re.search(r"[\s,;:" + _CLOSERS + r"]*$", body)
+    cut = m.start() if m else len(body)
+    tail = body[cut:].strip()
+    return f"{body[:cut]}?{tail}"
+
+
+def _complete_question(text: str) -> str:
+    """La línea con sus signos de pregunta completos. La pregunta abre en el
+    ¿ que había, en el interrogativo ("nena ¿qué vas a hacer?") o al
+    comienzo de la frase."""
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if "¿" in text and "?" not in text:
+        return _close_at_end(text)
+    if "?" in text and "¿" not in text:
+        out, rest = [], text
+        while "?" in rest:
+            at = rest.index("?")
+            clause, rest = rest[:at], rest[at + 1:]
+            starts = [m.end() for m in re.finditer(r"[.!:;" + _CLOSERS + r"“«]\s*", clause)]
+            begin = starts[-1] if starts else 0
+            lead = len(clause[begin:]) - len(clause[begin:].lstrip())
+            begin += lead
+            asked = _interrogative_at(clause[begin:])
+            if asked is not None:
+                begin += asked
+            out.append(f"{clause[:begin]}¿{clause[begin:].rstrip()}?")
+        return "".join(out) + rest
+    body = _strip_question_marks(text)
+    return _close_at_end("¿" + body)
+
+
+def _rule_question_balance(segments: list[dict], profile: dict) -> list[dict]:
+    """Un signo de pregunta sin su par es un error de escritura, sin importar
+    si la frase pregunta: "Si ya no tengo las caricias de mi madre?",
+    "¿Por qué soy wacho amor", "¿Cuántas" / "veces corro…?". Obligatorio con
+    las dos salidas a un clic: completar la pregunta (por defecto si hay un
+    interrogativo con tilde) o quitar los signos."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if ("?" not in text and "¿" not in text) or not _question_balance_broken(text):
+            continue
+        removed = _strip_question_marks(text)
+        if not _words(removed):
+            continue
+        completed = _complete_question(text)
+        asks = _interrogative_at(text) is not None and not _EXCLAMATIVE.search(
+            text.replace("¿", ""))
+        remove_fix = {"type": "set_text", "text": removed, "expect": _key_text(text)}
+        complete_fix = {"type": "set_text", "text": completed, "expect": _key_text(text)}
+        if asks:
+            fix, why = complete_fix, "La pregunta quedó sin uno de sus signos"
+            alternatives = [{"label": "No es pregunta", "why": "", "fix": remove_fix}]
+        else:
+            fix, why = remove_fix, "Signo de pregunta sin su par: si no pregunta, va sin signos"
+            alternatives = [{"label": "Es pregunta", "why": "", "fix": complete_fix}]
+        out.append({
+            "kind": "question_marks", "line": i, "required": True, "style_rule": True,
+            "title": "Signos de pregunta", "why": why, "fix": fix,
+            "alternatives": alternatives, "action": "Corregir",
+        })
+    return out
+
+
+def _rule_question_marks(segments: list[dict], profile: dict | None = None) -> list[dict]:
     """Sólo los casos que UMG devolvió; una pregunta de sí/no ("¿Me
-    querés?") es legítima y no se toca. El arreglo toca sólo esa frase."""
+    querés?") es legítima y no se toca. El arreglo toca sólo esa frase.
+
+    Con perfil de portal, la exclamación ("¿Qué lindo añorar…?") se corrige
+    como pide ese portal (Argentina: sin signos; Chile: con ¡!) y las líneas
+    con un signo sin par se resuelven en ``_rule_question_balance``."""
     out = []
     for i, seg in enumerate(segments):
         text = str(seg.get("text") or "")
         if "?" not in text and "¿" not in text:
+            continue
+        if profile is not None and _question_balance_broken(text):
             continue
         for m in re.finditer(r"¿[^?¿]*\??|^[^¿?]*\?", text):
             clause = m.group(0)
@@ -669,6 +807,17 @@ def _rule_question_marks(segments: list[dict]) -> list[dict]:
             required = True
             if _EXCLAMATIVE.search(body):
                 why, mode_ = "Es una exclamación: va con ¡ !", "exclaim"
+                if profile is not None and profile.get("exclaim") == "remove_question":
+                    why, mode_ = "Es una exclamación: en Argentina va sin signos", "remove_question"
+                    alternatives.append({
+                        "label": "Con ¡ !", "why": "",
+                        "fix": {"type": "punctuation", "mode": "exclaim", "clause": clause},
+                    })
+                elif profile is not None:
+                    alternatives.append({
+                        "label": "Sin signos", "why": "",
+                        "fix": {"type": "punctuation", "mode": "remove_question", "clause": clause},
+                    })
             elif {w.lower() for w in words} & _INTERROGATIVES:
                 continue  # ya pregunta con tilde ("¿que dónde llega…?")
             elif fold(first) in _ACCENTED_INTERROGATIVE and first.lower() not in _INTERROGATIVES:
@@ -692,6 +841,7 @@ def _rule_question_marks(segments: list[dict]) -> list[dict]:
                 continue
             out.append({
                 "kind": "question_marks", "line": i, "required": required,
+                "style_rule": profile is not None,
                 "title": "Signos de pregunta", "why": why,
                 "fix": {"type": "punctuation", "mode": mode_, "clause": clause},
                 "alternatives": alternatives, "action": "Corregir",
@@ -780,6 +930,172 @@ def _rule_accents(segments: list[dict]) -> list[dict]:
                                 "scope": "all"},
                         "action": "Unificar",
                     })
+    return out
+
+
+# --------------------------------------------------------------------------
+# Reglas de perfil UMG (punto final, paréntesis, tildes que faltan, preguntas
+# sin signos). Sólo corren con ``portal``; ninguna toca lo que se canta.
+# --------------------------------------------------------------------------
+
+_INITIALS_END = re.compile(r"(?:\b[^\W\d_]\.){2,}$", re.UNICODE)
+
+
+def _rule_terminal_period(segments: list[dict]) -> list[dict]:
+    """UMG nunca quiere punto al final de la línea ("Para no volver.",
+    "Lejos de vos."). Los puntos suspensivos y las siglas ("V.S.D.") quedan."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if not has_terminal_line_period(text) or _INITIALS_END.search(text.rstrip()):
+            continue
+        fixed = text.rstrip()[:-1].rstrip()
+        if not _words(fixed):
+            continue
+        out.append({
+            "kind": "terminal_period", "line": i, "required": True, "style_rule": True,
+            "title": "Punto final", "why": "Las líneas no llevan punto al final",
+            "fix": {"type": "set_text", "text": fixed, "expect": _key_text(text)},
+            "action": "Quitar", "dismiss": "Dejar el punto",
+        })
+    return out
+
+
+def _rule_parentheses(segments: list[dict]) -> list[dict]:
+    """UMG Argentina pidió sacar paréntesis 6 veces ("sacar paréntesis a la
+    frase", "(AY, AY, AY)" de más) pero aceptó otros 22 en versiones
+    finales: se sugiere, no bloquea. El texto queda, los signos no."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if "(" not in text and ")" not in text:
+            continue
+        fixed = re.sub(r"\s*[()]\s*", " ", text)
+        fixed = re.sub(r"\s+([,.;:!?])", r"\1", fixed)
+        fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+        if not _words(fixed) or fixed == text:
+            continue
+        out.append({
+            "kind": "parentheses", "line": i, "required": False, "style_rule": True,
+            "title": "Paréntesis", "why": "En Argentina los coros y ecos van sin paréntesis",
+            "fix": {"type": "set_text", "text": fixed, "expect": _key_text(text)},
+            "action": "Quitar", "dismiss": "Dejar los paréntesis",
+        })
+    return out
+
+
+# Palabras que sin tilde no existen (o son otra palabra rarísima en una
+# canción). Nada de pares que cambian el sentido (esta/está, mas/más,
+# sabia/sabía, hacia/hacía, seria/sería, venia/venía, vera/verá…).
+_ACCENT_LEXICON = {
+    w.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o")
+     .replace("ú", "u"): w
+    for w in (
+        # Imperfecto -ía de verbos -er/-ir (ARDÍAN, UMG Chile).
+        *(f"{stem}{end}" for stem in (
+            "había", "tenía", "podía", "quería", "decía", "sentía", "vivía", "creía",
+            "veía", "leía", "oía", "traía", "caía", "pedía", "perdía", "mentía",
+            "seguía", "conocía", "entendía", "existía", "latía", "partía", "dormía",
+            "moría", "salía", "volvía", "ardía", "dolía", "reía", "sonreía", "comía",
+            "bebía", "corría", "escribía", "sufría", "abría", "cubría", "ponía",
+            "temía", "debía", "parecía", "merecía", "crecía", "nacía",
+            "prefería", "elegía", "huía", "fingía", "subía",
+        ) for end in ("", "n", "s")),
+        # Futuro que no choca con el subjuntivo -ra (DARÁN, UMG Argentina).
+        *(f"{stem}{end}" for stem in (
+            "será", "estará", "tendrá", "podrá", "habrá", "hará", "dará", "vendrá",
+            "dirá", "sabrá", "querrá", "saldrá", "pondrá", "valdrá", "volverá",
+            "morirá", "vivirá", "sentirá", "dormirá", "verá",
+        ) for end in ("", "n", "s") if f"{stem}{end}" not in {"verá", "verás"}),
+        "irán",
+        # Voseo sin par sin tilde.
+        "querés", "tenés", "podés", "venís", "decís", "sentís", "pedís", "vivís",
+        "salís", "dormís",
+        # Sustantivos y adverbios de uso frecuente en las letras.
+        "día", "días", "mío", "mía", "míos", "mías", "todavía", "alegría", "melodía",
+        "poesía", "fantasía", "compañía", "policía", "energía", "armonía", "agonía",
+        "rebeldía", "cobardía", "valentía", "lejanía", "travesía", "también",
+        "después", "jamás", "además", "detrás", "atrás", "quizás", "aquí", "allí",
+        "ahí", "allá", "acá", "así", "ojalá", "corazón", "razón", "perdón", "adiós",
+        "ningún", "algún", "según", "común", "país", "raíz", "maíz", "baúl", "oído",
+        "reír", "sonreír", "oír", "fácil", "difícil", "ángel", "ángeles", "árbol",
+        "lágrima", "lágrimas", "música", "único", "única", "pájaro", "pájaros",
+        "café", "están", "frío", "demás", "compás", "sofá",
+        "mágico", "mágica", "teléfono", "pétalos", "lámpara", "brújula",
+    )
+}
+_GERUND_CLITIC = re.compile(
+    r"^(?P<stem>[a-zñ]+?)(?P<g>ando|iendo|yendo)"
+    r"(?P<cl>(?:me|te|se|nos|lo|la|le|los|las|les){1,2})$")
+_ESTA_NEXT = {
+    "de", "en", "bien", "mal", "aqui", "ahi", "alli", "aca", "alla", "lejos",
+    "cerca", "muy", "tan", "mas", "con", "sin", "para", "conmigo", "contigo",
+}
+_ENGLISH = {
+    "the", "you", "your", "and", "is", "are", "to", "of", "it", "my", "i", "i'm",
+    "im", "don't", "dont", "love", "baby", "with", "this", "that", "what", "all",
+    "need", "gonna", "get", "we", "just", "can", "never", "know", "yeah", "she",
+    "he", "they", "will", "was", "for", "like", "want",
+}
+
+
+def _looks_english(words: list[str]) -> bool:
+    return sum(1 for w in words if w.lower() in _ENGLISH) >= 2
+
+
+def _accented(word: str, next_word: str | None) -> str | None:
+    """La forma con tilde de ``word`` si la falta de tilde es un error sin
+    ambigüedad; ``None`` si no."""
+    lower = word.lower()
+    if any(c in "áéíóúü" for c in lower):  # ya tiene alguna tilde
+        return None
+    if lower in _ACCENT_LEXICON:
+        return _ACCENT_LEXICON[lower]
+    m = _GERUND_CLITIC.match(lower)
+    if m and len(m.group("stem")) >= 1:
+        accent = {"ando": "ándo", "iendo": "iéndo", "yendo": "yéndo"}[m.group("g")]
+        return m.group("stem") + accent + m.group("cl")
+    if len(lower) >= 5 and re.search(r"[^s][cs]ion$", lower):
+        return lower[:-3] + "ión"
+    if lower in {"esta", "estas"}:
+        follower = fold(next_word or "")
+        if next_word is None or follower in _ESTA_NEXT or re.search(r"(ando|iendo|yendo)$", follower):
+            return "está" if lower == "esta" else "estás"
+    return None
+
+
+def _rule_missing_accents(segments: list[dict], required: bool) -> list[dict]:
+    """Tildes que faltan sin dudas ("ARDIAN", "Descubriendose", "esta de
+    más", "daran"). Respeta mayúsculas; no mira líneas en inglés."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = unicodedata.normalize("NFC", str(seg.get("text") or ""))
+        tokens = text.split()
+        words = _words(text)
+        if not words or _looks_english(words):
+            continue
+        for k, raw in enumerate(tokens):
+            body = _split_punct(raw)[1]
+            if not body or not _WORD_RE.fullmatch(body):
+                continue
+            trail = _split_punct(raw)[2]
+            next_word = None
+            if k + 1 < len(tokens) and not re.search(r"[.;:!?…]", trail):
+                # "Y esta, la más linda": después de una coma no se decide.
+                next_word = "," if "," in trail else _split_punct(tokens[k + 1])[1]
+            fixed = _accented(body, next_word)
+            if not fixed or fold(fixed) != fold(body):
+                continue
+            contextual = body.lower() in {"esta", "estas"}
+            out.append({
+                "kind": "accent_missing", "line": i, "required": required,
+                "style_rule": True, "title": "Falta una tilde",
+                "why": f"Se escribe «{fixed}»",
+                "fix": {"type": "replace", "find": body, "replace": _match_case(body, fixed),
+                        "scope": "one" if contextual else "all",
+                        **({"at_word": k} if contextual else {})},
+                "action": "Corregir",
+            })
     return out
 
 
@@ -1240,8 +1556,13 @@ def build_review(
     title: str = "",
     official_text: str | None = None,
     memory_pairs: dict[str, str] | None = None,
+    portal: str | None = None,
 ) -> dict:
-    """Todos los puntos de la letra actual, listos para el editor."""
+    """Todos los puntos de la letra actual, listos para el editor.
+
+    ``portal`` (``argentina``/``chile``/``umg``) activa el perfil de estilo
+    de ese portal de UMG; sin portal, sólo las reglas de siempre."""
+    profile = style_profile(portal)
     segments = [
         {**s, "text": unicodedata.normalize("NFC", str(s.get("text") or ""))}
         for s in (segments or []) if isinstance(s, dict)
@@ -1342,7 +1663,13 @@ def build_review(
 
     vocabulary = {norm_token(w["word"]) for w in witness} | {
         t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in official_tokens}
-    items.extend(_rule_question_marks(segments))
+    items.extend(_rule_question_marks(segments, profile))
+    if profile is not None:
+        items.extend(_rule_question_balance(segments, profile))
+        items.extend(_rule_terminal_period(segments))
+        if profile.get("parentheses"):
+            items.extend(_rule_parentheses(segments))
+        items.extend(_rule_missing_accents(segments, required=bool(profile.get("accents_required", True))))
     items.extend(_rule_title(segments, title))
     items.extend(_rule_accents(segments))
     items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_clean), vocabulary))
@@ -1366,6 +1693,7 @@ def build_review(
         "items": pending[:MAX_ITEMS],
         "required_count": sum(1 for i in pending if i["required"]),
         "suggested_count": sum(1 for i in pending if not i["required"]),
+        "profile": str(portal).lower() if profile is not None else None,
         "sources": {
             "witness": bool(witness), "gemini": bool(gemini),
             "official": bool(official_tokens), "memory": len(memory_pairs or {}),
@@ -1422,6 +1750,7 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             if prev.get("listen") and not item.get("listen"):
                 for field in ("listen", "title", "action", "dismiss", "alternatives"):
                     prev[field] = item.get(field)
+            prev["style_rule"] = bool(prev.get("style_rule")) or bool(item.get("style_rule"))
             prev["required"] = prev["required"] or item["required"] or (
                 prev["kind"] in {"missing", "heard_different"} and len(prev["sources"]) >= 2)
             if prev["kind"] in {"missing", "heard_different"} and prev["sources"]:
@@ -1432,6 +1761,10 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
         fix = occ["fix"]
         if fix["type"] == "new_line":
             group_sig = ("new_line", sig[1:])
+        elif item["kind"] in _GROUP_ACROSS_LINES:
+            # Un solo punto con todas las líneas ("Quitar el punto final" en
+            # 7 líneas); cada aparición lleva su propio texto esperado.
+            group_sig = (item["kind"],)
         elif fix["type"] in {"replace", "insert"}:
             group_sig = (item["kind"], sig[1])
         elif fix["type"] == "inspect_structure":
@@ -1453,11 +1786,13 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
                 "keys": [key], "occurrences": [occ],
                 "alternatives": item.get("alternatives") or [],
                 "listen": bool(item.get("listen")),
+                "style_rule": bool(item.get("style_rule")),
             }
         else:
             g["occurrences"].append(occ)
             g["keys"].append(key)
             g["required"] = g["required"] or bool(item["required"])
+            g["style_rule"] = g["style_rule"] or bool(item.get("style_rule"))
             g["sources"] = sorted(set(g["sources"]) | item["sources"])
             g["listen"] = g["listen"] and bool(item.get("listen"))
     out = []
@@ -1534,7 +1869,7 @@ def required_for_scope(review: dict, scope: str) -> list[dict]:
         return []
     items = [i for i in review.get("items") or [] if i.get("required")]
     if scope == "missing_only":
-        items = [i for i in items if i.get("kind") == "missing"]
+        items = [i for i in items if i.get("kind") == "missing" or i.get("style_rule")]
     return items
 
 

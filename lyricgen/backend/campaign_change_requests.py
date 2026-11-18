@@ -106,6 +106,25 @@ def _step(request: DeliveryChangeRequest, job: Job | None, delivery: Delivery,
     return {"key": "correct", "tone": "idle", "label": "Sin atender"}
 
 
+def _close_verification(db, request, delivery, raw_overrides) -> dict | None:
+    import logging
+    import change_request_verification as crv
+    if not crv.enabled():
+        return None
+    try:
+        job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+        result = crv.verify_request(db, job, request)
+    except Exception:
+        logging.getLogger(__name__).warning("campaign change request %s: verification failed", request.id, exc_info=True)
+        return {"error": "verification_failed"}
+    if result is None:
+        return None
+    overrides = crv.parse_overrides(raw_overrides)
+    if crv.missing_overrides(result, overrides):
+        raise HTTPException(status_code=409, detail=crv.blocked_detail(result))
+    return crv.audit_summary(result, crv.clean_overrides(result, overrides))
+
+
 def _client_approval(delivery: Delivery) -> str | None:
     """The client's own verdict on the published cut, independent of ours."""
     if delivery.approved_at is not None:
@@ -199,6 +218,14 @@ def campaign_change_requests(
                     current_ids.add(_current.job_id)
             documents = {doc.job_id: doc for doc in db.query(EditorDocument).filter(
                 EditorDocument.job_id.in_(current_ids or {""})).all()}
+            try:
+                import change_request_verification as crv
+                page_deliveries = {delivery.id for _request, delivery in page}
+                history = ddb.query(DeliveryChangeRequest).filter(
+                    DeliveryChangeRequest.delivery_id.in_(page_deliveries or {0})).all()
+                recurrences = crv.recurrences_by_request(history)
+            except Exception:
+                recurrences = {}
             payload = []
             for request, delivery in page:
                 song = song_of(jobs_by_id.get(delivery.job_id))
@@ -220,6 +247,7 @@ def campaign_change_requests(
                     "step": _step(request, job, delivery, document),
                     "current_job_id": job.job_id if job is not None else None,
                     "closable_on_publish": closable,
+                    "recurrences": recurrences.get(request.id, []),
                 })
             last = page[-1][0] if more and page else None
             next_cursor = (f"{_iso(last.updated_at or last.submitted_at)}|{last.id}" if last is not None else None)
@@ -238,6 +266,48 @@ def campaign_change_requests(
 
 class ResolveBody(BaseModel):
     resolution_note: str = Field(default="", max_length=2000)
+    # Justificación interna por punto ✘ de la verificación (no la ve el cliente).
+    point_overrides: dict[str, str] = Field(default_factory=dict)
+
+
+def _campaign_request(db, ddb, campaign, request_id: int, *, lock: bool = False):
+    lineage = {job.job_id for job in _load_lineage(db, [campaign], full=False)[campaign.id]}
+    query = ddb.query(DeliveryChangeRequest, Delivery).join(
+        Delivery, Delivery.id == DeliveryChangeRequest.delivery_id,
+    ).filter(
+        DeliveryChangeRequest.id == request_id, Delivery.tenant_snapshot == campaign.tenant_id,
+        Delivery.job_id.in_(lineage or {""}),
+    )
+    if lock:
+        query = query.with_for_update(of=DeliveryChangeRequest)
+    row = query.first()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"code": "change_request_not_found"})
+    return row
+
+
+@router.get("/{campaign_id}/change-requests/{request_id}/verification")
+def campaign_change_request_verification(
+    campaign_id: str,
+    request_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """✔/✘ por punto del pedido contra la letra aprobada de la canción, y
+    las reincidencias contra pedidos ya cerrados de la misma entrega."""
+    import change_request_verification as crv
+    _require_scope(current_user)
+    campaign = _campaign_or_404(db, campaign_id, current_user)
+    if not feature_enabled():
+        raise HTTPException(status_code=404, detail={"code": "feature_disabled"})
+    request, delivery = _campaign_request(db, ddb, campaign, request_id)
+    history = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.delivery_id == delivery.id).all()
+    recurrences = crv.recurrences_by_request(history).get(request.id, [])
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    result = crv.verify_request(db, job, request) if crv.enabled() else None
+    return {"change_request_id": request.id, "enabled": crv.enabled(), "verification": result,
+            "recurrences": recurrences}
 
 
 @router.post("/{campaign_id}/change-requests/{request_id}/resolve")
@@ -267,19 +337,12 @@ def resolve_campaign_change_request(
             "code": "resolution_reason_required",
             "message": "Explicá por qué el pedido está atendido. Cerrar manualmente no publica otro video.",
         })
-    lineage = {job.job_id for job in _load_lineage(db, [campaign], full=False)[campaign.id]}
-    row = ddb.query(DeliveryChangeRequest, Delivery).join(
-        Delivery, Delivery.id == DeliveryChangeRequest.delivery_id,
-    ).filter(
-        DeliveryChangeRequest.id == request_id, Delivery.tenant_snapshot == campaign.tenant_id,
-        Delivery.job_id.in_(lineage or {""}),
-    ).with_for_update(of=DeliveryChangeRequest).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail={"code": "change_request_not_found"})
-    request, delivery = row
+    request, delivery = _campaign_request(db, ddb, campaign, request_id, lock=True)
     if request.resolved_at is not None:
         # Idempotent: a double click must not read as an error.
         return {"ok": True, "already_resolved": True, "resolved_at": _iso(request.resolved_at), "updated_at": _iso(request.updated_at)}
+    # Mismo control que Cambios: cada punto ✘ necesita su justificación.
+    verification_audit = _close_verification(db, request, delivery, body.point_overrides)
     now = datetime.now(timezone.utc)
     request.resolved_at = now
     request.updated_at = now
@@ -290,6 +353,7 @@ def resolve_campaign_change_request(
     db.add(AuditLog(user_id=current_user["id"], action="delivery.change_request.resolve", detail={
         "change_request_id": request_id, "delivery_id": delivery.id, "campaign_id": campaign.id,
         "source": "campaign", "note_preview": note[:200],
+        **({"verification": verification_audit} if verification_audit else {}),
     }))
     db.commit()
     return {"ok": True, "resolved_at": _iso(now), "updated_at": _iso(now)}

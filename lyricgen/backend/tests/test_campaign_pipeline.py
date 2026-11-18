@@ -281,8 +281,8 @@ def test_pipeline_reports_admin_and_inbox_flag(db, setup, monkeypatch):
         monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", campaign.tenant_id)
         owner = pipeline.campaign_pipeline(campaign.id, {**actor, "role": "user"}, db)
         on = pipeline.campaign_pipeline(campaign.id, actor, db)
-    assert off["features"] == {"change_requests_inbox": False, "change_request_actions": False} and off["is_admin"] is True
-    assert on["features"] == {"change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False
+    assert off["features"] == {"bulk_prompts": True, "change_requests_inbox": False, "change_request_actions": False} and off["is_admin"] is True
+    assert on["features"] == {"bulk_prompts": True, "change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False
 
 
 def test_pipeline_reports_per_delivery_whether_the_portal_serves_the_latest_render(db, setup, monkeypatch):
@@ -385,3 +385,46 @@ def test_outdated_songs_are_split_into_ready_to_resend_and_needing_approval(db, 
         monkeypatch.setattr(creative, "scoped_deliveries_db", session)
         flags = pipeline.campaign_pipeline(campaign.id, actor, db)["flags"]
     assert flags["portal_outdated"] == 2 and flags["resend_ready"] == 1 and flags["resend_review"] == 1
+
+
+def test_detail_pipeline_never_loads_lyrics_or_quality_blobs(db, setup, monkeypatch):
+    """A fresh session must preserve delivery freshness without deferred blob reads."""
+    from sqlalchemy import event
+    from delivery_freshness import render_fingerprint
+
+    campaign, items, actor = setup
+    job = add_job(db, campaign, actor, item=items[0], status="done")
+    job.segments_json = [{"start": 0, "end": 1, "text": "heavy lyrics"}]
+    job.transcription_quality = {"evidence": "heavy quality"}
+    job.render_params = {"concept": "heavy render config"}
+    job.edit_count = 2
+    job.previous_versions = [{"archived_at": "2026-11-17T12:00:00+00:00"}]
+    job.completed_at = datetime(2026, 11, 17, 12, tzinfo=timezone.utc)
+    db.commit()
+    db.refresh(job)
+    job_id, campaign_id = job.job_id, campaign.id
+    statements = []
+    def record(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    event.listen(db.bind, "before_cursor_execute", record)
+    try:
+        with Session(db.bind) as fresh:
+            row = fresh.query(BatchCampaign).filter_by(id=campaign_id).one()
+            # Compare the loaded projection's fingerprint to the full job to
+            # ensure a changed render still gets marked for resending.
+            loaded = pipeline._load_lineage(fresh, [row], full=True,
+                                             columns=pipeline._DETAIL_JOB_COLUMNS)[campaign_id][0]
+            assert render_fingerprint(loaded) == render_fingerprint(job)
+            monkeypatch.setattr(pipeline, "_publications", lambda ids, tenant: ({job_id: {
+                "umg_portals": ["argentina"], "published_fingerprints": ["older-render"],
+            }}, True))
+            result = pipeline.build_pipeline(fresh, row)
+            assert result["items"][0]["portal_outdated"] is True
+            assert result["items"][0]["current_job_id"] == job_id
+    finally:
+        event.remove(db.bind, "before_cursor_execute", record)
+    for statement in statements:
+        assert "jobs.segments_json" not in statement
+        assert "jobs.transcription_quality" not in statement
+        assert "jobs.render_params" not in statement

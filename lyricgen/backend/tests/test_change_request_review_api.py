@@ -239,6 +239,15 @@ def test_human_can_resolve_one_reviewed_publication_despite_automatic_evidence(
     publication_before = dict(delivery.published_file_keys)
     fingerprint_before = delivery.published_render_fingerprint
     body = _human_publication_body(client, admin_token, request)
+    if problem == 'text':
+        # "Revisé todo" ya no alcanza: el punto que no está en la letra
+        # publicada necesita su propia justificación interna.
+        blocked = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                              headers=auth(admin_token), json=body)
+        assert blocked.status_code == 409, blocked.text
+        detail = blocked.json()['detail']
+        assert detail['code'] == 'change_request_points_unverified'
+        body['point_overrides'] = {pid: 'El cliente citó mal la frase; el video está bien.' for pid in detail['failing']}
     response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
                            headers=auth(admin_token), json=body)
     assert response.status_code == 200, response.text
@@ -255,6 +264,11 @@ def test_human_can_resolve_one_reviewed_publication_despite_automatic_evidence(
     audit = db.query(AuditLog).filter_by(action='delivery.change_request.resolve').order_by(AuditLog.id.desc()).first()
     assert audit.detail['source'] == 'published_human_review'
     assert audit.detail['reason'] == body['publication_review_reason']
+    if problem == 'text':
+        [point] = [p for p in audit.detail['verification']['points'] if p['status'] == 'fail']
+        assert point['override'] == 'El cliente citó mal la frase; el video está bien.'
+        # La justificación es interna: el cliente sólo ve el motivo del cierre.
+        assert 'citó mal' not in request.resolution_note
 
 
 @pytest.mark.parametrize('changed', ['comment', 'revision', 'fingerprint', 'files', 'render'])
@@ -347,6 +361,9 @@ def test_publication_close_refused_when_no_fix_was_saved_after_request(client, a
 def _published_text_mismatch(client, admin_token, manual_request, db, monkeypatch):
     from database import EditorVersion
     monkeypatch.setenv('CHANGE_REQUEST_PUBLISH_GUARD_ENABLED', '1')
+    # Control de texto anterior (token + motivo único): sólo con la
+    # verificación punto por punto apagada.
+    monkeypatch.setenv('CHANGE_REQUEST_CLOSE_VERIFICATION', '0')
     job, document, cr, delivery = _published_without_ticking(client, admin_token, manual_request, db)
     cr.comment = '0:00 Letra completa coregida a mano'
     version = db.query(EditorVersion).filter_by(job_id=job.job_id, revision=document.revision).one()

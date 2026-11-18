@@ -7,8 +7,11 @@ const errors = {
   portal_contract_unavailable: "El portal no está disponible para este envío.",
   ambiguous_replacement: "Hay varios pedidos del cliente vinculados a esta canción. Elegí la entrega a corregir desde Cambios antes de publicar.",
   change_request_newer_than_version: "Llegó un pedido del cliente más nuevo que la letra aprobada. Corregí y aprobá la letra, o enviala de nuevo con «Publicar igual» y un motivo.",
+  metadata_not_canonical: "El artista o el título no están escritos como los pide UMG.",
   unexpected_error: "Ocurrió un error inesperado al publicar. Se puede reintentar.",
 };
+// Códigos cuyo detalle dice qué corregir (el nombre que pide UMG).
+const DETAIL_CODES = new Set(["metadata_not_canonical"]);
 const RETRY_CODES = {
   operation_in_progress: "El envío todavía se está procesando. Esperá a que termine o a que aparezca como detenido.",
   nothing_to_retry: "No queda nada para reintentar en este envío.",
@@ -80,7 +83,7 @@ export default function CampaignDeliveryProgress({ operationId, request, onSelec
       <p role="status">{operation.sent_count || 0} de {operation.total_count} enviados · {failed.length} con error{operation.status === "completed" ? " · Envío completado" : ["partial", "failed"].includes(operation.status) ? " · Requiere atención" : operation.stalled ? " · Detenido" : " · En curso"}</p>
       {operation.stalled && <p role="alert" className="text-sm text-amber-200">Este envío parece detenido: hace más de 10 minutos que no avanza. Podés reintentarlo; no se duplica nada de lo ya enviado.</p>}
       <p className="text-xs text-ink-secondary">Este resumen es de este envío, no de toda la campaña. Podés salir y volver a este enlace para consultar el avance.</p>
-      {failed.length > 0 && <><ul className="max-h-40 overflow-auto text-sm">{failed.map(item => <li key={item.job_id}>{describe?.(item.job_id) || item.job_id}: {errors[item.error_code] || "No se pudo enviar. Revisá los archivos y volvé a intentarlo."}{item.error_detail && !errors[item.error_code] ? ` (${item.error_detail})` : ""}</li>)}</ul><button className="text-sm underline" onClick={() => onSelectFailed(failed.map(item => item.job_id))}>Seleccionar sólo los fallidos</button></>}
+      {failed.length > 0 && <><ul className="max-h-40 overflow-auto text-sm">{failed.map(item => <li key={item.job_id}>{describe?.(item.job_id) || item.job_id}: {errors[item.error_code] || "No se pudo enviar. Revisá los archivos y volvé a intentarlo."}{item.error_detail && (!errors[item.error_code] || DETAIL_CODES.has(item.error_code)) ? ` (${item.error_detail})` : ""}</li>)}</ul><button className="text-sm underline" onClick={() => onSelectFailed(failed.map(item => item.job_id))}>Seleccionar sólo los fallidos</button></>}
       {canRetry && <button className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-white disabled:opacity-60" disabled={retrying} onClick={retry}>{retrying ? "Reintentando…" : operation.stalled && !retryable.length ? "Reintentar envío" : `Reintentar ${retryable.length} ${retryable.length === 1 ? "fallido" : "fallidos"}`}</button>}
       {retryNotice && <p role={retryNotice.tone === "error" ? "alert" : "status"} className="text-sm">{retryNotice.text}</p>}
       {operation.items?.length > 0 && <details className="text-sm"><summary className="cursor-pointer text-ink-secondary">Canciones de este envío ({operation.items.length})</summary>
