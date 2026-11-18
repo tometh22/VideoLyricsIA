@@ -23,14 +23,28 @@ from umg_metadata import Learned, normalize
     ("Congreso", "Donde Estaras", ("Congreso", "¿Dónde Estarás?")),
     ("Congreso", "Heroína De New York", ("Congreso", "Heroína De Nueva York")),
     ("Los Prisioneros", "Porque Los Ricos", ("Los Prisioneros", "Por Qué Los Ricos")),
-    ("Mercedes Sosa, Ariel Ramirez", "La Anunciación", ("Mercedes Sosa, Ariel Ramírez", "La Anunciación")),
-    ("Fito Paez & Spinetta", "Parte Del Aire", ("Fito Páez & Spinetta", "Parte Del Aire")),
-    ("Coti feat. Fito Paez", "Andar Conmigo", ("Coti Feat. Fito Páez", "Andar Conmigo")),
 ])
 def test_normalize_known_umg_corrections(artist, title, expected):
     result = normalize(artist, title)
     assert (result.artist, result.title) == expected
     assert result.changed
+
+
+@pytest.mark.parametrize("artist,title", [
+    ("Babasonicos", "Luces"),
+    ("Tan Bionica", "700 Toneladas"),
+    ("Fito Paez & Spinetta", "Parte Del Aire"),
+    ("Mercedes Sosa, Ariel Ramirez", "La Anunciación"),
+    ("Abuelos De La Nada", "Mil Horas"),
+    ("Charly García", "Cancion Para Mi Muerte"),
+])
+def test_does_not_add_accents_or_articles_the_client_never_asked_for(artist, title):
+    """18-nov-2026: UMG venía aceptando estas escrituras. Agregarles tildes o
+    "Los" por ortografía oficial cambia nombres que el cliente no pidió y frena
+    republicar videos ya renderizados: sólo se corrige lo que UMG pidió."""
+    result = normalize(artist, title)
+    assert (result.artist, result.title) == (artist, title)
+    assert not result.changed
 
 
 def test_unknown_names_and_other_versions_are_left_alone():

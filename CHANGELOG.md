@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.177] - 2026-11-18
+
+### Fixed
+- Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
+
 ## [1.1.176] - 2026-11-18
 
 ### Fixed
