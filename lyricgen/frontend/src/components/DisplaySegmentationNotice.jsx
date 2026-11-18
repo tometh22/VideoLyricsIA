@@ -17,7 +17,8 @@ export default function DisplaySegmentationNotice({ report, stale, onSeek, t }) 
   return (
     <section data-testid="display-segmentation-notice" aria-label={label("title", "División de frases")}
       className="mb-4 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-3 text-xs text-gray-200">
-      <p className="font-semibold">{label("title", "División de frases")}</p>
+      <details>
+      <summary className="cursor-pointer font-semibold min-h-6">{label("title", "División de frases")} · {["unavailable", "contract_rejected"].includes(report.status) ? label("unchecked", "No comprobado") : label("review", "Tramos para revisar: {count}").replace("{count}", points.length)}{stale ? ` · ${label("previous", "Análisis anterior")}` : ""}</summary>
       <p className="mt-1">
         {stale ? label("stale", "El análisis corresponde a una versión anterior. Revisá tus cambios.")
           : ["unavailable", "contract_rejected"].includes(report.status)
@@ -38,6 +39,7 @@ export default function DisplaySegmentationNotice({ report, stale, onSeek, t }) 
           </button>)}
         </div>
       </div>}
+      </details>
     </section>
   );
 }
