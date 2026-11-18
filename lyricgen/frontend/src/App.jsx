@@ -6492,6 +6492,7 @@ export default function App() {
             // animation/contrast. Layout colapsa a 1 columna (timeline +
             // lista a ancho completo).
             hideTypographyControls={true}
+            startAtWorkspace={dedicatedCampaignReview}
             // Phase C 2026-05-25: callback que sincroniza el preview central
             // con la línea que está sonando ahora. Actualiza un ref para no
             // disparar re-renders a 60fps.

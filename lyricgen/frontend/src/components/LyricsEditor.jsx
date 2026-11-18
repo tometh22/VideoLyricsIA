@@ -808,6 +808,7 @@ export default function LyricsEditor({
   // siempre.
   hideTypographyControls = false,
   hideInternalPreview = false,
+  startAtWorkspace = false,
   // Phase C 2026-05-25: callback que publica el tick de playback hacia
   // el padre (App.jsx). El padre típicamente escribe en un ref para
   // que el WizardLivePreview central pueda leerlo sin pasar por
@@ -6912,6 +6913,7 @@ export default function LyricsEditor({
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
                 activeId={activeId} isPlaying={isPlaying}
+                startAtWorkspace={startAtWorkspace && (!editorV2Enabled || durableHydrated)}
                 preview={<div className="mx-auto w-full max-w-[320px]">
                   <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
                   <LyricVideoPreview segments={previewSegments} currentTime={isPlaying ? currentTime : ((sanitizedEdited.find(line => line._id === focusedSegId) || sanitizedEdited[0])?.start ?? currentTime)} isPlaying={isPlaying}
