@@ -18,8 +18,11 @@ This module is the non-destructive product path:
    that the archive row names) installs the new machine output as a NEW
    revision and as the new pre-human baseline.  Nothing is deleted: previous
    versions and correction observations stay exactly as they were.
-3. ``settle_failed`` returns a failed attempt to the editable state with the
-   previous text intact.
+3. ``settle_stalled`` returns a failed or dropped attempt to the editable
+   state with the previous text intact (worker failure, RQ callback, reaper,
+   status polling).
+4. ``worker_fleet_ready`` refuses to enqueue while any worker serving the
+   target queue runs other backend code (rolling deploy).
 """
 
 from __future__ import annotations
@@ -92,23 +95,51 @@ def for_attempt(db, job_id: str, attempt_id: str | None, *, lock: bool = False):
     return query.first()
 
 
-def settle_failed(db, job) -> bool:
-    """Return a failed re-transcription to the editable previous version.
+ATTEMPT_ENDED_WITHOUT_RESULT = "attempt_ended_without_result"
 
-    The worker, the RQ failure callback and the reaper all mark the job
-    ``transcription_failed``.  For a re-transcription that would strand a job
-    whose previous text is still intact, so the job goes back to review and
-    the archive row records the failure.  Caller holds the Job row lock and
-    commits.
-    """
-    if job.status != "transcription_failed":
+
+def _attempt_finished(db, attempt_id: str | None) -> bool:
+    """The outbox consumer ran the attempt to completion (success or discard)."""
+    if not attempt_id:
         return False
-    row = for_attempt(db, job.job_id, job.active_transcription_attempt_id, lock=True)
+    from database import JobOutboxEvent
+    event = db.query(JobOutboxEvent.status).filter(
+        JobOutboxEvent.id == str(attempt_id),
+    ).first()
+    return bool(event is not None and event[0] == "consumed")
+
+
+def settle_stalled(db, job) -> bool:
+    """Return a re-transcription that will never install back to review.
+
+    Two ways an attempt can end without a result, both leaving a job whose
+    previous text is intact:
+
+    * the job was marked ``transcription_failed`` (worker ``_fail``, the RQ
+      failure callback or the reaper);
+    * the outbox consumer finished the attempt but the archive row is still
+      ``pending`` and the job still says ``transcribing``.  Current code always
+      resolves the row in the same transaction it persists, so this only
+      happens when a worker on older code (mid-deploy) or an early worker
+      discard dropped the result.  Without this the job would wait for the
+      reaper's 120-minute stuck-transcription timeout.
+
+    The job goes back to review and the row records why.  Caller holds the
+    Job row lock and commits.
+    """
+    attempt_id = job.active_transcription_attempt_id
+    if job.status == "transcription_failed":
+        reason = str(job.error or "transcription_failed")
+    elif job.status in ACTIVE_TRANSCRIPTION_STATUSES and _attempt_finished(db, attempt_id):
+        reason = ATTEMPT_ENDED_WITHOUT_RESULT
+    else:
+        return False
+    row = for_attempt(db, job.job_id, attempt_id, lock=True)
     if row is None or row.status not in {"pending", "failed"}:
         return False
     if row.status == "pending":
         row.status = "failed"
-        row.error = str(job.error or "transcription_failed")[:500]
+        row.error = reason[:500]
         row.completed_at = _now()
     job.status = "transcribed_pending"
     job.current_step = "editing"
@@ -116,6 +147,83 @@ def settle_failed(db, job) -> bool:
     job.error = None
     db.flush()
     return True
+
+
+# Backwards-compatible name used by the worker and the status endpoint.
+settle_failed = settle_stalled
+
+
+def settle_stalled_jobs(db, *, limit: int = 50) -> int:
+    """Reaper sweep: settle every pending re-transcription that cannot finish."""
+    from database import EditorRetranscription, Job
+    job_ids = [
+        row[0] for row in db.query(EditorRetranscription.job_id).filter(
+            EditorRetranscription.status == "pending",
+        ).limit(limit).all()
+    ]
+    settled = 0
+    for job_id in job_ids:
+        job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+        if job is not None and settle_stalled(db, job):
+            settled += 1
+    return settled
+
+
+FLEET_UPDATING_MESSAGE = "Genly se está actualizando, probá en unos minutos."
+
+
+def transcription_queue_for(kwargs: dict) -> str:
+    """Mirror of queue_jobs.enqueue_transcription's queue choice."""
+    return "transcription_batch" if kwargs.get("workload_class") == "batch" else "transcription"
+
+
+def worker_fleet_ready(queue_name: str) -> tuple[bool, str]:
+    """Only enqueue when every worker serving ``queue_name`` runs this code.
+
+    A worker on an older release does not know the archive row: it would
+    discard the forced-language result over the human revision.  The proof is
+    the same backend code fingerprint /health compares (worker release
+    heartbeats in Redis); any missing piece of evidence fails closed.
+    Without Redis in a non-managed environment (local dev, tests) the
+    transcription runs in this very process, so the code is the same.
+    """
+    import json
+    import os
+
+    environment = os.environ.get("ENVIRONMENT", "production").strip().lower()
+    managed = environment in {"staging", "stage", "prod", "production"}
+    if not os.environ.get("REDIS_URL", "").strip():
+        return (not managed, "in_process" if not managed else "queue_unavailable")
+    try:
+        from observability import backend_code_fingerprint
+        from queue_jobs import _init_redis
+
+        api_fingerprint = str(backend_code_fingerprint() or "").strip()
+        if not api_fingerprint:
+            return False, "api_fingerprint_unknown"
+        redis, _, _ = _init_redis()
+        if redis is None:
+            return False, "queue_unavailable"
+        serving = []
+        for key in redis.scan_iter(match="genly:worker:release:*", count=50):
+            raw = redis.get(key)
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            row = json.loads(raw)
+            if queue_name in (row.get("queues") or []):
+                serving.append(row)
+        if not serving:
+            return False, "no_worker_for_queue"
+        if any(
+            str(row.get("code_fingerprint") or "").strip() != api_fingerprint
+            for row in serving
+        ):
+            return False, "worker_release_mismatch"
+        return True, "match"
+    except Exception:
+        return False, "fleet_unverifiable"
 
 
 def _checkpoint_current_text(db, job, document, user_id: int | None) -> str | None:
@@ -151,6 +259,7 @@ def start(
     audio_path: str,
     transcription_kwargs: dict,
     request_fingerprint: str = "",
+    fleet_ready=None,
 ):
     """Archive the current editor state and enqueue the forced-language attempt.
 
@@ -160,7 +269,7 @@ def start(
     """
     from database import AuditLog, EditorDocument, EditorRetranscription
 
-    settle_failed(db, job)
+    settle_stalled(db, job)
     language = str(language or "").strip().lower()
     if language not in SUPPORTED_LANGUAGES:
         raise RetranscriptionRejected(
@@ -194,6 +303,13 @@ def start(
         raise RetranscriptionRejected(
             409, "audio_unavailable",
             "No encontramos el audio original de esta canción.",
+        )
+    ready, fleet_reason = (fleet_ready or worker_fleet_ready)(
+        transcription_queue_for(transcription_kwargs),
+    )
+    if not ready:
+        raise RetranscriptionRejected(
+            503, "fleet_updating", FLEET_UPDATING_MESSAGE, reason=fleet_reason,
         )
 
     document = None

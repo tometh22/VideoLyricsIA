@@ -16706,6 +16706,7 @@ async def retranscribe_job_language(
             db.rollback()
             return JSONResponse(
                 status_code=rejected.status_code, content=rejected.payload(),
+                headers={"Retry-After": "120"} if rejected.status_code == 503 else None,
             )
         payload = retranscription.status_payload(job, row)
         event_id = event.id
@@ -16733,9 +16734,10 @@ async def retranscribe_job_language_status(
         # Polled every few seconds: only lock the row when a failed attempt
         # has to be returned to review.
         job = _retranscription_job_or_404(db, job_id, current_user, lock=False)
-        if job.status == "transcription_failed":
+        if (job.status == "transcription_failed"
+                or job.status in retranscription.ACTIVE_TRANSCRIPTION_STATUSES):
             job = _retranscription_job_or_404(db, job_id, current_user)
-            retranscription.settle_failed(db, job)
+            retranscription.settle_stalled(db, job)
         payload = retranscription.status_payload(job, retranscription.latest(db, job_id))
         db.commit()
         return payload

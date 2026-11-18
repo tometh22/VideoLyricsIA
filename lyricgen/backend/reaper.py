@@ -674,6 +674,10 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
             "rq_removed": rq_removed,
         },
     ))
+    # A reviewer-requested re-transcription keeps its previous text: return
+    # it to review instead of leaving the song in transcription_failed.
+    from editor_retranscription import settle_stalled
+    settle_stalled(db, locked)
 
 
 def revert_abandoned_edit(db: Session, job: Job) -> None:
@@ -1362,6 +1366,18 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     "[REAPER] reap transcription %s failed: %s",
                     job.job_id, e,
                 )
+        # Re-transcriptions whose attempt ended without installing (worker on
+        # older code mid-deploy, early discard) go back to review now instead
+        # of waiting for the stuck-transcription timeout.
+        try:
+            from editor_retranscription import settle_stalled_jobs
+            _n_rt = settle_stalled_jobs(db)
+            db.commit()
+            if _n_rt:
+                logger.warning("[REAPER] returned %d stalled re-transcription(s) to review", _n_rt)
+        except Exception as e:
+            db.rollback()
+            logger.warning("[REAPER] settle re-transcriptions failed: %s", e)
         if _n_tr:
             logger.info("[REAPER] cleaned up %d abandoned transcribed_pending job(s)", _n_tr)
         if _n_up:

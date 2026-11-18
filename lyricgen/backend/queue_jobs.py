@@ -424,6 +424,10 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
                 error=err_msg[:500], error_code=error_code,
                 current_step="error",
             )
+        # A reviewer-requested re-transcription keeps its previous text and
+        # returns to review (editor_retranscription.settle_stalled).
+        from transcription_worker import _settle_failed_retranscription
+        _settle_failed_retranscription(job_id_db)
     except Exception as e:  # pragma: no cover
         logger.warning("transcription_failure_callback failed: %s", e)
 

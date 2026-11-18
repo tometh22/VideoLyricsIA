@@ -58,6 +58,9 @@ def harness(client, user_token, monkeypatch, tmp_path):
     dispatched = []
     calls = []
     monkeypatch.setenv("ASYNC_TRANSCRIBE_ENABLED", "1")
+    # No Redis: the transcription runs in this process, so the fleet gate
+    # (worker_fleet_ready) reports the same code. Tested separately below.
+    monkeypatch.delenv("REDIS_URL", raising=False)
     for name in [
         "CTC_ALIGN_ENABLED", "ADLIB_CONSENSUS_ENABLED", "CHORUS_SNAP_ENABLED",
         "APPROVED_TEXT_REUSE_ENABLED", "TRANSCRIPTION_QUALITY_INLINE_RETRY",
@@ -501,3 +504,159 @@ def test_campaign_reviewer_retranscribes_through_the_campaign_worker_contract(
         row = db.query(EditorRetranscription).filter_by(job_id=job_id).one()
         assert row.archived_version_id is not None
         assert row.requested_by == reviewer["id"]
+
+
+# ---------------------------------------------------------------------------
+# Rolling deploys: an API on this code may coexist with workers on older code.
+# ---------------------------------------------------------------------------
+
+def _fake_fleet(monkeypatch, rows, *, fingerprint="fp-new"):
+    import json
+    import fakeredis
+    import observability
+    import queue_jobs
+    redis = fakeredis.FakeRedis()
+    for index, row in enumerate(rows):
+        redis.set(f"genly:worker:release:w{index}", json.dumps(row))
+    monkeypatch.setenv("REDIS_URL", "redis://fake")
+    monkeypatch.setattr(queue_jobs, "_init_redis", lambda: (redis, None, None))
+    monkeypatch.setattr(observability, "backend_code_fingerprint", lambda: fingerprint)
+
+
+def test_fleet_gate_requires_every_worker_on_the_queue_to_run_this_code(monkeypatch):
+    from editor_retranscription import worker_fleet_ready
+    new = {"queues": ["transcription_batch", "campaign_control"], "code_fingerprint": "fp-new"}
+    old = {"queues": ["transcription_batch"], "code_fingerprint": "fp-old"}
+    other = {"queues": ["enterprise"], "code_fingerprint": "fp-old"}
+    _fake_fleet(monkeypatch, [new, other])
+    assert worker_fleet_ready("transcription_batch") == (True, "match")
+    _fake_fleet(monkeypatch, [new, old])
+    assert worker_fleet_ready("transcription_batch") == (False, "worker_release_mismatch")
+    _fake_fleet(monkeypatch, [new, {"queues": ["transcription_batch"]}])
+    assert worker_fleet_ready("transcription_batch")[0] is False  # old worker, no fingerprint
+    _fake_fleet(monkeypatch, [other])
+    assert worker_fleet_ready("transcription_batch") == (False, "no_worker_for_queue")
+    _fake_fleet(monkeypatch, [new], fingerprint="")
+    assert worker_fleet_ready("transcription_batch") == (False, "api_fingerprint_unknown")
+
+
+def test_fleet_gate_fails_closed_without_queue_in_managed_env(monkeypatch):
+    from editor_retranscription import worker_fleet_ready
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    assert worker_fleet_ready("transcription") == (False, "queue_unavailable")
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    assert worker_fleet_ready("transcription") == (True, "in_process")
+    import queue_jobs
+    monkeypatch.setenv("REDIS_URL", "redis://down")
+    def broken():
+        raise ConnectionError("down")
+    monkeypatch.setattr(queue_jobs, "_init_redis", broken)
+    assert worker_fleet_ready("transcription") == (False, "fleet_unverifiable")
+
+
+def test_endpoint_refuses_while_workers_run_other_code(harness, monkeypatch):
+    h = harness
+    jid = h["job_id"]
+    before = _snapshot(jid)
+    _fake_fleet(monkeypatch, [{"queues": ["transcription"], "code_fingerprint": "fp-old"}])
+    res = h["client"].post(f"/jobs/{jid}/retranscribe-language", headers=h["headers"],
+                           json={"language": "es", "base_revision": before["revision"]})
+    assert res.status_code == 503
+    assert res.json()["code"] == "fleet_updating"
+    assert res.json()["message"] == "Genly se está actualizando, probá en unos minutos."
+    assert res.headers.get("retry-after") == "120"
+    assert h["dispatched"] == []
+    assert _snapshot(jid) == before
+    from database import EditorRetranscription, SessionLocal
+    with SessionLocal() as db:
+        assert db.query(EditorRetranscription).filter_by(job_id=jid).count() == 0
+
+
+def _run_as_old_worker(h, event_id, monkeypatch):
+    """The real outbox consumer, with the worker blind to the archive row —
+    exactly what a worker on the previous release does."""
+    import editor_retranscription
+    from database import JobOutboxEvent, SessionLocal
+    from transactional_outbox import run_outbox_transcription
+    with SessionLocal() as db:
+        event = db.query(JobOutboxEvent).filter_by(id=event_id).one()
+        payload, dedupe_key = dict(event.payload), event.dedupe_key
+    kwargs = dict(payload["transcription_kwargs"])
+    kwargs.pop("tenant_id", None)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(editor_retranscription, "for_attempt", lambda *a, **kw: None)
+    try:
+        return run_outbox_transcription(
+            h["job_id"], event_id, dedupe_key, payload["audio_path"], kwargs,
+        )
+    finally:
+        mp.undo()
+
+
+@pytest.mark.parametrize("healer", ["status_poll", "reaper_sweep"])
+def test_old_worker_discard_returns_the_song_to_review(harness, monkeypatch, healer):
+    h = harness
+    jid = h["job_id"]
+    before = _snapshot(jid)
+    res = h["client"].post(f"/jobs/{jid}/retranscribe-language", headers=h["headers"],
+                           json={"language": "es", "base_revision": before["revision"]})
+    assert res.status_code == 202, res.text
+    event_id = h["dispatched"][0]
+    h["state"]["segments"] = SPANISH
+    _run_as_old_worker(h, event_id, monkeypatch)
+    stuck = _snapshot(jid)
+    assert stuck["status"] == "transcribing"          # the old behaviour
+    assert stuck["segments"] == before["segments"]    # result was discarded
+
+    if healer == "status_poll":
+        status = h["client"].get(f"/jobs/{jid}/retranscribe-language", headers=h["headers"])
+        assert status.status_code == 200
+        assert status.json()["status"] == "failed"
+        assert status.json()["error"] == "attempt_ended_without_result"
+    else:
+        from database import SessionLocal
+        from editor_retranscription import settle_stalled_jobs
+        with SessionLocal() as db:
+            assert settle_stalled_jobs(db) == 1
+            db.commit()
+    after = _snapshot(jid)
+    assert after["status"] == "transcribed_pending"
+    assert after["segments"] == before["segments"]
+    assert after["machine_evidence"] == before["machine_evidence"]
+    for version_id, value in before["versions"].items():
+        assert after["versions"][version_id] == value
+    # And the reviewer can ask again once the fleet is updated.
+    again = h["client"].post(f"/jobs/{jid}/retranscribe-language", headers=h["headers"],
+                             json={"language": "es", "base_revision": after["revision"]})
+    assert again.status_code == 202, again.text
+
+
+def test_reaper_timeout_returns_a_stuck_retranscription_to_review(harness):
+    """Worker died without a trace: the stuck-transcription reaper heals it."""
+    h = harness
+    jid = h["job_id"]
+    before = _snapshot(jid)
+    res = h["client"].post(f"/jobs/{jid}/retranscribe-language", headers=h["headers"],
+                           json={"language": "es", "base_revision": before["revision"]})
+    assert res.status_code == 202, res.text
+    from datetime import datetime, timedelta, timezone
+    from database import EditorRetranscription, Job, SessionLocal
+    import reaper
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=jid).one()
+        job.status = "transcribing"
+        job.last_progress_at = datetime.now(timezone.utc) - timedelta(hours=5)
+        db.commit()
+    with SessionLocal() as db:
+        stuck = [job for job in reaper.find_stuck_transcriptions(db) if job.job_id == jid]
+        assert stuck
+        reaper.reap_stuck_transcription(db, stuck[0])
+        db.commit()
+    after = _snapshot(jid)
+    assert after["status"] == "transcribed_pending"
+    assert after["segments"] == before["segments"]
+    with SessionLocal() as db:
+        row = db.query(EditorRetranscription).filter_by(job_id=jid).one()
+        assert row.status == "failed" and row.error
+

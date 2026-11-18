@@ -28,6 +28,8 @@ const FAILURE_MESSAGES = {
   not_retranscribable: "La letra de esta canción ya no está en revisión; no se puede volver a transcribir.",
   audio_unavailable: "No encontramos el audio original de esta canción.",
   unsupported_language: "Elegí un idioma de la lista.",
+  fleet_updating: "Genly se está actualizando, probá en unos minutos.",
+  attempt_ended_without_result: "Genly se estaba actualizando y no pudo guardar la letra nueva. La versión anterior sigue en el editor; probá de nuevo en unos minutos.",
   edited_during_retranscription: "La letra se editó mientras Genly escuchaba la canción. Quedó tu edición; si querés, volvé a intentarlo.",
 };
 

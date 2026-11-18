@@ -2327,11 +2327,11 @@ def _settle_failed_retranscription(job_id: str) -> None:
     """
     try:
         from database import Job, SessionLocal
-        from editor_retranscription import settle_failed
+        from editor_retranscription import settle_stalled
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
-            if job is not None and settle_failed(db, job):
+            if job is not None and settle_stalled(db, job):
                 db.commit()
             else:
                 db.rollback()
