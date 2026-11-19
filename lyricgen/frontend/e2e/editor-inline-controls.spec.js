@@ -60,3 +60,21 @@ test('offers a timing correction for later repetitions without applying it autom
  await panel.getByRole('checkbox').check();await panel.getByRole('button',{name:'Aplicar duración a las marcadas'}).click();
  await expect.poll(()=>h.saves.some(save=>{const source=save.segments.find(row=>row.segment_id==='b'),target=save.segments.find(row=>row.segment_id==='c');return Number(target.start)===3&&Math.abs((target.end-target.start)-(source.end-source.start))<.001;})).toBe(true);
 });
+test('drags sidebar wider and narrower while keeping text rows aligned and the document intact',async({page})=>{
+ const h=await open(page);const handle=page.getByRole('separator',{name:'Ajustar ancho de la barra lateral'});
+ await handle.evaluate(node=>node.scrollIntoView({block:'center',behavior:'instant'}));
+ const label=page.getByTestId('timeline-label-row').first();
+ const initialHeight=(await label.boundingBox()).height;
+ const initial=Number(await handle.getAttribute('aria-valuenow'));
+ const rect=await handle.boundingBox();
+ await page.mouse.move(rect.x+rect.width/2,rect.y+12);await page.mouse.down();await page.mouse.move(rect.x+rect.width/2+100,rect.y+12,{steps:5});await page.mouse.up();
+ await expect(handle).toHaveAttribute('aria-valuenow',String(initial+100));
+ await expect.poll(async()=>(await label.boundingBox()).height).toBeLessThan(initialHeight);
+ const row=page.getByTestId('timeline-label-row').nth(1),block=page.getByTestId('timeline-segment').nth(1);
+ await expect.poll(async()=>Math.abs((await row.boundingBox()).y+7-(await block.boundingBox()).y)).toBeLessThan(2);
+ const wide=await handle.boundingBox();
+ await page.mouse.move(wide.x+wide.width/2,wide.y+12);await page.mouse.down();await page.mouse.move(wide.x+wide.width/2-140,wide.y+12,{steps:5});await page.mouse.up();
+ await expect(handle).toHaveAttribute('aria-valuenow',String(initial-40));
+ expect(h.saves).toHaveLength(0);
+ await page.screenshot({path:'/Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/editor-sidebar-resizable.png'});
+});

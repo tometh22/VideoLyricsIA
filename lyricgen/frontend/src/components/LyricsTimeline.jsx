@@ -32,7 +32,9 @@ const MOVE_HIT_MIN_PX = 28;
 const MIN_DUR_S = 0.3;
 const CLICK_SLOP_PX = 5;
 const FOLLOW_SUPPRESS_MS = 2500;
-const LABEL_W = 264;
+const DEFAULT_LABEL_W = 264;
+const MIN_LABEL_W = 180;
+const MAX_LABEL_W = 560;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -171,6 +173,10 @@ export default function LyricsTimeline({
   const semanticTimeRef = useRef(currentTime);
   semanticTimeRef.current = currentTime;
   const [viewportWidth, setViewportWidth] = useState(0);
+  const [preferredLabelWidth, setPreferredLabelWidth] = useState(DEFAULT_LABEL_W);
+  const railResizeRef = useRef(null);
+  const maxLabelWidth = Math.min(MAX_LABEL_W, Math.max(MIN_LABEL_W, (viewportWidth || 960) - 180));
+  const labelWidth = clamp(preferredLabelWidth, MIN_LABEL_W, maxLabelWidth);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [marquee, setMarquee] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -204,8 +210,8 @@ export default function LyricsTimeline({
   // outliers). Those display bounds must never authorize edits past the file.
   const editDuration = knownAudioDuration || knownWaveformDuration || total;
   const focusedSegmentAvailable = normalizedSegments.some(item => item._id === focusedSegId);
-  const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - LABEL_W), total * pxPerSec + 24);
-  const surfaceWidth = LABEL_W + trackWidth;
+  const trackWidth = Math.max(Math.max(320, (viewportWidth || 960) - labelWidth), total * pxPerSec + 24);
+  const surfaceWidth = labelWidth + trackWidth;
   const rowLayout = useMemo(() => {
     let top = 0;
     return normalizedSegments.map(segment => {
@@ -283,8 +289,8 @@ export default function LyricsTimeline({
   }, []);
 
   const fitZoom = useCallback(() => (
-    clamp((Math.max(viewportWidth, 960) - LABEL_W - 24) / Math.max(total, 1), ZOOM_MIN, ZOOM_MAX)
-  ), [total, viewportWidth]);
+    clamp((Math.max(viewportWidth, 960) - labelWidth - 24) / Math.max(total, 1), ZOOM_MIN, ZOOM_MAX)
+  ), [total, viewportWidth, labelWidth]);
 
   useEffect(() => {
     const valid = new Set(normalizedSegments.map((s) => s._id));
@@ -314,7 +320,7 @@ export default function LyricsTimeline({
     const startX = segment.start * pxPerSec;
     const endX = segment.end * pxPerSec;
     const visibleStart = scroll.scrollLeft + 12;
-    const visibleEnd = scroll.scrollLeft + viewport - LABEL_W - 12;
+    const visibleEnd = scroll.scrollLeft + viewport - labelWidth - 12;
     if (startX < visibleStart || endX > visibleEnd) {
       const left = Math.max(0, startX - 24);
       if (typeof scroll.scrollTo === "function") scroll.scrollTo({ left, behavior: "auto" });
@@ -323,7 +329,7 @@ export default function LyricsTimeline({
   // Only explicit focus or viewport/zoom changes reveal a range; autosave,
   // typing and playback must not reset the user's scroll or selection.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedSegId, focusedSegmentAvailable, viewportWidth, pxPerSec]);
+  }, [focusedSegId, focusedSegmentAvailable, viewportWidth, pxPerSec, labelWidth]);
 
   const xToTime = useCallback((clientX) => {
     const rect = trackRef.current?.getBoundingClientRect();
@@ -723,7 +729,7 @@ export default function LyricsTimeline({
   const scrollToPlayhead = useCallback(() => {
     const sc = scrollRef.current;
     if (!sc || typeof sc.scrollTo !== "function" || Date.now() - lastInteractionRef.current < FOLLOW_SUPPRESS_MS) return;
-    const x = LABEL_W + currentTime * pxPerSec;
+    const x = labelWidth + currentTime * pxPerSec;
     const left = sc.scrollLeft;
     const right = left + sc.clientWidth;
     if (x < left + 80 || x > right - 120) {
@@ -734,7 +740,7 @@ export default function LyricsTimeline({
     } else {
       lastFollowTargetRef.current = null;
     }
-  }, [currentTime, pxPerSec]);
+  }, [currentTime, pxPerSec, labelWidth]);
 
   useEffect(() => {
     if (isPlaying && followEnabled && editingTextId == null) scrollToPlayhead();
@@ -1094,13 +1100,70 @@ export default function LyricsTimeline({
         data-testid="timeline-scroll"
         data-scroll-owner="horizontal-only"
         className="overflow-x-auto overflow-y-hidden overscroll-x-contain"
-        style={{ scrollPaddingLeft: LABEL_W + 12 }}
+        style={{ scrollPaddingLeft: labelWidth + 12 }}
         onWheel={markInteraction}
       >
         <div className="relative min-w-full" style={{ width: surfaceWidth }}>
+          <div className="pointer-events-none sticky left-0 z-50" style={{ width: labelWidth, height: 0 }}>
+            <div role="separator" aria-orientation="vertical" tabIndex={0}
+              data-testid="timeline-sidebar-resizer"
+              aria-label={t("timeline.resize_sidebar")}
+              title={t("timeline.resize_sidebar_hint")}
+              aria-valuemin={MIN_LABEL_W} aria-valuemax={maxLabelWidth} aria-valuenow={Math.round(labelWidth)}
+              className="pointer-events-auto absolute top-0 w-2.5 cursor-col-resize touch-none select-none outline-none group focus-visible:bg-brand/30 hover:bg-brand/20"
+              style={{ left: labelWidth - 5, height: trackHeight + 36 + 56 }}
+              onPointerDown={event => {
+                if (event.button !== 0) return;
+                event.preventDefault(); event.stopPropagation();
+                event.currentTarget.focus({ preventScroll: true });
+                railResizeRef.current = { pointerId: event.pointerId, x: event.clientX, width: labelWidth };
+                event.currentTarget.setPointerCapture?.(event.pointerId);
+                markInteraction();
+              }}
+              onPointerMove={event => {
+                const drag = railResizeRef.current;
+                if (!drag || drag.pointerId !== event.pointerId) return;
+                event.preventDefault(); event.stopPropagation();
+                setPreferredLabelWidth(clamp(drag.width + event.clientX - drag.x, MIN_LABEL_W, maxLabelWidth));
+                markInteraction();
+              }}
+              onPointerUp={event => {
+                const drag = railResizeRef.current;
+                if (!drag || drag.pointerId !== event.pointerId) return;
+                event.stopPropagation();
+                setPreferredLabelWidth(clamp(drag.width + event.clientX - drag.x, MIN_LABEL_W, maxLabelWidth));
+                railResizeRef.current = null;
+                if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+              }}
+              onPointerCancel={event => {
+                const drag = railResizeRef.current;
+                if (!drag || drag.pointerId !== event.pointerId) return;
+                setPreferredLabelWidth(drag.width);
+                railResizeRef.current = null;
+              }}
+              onLostPointerCapture={() => { railResizeRef.current = null; }}
+              onDoubleClick={event => { event.preventDefault(); event.stopPropagation(); setPreferredLabelWidth(DEFAULT_LABEL_W); }}
+              onKeyDown={event => {
+                if (event.key === "Escape" && railResizeRef.current) {
+                  event.preventDefault(); event.stopPropagation();
+                  setPreferredLabelWidth(railResizeRef.current.width);
+                  railResizeRef.current = null;
+                  return;
+                }
+                const delta = event.shiftKey ? 40 : 20;
+                const next = event.key === "ArrowLeft" ? labelWidth - delta : event.key === "ArrowRight" ? labelWidth + delta
+                  : event.key === "Home" ? MIN_LABEL_W : event.key === "End" ? maxLabelWidth : null;
+                if (next == null) return;
+                event.preventDefault(); event.stopPropagation();
+                setPreferredLabelWidth(clamp(next, MIN_LABEL_W, maxLabelWidth));
+                markInteraction();
+              }}>
+              <span aria-hidden="true" className="absolute inset-y-0 left-1 w-px bg-white/15 group-hover:bg-brand-light group-focus-visible:bg-brand-light" />
+            </div>
+          </div>
           <div data-testid="timeline-ruler" className="relative h-9 border-b border-white/[0.06] bg-surface-1/90">
-            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[9px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary" style={{ width: LABEL_W }}>{t("timeline.lyrics_rail", "Letras")}<button type="button" className="ml-auto rounded px-2 py-1 text-base text-white hover:bg-brand/20" aria-label={t("timeline.add_from_sidebar")} onClick={() => setInsertTime(Number(Math.max(0, Math.min(editDuration, currentTime)).toFixed(2)))}>+</button></div>
-            <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
+            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[9px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary" style={{ width: labelWidth }}>{t("timeline.lyrics_rail", "Letras")}<button type="button" className="ml-auto rounded px-2 py-1 text-base text-white hover:bg-brand/20" aria-label={t("timeline.add_from_sidebar")} onClick={() => setInsertTime(Number(Math.max(0, Math.min(editDuration, currentTime)).toFixed(2)))}>+</button></div>
+            <div className="absolute inset-y-0 cursor-pointer" style={{ left: labelWidth, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
               {ticks.map((time) => (
                 <div key={time} className="absolute top-0 bottom-0 border-l border-white/[0.08] pointer-events-none" style={{ left: time * pxPerSec }}>
                   <span className="absolute top-1 left-1 text-[9px] text-ink-tertiary tabular-nums whitespace-nowrap">{fmt(time)}</span>
@@ -1110,7 +1173,7 @@ export default function LyricsTimeline({
           </div>
 
           <div className="relative h-14 border-b border-white/[0.06] bg-brand/[0.035]">
-            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[10px] text-ink-tertiary" style={{ width: LABEL_W }}>
+            <div className="sticky left-0 z-40 flex h-full items-center border-r border-white/[0.08] bg-surface-1/95 px-4 text-[10px] text-ink-tertiary" style={{ width: labelWidth }}>
               <span className="inline-flex min-w-0 items-center gap-2">
                 <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-light/70" />
                 <span className="min-w-0">
@@ -1119,7 +1182,7 @@ export default function LyricsTimeline({
                 </span>
               </span>
             </div>
-            <div className="absolute inset-y-0 cursor-pointer" style={{ left: LABEL_W, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
+            <div className="absolute inset-y-0 cursor-pointer" style={{ left: labelWidth, width: trackWidth }} onClick={(event) => seekAt(event.clientX)}>
               {waveform?.peaks?.length ? <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none opacity-80" aria-hidden="true" /> : null}
               {!waveform?.peaks?.length && waveformLoading && (
                 <div className="absolute inset-0 flex items-center gap-1.5 overflow-hidden px-4" role="status">
@@ -1161,7 +1224,7 @@ export default function LyricsTimeline({
           </div>
 
           <div className="relative" style={{ width: surfaceWidth, height: trackHeight }}>
-            <div className="sticky left-0 z-40 border-r border-white/[0.08] bg-surface-1/95 shadow-[12px_0_24px_rgba(0,0,0,.18)]" ref={labelRailRef} style={{ width: LABEL_W }}>
+            <div className="sticky left-0 z-40 border-r border-white/[0.08] bg-surface-1/95 shadow-[12px_0_24px_rgba(0,0,0,.18)]" ref={labelRailRef} style={{ width: labelWidth }}>
               {normalizedSegments.map((segment, index) => {
                 const isSelected = selectedIds.has(segment._id);
                 const isActive = activeId === segment._id;
@@ -1217,7 +1280,7 @@ export default function LyricsTimeline({
               data-testid="timeline-lane"
               data-px-per-sec={pxPerSec}
               className="absolute top-0 cursor-crosshair bg-[linear-gradient(90deg,rgba(255,255,255,.018)_1px,transparent_1px)]"
-              style={{ left: LABEL_W, width: trackWidth, height: trackHeight, backgroundSize: `${Math.max(24, tickStep * pxPerSec)}px 100%` }}
+              style={{ left: labelWidth, width: trackWidth, height: trackHeight, backgroundSize: `${Math.max(24, tickStep * pxPerSec)}px 100%` }}
               onContextMenu={event => { if (event.target.closest("input, textarea")) return; event.preventDefault(); event.stopPropagation(); setInsertTime(Number(xToTime(event.clientX).toFixed(2))); }}
               onPointerDown={(event) => beginMarquee(event)}
               onPointerMove={updateMarquee}
@@ -1251,7 +1314,7 @@ export default function LyricsTimeline({
                   aria-pressed={editingTextId === segment._id ? undefined : isSelected}
                   aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
                   className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-colors select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
-                  style={{ left: start * pxPerSec, top: rowLayout[index].top + 7, width, height: rowLayout[index].height - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
+                  style={{ left: start * pxPerSec, top: rowLayout[index].top + 7, width, height: rowLayout[index].height - 14, touchAction: "none", scrollMarginLeft: labelWidth + 12 }}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => {
                     if (event.target !== event.currentTarget) return;

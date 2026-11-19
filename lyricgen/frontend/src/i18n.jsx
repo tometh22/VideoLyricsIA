@@ -5,6 +5,8 @@ import { createContext, useContext, useState, useCallback } from "react";
 // dictionary via I18nProvider below — exporting is read-only.
 export const translations = {
   es: {
+    "timeline.resize_sidebar": "Ajustar ancho de la barra lateral",
+    "timeline.resize_sidebar_hint": "Arrastrá para cambiar el ancho · Flechas para ajustar · Doble clic para restablecer",
     "timeline.add_at_cursor": "Agregar línea en el cursor",
     "timeline.insert_time": "Inicio (segundos)",
     "timeline.insert_time_label": "Inicio de la línea nueva en segundos",
@@ -2551,6 +2553,8 @@ export const translations = {
   },
 
   en: {
+    "timeline.resize_sidebar": "Resize lyric sidebar",
+    "timeline.resize_sidebar_hint": "Drag to resize · Arrow keys to adjust · Double-click to reset",
     "timeline.add_at_cursor": "Add line at cursor",
     "timeline.insert_time": "Start (seconds)",
     "timeline.insert_time_label": "New line start in seconds",
@@ -5009,6 +5013,8 @@ export const translations = {
   },
 
   pt: {
+    "timeline.resize_sidebar": "Ajustar largura da barra lateral",
+    "timeline.resize_sidebar_hint": "Arraste para ajustar · Setas para ajustar · Clique duplo para restaurar",
     "timeline.add_at_cursor": "Adicionar linha no cursor",
     "timeline.insert_time": "Início (segundos)",
     "timeline.insert_time_label": "Início da nova linha em segundos",

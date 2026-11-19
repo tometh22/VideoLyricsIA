@@ -46,3 +46,25 @@ it('Escape closes a reconciled inline edit without restoring old remote text',()
  expect(screen.queryByRole('textbox')).toBeNull();
  expect(change).not.toHaveBeenCalled();
 });
+it('resizes the sidebar by dragging without changing lyrics or timings',()=>{
+ const change=vi.fn(),timing=vi.fn();render(<LyricsTimeline segments={rows} onTextChange={change} onTimingChange={timing}/>);
+ const handle=screen.getByRole('separator',{name:'Ajustar ancho de la barra lateral'});
+ expect(handle).toHaveAttribute('aria-valuenow','264');
+ fireEvent.pointerDown(handle,{button:0,pointerId:7,clientX:264});
+ fireEvent.pointerMove(handle,{pointerId:7,clientX:364});
+ fireEvent.pointerUp(handle,{pointerId:7,clientX:364});
+ expect(handle).toHaveAttribute('aria-valuenow','364');
+ expect(screen.getByTestId('timeline-lane')).toHaveStyle({left:'364px'});
+ expect(change).not.toHaveBeenCalled();expect(timing).not.toHaveBeenCalled();
+ fireEvent.doubleClick(handle);expect(handle).toHaveAttribute('aria-valuenow','264');
+});
+it('supports keyboard bounds and cancels an interrupted sidebar drag',()=>{
+ render(<LyricsTimeline segments={rows}/>);
+ const handle=screen.getByRole('separator');
+ fireEvent.keyDown(handle,{key:'Home'});expect(handle).toHaveAttribute('aria-valuenow','180');
+ fireEvent.keyDown(handle,{key:'ArrowRight'});expect(handle).toHaveAttribute('aria-valuenow','200');
+ fireEvent.pointerDown(handle,{button:0,pointerId:7,clientX:200});
+ fireEvent.pointerMove(handle,{pointerId:7,clientX:500});
+ fireEvent.pointerCancel(handle,{pointerId:7});expect(handle).toHaveAttribute('aria-valuenow','200');
+ fireEvent.keyDown(handle,{key:'End'});expect(handle).toHaveAttribute('aria-valuenow',handle.getAttribute('aria-valuemax'));
+});
