@@ -1,10 +1,23 @@
 # Changelog
 
-## [1.1.177] - 2026-11-18
+## [1.1.183] - 2026-11-19
 
 ### Fixed
-- Keep Argentine voseo in Revisión rápida (Argentina portal only): when the machine normalised "querés", "vení", "anotate", "No te quedés" or "Te llevás" to tú, propose the vos form with one click. Required when two independent ears (witness, Gemini, official lyrics) wrote the vos form, or one did and the song already uses voseo in another line; a suggestion with a single ear or with only the song's own voseo. Ears are now compared with accents, so "llevas"/"llevás" is no longer invisible. Songs that really use tú (ballads, folklore, foreign artists) are left alone without evidence, official lyrics in tú win, forms that are also other words ("ven", "mira", "ganas") need an ear, and an ear that matches the voseo point is merged into it instead of showing a second card. Chile and portal-less UMG deliveries are never touched.
+- Keep Argentine voseo in Revisión rápida (Argentina portal only): when the machine normalised "querés", "vení", "anotate", "No te quedés" or "Te llevás" to tú, propose the vos form with one click. Marked as priority (`required`, listed first; like the rest of Revisión rápida it never blocks approval) when two independent ears (witness, Gemini, official lyrics) wrote the vos form, or one did and the song already uses voseo in another line; a suggestion with a single ear or with only the song's own voseo. Ears are now compared with accents, so "llevas"/"llevás" is no longer invisible. Songs that really use tú (ballads, folklore, foreign artists) are left alone without evidence, official lyrics in tú win, forms that are also other words ("ven", "mira", "ganas") need an ear, and an ear that matches the voseo point is merged into it instead of showing a second card. Chile and portal-less UMG deliveries are never touched.
 - Add `scripts/measure_umg_voseo_bank.py`, an offline measurement of the voseo rule over exported UMG requests, delivered and final lyrics.
+
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
+
+## [1.1.178] - 2026-11-18
+
+### Fixed
+- Restore a single live lyric preview beside campaign editing, selecting paused lines by identity, preserving unconfirmed-text masking and following existing audio playback. Keep read-only touch scrolling, bounded detail scrolling and native disclosure keyboard actions.
+- Start quality proposals collapsed; keep stale/expired warnings and a local hide action accessible outside the disclosure. Prevent applying outdated proposals and announce in-flight decisions once.
+- Make lyric-review suggestions advisory across campaigns, individual jobs and re-renders, including missing-text and portal-style suggestions. Preserve snapshot, revision, language and structural approval controls. Legacy `LYRIC_REVIEW_MODE=enforce` now behaves as `observe`; `LYRIC_REVIEW_ENFORCE_TENANTS` no longer enables blocking. Deploy compatible API and frontend before verifying approval.
 
 ## [1.1.176] - 2026-11-18
 

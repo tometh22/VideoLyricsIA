@@ -46,3 +46,36 @@ describe("sixth audit: approval identity after equivalent replacement", () => {
     expect(onApprove.mock.calls.at(-1)[1].confirmedLineIds).toEqual(["replacement-a"]);
   });
 });
+
+it("uses occurrence IDs from the persisted snapshot after an equivalent server identity replacement", async () => {
+  const jobId = "legacyidentity";
+  const segments = [
+    { segment_id: "a", start: 0, end: 2, text: "Primera frase" },
+    { segment_id: "b", start: 3, end: 5, text: "Segunda frase" },
+  ];
+  const remote = segments.map(segment => ({ ...segment, segment_id: "16" }));
+  const writes = [];
+  const request = vi.fn(async (path, options = {}) => {
+    if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+    if (path === `/editor/${jobId}` && !options.method) return reply({
+      job_id: jobId, revision: 1, segments, original_segments: segments, lock: { active: false },
+    });
+    if (path === `/editor/${jobId}` && options.method === "PATCH") {
+      writes.push(JSON.parse(options.body));
+      if (writes.length === 1) return reply({ detail: { server_revision: 2, server_segments: remote } }, 409);
+      return reply({ revision: 3, version_id: "persisted-v3" });
+    }
+    return reply({});
+  });
+  const onApprove = vi.fn().mockResolvedValue({ ok: true });
+  render(<LyricsEditor segments={segments} transcribeJobId={jobId} filename="song.wav"
+    requireLineReview disableBeforeUnload user={{ id: 42, tenant_id: "audit6", features: { editor_v2: true } }}
+    editorRequest={request} onApprove={onApprove} onBack={vi.fn()} submitLabel="Aprobar letra y timing" />);
+  await waitFor(() => expect(screen.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false"));
+  fireEvent.click(screen.getByRole("button", { name: "Aprobar letra y timing", exact: true }));
+  await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+  expect(onApprove.mock.calls[0][0].map(row => row.segment_id)).toEqual(["16", "16"]);
+  expect(onApprove.mock.calls[0][1]).toMatchObject({
+    confirmedLineIds: ["index:0", "index:1"], editorRevision: 3, editorVersionId: "persisted-v3",
+  });
+});

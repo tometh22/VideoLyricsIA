@@ -1,3 +1,4 @@
+import { reviewLineIds } from "../lib/reviewLineIds";
 import DisplaySegmentationNotice from "./DisplaySegmentationNotice";
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { editorSeekProperties } from "../lib/editorSeekTelemetry";
@@ -808,6 +809,7 @@ export default function LyricsEditor({
   // siempre.
   hideTypographyControls = false,
   hideInternalPreview = false,
+  startAtWorkspace = false,
   // Phase C 2026-05-25: callback que publica el tick de playback hacia
   // el padre (App.jsx). El padre típicamente escribe en un ref para
   // que el WizardLivePreview central pueda leerlo sin pasar por
@@ -2164,6 +2166,7 @@ export default function LyricsEditor({
     setTextEditStart(null);
     setEditHistory(editHistory.slice(0, -1));
     setIsDirty(true);
+    setFlushCounter((count) => count + 1);
     trackEditorEvent("editor_undo", { operation: "edit", count: 1 });
   }, [editHistory, trackEditorEvent]);
 
@@ -3079,7 +3082,7 @@ export default function LyricsEditor({
   // se ocultan al instante los puntos que el revisor ya resolvió hasta que el
   // servidor confirme la letra nueva.
   const lyricReview = durableEditor.document?.lyric_review || null;
-  const lyricReviewMode = lyricReview?.mode || "enforce";
+  const lyricReviewMode = lyricReview?.mode || "observe";
   const [reviewResolvedIds, setReviewResolvedIds] = useState(() => new Set());
   const [reviewFailedIds, setReviewFailedIds] = useState(() => new Set());
   const [reviewDecisions, setReviewDecisions] = useState([]);
@@ -3112,27 +3115,6 @@ export default function LyricsEditor({
     lyricReviewMode === "off" ? []
       : validItems(lyricReview?.items).filter((item) => !reviewResolvedIds.has(item.id))
   ), [lyricReview, lyricReviewMode, reviewResolvedIds]);
-  const pendingRequiredReview = pendingReviewItems.filter((item) => item.required).length;
-  const reviewBlocksApproval = lyricReviewMode === "enforce" && pendingRequiredReview > 0;
-  const focusLyricReview = useCallback((scroll = true) => {
-    const panel = reviewPanelRef.current;
-    if (!panel) return;
-    // Validation owns the next focus target. Approval may still have the
-    // editor inert here; focus this panel after unlocking, not the submitter.
-    if (approveInFlightRef.current) approvalReturnFocusRef.current = panel;
-    if (scroll) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    panel.focus({ preventScroll: true });
-  }, []);
-  // Con puntos obligatorios, el panel toma el teclado al abrir la canción
-  // (sin mover la página ni robar el foco de un campo en el que se escribe).
-  const reviewAutoFocused = useRef(false);
-  useEffect(() => {
-    if (reviewAutoFocused.current || !reviewBlocksApproval) return;
-    const tag = (document.activeElement?.tagName || "").toUpperCase();
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
-    reviewAutoFocused.current = true;
-    window.requestAnimationFrame(() => focusLyricReview(false));
-  }, [focusLyricReview, reviewBlocksApproval]);
   const lineIdForReviewItem = useCallback((item, segments = editedRef.current) => {
     const occurrence = item?.occurrences?.[0];
     if (!occurrence) return null;
@@ -3189,7 +3171,7 @@ export default function LyricsEditor({
   }, [recordReviewDecision, trackEditorEvent]);
   const dismissLyricReview = useCallback((item) => {
     recordReviewDecision(item, "dismiss", dismissReviewItem(editedRef.current, item));
-    setReviewStatus(`${item.dismiss || "Está bien así"} · Z para deshacer`);
+    setReviewStatus("Letra conservada · Z para deshacer");
   }, [recordReviewDecision]);
   const undoLyricReview = useCallback(() => {
     const last = reviewDecisions[reviewDecisions.length - 1];
@@ -3555,7 +3537,7 @@ export default function LyricsEditor({
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing || tag === "SELECT") return;
-      if ((tag === "BUTTON" || tag === "A") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
+      if ((tag === "BUTTON" || tag === "A" || tag === "SUMMARY") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
         // doesn't anchor 3 lines from one apparent tap. Native autorepeat
@@ -4362,6 +4344,8 @@ export default function LyricsEditor({
       : segment
   )), [maskedCandidateSegmentIds, sanitizedEdited, t]);
 
+  const selectedPreviewSegment = previewSegments.find(segment => segment._id === focusedSegId) || previewSegments[0];
+
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
     setTimingWorkspaceMode("timeline");
@@ -4495,11 +4479,6 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
-    if (reviewBlocksApproval) {
-      focusLyricReview();
-      setReviewStatus(`Para aprobar, resolvé ${pendingRequiredReview === 1 ? "este punto" : `estos ${pendingRequiredReview} puntos`}.`);
-      return;
-    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -4543,17 +4522,10 @@ export default function LyricsEditor({
     // The campaign CTA is the one song-level attestation. Send every line
     // identity from that exact persisted snapshot so the backend can still
     // reject stale/partial documents without requiring per-line clicks.
-    const confirmedLineIdsForApproval = cleaned
-      .filter((segment) => requireLineReview || reviewedLineIds.includes(segment._id))
-      .map((segment, index) => {
-        const persistedIdentity = String(segment.segment_id || segment.id || "").trim();
-        // The August campaign was materialized before stable `segment_id`s
-        // existed. Its durable revision still binds the exact snapshot, so
-        // use the same ordered fallback as the API instead of submitting an
-        // empty list and making every legacy song impossible to approve.
-        return persistedIdentity || `index:${index}`;
-      })
-      .filter(Boolean);
+    const cleanedReviewIds = reviewLineIds(cleaned);
+    const confirmedLineIdsForApproval = cleanedReviewIds.filter((_, index) =>
+      requireLineReview || reviewedLineIds.includes(cleaned[index]._id));
+
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
@@ -4641,19 +4613,11 @@ export default function LyricsEditor({
         return;
       }
       if (!approvalSnapshotStillCurrent(savedScreenSnapshot)) return;
-      // El guardado recién hecho es la verdad: si la letra que se va a
-      // aprobar todavía tiene puntos obligatorios, se deciden antes.
-      if (saveResult?.lyricReview?.mode === "enforce"
-        && validItems(saveResult.lyricReview.items).some((item) => item.required)) {
-        setReviewResolvedIds(new Set());
-        focusLyricReview();
-        setReviewStatus("Para aprobar, resolvé los puntos de la revisión rápida.");
-        return;
-      }
       // Derive both payload and attestation identities from the successful
       // write, including equivalent identity/renderer metadata replacements.
       // Non-campaign reviews retain only the originally reviewed occurrences.
       const confirmedIdsForSnapshot = (snapshot) => {
+        const snapshotReviewIds = reviewLineIds(snapshot);
         const unmatched = new Set(cleaned.map((_, index) => index));
         return snapshot.flatMap((segment, index) => {
           let reviewed = requireLineReview;
@@ -4670,7 +4634,7 @@ export default function LyricsEditor({
             }
           }
           if (!reviewed) return [];
-          return [String(segment.segment_id || segment.id || "").trim() || `index:${index}`];
+          return [snapshotReviewIds[index]];
         });
       };
       let approvalResult = null;
@@ -5307,20 +5271,13 @@ export default function LyricsEditor({
             data-quality-review-required={campaignQualityReview ? "true" : "false"}
             data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
-            data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
-            title={!hasLyrics ? "Agregá o recuperá la letra antes de aprobar" : reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
-            className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
-              ? "bg-surface-2 text-white ring-1 ring-white/15 hover:bg-surface-3"
-              : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
+            data-lyric-review-blocked="false"
+            title={!hasLyrics ? "Agregá o recuperá la letra antes de aprobar" : undefined}
+            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {reviewBlocksApproval && !isApproving && (
-              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-300/15 px-1.5 text-[11px] font-bold tabular-nums text-amber-200">{pendingRequiredReview}</span>
-            )}
             {isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
-              : reviewBlocksApproval
-                ? "Faltan para aprobar · Revisar"
-                : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>
@@ -6912,6 +6869,15 @@ export default function LyricsEditor({
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
                 activeId={activeId} isPlaying={isPlaying}
+                startAtWorkspace={startAtWorkspace && (!editorV2Enabled || durableHydrated)}
+                preview={!hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
+                  <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
+                  {!previewBgUrl && <p className="mb-2 text-xs text-ink-secondary">Fondo de referencia; el fondo final se genera después.</p>}
+                  <LyricVideoPreview segments={isPlaying ? previewSegments : (selectedPreviewSegment ? [selectedPreviewSegment] : [])} currentTime={isPlaying ? currentTime : (selectedPreviewSegment?.start ?? currentTime)} isPlaying={isPlaying}
+                    backgroundUrl={previewBgUrl || null} backgroundStyle={backgroundStyle || "default"}
+                    font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
+                    textContrast={selectedContrast} fontScale={fontScale} editable={false} t={t} />
+                </div>}
                 audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                 onSelect={(line) => { setFocusedSegId(line._id); if (audioUrl && !audioError && audioMetadataReady) seekTo(line.start, true, line); }}
                 onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}

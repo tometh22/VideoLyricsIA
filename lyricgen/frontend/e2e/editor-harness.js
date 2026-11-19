@@ -126,6 +126,7 @@ export async function installEditorHarness(page, options = {}) {
         revision: durableRevision,
         segments: durableSegments,
         original_segments: durableOriginal,
+        ...(options.qualityProposal ? { quality_proposal: options.qualityProposal } : {}),
         latest_approved_version: options.latestApprovedVersion || null,
         ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
         updated_by: null,

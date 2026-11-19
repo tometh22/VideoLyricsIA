@@ -12,6 +12,9 @@ const REASON_LABELS = {
   text_audio_mismatch: "La letra no coincide claramente con el audio",
   text_mismatch: "Posible diferencia entre letra y audio",
   voiced_gap: "Hay voz detectada sin una frase asignada",
+  card_ends_before_stable_vocal_tail: "Revisar el final de la frase contra el audio",
+  fixed_wrapper_padding: "Revisar el margen al final de la frase",
+  display_boundary_inherited_from_next_line: "Revisar la separación con la frase siguiente",
   vocalization: "Posible vocalización faltante o incorrecta",
 };
 
@@ -35,7 +38,7 @@ function reasonLabel(reason) {
   }
   const value = String(reason).trim();
   if (!value) return "Revisión de calidad recomendada";
-  return REASON_LABELS[value] || `${value.charAt(0).toUpperCase()}${value.slice(1).replaceAll("_", " ")}`;
+  return REASON_LABELS[value.toLowerCase().replaceAll(" ", "_")] || "Ajuste sugerido · verificar con el audio";
 }
 
 function segmentView(segment, fallbackStart, fallbackEnd) {
@@ -122,6 +125,7 @@ export default function QualityProposalPanel({
   rejecting = false,
 }) {
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const [hiddenUnavailableKey, setHiddenUnavailableKey] = useState(null);
   const [clock, setClock] = useState(() => Date.now());
   const telemetryRoot = useReviewerCandidateTelemetry(proposal, onReviewTelemetry);
 
@@ -174,7 +178,8 @@ export default function QualityProposalPanel({
     return () => window.clearTimeout(timeout);
   }, [clock, expiry]);
 
-  if (!proposal) return null;
+  const unavailableKey = JSON.stringify([proposal?.id, proposal?.base_revision, currentRevision, status]);
+  if (!proposal || (unavailable && hiddenUnavailableKey === unavailableKey)) return null;
 
   const selectedEntries = windowEntries.filter((entry) => selectedKeys.has(entry.key));
   const busy = applying || dismissing || observing || rejecting;
@@ -202,9 +207,9 @@ export default function QualityProposalPanel({
   };
 
   const stateMessage = stale
-    ? "Esta propuesta corresponde a una versión anterior de la letra. Actualizá el análisis para continuar."
+    ? "Esta propuesta corresponde a una versión anterior de la letra y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
     : expired
-      ? "Esta propuesta venció. Solicitá un nuevo análisis antes de aplicar cambios."
+      ? "Esta propuesta venció y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
       : closed
         ? status === "applied"
           ? "Esta propuesta ya fue aplicada."
@@ -216,11 +221,32 @@ export default function QualityProposalPanel({
   return (
     <section
       ref={telemetryRoot}
-      className="rounded-2xl border border-cyan-400/20 bg-slate-950/80 p-4 text-gray-100 shadow-xl shadow-black/20"
+      className="rounded-2xl border border-cyan-400/20 bg-slate-950/80 px-3 py-2 text-gray-100 shadow-xl shadow-black/20"
       aria-labelledby={`quality-proposal-title-${proposal.id}`}
       data-testid="quality-proposal-panel"
       data-proposal-state={stale ? "stale" : expired ? "expired" : closed ? status : "active"}
     >
+      {busy && <p role="status" className="mb-2 text-xs text-cyan-200">{applying ? "Aplicando cambios…" : dismissing ? "Descartando propuesta…" : "Guardando decisión…"}</p>}
+      {stateMessage && (
+        <div
+          className="mt-4 rounded-xl border border-amber-400/30 bg-amber-950/30 px-3 py-2 text-sm text-amber-100"
+          role="alert"
+        >
+          {stateMessage}
+          {(stale || expired) && <button type="button" disabled={busy}
+            onClick={() => setHiddenUnavailableKey(unavailableKey)}
+            className="ml-3 rounded-lg border border-white/20 px-3 py-2 text-sm text-white hover:bg-white/10">
+            Ocultar propuesta
+          </button>}
+        </div>
+      )}
+
+      <details key={proposal.id} className="group/proposals" data-testid="quality-proposal-disclosure">
+        <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 rounded-lg py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300">
+          <span><span className="font-semibold">Sugerencias de ajuste · {windowEntries.length} zonas</span><span className="ml-2 text-xs text-gray-400">Aplicación manual</span></span>
+          <span className="text-cyan-200"><span aria-hidden="true" className="mr-2 inline-block transition-transform group-open/proposals:rotate-90">▸</span>Ver propuestas</span>
+        </summary>
+        <div className="mt-3 max-h-[min(52dvh,480px)] overflow-y-auto overscroll-contain pr-2" data-testid="quality-proposal-scroll">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
@@ -246,14 +272,6 @@ export default function QualityProposalPanel({
         </span>
       </div>
 
-      {stateMessage && (
-        <div
-          className="mt-4 rounded-xl border border-amber-400/30 bg-amber-950/30 px-3 py-2 text-sm text-amber-100"
-          role="alert"
-        >
-          {stateMessage}
-        </div>
-      )}
 
       {proposal?.reviewer_assist?.candidate && (
         <section className="mt-4 space-y-3" aria-label="Canción candidata completa">
@@ -442,6 +460,7 @@ export default function QualityProposalPanel({
         })}
       </fieldset>
 
+        </div>
       {!observationOnly && <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-gray-400" aria-live="polite">
           {selectedEntries.length === 0
@@ -467,6 +486,7 @@ export default function QualityProposalPanel({
           </button>
         </div>
       </div>}
+      </details>
     </section>
   );
 }

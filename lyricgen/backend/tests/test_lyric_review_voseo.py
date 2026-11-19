@@ -118,7 +118,7 @@ def test_ear_hearing_a_different_spelling_is_absorbed_not_duplicated():
     assert item["required"] is True
     assert item["occurrences"][0]["after"] == "Me dijiste que no querés volver al barrio"
     # Lo que oyeron los oídos cuenta como voseo de la canción: "Te llevas"
-    # pasa a sugerencia (sin oído propio, no obligatoria).
+    # pasa a sugerencia (sin oído propio, no prioritaria).
     [other] = [i for i in _voseo(review) if i["occurrences"][0]["line_index"] == 1]
     assert other["required"] is False and other["sources"] == []
     text_items = [i for i in review["items"] if i["kind"] in {"heard_different", "missing"}
