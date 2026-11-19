@@ -12,7 +12,7 @@ const GUIDE = [
 ];
 
 const SHORTCUTS = [
-  ["Enter", "aplicar"], ["⌫", "está bien así"], ["1–3", "otra opción"], ["E", "escuchar"],
+  ["Enter", "aplicar"], ["⌫", "conservar mi letra"], ["1–3", "otra opción"], ["E", "escuchar"],
   ["J / K", "siguiente / anterior"], ["M", "editar a mano"], ["Z", "deshacer"], ["?", "ayuda"],
 ];
 
@@ -102,6 +102,9 @@ const UNDO = "M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3";
 const ghost = "inline-flex h-10 items-center rounded-button px-3 text-sm text-white ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light sm:h-9";
 const link = "rounded px-1 text-ink-secondary transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light";
 
+const suggestionTitle = (item) => item.kind === "heard_different" ? "Posible diferencia"
+  : item.kind === "missing" ? "Posible texto faltante" : item.title;
+
 function ActiveCard({ item, failed, playing, onPlay, onApply, onDismiss, onEdit }) {
   const occurrence = item.occurrences[0];
   const count = item.occurrences.length;
@@ -111,8 +114,8 @@ function ActiveCard({ item, failed, playing, onPlay, onApply, onDismiss, onEdit 
       className={`rounded-xl bg-surface-2 p-4 ring-1 ${failed ? "ring-rose-300/40" : "ring-white/[0.07]"}`}
     >
       <div className="flex items-center gap-2 text-xs">
-        <span className="font-medium text-white/90">{item.title}</span>
-        {!item.required && <span className="rounded-full bg-white/[0.06] px-2 py-0.5 text-[10px] text-ink-secondary">Sugerencia</span>}
+        <span className="font-medium text-white/90">{suggestionTitle(item)}</span>
+        <span className="rounded-full bg-white/[0.06] px-2 py-0.5 text-[10px] text-ink-secondary">Opcional</span>
         {count > 1 && <span className="text-white/50">· {count} lugares, se corrigen juntos</span>}
         <button type="button" onClick={() => onPlay(item)}
           className="ml-auto inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full bg-white/[0.06] px-2.5 font-medium tabular-nums text-white transition-colors hover:bg-white/[0.12] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
@@ -131,10 +134,10 @@ function ActiveCard({ item, failed, playing, onPlay, onApply, onDismiss, onEdit 
         <button type="button" onClick={() => (item.listen ? onPlay(item) : onApply(item))}
           className="inline-flex h-10 items-center rounded-button bg-brand px-4 text-sm font-semibold text-white shadow-lg shadow-brand/20 transition-colors hover:bg-brand-light focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 sm:h-9">
           {item.listen && <Icon path={playing ? STOP : PLAY} className="mr-1.5 h-3 w-3" />}
-          {item.listen ? (playing ? "Detener" : "Escuchar") : (item.action || "Corregir")}<Kbd dark>Enter</Kbd>
+          {item.listen ? (playing ? "Detener" : "Escuchar") : "Aplicar sugerencia"}<Kbd dark>Enter</Kbd>
         </button>
         <button type="button" onClick={() => onDismiss(item)} className={ghost}>
-          {item.dismiss || "Está bien así"}<Kbd>⌫</Kbd>
+          Conservar mi letra<Kbd>⌫</Kbd>
         </button>
         {(item.alternatives || []).slice(0, 3).map((alt, k) => (
           <button key={`${alt.label || alt.replace}-${k}`} type="button" onClick={() => onApply(item, alt)}
@@ -157,10 +160,10 @@ function QueueRow({ item, onSelect }) {
       <button type="button" onClick={() => onSelect(item)} data-testid="lyric-review-item"
         className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left text-xs transition-colors hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light">
         <span className="w-9 shrink-0 tabular-nums text-white/50">{formatTime(item.start)}</span>
-        <span className="shrink-0 text-white/80">{item.title}</span>
+        <span className="shrink-0 text-white/80">{suggestionTitle(item)}</span>
         <span className="min-w-0 flex-1 truncate text-white/50">{item.listen ? occurrence.before : occurrence.after || occurrence.before}</span>
         {item.occurrences.length > 1 && <span className="shrink-0 tabular-nums text-white/50">×{item.occurrences.length}</span>}
-        {!item.required && <span className="shrink-0 text-[10px] text-white/50">sugerencia</span>}
+        <span className="shrink-0 text-[10px] text-white/50">opcional</span>
       </button>
     </li>
   );
@@ -193,15 +196,13 @@ function Help({ compared }) {
   );
 }
 
-// Revisión rápida: una tarjeta a la vez, todo con el teclado. Lo obligatorio
-// va primero y frena "Aprobar"; las sugerencias no frenan.
+// Revisión opcional: se abre por decisión de la persona, sin tomar el foco
+// ni condicionar la aprobación. `required` sólo conserva el orden legado.
 const LyricReviewPanel = forwardRef(function LyricReviewPanel({
   review, items, failedIds, decidedCount = 0, status = "", playingId, autoPlay = true,
   onToggleAutoPlay, onPlay, onApply, onDismiss, onEdit, onUndo, canUndo = false,
   onActivate, onOpenOfficial, hasLyrics = true,
 }, ref) {
-  const required = useMemo(() => items.filter((item) => item.required), [items]);
-  const suggested = useMemo(() => items.filter((item) => !item.required), [items]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [activeId, setActiveId] = useState(null);
@@ -209,8 +210,8 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
   const lastAction = useRef(0);
 
   const visible = useMemo(
-    () => (showSuggestions ? [...required, ...suggested] : required),
-    [required, suggested, showSuggestions],
+    () => (showSuggestions ? items : []),
+    [items, showSuggestions],
   );
   const active = visible.find((item) => item.id === activeId) || visible[0] || null;
 
@@ -231,7 +232,6 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
   }, [active?.id]);
 
   if (!review || review.mode === "off") return null;
-  const enforce = review.mode === "enforce";
   const sources = review.sources || {};
   const risk = review.risk || {};
   const reasons = Array.isArray(risk.reasons) ? risk.reasons : [];
@@ -287,16 +287,14 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
     sources.gemini && "Gemini",
     sources.witness && "testigo",
   ].filter(Boolean);
-  const allClear = hasLyrics && required.length === 0;
+  const allClear = hasLyrics && items.length === 0;
   const queue = visible.filter((item) => item.id !== active?.id);
   const heading = !hasLyrics
     ? "No hay letra para revisar"
     : allClear
-    ? "Sin observaciones pendientes"
-    : enforce
-      ? `Faltan ${required.length} para aprobar`
-      : `${required.length} para revisar`;
-  const total = decidedCount + required.length;
+      ? "Sin sugerencias pendientes"
+      : `${items.length} ${items.length === 1 ? "sugerencia opcional" : "sugerencias opcionales"}`;
+  const total = decidedCount + items.length;
   const progress = total > 0 ? Math.round((decidedCount / total) * 100) : 100;
 
   return (
@@ -305,7 +303,7 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       tabIndex={-1}
       onKeyDown={handleKeyDown}
       data-testid="lyric-review-panel"
-      aria-label="Revisión rápida de la letra"
+      aria-label="Sugerencias de letra"
       className="relative mb-4 overflow-hidden rounded-card bg-surface-1 outline-none ring-1 ring-white/[0.08] transition-shadow focus:ring-brand-light/60"
     >
       {total > 0 && (
@@ -318,10 +316,10 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       <header className="flex items-center gap-3 px-4 pt-3.5">
         <span className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${allClear
           ? "bg-emerald-400/15 text-emerald-200" : "bg-amber-300/15 text-amber-200"}`} aria-hidden="true">
-          {allClear ? <Icon path={CHECK} /> : !hasLyrics ? "!" : <span className="text-[11px] font-bold tabular-nums">{required.length}</span>}
+          {allClear ? <Icon path={CHECK} /> : !hasLyrics ? "!" : <span className="text-[11px] font-bold tabular-nums">{items.length}</span>}
         </span>
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold text-white">Revisión rápida</h3>
+          <h3 className="text-sm font-semibold text-white">Sugerencias de letra</h3>
           <p className="text-xs text-ink-secondary">
             <span data-testid="lyric-review-heading">{heading}</span>
             {decidedCount > 0 && <span className="text-white/50"> · {decidedCount} {decidedCount === 1 ? "resuelto" : "resueltos"}</span>}
@@ -344,6 +342,9 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
         </div>
       </header>
 
+      {hasLyrics && <p className="mx-4 mt-2 text-xs text-ink-secondary">
+        Las sugerencias pueden equivocarse. Podés aprobar con tu letra actual sin aplicarlas.
+      </p>}
       {showHelp && <Help compared={compared} />}
 
       {risk.level === "high" && reasons.length > 0 && (
@@ -371,16 +372,16 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
         {status
           ? <p data-testid="lyric-review-status" className="min-w-0 truncate text-ink-secondary">{status}</p>
           : !hasLyrics ? <p className="text-white/50">Recuperá una versión anterior o agregá la letra antes de aprobar.</p>
-          : !active && !suggested.length && <p className="text-white/50">Sin puntos para revisar en esta letra.</p>}
+          : !active && !items.length && <p className="text-white/50">Sin puntos para revisar en esta letra.</p>}
         <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">
           {canUndo && (
             <button type="button" onClick={() => decide(onUndo)} className={`inline-flex items-center gap-1 ${link}`}>
               <Icon path={UNDO} className="h-3 w-3" />Deshacer<Kbd>Z</Kbd>
             </button>
           )}
-          {suggested.length > 0 && (
-            <button type="button" onClick={() => setShowSuggestions((v) => !v)} className={link}>
-              {showSuggestions ? "Ocultar sugerencias" : `Ver ${suggested.length} ${suggested.length === 1 ? "sugerencia" : "sugerencias"} (${required.length ? "no bloquean" : "opcional"})`}
+          {items.length > 0 && (
+            <button type="button" onClick={() => setShowSuggestions((v) => !v)} aria-expanded={showSuggestions} className={link}>
+              {showSuggestions ? "Ocultar sugerencias" : `Ver ${items.length} ${items.length === 1 ? "sugerencia" : "sugerencias"}`}
             </button>
           )}
           {onOpenOfficial && (

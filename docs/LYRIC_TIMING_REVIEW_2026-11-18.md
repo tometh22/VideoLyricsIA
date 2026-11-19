@@ -28,7 +28,7 @@ fuera del repo). Costo de la medición: US$ 0, sin audio ni APIs.
   la repetición más cercana en el tiempo (un coro repetido dentro de la
   ventana hacía parecer la línea corrida varios segundos).
 
-**Obligatorio (inequívoco)** = el testigo whisper-1 confirma lo que miden los
+**Prioritario (inequívoco, `required`)** = el testigo whisper-1 confirma lo que miden los
 alineadores. CTC y WhisperX usan el mismo modelo acústico (wav2vec2 español):
 su acuerdo solo no prueba nada, así que sin el testigo el aviso es sugerencia.
 El testigo nunca da el tiempo (su reloj es grueso), sólo confirma que la voz
@@ -39,8 +39,9 @@ todavía no empezó o todavía sigue.
 `LYRIC_REVIEW_TIMING_MODE` = `observe` (por defecto) | `enforce` | `off`.
 
 - `observe`: los avisos aparecen como sugerencias; no frenan nada.
-- `enforce`: además los inequívocos frenan "Aprobar" (como el resto de la
-  Revisión rápida, sólo donde `LYRIC_REVIEW_MODE` la hace obligatoria).
+- `enforce`: además los inequívocos se marcan `required` (prioridad: se
+  listan primero). No frenan "Aprobar": desde 1.1.178 la Revisión rápida es
+  orientativa y `required` sólo ordena.
 - `off`: no se calculan.
 
 Por qué `observe` por defecto: sobre las versiones que UMG aceptó deja 0,20

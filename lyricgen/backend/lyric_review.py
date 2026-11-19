@@ -25,9 +25,9 @@ QUÉ DEVUELVE
 ------------
 Una lista de puntos a revisar, cada uno con un arreglo de un click:
 
-- ``required`` bloquea la aprobación hasta que el revisor aplica o descarta.
-  Sólo lo es lo que tiene dos fuentes que coinciden o una regla objetiva.
-- lo que oyó una sola fuente es una sugerencia: se muestra, no bloquea.
+- ``required`` es un campo legado de prioridad: ordena primero los puntos
+  con fuentes coincidentes o reglas de estilo, pero NO bloquea la aprobación.
+- todas las propuestas son opcionales: incluso varias fuentes pueden errar.
 - los arreglos idénticos se agrupan ("aplicar en las 8 repeticiones"), que
   es exactamente lo que UMG pide cuando dice "corregir en todos los coros".
 
@@ -174,10 +174,13 @@ def style_profile(portal: str | None) -> dict[str, Any] | None:
 
 
 def mode() -> str:
-    """``enforce`` (default): aprobar exige decidir los puntos obligatorios.
-    ``observe``: se muestran sin bloquear. ``off``: no se calculan."""
-    value = os.environ.get("LYRIC_REVIEW_MODE", "enforce").strip().lower()
-    return value if value in {"enforce", "observe", "off"} else "enforce"
+    """La revisión es orientativa; ``off`` desactiva su cálculo.
+
+    ``enforce`` se acepta como valor legado de ``observe``. Una configuración
+    antigua no debe volver a bloquear decisiones editoriales humanas.
+    """
+    value = os.environ.get("LYRIC_REVIEW_MODE", "observe").strip().lower()
+    return "off" if value == "off" else "observe"
 
 
 def fold(text: str) -> str:
@@ -1408,7 +1411,8 @@ def _rule_voice_timing(segments: list[dict], machine_evidence: Any, enforce: boo
     termine el canto, medido con los alineadores guardados (ver
     ``lyric_timing_review``). Reemplaza a la vieja regla con los tiempos del
     testigo whisper-1, que sobre 298 canciones aprobadas dio 52 avisos y
-    acertó 1 pedido. Obligatorio sólo lo inequívoco y sólo en ``enforce``."""
+    acertó 1 pedido. Prioritario (``required``) sólo lo inequívoco y sólo en
+    ``enforce``; como toda la Revisión rápida, no bloquea la aprobación."""
     out = []
     for finding in find_timing_issues(segments, machine_evidence):
         text = describe(finding)
@@ -1848,11 +1852,9 @@ def gemini_text(machine_evidence: Any) -> str:
 
 
 def required_for_scope(review: dict, scope: str) -> list[dict]:
-    """Puntos que bloquean según el camino de aprobación: ``full`` (editor y
-    campañas), ``missing_only`` (re-render por pedido de cambio: lo que se
-    canta y se perdió, más el estilo del portal de UMG — ahí reaparecían el
-    punto final y los signos que el cliente ya había pedido sacar) o
-    ``none``."""
+    """Filtro legado de prioridad por alcance; no concede poder de bloqueo.
+    La política activa se determina en ``mode()`` y es orientativa.
+    """
     if scope == "none":
         return []
     items = [i for i in review.get("items") or [] if i.get("required")]

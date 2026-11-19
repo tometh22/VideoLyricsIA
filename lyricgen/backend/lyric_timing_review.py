@@ -36,10 +36,12 @@ inequívoco: el testigo, que es otro modelo, confirma lo que miden los
 alineadores. Puro, sin I/O.
 
 ``LYRIC_REVIEW_TIMING_MODE`` (``observe`` por defecto | ``enforce`` | ``off``):
-``observe`` muestra los avisos como sugerencias, sin frenar nada; ``enforce``
-además frena la aprobación con los inequívocos; ``off`` no los calcula. El
-default es ``observe`` porque sobre las versiones que UMG aceptó deja ~0,2
-avisos por canción y ninguno bloquea ni cambia tiempos: se puede validar en
+``observe`` muestra los avisos como sugerencias; ``enforce`` además marca los
+inequívocos como ``required`` (prioridad: se listan primero); ``off`` no los
+calcula. Ninguno frena la aprobación: la Revisión rápida es orientativa y
+``required`` sólo ordena. El default es ``observe`` porque sobre las versiones
+que UMG aceptó deja ~0,2 avisos por canción y ninguno cambia tiempos: se puede
+validar en
 staging sin tocar variables. Medición y decisión en
 ``docs/LYRIC_TIMING_REVIEW_2026-11-18.md``.
 """

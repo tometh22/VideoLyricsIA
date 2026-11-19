@@ -212,7 +212,7 @@ def test_quick_review_shows_a_suggestion_in_observe(monkeypatch):
     assert "1:23,3" in item["why"] and item["action"] == "Mover el inicio a 1:23,2"
 
 
-def test_quick_review_blocks_only_in_enforce(monkeypatch):
+def test_quick_review_prioritizes_only_in_enforce(monkeypatch):
     screen, evidence = _review_inputs()
     monkeypatch.setenv("LYRIC_REVIEW_TIMING_MODE", "enforce")
     [item] = _timing_items(build_review(screen, original_segments=screen, machine_evidence=evidence))

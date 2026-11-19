@@ -1,9 +1,22 @@
 # Changelog
 
-## [1.1.177] - 2026-11-18
+## [1.1.182] - 2026-11-19
 
 ### Added
-- Warn in Revisión rápida when a line is out of sync with the voice: it appears before the singing starts, stays on screen without voice, enters late, or leaves before the last word ends. Times come from the stored forced-alignment words and the whole-song WhisperX words; the whisper-1 witness only confirms. Each warning moves the line start or end to the measured time with one click, never past the neighbouring line, never touching text or line breaks, and is skipped if the line was moved by hand after the server saw it. Nothing changes timing on its own. `LYRIC_REVIEW_TIMING_MODE=observe` (default) shows them as suggestions; `enforce` makes the witness-confirmed ones required; `off` disables them. Measured on 201 UMG songs: 20 % of client timing points flagged near the cited time (3 % by chance), 0.21 warnings per accepted song. Replaces the disconnected whisper-1 `_rule_timing`. Details in `docs/LYRIC_TIMING_REVIEW_2026-11-18.md`; offline measurement in `scripts/measure_lyric_timing_review.py`.
+- Warn in Revisión rápida when a line is out of sync with the voice: it appears before the singing starts, stays on screen without voice, enters late, or leaves before the last word ends. Times come from the stored forced-alignment words and the whole-song WhisperX words; the whisper-1 witness only confirms. Each warning moves the line start or end to the measured time with one click, never past the neighbouring line, never touching text or line breaks, and is skipped if the line was moved by hand after the server saw it. Nothing changes timing on its own. `LYRIC_REVIEW_TIMING_MODE=observe` (default) shows them as suggestions; `enforce` marks the witness-confirmed ones as `required` (priority, listed first; like the rest of Revisión rápida they never block approval); `off` disables them. Measured on 201 UMG songs: 20 % of client timing points flagged near the cited time (3 % by chance), 0.21 warnings per accepted song. Replaces the disconnected whisper-1 `_rule_timing`. Details in `docs/LYRIC_TIMING_REVIEW_2026-11-18.md`; offline measurement in `scripts/measure_lyric_timing_review.py`.
+
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
+
+## [1.1.178] - 2026-11-18
+
+### Fixed
+- Restore a single live lyric preview beside campaign editing, selecting paused lines by identity, preserving unconfirmed-text masking and following existing audio playback. Keep read-only touch scrolling, bounded detail scrolling and native disclosure keyboard actions.
+- Start quality proposals collapsed; keep stale/expired warnings and a local hide action accessible outside the disclosure. Prevent applying outdated proposals and announce in-flight decisions once.
+- Make lyric-review suggestions advisory across campaigns, individual jobs and re-renders, including missing-text and portal-style suggestions. Preserve snapshot, revision, language and structural approval controls. Legacy `LYRIC_REVIEW_MODE=enforce` now behaves as `observe`; `LYRIC_REVIEW_ENFORCE_TENANTS` no longer enables blocking. Deploy compatible API and frontend before verifying approval.
 
 ## [1.1.176] - 2026-11-18
 
