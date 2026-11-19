@@ -469,12 +469,12 @@ describe("LyricsTimeline", () => {
     expect(props.onDeleteSelection).not.toHaveBeenCalled();
   });
 
-  it("supports keyboard navigation in the line column without toggling playback", async () => {
+  it("uses Enter for line navigation and Space for playback in the line column", async () => {
     const props = setup();
     const row = screen.getAllByTestId("timeline-label-row")[1];
     row.querySelector("button").focus();
     await userEvent.keyboard("{Enter} ");
-    expect(props.onFocus).toHaveBeenCalledTimes(2);
+    expect(props.onFocus).toHaveBeenCalledTimes(1);
     expect(props.onSeek).toHaveBeenLastCalledWith(10, expect.objectContaining({ _id: 1 }));
     expect(row).toHaveAttribute("data-selected", "true");
   });

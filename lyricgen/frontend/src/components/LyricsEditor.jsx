@@ -11,6 +11,8 @@ import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
+import RepeatTimingProposal from "./RepeatTimingProposal";
+import { proposeRepeatTiming, repeatTimingChanges } from "../lib/repeatTiming";
 import CampaignLyricsReview from "./CampaignLyricsReview";
 import RepeatOccurrencesList, { repeatApplyLabel, selectedRepeatIds } from "./RepeatOccurrencesList";
 import LocalDraftRecovery from "./LocalDraftRecovery";
@@ -2063,6 +2065,7 @@ export default function LyricsEditor({
   // "apply this change to the N other identical lines?".
   const [textEditStart, setTextEditStart] = useState(null);
   const [propagationPrompt, setPropagationPrompt] = useState(null);
+  const [timingRepeatPrompt, setTimingRepeatPrompt] = useState(null);
   useEffect(() => {
     if (!propagationPrompt) return;
     const source = edited.find((row) => row._id === propagationPrompt.id);
@@ -2177,6 +2180,7 @@ export default function LyricsEditor({
   // timeline only captures history after a drag actually commits, so pointer
   // cancellation cannot create a phantom Undo entry.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
+    setTimingRepeatPrompt(proposeRepeatTiming(editedRef.current, id, newStart, newEnd, duration));
     markLinesReviewedByEdit(id);
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
@@ -2197,10 +2201,12 @@ export default function LyricsEditor({
     // flush effect below reads the just-updated `edited` and persists.
     setFlushCounter((c) => c + 1);
     trackEditorEvent("editor_timing_changed", { count: 1, operation: interaction.operation || "resize_or_move" });
-  }, [markLinesReviewedByEdit, trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent, duration]);
 
   const handleTimelineTimingChangeBatch = useCallback((changes, interaction = {}) => {
     if (!changes?.length) return;
+    if (changes.length === 1) setTimingRepeatPrompt(proposeRepeatTiming(editedRef.current, changes[0].id, changes[0].start, changes[0].end, duration));
+    else setTimingRepeatPrompt(null);
     markLinesReviewedByEdit(changes.map(({ id }) => id));
     const firstOriginal = editedRef.current.find((segment) => segment._id === changes[0].id);
     const deltaMs = firstOriginal ? Math.round((changes[0].start - firstOriginal.start) * 1000) : 0;
@@ -2232,7 +2238,7 @@ export default function LyricsEditor({
       delta_ms: deltaMs,
       duration_ms: Math.round(interaction.durationMs || 0),
     });
-  }, [markLinesReviewedByEdit, trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent, duration]);
 
   const handleGuidedTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
     pushEditHistory();
@@ -3715,6 +3721,7 @@ export default function LyricsEditor({
   // hand never match and are never touched. Newly-typed text is compared
   // exact (trim + collapsed whitespace), case/accent sensitive.
   const handleTextBlur = (id, newText) => {
+    setFlushCounter(c => c + 1);
     const start = textEditStart;
     setTextEditStart(null);
     if (!start || start.id !== id) return;
@@ -4131,6 +4138,47 @@ export default function LyricsEditor({
     });
     setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
+  };
+
+  const addLineAtTime = (seconds) => {
+    const current = editedRef.current;
+    const start = Number(seconds);
+    if (!Number.isFinite(start) || start < 0 || (duration > 0 && start >= duration)
+      || current.some(row => row.start < start + MIN_GAP_S && row.end + MIN_GAP_S > start)) {
+      toast({ message: t("timeline.insert_occupied"), tone: "warning" });
+      return null;
+    }
+    const next = current.filter(row => row.start > start).sort((a, b) => a.start - b.start)[0];
+    const end = Math.min(start + 3, duration || start + 3, next ? next.start - MIN_GAP_S : Infinity);
+    if (end - start < 0.1) return null;
+    const id = current.reduce((maximum, row) => Math.max(maximum, Number(row._id) || 0), -1) + 1;
+    pushEditHistory();
+    setEdited(previous => [...previous, { _id: id, segment_id: mintSegmentId(), start, end, text: "", review: true, locked: true }].sort((a, b) => a.start - b.start));
+    setFocusedSegId(id);
+    setFlushCounter(c => c + 1);
+    recordEditorAction("addLine", { trigger: "exact_time" });
+    return id;
+  };
+
+  const applyRepeatTiming = (ids) => {
+    const changes = repeatTimingChanges(editedRef.current, timingRepeatPrompt, ids, duration);
+    setTimingRepeatPrompt(null);
+    // Never apply a subset silently if a remote edit invalidated the proposal.
+    if (!changes.length || changes.length !== ids.length) {
+      toast({ message: t("timeline.repeat_stale"), tone: "warning" });
+      return;
+    }
+    pushEditHistory();
+    markLinesReviewedByEdit(ids);
+    const byId = new Map(changes.map(change => [change.id, change]));
+    setEdited(previous => previous.map(row => {
+      const change = byId.get(row._id);
+      if (!change) return row;
+      // Absolute word timestamps no longer describe the adjusted interval.
+      const { words, ...rest } = row;
+      return { ...rest, start: change.start, end: change.end, locked: true, review: true };
+    }));
+    setFlushCounter(c => c + 1);
   };
 
   // Smart "Agregar línea": when the operator has a row selected/focused,
@@ -6850,6 +6898,19 @@ export default function LyricsEditor({
                           onTimingChange={handleTimelineTimingChange}
                           onTimingChangeBatch={handleTimelineTimingChangeBatch}
                           onTextChange={updateText}
+                          onTextEditStart={(id, text) => setTextEditStart({ id, text })}
+                          onTextEditCommit={handleTextBlur}
+                          onTogglePlayback={syncMode ? tapAnchor : togglePlay}
+                          onAddAtTime={addLineAtTime}
+                          repeatProposal={<>
+                            {propagationPrompt && <section className="border-b border-white/10 bg-brand/10 p-3 text-xs text-white" aria-label={t("timeline.repeat_text_region")}>
+                              <p>{t("timeline.repeat_text_prompt")}</p>
+                              <RepeatOccurrencesList prompt={propagationPrompt} segments={edited} onToggle={togglePropagationOccurrence} t={t} />
+                              <button type="button" className="mr-3 mt-2 rounded bg-brand px-3 py-2" disabled={!selectedRepeatIds(propagationPrompt).length} onClick={applyPropagation}>{repeatApplyLabel(propagationPrompt, t)}</button>
+                              <button type="button" onClick={dismissPropagation}>{t("timeline.repeat_only_this")}</button>
+                            </section>}
+                            {timingRepeatPrompt && <RepeatTimingProposal key={timingRepeatPrompt.sourceSnapshot} proposal={timingRepeatPrompt} segments={edited} onApply={applyRepeatTiming} onDismiss={() => setTimingRepeatPrompt(null)} />}
+                          </>}
                           onDuplicateLine={duplicateSeg}
                           onDeleteSelection={deleteSegments}
                           onFocus={focusSegment}
