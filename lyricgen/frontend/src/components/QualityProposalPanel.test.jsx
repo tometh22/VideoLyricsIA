@@ -1,7 +1,14 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render as rtlRender, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import QualityProposalPanel from "./QualityProposalPanel";
+
+function render(ui) {
+  const view = rtlRender(ui);
+  const summary = view.container.querySelector('details[data-testid="quality-proposal-disclosure"] > summary');
+  if (summary) fireEvent.click(summary);
+  return view;
+}
 
 const PROPOSAL = {
   id: "proposal-v6-1",
@@ -280,4 +287,35 @@ describe("QualityProposalPanel", () => {
     expect(screen.getByText(/No hay ventanas sugeridas/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Aplicar seleccionadas/i })).toBeDisabled();
   });
+});
+
+it("lets the reviewer hide a stale proposal without applying or rejecting an old revision", async () => {
+  const apply = vi.fn(); const reject = vi.fn(); const dismiss = vi.fn();
+  const { rerender } = rtlRender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={13}
+    onApplySelected={apply} onRejectWindow={reject} onDismiss={dismiss} />);
+  expect(screen.getByRole("alert")).toHaveTextContent("aprobar tu letra actual sin resolverla");
+  expect(screen.getByTestId("quality-proposal-disclosure")).not.toHaveAttribute("open");
+  await userEvent.click(screen.getByRole("button", { name: "Ocultar propuesta" }));
+  expect(screen.queryByTestId("quality-proposal-panel")).toBeNull();
+  expect(apply).not.toHaveBeenCalled(); expect(reject).not.toHaveBeenCalled(); expect(dismiss).not.toHaveBeenCalled();
+  rerender(<QualityProposalPanel proposal={{ ...PROPOSAL, id: "fresh", base_revision: 13 }} currentRevision={13}
+    onApplySelected={apply} />);
+  expect(screen.getByTestId("quality-proposal-panel")).toHaveAttribute("data-proposal-state", "active");
+});
+ it("starts compact without exposing or applying suggestions, and preserves stale warnings", () => {
+   const apply = vi.fn();
+   const view = rtlRender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={12} onApplySelected={apply} />);
+   expect(screen.getByTestId("quality-proposal-disclosure")).not.toHaveAttribute("open");
+   expect(screen.getByTestId("quality-proposal-window-outro-a")).not.toBeVisible();
+   expect(apply).not.toHaveBeenCalled();
+   view.rerender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={13} onApplySelected={apply} />);
+   expect(screen.getByRole("alert")).toBeVisible();
+   expect(screen.getByRole("alert")).toHaveTextContent("versión anterior");
+ });
+
+it("announces one busy status while the proposal disclosure stays closed", () => {
+  rtlRender(<QualityProposalPanel proposal={PROPOSAL} currentRevision={12} applying />);
+  expect(screen.getByTestId("quality-proposal-disclosure")).not.toHaveAttribute("open");
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+  expect(screen.getByRole("status")).toHaveTextContent("Aplicando cambios");
 });

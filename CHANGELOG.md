@@ -1,10 +1,23 @@
 # Changelog
 
-## [1.1.179] - 2026-11-18
+## [1.1.184] - 2026-11-19
 
 ### Added
 - Check AI backgrounds for what UMG rejected in its September–November change requests: guns and knives, blood or raw meat, human body parts without a face, burned-in overlays such as a "16:9" label, and black letterbox bars. Weapons, gore, body parts and overlays use a separate, capped Vision call (at most 8 frames per background) that leaves the existing people/brand/anatomy request untouched; letterbox bars are measured without AI from the effective aspect ratio of the picture. Any error, timeout or quota response from the new call counts as "not evaluated" and never fails a job. `BACKGROUND_EXTENDED_QC_MODE` defaults to `observe` (findings are recorded, nothing is rejected); `enforce` sends the categories in `BACKGROUND_EXTENDED_QC_ENFORCE` (default `weapon,gore,overlay,letterbox`) through the existing regenerate-once → safe-gradient recovery before the final render, with letterbox rejected before any Vision call is paid; `off` disables it.
 - Show background findings in the delivery review before publishing: what the validator observed on the current background and its scene clips (weapon, gore, body parts, people, malformed anatomy, brand, overlay, letterbox) plus a letterbox scan of the encoded video, as "review" items with a "Revisado" action and two new checks. `DELIVERY_QC_BACKGROUND_MODE` defaults to `observe` (never blocks); `enforce` requires a reviewer to acknowledge them before an UMG publication; `off` hides them.
+
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
+
+## [1.1.178] - 2026-11-18
+
+### Fixed
+- Restore a single live lyric preview beside campaign editing, selecting paused lines by identity, preserving unconfirmed-text masking and following existing audio playback. Keep read-only touch scrolling, bounded detail scrolling and native disclosure keyboard actions.
+- Start quality proposals collapsed; keep stale/expired warnings and a local hide action accessible outside the disclosure. Prevent applying outdated proposals and announce in-flight decisions once.
+- Make lyric-review suggestions advisory across campaigns, individual jobs and re-renders, including missing-text and portal-style suggestions. Preserve snapshot, revision, language and structural approval controls. Legacy `LYRIC_REVIEW_MODE=enforce` now behaves as `observe`; `LYRIC_REVIEW_ENFORCE_TENANTS` no longer enables blocking. Deploy compatible API and frontend before verifying approval.
 
 ## [1.1.176] - 2026-11-18
 

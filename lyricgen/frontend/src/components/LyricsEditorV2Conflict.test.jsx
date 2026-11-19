@@ -367,6 +367,7 @@ describe("Editor 2.0 quality proposal ambiguous timeout recovery", () => {
     const { request, releaseReconciliation, mutationSuffix } = makeAmbiguousProposalRequest("apply");
     renderEditor(request);
 
+    fireEvent.click(await screen.findByText(/Ver propuestas/));
     let checkbox = await screen.findByRole("checkbox", { name: /Seleccionar zona 1/i });
     fireEvent.click(checkbox);
     fireEvent.click(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }));
@@ -401,6 +402,7 @@ describe("Editor 2.0 quality proposal ambiguous timeout recovery", () => {
     const { request, releaseReconciliation, mutationSuffix } = makeAmbiguousProposalRequest("dismiss");
     renderEditor(request);
 
+    fireEvent.click(await screen.findByText(/Ver propuestas/));
     fireEvent.click(await screen.findByRole("button", { name: "Descartar propuesta" }));
     await waitFor(() => expect(
       request.mock.calls.filter(([path]) => path.endsWith(mutationSuffix)),
