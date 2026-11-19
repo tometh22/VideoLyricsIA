@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
+import { publishReviewFrom } from "../../../../lib/publishReview";
 import { describePublishError } from "./changeRequestWorkflow";
 import { byPublicationMode, setPublicationMode } from "./publicationMode";
 
@@ -546,7 +547,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   // The corrected cut is already in the portal (sent from a campaign without
   // ticking this request): record the close as a publication, bound to the
   // exact cut the operator is looking at. No note needed.
-  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems, textReview, pointOverrides) => {
+  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems, textReview, pointOverrides, publishReviewToken) => {
     if (!publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: id, tone: "error", text: "Falta verificar el corte publicado. Actualizá el pedido y reintentá." });
       return;
@@ -569,6 +570,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           } : textReview ? { text_review_token: textReview.token,
             text_review_reason: textReview.reason } : {}),
           ...(pointOverrides && Object.keys(pointOverrides).length ? { point_overrides: pointOverrides } : {}),
+          ...(publishReviewToken ? { publish_review_token: publishReviewToken } : {}),
         }),
       });
       if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
@@ -577,6 +579,14 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         : `Pedido resuelto ${textReview?.publicationToken ? "con revisión humana de" : textReview ? "con revisión manual de" : "con"} la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
       await loadChangeRequests();
     } catch (err) {
+      const publishReview = publishReviewFrom(err?.detail);
+      if (publishReview) {
+        // Mismo resumen que al publicar: "Dar por resuelto igual" reenvía el token.
+        setCrPublishNotice({ requestId: id, tone: "wait", text: "Antes de darlo por resuelto, mirá qué quedó sin escuchar y sin revisar.",
+          publishReview: { ...publishReview, action: "confirm",
+            args: [id, publication, confirmedItems, textReview, pointOverrides] } });
+        return;
+      }
       const unknown = mutationOutcomeUnknown(err);
       const review = err?.detail?.code === "requested_text_not_found"
         && typeof err.detail.review_token === "string" && Array.isArray(err.detail.missing)
@@ -637,7 +647,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } finally { renderLockRef.current = false; endProposalWork(work); }
   }, [crRenderReview, loadChangeRequests, beginProposalWork, endProposalWork]);
 
-  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication, pointOverrides) => {
+  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication, pointOverrides, publishReviewToken) => {
     if (!portalId || !publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: crId, tone: "error", text: "Falta verificar el destino o la revisión del corte. Actualizá el pedido antes de publicar." });
       return;
@@ -669,9 +679,19 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
               reviewed_editor_revision: publication.editor_revision,
               ...(pointOverrides && Object.keys(pointOverrides).length
                 ? { change_request_point_overrides: pointOverrides } : {}) } : {}),
+            ...(publishReviewToken ? { publish_review_token: publishReviewToken } : {}),
           }),
         });
       } catch (err) {
+        const publishReview = publishReviewFrom(err?.detail);
+        if (publishReview) {
+          // PUBLISH_REVIEW_SUMMARY=prompt: nada se publicó. "Publicar igual"
+          // reenvía el token del resumen visto.
+          setCrPublishNotice({ requestId: crId, tone: "wait", text: "Antes de publicar, mirá qué quedó sin escuchar y sin revisar.",
+            publishReview: { ...publishReview, action: "publish",
+              args: [jobId, portalId, crId, publication, pointOverrides] } });
+          return;
+        }
         const gate = err?.detail?.delivery_qc;
         if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
           const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId)}`;

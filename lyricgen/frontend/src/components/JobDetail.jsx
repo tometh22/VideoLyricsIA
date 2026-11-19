@@ -11,6 +11,8 @@ import ContentValidationToggle, { isUniversalAccount } from "./ContentValidation
 import { useAlert } from "./AlertProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import EnableProResModal from "./EnableProResModal";
+import { PublishReviewDialog } from "./PublishReviewSummary";
+import { publishReviewFrom } from "../lib/publishReview";
 import DriveTransferModal from "./DriveTransferModal";
 import ScenesFilmstrip from "./ScenesFilmstrip";
 import SceneEditModal from "./SceneEditModal";
@@ -542,8 +544,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     throw timeout;
   };
 
-  const publishToUMG = async (requestedPortal = sendUmgPortal) => {
+  const publishToUMG = async (requestedPortal = sendUmgPortal, publishReviewToken = null) => {
     if (sendingUmg) return;
+    // El resumen ya visto sigue valiendo si después hay que preparar el
+    // ProRes y reintentar: el backend vuelve a pedirlo sólo si cambió.
+    const reviewToken = publishReviewToken || acknowledgedReviewRef.current;
     const targetPortal = UMG_PORTALS.some(({ id }) => id === requestedPortal)
       ? requestedPortal
       : "argentina";
@@ -559,7 +564,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         resp = await fetchUmgWithRetry(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({ portal_id: targetPortal }),
+          body: JSON.stringify({
+            portal_id: targetPortal,
+            ...(reviewToken ? { publish_review_token: reviewToken } : {}),
+          }),
         });
         result = await resp.json().catch(() => ({}));
         // Enabling ProRes changes the QC input fingerprint (delivery spec),
@@ -627,6 +635,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         if (resp.status === 409 && detail?.code === "prores_required") {
           setSendUmgAfterProres(true);
           setShowProResModal(true);
+          return;
+        }
+        // Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY=prompt): líneas
+        // sin escuchar y avisos sin mirar. "Publicar igual" reenvía su token.
+        const review = resp.status === 409 ? publishReviewFrom(detail) : null;
+        if (review) {
+          setPublishReview({ ...review, portal: targetPortal });
           return;
         }
         alert({
@@ -980,6 +995,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   ]);
   const [proResHint, setProResHint] = useState(null);
   const [showProResModal, setShowProResModal] = useState(false);
+  const [publishReview, setPublishReview] = useState(null);
+  const acknowledgedReviewRef = useRef(null);
   const [proResToast, setProResToast] = useState(null);
   const [driveConnected, setDriveConnected] = useState(false);
   const [showDriveModal, setShowDriveModal] = useState(false);
@@ -2537,6 +2554,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </button>
         </div>
       )}
+
+      <PublishReviewDialog
+        review={publishReview}
+        busy={sendingUmg}
+        onClose={() => setPublishReview(null)}
+        onConfirm={() => {
+          const review = publishReview;
+          setPublishReview(null);
+          acknowledgedReviewRef.current = review.summaries[0]?.token || null;
+          publishToUMG(review.portal, acknowledgedReviewRef.current);
+        }}
+      />
 
       {showProResModal && (
         <EnableProResModal

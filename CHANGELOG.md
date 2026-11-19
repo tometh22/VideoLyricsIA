@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.185] - 2026-11-19
+
+### Added
+- Summarize, before a lyric video reaches the UMG portal, the lines nobody played in the editor (from the existing `editor_audio_played` telemetry: a line counts as heard when at least half of it played, by anyone, before publishing; lines are only listed when that telemetry is complete for the song: when the server heartbeat says someone listened but their played ranges never arrived, or nothing played, the summary says listening data is unavailable instead of claiming nobody listened) and the Quick Review points still pending from high-precision sources: the official lyrics, two ears agreeing, and the portal style rules (final period, unpaired ¿?, missing accents including voseo). Every publication path computes it: single publish from the video page and from Cambios, "confirm publication", and campaign sends (one confirmation for the whole send, with the count per song). No schema change.
+- `PUBLISH_REVIEW_SUMMARY=observe` (default) computes the summary and records it in the local audit log (`delivery.publish_review`: who, unheard lines, pending warnings) without showing anything. `prompt` shows it and requires one click on "Publicar igual", which resends the token of the summary seen and is recorded the same way. `off` skips it. It never blocks hard: a failure to compute it publishes and records `unavailable`. Art Tracks are excluded.
+- `scripts/report_listening_coverage.py` now shares its coverage math with the publication summary (`listening_coverage.py`).
+
 ## [1.1.180] - 2026-11-18
 
 ### Fixed
