@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.186] - 2026-11-19
+
+### Added
+- `REANCHOR_HOLD_MODE=off|observe|apply` (default `off`): editor re-anchoring ("Re-sincronizar", pasted official lyrics) can apply the same reading hold as upload (`lead_in.apply_hold`, i.e. the fleet's `LYRIC_HOLD_S`/`LYRIC_MIN_GAP_MS`); re-anchored lines currently vanish on the last phoneme. Only extends, only lines this re-anchor re-timed that end on their last word, never locked lines. `observe` reports the would-be changes in the response and the audit log without touching segments. Offline bank (201 UMG songs): extend-the-end requests within 0.5 s of the accepted end go from 8 to 17 of 112, 32 move closer, 1 of 41 shorten requests is lengthened; 12.3% of accepted Argentina lines (+0.39 s mean, max +0.5) and 1.3% of Chile lines change.
+- `docs/UMG_AR_CRITERIO_FORMA_TIMING_2026-11-19.md`: Argentina's form/timing criterion measured on its change requests, what the pipeline contradicts, and a draft question for the client.
+
 ## [1.1.180] - 2026-11-18
 
 ### Fixed
