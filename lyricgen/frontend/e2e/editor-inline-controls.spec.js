@@ -38,7 +38,7 @@ test('inserts at the chosen exact time from the sidebar and persists new text',a
  await expect(input).toBeFocused();await input.fill('La línea que faltaba');await input.press('Enter');
  await expect.poll(()=>h.saves.some(save=>save.segments.some(row=>row.text==='La línea que faltaba'&&Math.abs(Number(row.start)-2.2)<.001&&Number(row.end)<=2.95))).toBe(true);
 });
-test('right-click uses the pointer timestamp and long sidebar rows align with blocks',async({page})=>{
+test('right-click uses the pointer timestamp and long sidebar rows align with blocks',async({page},testInfo)=>{
  await open(page);
  const row=page.getByTestId('timeline-label-row').nth(1);const block=page.getByTestId('timeline-segment').nth(1);
  await expect.poll(async()=>Math.abs((await row.boundingBox()).y+7-(await block.boundingBox()).y)).toBeLessThan(2);
@@ -47,7 +47,7 @@ test('right-click uses the pointer timestamp and long sidebar rows align with bl
  await lane.click({button:'right',position:{x:2.2*px,y:10}});
  expect(Number(await page.getByLabel('Inicio de la línea nueva en segundos').inputValue())).toBeCloseTo(2.2,1);
  await page.getByLabel('Studio de tiempos').evaluate(node=>window.scrollTo({top:node.getBoundingClientRect().top+window.scrollY-90,behavior:'instant'}));
- await page.screenshot({path:'/Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/editor-controls-sidebar.png'});
+ await page.screenshot({path:testInfo.outputPath('editor-controls-sidebar.png')});
 });
 test('offers a timing correction for later repetitions without applying it automatically',async({page})=>{
  const h=await open(page);
@@ -60,7 +60,7 @@ test('offers a timing correction for later repetitions without applying it autom
  await panel.getByRole('checkbox').check();await panel.getByRole('button',{name:'Aplicar duración a las marcadas'}).click();
  await expect.poll(()=>h.saves.some(save=>{const source=save.segments.find(row=>row.segment_id==='b'),target=save.segments.find(row=>row.segment_id==='c');return Number(target.start)===3&&Math.abs((target.end-target.start)-(source.end-source.start))<.001;})).toBe(true);
 });
-test('drags sidebar wider and narrower while keeping text rows aligned and the document intact',async({page})=>{
+test('drags sidebar wider and narrower while keeping text rows aligned and the document intact',async({page},testInfo)=>{
  const h=await open(page);const handle=page.getByRole('separator',{name:'Ajustar ancho de la barra lateral'});
  await handle.evaluate(node=>node.scrollIntoView({block:'center',behavior:'instant'}));
  const label=page.getByTestId('timeline-label-row').first();
@@ -76,5 +76,5 @@ test('drags sidebar wider and narrower while keeping text rows aligned and the d
  await page.mouse.move(wide.x+wide.width/2,wide.y+12);await page.mouse.down();await page.mouse.move(wide.x+wide.width/2-140,wide.y+12,{steps:5});await page.mouse.up();
  await expect(handle).toHaveAttribute('aria-valuenow',String(initial-40));
  expect(h.saves).toHaveLength(0);
- await page.screenshot({path:'/Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/editor-sidebar-resizable.png'});
+ await page.screenshot({path:testInfo.outputPath('editor-sidebar-resizable.png')});
 });
