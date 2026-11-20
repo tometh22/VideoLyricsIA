@@ -24,6 +24,7 @@ import PublishedRequestChecklist from "./PublishedRequestChecklist";
 import PublishedTextReview from "./PublishedTextReview";
 import PublishedHumanReview from "./PublishedHumanReview";
 import RequestVerification from "./RequestVerification";
+import PublishReviewSummary from "../../../PublishReviewSummary";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -310,6 +311,15 @@ export default function ChangeRequestsPanel({
       [item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication], pointOverrides));
   }, [prepareProRes, publishDeliveryUpdate]);
 
+  // Resumen antes de publicar visto: reenviar la MISMA acción con su token.
+  const confirmPublishReview = useCallback((review) => {
+    const token = review?.summaries?.[0]?.token || null;
+    const args = [...(review?.args || [])];
+    while (args.length < 5) args.push(undefined);
+    if (review?.action === "confirm") confirmChangeRequestPublication?.(...args, token);
+    else publishDeliveryUpdate(...args, token);
+  }, [confirmChangeRequestPublication, publishDeliveryUpdate]);
+
   useEffect(() => {
     if (!returnNotice || typeof window === "undefined") return;
     const url = new URL(window.location.href);
@@ -424,6 +434,8 @@ export default function ChangeRequestsPanel({
               onReconcile={() => reconcilePublication?.(selectedItem.id)}
               visibilityBusy={visibilityBusyId != null && visibilityBusyId === selectedItem.delivery?.id}
               onChangeVisibility={setDeliveryVisibility}
+              onConfirmPublishReview={confirmPublishReview}
+              onDismissNotice={dismissPublishNotice}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === selectedItem.id}
@@ -484,7 +496,7 @@ function ChangeRequestCard({
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground, onRefresh, onReconcile,
-  visibilityBusy = false, onChangeVisibility,
+  visibilityBusy = false, onChangeVisibility, onConfirmPublishReview, onDismissNotice,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
@@ -869,6 +881,19 @@ function ChangeRequestCard({
             >
               {actionNotice.actionLabel || "Revisar el video"}
             </a>
+          )}
+          {actionNotice.publishReview && (
+            <div className="mt-3 text-left">
+              <PublishReviewSummary
+                embedded
+                summaries={actionNotice.publishReview.summaries}
+                totals={actionNotice.publishReview.totals}
+                busy={publishing || resolving}
+                confirmLabel={actionNotice.publishReview.action === "confirm" ? "Dar por resuelto igual" : "Publicar igual"}
+                onConfirm={() => onConfirmPublishReview?.(actionNotice.publishReview)}
+                onCancel={onDismissNotice}
+              />
+            </div>
           )}
         </div>}
         {qcNeedsReview && !actionNotice && (

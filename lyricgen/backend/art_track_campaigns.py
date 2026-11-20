@@ -137,6 +137,9 @@ class DeliveryCreate(BaseModel):
     publish_anyway: bool = False
     override_reason: str | None = Field(default=None, max_length=1000)
     override_job_ids: list[str] | None = Field(default=None, max_length=1000)
+    # PUBLISH_REVIEW_SUMMARY=prompt: job_id -> token del resumen (líneas sin
+    # escuchar y avisos sin mirar) que se vio antes de "Publicar igual".
+    publish_review_tokens: dict[str, str] | None = Field(default=None, max_length=1000)
 
 
 def _asset_key(asset: BatchCampaignAsset) -> str:
@@ -693,6 +696,34 @@ def delivery_change_request_guard(campaign_id: str, job_ids: str = Query(default
             "blocked": [_guard_entry(job, results[job.job_id]) for job in jobs if results.get(job.job_id, {}).get("blocked")]}
 
 
+@router.get("/art-track-campaigns/{campaign_id}/deliveries/publish-review")
+@router.get("/campaigns/{campaign_id}/deliveries/publish-review")
+def delivery_publish_review(campaign_id: str, job_ids: str = Query(default="", max_length=20000),
+                            current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY=prompt). Sólo lectura.
+
+    Por canción: líneas que nadie escuchó en el editor y avisos precisos de la
+    Revisión rápida sin mirar. El diálogo de envío lo muestra una vez con el
+    total por canción; el envío vuelve a calcularlo y exige sus tokens.
+    """
+    import publish_review
+    _require_scope(current_user); campaign = _campaign_for_delivery(db, campaign_id, current_user)
+    current = publish_review.mode()
+    if current != "prompt" or campaign.kind == "art_track":
+        return {"mode": current, "available": True, "summaries": [], "totals": publish_review.totals([])}
+    wanted = [value for value in job_ids.split(",") if value][:1000]
+    jobs = db.query(Job).filter(
+        Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id,
+        Job.job_id.in_(wanted or [""]),
+    ).all()
+    decision = publish_review.evaluate(db, jobs)
+    if decision["error"]:
+        return {"mode": current, "available": False, "summaries": [], "totals": publish_review.totals([])}
+    shown = [summary for summary in decision["summaries"].values() if summary["needs_attention"]]
+    return {"mode": current, "available": True, "summaries": shown,
+            "totals": {**publish_review.totals(shown), "songs": len(decision["summaries"])}}
+
+
 def _apply_publish_guard(db, ddb, candidates, body) -> tuple[list[dict], dict[str, dict]]:
     """Regla de versión por canción: (frenadas, publicadas igual con motivo).
 
@@ -834,6 +865,14 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
                 "code": guard.GUARD_CODE, "blocked": guard_blocked,
                 "message": "Todas las canciones elegidas tienen pedidos de cambio abiertos más nuevos que su versión aprobada. Corregí y aprobá la letra, o publicá igual indicando el motivo.",
             })
+    # Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY): una sola
+    # confirmación para todo el envío, con el total por canción.
+    import publish_review
+    review_tokens = {str(k): str(v) for k, v in (body.publish_review_tokens or {}).items()}
+    review_decision = (publish_review.evaluate(db, [job for _item, job in candidates], review_tokens)
+                       if campaign.kind != "art_track" else {"mode": "off", "summaries": {}, "pending": [], "error": None})
+    if review_decision["pending"]:
+        raise HTTPException(status_code=409, detail=publish_review.required_detail(review_decision["pending"]))
     intents = _validated_close_intents(db, ddb, campaign, candidates, destination, body)
     operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id, destination_portal=destination, status="queued", idempotency_key=body.idempotency_key, created_by=current_user["id"], total_count=len(candidates), created_at=_now(), updated_at=_now())
     db.add(operation); db.flush()
@@ -852,6 +891,11 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
             db.add(guard.override_audit(current_user["id"], job, result, reason, "campaign_bulk",
                                         campaign_id=campaign.id, delivery_batch_id=operation.id,
                                         portal_id=destination))
+    for row in publish_review.audit_entries(
+            current_user["id"], review_decision, review_tokens, "campaign_bulk",
+            job_ids=[job.job_id for _item, job in candidates],
+            campaign_id=campaign.id, delivery_batch_id=operation.id, portal_id=destination):
+        db.add(row)
     for item, job in candidates:
         db.add(DeliveryBatchItem(id=str(uuid.uuid4()), delivery_batch_id=operation.id, campaign_id=campaign.id, job_id=job.job_id, approved_render_fingerprint=_fingerprint(job), status="pending", change_request_intent=intents.get(job.job_id), created_at=_now(), updated_at=_now()))
     db.commit()
