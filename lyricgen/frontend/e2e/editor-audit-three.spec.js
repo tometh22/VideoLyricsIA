@@ -26,6 +26,11 @@ test("campaign refuses to open design after failed lyric save and retries withou
   await input.fill("Texto humano que debe sobrevivir");
   await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
   await expect.poll(() => attempts).toBeGreaterThan(0);
+  // A request starting does not mean the save-aware navigation has settled:
+  // autosave can still drain a trailing request. Keep the API failing until
+  // the editor confirms that leaving was blocked, then explicitly retry.
+  await expect(page.getByText("Tus cambios siguen en pantalla. Reintentá guardar antes de salir.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Volver a revisar letra", exact: true })).toHaveCount(0);
   await expect(page.getByTestId("campaign-line-workspace")).toBeVisible();
   await expect(input).toHaveValue("Texto humano que debe sobrevivir");
   expect(harness.saves).toHaveLength(0);
