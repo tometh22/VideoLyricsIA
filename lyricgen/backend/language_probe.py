@@ -67,17 +67,44 @@ def _code(value) -> str | None:
     return code if _CODE.match(code) else None
 
 
-def parse_probe_response(text: str) -> dict:
+# Gemini finish reasons that mean the model ended its answer on purpose. Any
+# other reason (MAX_TOKENS, SAFETY, RECITATION, ...) may have cut the sections
+# list short, so the languages it lists are not exhaustive.
+_COMPLETE_FINISH_REASONS = frozenset({"", "STOP", "FINISH_REASON_UNSPECIFIED"})
+
+
+def finish_reason_name(response) -> str:
+    """``FinishReason.MAX_TOKENS`` / ``"MAX_TOKENS"`` -> ``"MAX_TOKENS"``."""
+    try:
+        candidate = (getattr(response, "candidates", None) or [None])[0]
+    except (TypeError, IndexError):
+        candidate = None
+    reason = getattr(candidate, "finish_reason", None) if candidate is not None else None
+    if reason is None:
+        return ""
+    name = getattr(reason, "name", None) or str(reason)
+    return name.rsplit(".", 1)[-1].strip().upper()
+
+
+def parse_probe_response(text: str, finish_reason: str | None = None) -> dict:
     """Normalize Gemini's JSON answer into the persisted probe contract.
 
-    Tolerates a truncated sections list (a song with many short parts can hit
-    the output limit): every complete section object is kept.
+    A truncated answer (unparseable JSON, or any finish reason other than a
+    natural stop, e.g. MAX_TOKENS) keeps the sections it recovered for display
+    but is marked ``status="incomplete"`` / ``complete=False``: a language that
+    was cut off the list is NOT evidence that it is absent, so the line check
+    must abstain instead of flagging verses in it.
     """
     raw = (text or "").strip()
     data = None
+    finish = str(finish_reason or "").strip().upper()
+    incomplete_reason = (
+        None if finish in _COMPLETE_FINISH_REASONS else f"finish_{finish.lower()}"
+    )
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
+        incomplete_reason = incomplete_reason or "truncated_response"
         main = re.search(r'"main_language"\s*:\s*"([^"]*)"', raw)
         sections = [
             {"start_s": float(a), "end_s": float(b), "language": c}
@@ -108,9 +135,13 @@ def parse_probe_response(text: str) -> dict:
     if main and main != "none" and main not in languages:
         languages = sorted({*languages, main})
     status = "ok" if languages else ("no_vocals" if main == "none" or sections else "unavailable")
+    if incomplete_reason and status != "unavailable":
+        status = "incomplete"
     return {
         "schema": SCHEMA, "source": "gemini", "model": MODEL,
         "status": status,
+        "complete": incomplete_reason is None,
+        "incomplete_reason": incomplete_reason,
         "main_language": main if main and main != "none" else None,
         "languages": languages,
         # Unsupported codes are kept: they make the line check abstain instead
@@ -191,7 +222,10 @@ def probe_sung_languages(audio_path: str, *, timeout_s: float = 60.0,
                 if last_reason != "quota_exhausted":
                     break
                 continue
-            probe = parse_probe_response(getattr(response, "text", "") or "")
+            probe = parse_probe_response(
+                getattr(response, "text", "") or "",
+                finish_reason=finish_reason_name(response),
+            )
             probe["attempts"] = attempt + 1
             probe["elapsed_s"] = round(time.monotonic() - started, 2)
             logger.info("[LANGUAGE-PROBE] status=%s main=%s languages=%s",
@@ -202,4 +236,4 @@ def probe_sung_languages(audio_path: str, *, timeout_s: float = 60.0,
     return probe
 
 
-__all__ = ["SCHEMA", "enabled", "parse_probe_response", "probe_sung_languages"]
+__all__ = ["SCHEMA", "enabled", "finish_reason_name", "parse_probe_response", "probe_sung_languages"]

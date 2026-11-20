@@ -405,10 +405,13 @@ def probe_conflict_indices(output, language_probe) -> list[int]:
 
     Abstains (``[]``) when the probe is missing/unavailable, reports a
     language this module cannot classify (no coercion of e.g. Catalan), or
-    fewer than two lines conflict.
+    fewer than two lines conflict, or the probe answer was incomplete.
     """
     probe = language_probe if isinstance(language_probe, dict) else {}
-    if probe.get("status") != "ok":
+    # A truncated answer lists only the languages before the cut: absence from
+    # it proves nothing. ``complete`` defaults to True for probes persisted
+    # before the flag existed (their status already encodes parse failures).
+    if probe.get("status") != "ok" or probe.get("complete") is False:
         return []
     heard = {str(code).strip().lower() for code in probe.get("languages") or [] if code}
     if not heard or not heard <= SUPPORTED_LANGUAGES:
@@ -436,6 +439,7 @@ def probe_summary(language_probe) -> dict | None:
         "source": str(probe.get("source") or "gemini"),
         "main_language": main,
         "languages": sorted(str(code) for code in probe.get("languages") or []),
+        "complete": probe.get("complete") is not False,
     }
 
 

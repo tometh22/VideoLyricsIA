@@ -122,7 +122,11 @@ def test_parse_probe_response_normalizes_and_tolerates_truncation():
     truncated = language_probe.parse_probe_response(
         '{"main_language":"en","sections":[{"start_s":0,"end_s":30,"language":"en"},'
         '{"start_s":30,"end_s":32,"language":"no')
-    assert truncated["status"] == "ok" and truncated["languages"] == ["en"]
+    # Recovered sections stay visible, but the list is not exhaustive.
+    assert truncated["status"] == "incomplete" and truncated["languages"] == ["en"]
+    assert truncated["complete"] is False
+    assert truncated["incomplete_reason"] == "truncated_response"
+    assert ok["complete"] is True and ok["incomplete_reason"] is None
     silent = language_probe.parse_probe_response(
         '{"main_language":"none","sections":[{"start_s":0,"end_s":180,"language":"none"}]}')
     assert silent["status"] == "no_vocals" and silent["languages"] == []
@@ -139,6 +143,13 @@ class _FakeModels:
         answer = self.answers.pop(0)
         if isinstance(answer, BaseException):
             raise answer
+        if isinstance(answer, tuple):
+            text, finish = answer
+            return types.SimpleNamespace(
+                text=text,
+                candidates=[types.SimpleNamespace(
+                    finish_reason=types.SimpleNamespace(name=finish))],
+            )
         return types.SimpleNamespace(text=answer)
 
 
@@ -181,3 +192,78 @@ def test_probe_kill_switch(monkeypatch, tmp_path):
 def test_probe_module_never_requests_lyrics():
     prompt = language_probe._PROMPT.lower()
     assert "do not transcribe" in prompt and "translate" in prompt
+
+
+# --- Regression: review r4618337711 (truncated Gemini answer) -------------
+# An English intro section parsed completely, then the answer is cut inside the
+# Spanish section. The recovered list says ["en"]; treating it as exhaustive
+# flagged two correct Spanish verses and blocked approval.
+TRUNCATED_EN_THEN_CUT_ES = (
+    '{"main_language":"en","sections":[{"start_s":0,"end_s":30,"language":"en"},'
+    '{"start_s":30,"end_s":180,"language":"e'
+)
+TWO_SPANISH_VERSES = _segs([
+    "Yo tengo tu nombre guardado en el corazón",
+    "Nunca supe decirte que eras mi vida",
+])
+
+
+def test_truncated_answer_never_gates_valid_spanish_verses():
+    probe = language_probe.parse_probe_response(TRUNCATED_EN_THEN_CUT_ES)
+    assert probe["status"] == "incomplete" and probe["complete"] is False
+    assert probe["languages"] == ["en"]
+    assert probe_conflict_indices(TWO_SPANISH_VERSES, probe) == []
+    review = review_payload(TWO_SPANISH_VERSES, {"language_probe": probe}, 0)
+    assert review["language_probe_conflict"] is False
+    assert review["needs_language_review"] is False
+    assert review["language_probe"]["complete"] is False
+    assert review["language_probe"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("finish", ["MAX_TOKENS", "SAFETY", "RECITATION"])
+def test_parseable_json_with_incomplete_finish_reason_abstains(finish):
+    probe = language_probe.parse_probe_response(
+        '{"main_language":"en","sections":[{"start_s":0,"end_s":30,"language":"en"}]}',
+        finish_reason=finish,
+    )
+    assert probe["status"] == "incomplete" and probe["complete"] is False
+    assert probe["incomplete_reason"] == f"finish_{finish.lower()}"
+    review = review_payload(TWO_SPANISH_VERSES, {"language_probe": probe}, 0)
+    assert review["needs_language_review"] is False
+
+
+def test_complete_answer_still_gates_the_same_lines():
+    """Control: an exhaustive English-only answer keeps flagging them."""
+    probe = language_probe.parse_probe_response(
+        '{"main_language":"en","sections":[{"start_s":0,"end_s":180,"language":"en"}]}',
+        finish_reason="STOP",
+    )
+    assert probe["status"] == "ok" and probe["complete"] is True
+    review = review_payload(TWO_SPANISH_VERSES, {"language_probe": probe}, 0)
+    assert review["language_probe_conflict"] is True
+    assert review["needs_language_review"] is True
+    assert review["language_probe_conflict_indices"] == [0, 1]
+
+
+def test_persisted_probe_marked_incomplete_abstains_even_if_status_ok():
+    legacy = {**PROBE_ES, "main_language": "en", "languages": ["en"], "complete": False}
+    assert probe_conflict_indices(TWO_SPANISH_VERSES, legacy) == []
+
+
+def test_probe_records_max_tokens_from_the_provider(monkeypatch, tmp_path):
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"RIFF")
+    _install_fake_client(monkeypatch, [(
+        '{"main_language":"en","sections":[{"start_s":0,"end_s":30,"language":"en"}]}',
+        "MAX_TOKENS",
+    )])
+    probe = language_probe.probe_sung_languages(str(audio), backoff=(0.0,))
+    assert probe["status"] == "incomplete"
+    assert probe["incomplete_reason"] == "finish_max_tokens"
+
+
+def test_finish_reason_name_normalizes_sdk_enums():
+    enum_like = types.SimpleNamespace(candidates=[types.SimpleNamespace(
+        finish_reason="FinishReason.MAX_TOKENS")])
+    assert language_probe.finish_reason_name(enum_like) == "MAX_TOKENS"
+    assert language_probe.finish_reason_name(types.SimpleNamespace(text="{}")) == ""
