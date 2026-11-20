@@ -1,10 +1,16 @@
 # Changelog
 
-## [1.1.193] - 2026-11-20
+## [1.1.194] - 2026-11-20
 
 ### Added
 - Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
 - Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
+
+## [1.1.193] - 2026-11-20
+
+### Fixed
+- Insert campaign lyric lines immediately below the selected occurrence, including adjacent or overlapping phrases. Add row deletion and mouse, touch and keyboard reordering with immediate persistence and Undo; preserve neighbouring timings and flag the placed line for timing review.
+- Render the campaign editor's text preview with browser libass, the final video's shared ASS composer, bundled font files and output dimensions. Keep line breaks stable when the panel resizes, discard stale preview responses and expose retry on failure.
 
 ## [1.1.192] - 2026-11-19
 
