@@ -130,8 +130,8 @@ and `quality_gates.fleet_runtime_token_match=true`. Do not accept a partial
 recovery if source identity or runtime tokens disagree; never hide the guard,
 change flags to equalize tokens, or publish a feature checkout manually.
 
-Railway's [Config-as-Code reference] (checked 2026-11-20)(https://docs.railway.com/config-as-code/reference)
-announces legacy TOML support through 2026-12-01. This patch repairs the existing
+Railway's [Config-as-Code reference](https://docs.railway.com/config-as-code/reference)
+(checked 2026-11-20) announces legacy TOML support through 2026-12-01. This patch repairs the existing
 files; migrating the same contract to Infrastructure as Code is separate,
 coordinated work before that deadline, not an infrastructure action in this PR.
 
