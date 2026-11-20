@@ -130,3 +130,41 @@ describe("filas con segment_id duplicado (incidente f866cbcf0e49)", () => {
     expect(result.conflicts[0].key).toBe("4");
   });
 });
+
+// Replacements from the backend used to lose identity. Hydration assigned
+// local ids and a subsequent rebase appended the same server rows again.
+describe("legacy identity recovery (e1c25ae3df2e)", () => {
+  const old = [
+    { _id: 0, text: "first", start: 1, end: 2 },
+    { _id: 1, text: "old", start: 3, end: 4 },
+    { _id: 2, text: "last", start: 5, end: 6 },
+  ];
+  const remote = [old[0], { text: "replacement", start: 3, end: 4 }, old[2]];
+  const hydrated = remote.map((s, i) => ({ ...s, _id: i }));
+
+  it("does not append hydrated replacements on an unchanged rebase", () => {
+    expect(mergeThreeWay(old, hydrated, remote).merged.map(s => s.text))
+      .toEqual(["first", "replacement", "last"]);
+  });
+
+  it("preserves an in-flight edit while matching the other replacement", () => {
+    const local = hydrated.map((s, i) => i === 0 ? { ...s, text: "edited" } : s);
+    expect(mergeThreeWay(old, local, remote).merged.map(s => s.text))
+      .toEqual(["edited", "replacement", "last"]);
+  });
+
+  it("matches repeated occurrences one-to-one rather than deduplicating lyrics", () => {
+    const chorus = { text: "chorus", start: 7, end: 8 };
+    const local = [{ ...chorus, _id: 10 }, { ...chorus, _id: 11 }];
+    expect(mergeThreeWay([], local, [chorus, { ...chorus }]).merged).toHaveLength(2);
+    const later = { ...chorus, start: 10, end: 11 };
+    expect(mergeThreeWay([], [local[0]], [later]).merged).toHaveLength(2);
+  });
+
+  it("preserves separate explicit identities even with identical content", () => {
+    const row = { text: "chorus", start: 7, end: 8 };
+    const left = { ...row, segment_id: "left" };
+    const right = { ...row, segment_id: "right" };
+    expect(mergeThreeWay([], [left], [right]).merged).toHaveLength(2);
+  });
+});
