@@ -2,6 +2,7 @@ import { reviewLineIds } from "./lib/reviewLineIds";
 import { reviewCreativeSettings } from "./lib/campaignCreative";
 import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
+import { fetchLanguageRetranscription, startLanguageRetranscription } from "./lib/languageRetranscription";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { pollReanchorTask } from "./lib/reanchorTask";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
@@ -3906,6 +3907,21 @@ export default function App() {
     return result;
   };
 
+  // Re-hear the song with a reviewer-chosen language. The editor reloads the
+  // canonical server version once the new transcription is installed.
+  const handleRetranscribeLanguage = ({ language, baseRevision } = {}) => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    return startLanguageRetranscription(
+      (path, options) => authFetch(`${API}${path}`, options), jobId, language, baseRevision,
+    );
+  };
+  const handlePollRetranscription = () => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    return fetchLanguageRetranscription(
+      (path, options) => authFetch(`${API}${path}`, options), jobId,
+    );
+  };
+
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
@@ -6398,6 +6414,11 @@ export default function App() {
             needsLanguageReview={!!currentReview.needsLanguageReview}
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
+            // Campaign lyrics review only: wizard uploads still pick the
+            // language before uploading, and post-render edits are not in review.
+            onRetranscribeLanguage={currentReview.campaignId && !currentReview.editMode ? handleRetranscribeLanguage : null}
+            onPollRetranscription={currentReview.campaignId && !currentReview.editMode ? handlePollRetranscription : null}
+            languageProbe={currentReview.languageProbe || currentReview.transcriptionQuality?.language_probe || null}
             onApprove={handleApproveLyrics}
             submitLabel={(currentReview.editMode || currentReview.editingJobId || currentReview.changeRequestContext) ? "Aprobar cambios y generar video" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
