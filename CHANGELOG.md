@@ -2,6 +2,9 @@
 
 ## [1.1.195] - 2026-11-20
 
+### CI / automation
+- Report unverified smoke-session revocation on authentication or cleanup errors; never revoke another session. Require the exact staging release and fleet runtime parity before authenticated reads. This automation correction retains application version 1.1.195.
+
 ### Fixed
 - Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
 
