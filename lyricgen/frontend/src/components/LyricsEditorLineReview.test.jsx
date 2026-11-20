@@ -41,10 +41,76 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   segmentsStore._clearAll();
 });
 
 describe("LyricsEditor — aprobación por canción", () => {
+  it("mueve el resaltado con el audio sin cambiar la línea que se está editando", async () => {
+    let frame;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((callback) => { frame = callback; return 1; }));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    const { container } = render(<LyricsEditor {...props({ audioUrl: "https://example.com/song.mp3" })} />);
+    const audio = container.querySelector("audio");
+    const first = screen.getByTestId("review-line-1");
+    const second = screen.getByTestId("review-line-2");
+    const input = screen.getByLabelText("Letra de esta línea");
+    expect(first).toHaveAttribute("aria-current", "true");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: false });
+    fireEvent.play(audio);
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveClass("bg-brand/20");
+
+    // Keep a text edit in progress as playback crosses to the next lyric.
+    act(() => { input.focus(); });
+    fireEvent.change(input, { target: { value: "Primera corregida" } });
+    input.setSelectionRange(5, 5);
+
+    // An intro/seek with no active lyric must not claim the edit target is playing.
+    act(() => { audio.currentTime = 0; frame(); });
+    expect(first).not.toHaveAttribute("aria-current");
+    expect(second).not.toHaveAttribute("aria-current");
+    expect(first).not.toHaveClass("bg-brand/20");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
+
+    act(() => { audio.currentTime = 5.5; frame(); });
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(second).toHaveClass("bg-brand/20");
+    expect(first).not.toHaveClass("bg-brand/20");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
+    expect(screen.getByTestId("selected-line-panel")).toHaveTextContent("Línea 1");
+
+    // Backward playback/seek follows the same clock rather than a row counter.
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(second).not.toHaveAttribute("aria-current");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: true });
+    fireEvent.pause(audio);
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(first).toHaveClass("bg-brand/20");
+    await userEvent.click(second);
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(input).toHaveValue("Segunda línea");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: false });
+    fireEvent.play(audio);
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveAttribute("aria-current", "true");
+    Object.defineProperty(audio, "paused", { configurable: true, value: true });
+    fireEvent.ended(audio);
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(second).toHaveClass("bg-brand/20");
+    expect(first).not.toHaveClass("bg-brand/20");
+  });
+
   it("no recorta ni persiste timings al abrir una campaña de 41 líneas", async () => {
     const longSegments = Array.from({ length: 41 }, (_, index) => ({
       segment_id: `long-line-${index + 1}`,

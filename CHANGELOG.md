@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.205] - 2026-11-20
+
+### Fixed
+- Make the campaign lyric highlight follow audio playback instead of staying on the manually selected line. Keep the text edit target and caret stable; restore the selected-line highlight when playback pauses or ends. Preserve the existing audio follow, playing indicator, reordering and deletion controls.
+
 ## [1.1.195] - 2026-11-20
 
 ### CI / automation

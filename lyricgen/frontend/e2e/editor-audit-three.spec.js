@@ -26,6 +26,10 @@ test("campaign refuses to open design after failed lyric save and retries withou
   await input.fill("Texto humano que debe sobrevivir");
   await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
   await expect.poll(() => attempts).toBeGreaterThan(0);
+  // A request starting does not mean the failed save/exit has settled. Keep
+  // returning 503 until the editor actually refuses navigation; otherwise
+  // the first exit can succeed after `fail` flips and detach the retry button.
+  await expect(page.getByText("Tus cambios siguen en pantalla. Reintentá guardar antes de salir.", { exact: true })).toBeVisible();
   await expect(page.getByTestId("campaign-line-workspace")).toBeVisible();
   await expect(input).toHaveValue("Texto humano que debe sobrevivir");
   expect(harness.saves).toHaveLength(0);
