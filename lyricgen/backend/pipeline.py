@@ -6771,9 +6771,15 @@ def _validation_observe_only() -> bool:
 
 
 def _has_anatomy_violation(result: dict) -> bool:
-    """Only affirmative anatomical evidence can override observation mode."""
+    """Only affirmative anatomical evidence can override observation mode.
+
+    ``hard_violation`` extends the same rule to extended background categories
+    (weapon/gore/letterbox…) ONLY when BACKGROUND_EXTENDED_QC_MODE=enforce lists
+    them — the validator sets it; in the default observe mode it is never True.
+    """
     return bool(
-        (result.get("detections") or {}).get("anatomy") is True
+        result.get("hard_violation") is True
+        or (result.get("detections") or {}).get("anatomy") is True
         or any(str(item.get("type", "")).startswith("anatomy:")
                for item in result.get("issues", []) if isinstance(item, dict))
     )
@@ -7220,6 +7226,8 @@ def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
             continue
         detections = validation.get("detections") or {}
         if any(detections.get(c) for c in ("people", "brand", "anatomy")):
+            return True
+        if validation.get("hard_violation") is True:
             return True
         blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
         if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
@@ -14821,6 +14829,15 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
+                if "extended_qc" in _scene_validation:
+                    # Extended background QC: keep the evidence on the clip so
+                    # Delivery QC can show it to the operator before publish.
+                    scene["validation"]["hard_violation"] = bool(
+                        _scene_validation.get("hard_violation")
+                    )
+                    scene["validation"]["observations"] = list(
+                        _scene_validation.get("observations") or []
+                    )[:12]
                 if _inherit_inconclusive_scene_verdict(
                     scene,
                     verdict=_scene_validation,

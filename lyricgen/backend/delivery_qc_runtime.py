@@ -14,6 +14,11 @@ import os
 from uuid import uuid4
 from typing import Any, Mapping, Sequence
 
+from delivery_background_qc import (
+    CONTENT_CODES as BACKGROUND_CONTENT_CODES,
+    LETTERBOX_CODES as BACKGROUND_LETTERBOX_CODES,
+    build_background_issues,
+)
 from delivery_media_qc import inspect_delivery_media
 from delivery_ocr import inspect_rendered_text, select_identity_observation
 from delivery_preflight import build_delivery_preflight, frame_timecode
@@ -76,7 +81,14 @@ CHECK_DEFINITIONS = (
     }),
     ("ocr_title", "Texto visible del title card", "final_frame_ocr", {"OCR_TITLE_MISMATCH"}),
     ("ocr_lyrics", "Texto visible de las letras", "final_frame_ocr", {"OCR_LYRIC_MISMATCH"}),
+    # Background findings (delivery_background_qc). Omitted from the checklist
+    # entirely when DELIVERY_QC_BACKGROUND_MODE=off.
+    ("background_content", "Fondo sin armas, sangre, cuerpos, marcas ni rótulos",
+     "background_validator", set(BACKGROUND_CONTENT_CODES)),
+    ("background_letterbox", "Sin bordes negros", "background_letterbox_scan",
+     set(BACKGROUND_LETTERBOX_CODES)),
 )
+_BACKGROUND_CHECK_IDS = frozenset({"background_content", "background_letterbox"})
 
 
 def mandatory_reviewer_issues() -> list[dict[str, Any]]:
@@ -315,6 +327,7 @@ def _build_check_results(
     quality: Mapping[str, Any],
     spec: Mapping[str, Any],
     rendered: Mapping[str, Any],
+    background: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the operator-facing checklist from actual detector evidence.
 
@@ -322,6 +335,7 @@ def _build_check_results(
     unavailable, or uncalibrated detectors are explicitly NOT_RUN so their
     absence can never look like a clean result.
     """
+    background = background or {"mode": "off"}
     rows = list(issues)
     results: list[dict[str, Any]] = []
     media_probe = media.get("probe") or {}
@@ -330,10 +344,21 @@ def _build_check_results(
     quality_verdict = str(quality.get("decision") or quality.get("verdict") or "").strip().lower()
 
     for check_id, label, detector, codes in CHECK_DEFINITIONS:
+        if check_id in _BACKGROUND_CHECK_IDS and background.get("mode") == "off":
+            continue
         matched = [row for row in rows if str(row.get("code")) in codes]
         status = _check_status(matched)
         reason = ""
-        if check_id == "media_delivery_spec" and not spec:
+        if check_id == "background_content" and not matched and not background.get("validator_extended"):
+            status, reason = "NOT_RUN", (
+                "Este fondo se validó sin las categorías extendidas "
+                "(arma, sangre, cuerpo, rótulo)."
+            )
+        elif check_id == "background_letterbox" and not matched and not (
+            background.get("render_scan") or {}
+        ).get("ran"):
+            status, reason = "NOT_RUN", "No se pudo medir el render para buscar bordes negros."
+        elif check_id == "media_delivery_spec" and not spec:
             status, reason = "NOT_RUN", "No se definió un perfil técnico para comparar."
         elif check_id == "metadata_title" and not matched and not rendered.get("rendered_title"):
             status, reason = "NOT_RUN", "No hubo texto de title card para comparar."
@@ -640,6 +665,7 @@ def build_runtime_report(
         video_path, metadata={"artist": job.artist, "title": job.song_title},
         segments=segments, ocr_callback=ocr_callback, enabled=umg_ocr_enabled,
     )
+    background_issues, background_meta = build_background_issues(job, video_path)
     ocr_observations = ocr.get("observations") or []
     title_ocr = select_identity_observation(
         ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="title",
@@ -684,6 +710,7 @@ def build_runtime_report(
         list(base.get("issues") or [])
         + list(media.get("issues") or [])
         + list(ocr.get("issues") or [])
+        + list(background_issues)
         + list(shadow_issues)
         + mandatory_reviewer_issues()
     )
@@ -732,6 +759,7 @@ def build_runtime_report(
             "rendered_title": trusted_ocr_text(title_ocr),
             "rendered_artist": trusted_ocr_text(artist_ocr),
         },
+        background=background_meta,
     )
     check_summary = {
         "total": len(checks),
@@ -829,7 +857,7 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
             'edit_count', 'transcription_quality', 'workload_class',
             'audio_revision', 'input_audio_sha256', 'delivery_profile', 'prores_ready',
             's3_keys', 'segments_json', 'render_params', 'scene_plan', 'background_key',
-            'job_id', 'previous_versions', 'completed_at')})
+            'job_id', 'previous_versions', 'completed_at', 'validation_result')})
         db.rollback()
         report = build_runtime_report(job=snapshot, video_path=video_path, segments=rows, previous=previous, mode_override=mode_override)
         from delivery_acoustic_qc import build_acoustic_checks
