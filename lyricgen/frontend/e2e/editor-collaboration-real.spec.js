@@ -147,7 +147,7 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
     await expect(page.getByTestId("timeline-lane")).toBeVisible();
     await page.getByTestId("timeline-segment-body").first().dblclick();
-    const input = page.getByTestId("timeline-segment").first().locator("input");
+    const input = page.getByRole("textbox", { name: "Letra de esta línea 1", exact: true });
     await input.fill("Persistencia real con espacios");
     await expect.poll(async () => (await revision(request, token)).segments[0].text).toBe("Persistencia real con espacios");
     await expect(input).toBeFocused();

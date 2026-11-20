@@ -1,10 +1,20 @@
 # Changelog
 
-## [1.1.185] - 2026-11-18
+## [1.1.194] - 2026-11-20
 
 ### Added
 - Let a campaign reviewer re-transcribe a song from its audio in a chosen language (Spanish, English, Portuguese, French, Italian, German) from the editor's language alerts or the Tools menu. The current text stays in the version history ("Antes de volver a transcribir"), the previous pre-human machine snapshot, evidence and quality verdict are archived in the new append-only `editor_retranscriptions` table, and the new lyrics arrive as a new revision for review. No editor version or correction observation is deleted. The forced language reaches WhisperX and every post-pass, a mixed audio reference no longer demotes it to auto-detection, and a previous language attestation does not carry over to the new text.
 - Refuse the request with "Genly se está actualizando, probá en unos minutos" while any worker serving the target queue runs different backend code, and return any attempt that ends without a result (failure, reaper timeout, a worker on older code discarding it) to review with the previous text intact.
+
+## [1.1.192] - 2026-11-19
+
+### Fixed
+- Show complete lyric text in the timeline sidebar with matching row heights. Allow stable inline edits from sidebar and timeline; Enter flushes autosave and returns keyboard focus, while Space toggles playback outside text fields and preserves Sync mode. Keep editing stationary and preserve reconciled remote corrections. Cover long songs during playback: anchor the input outside scrollports, reserve the undo toolbar before typing, and keep playing-row text metrics stable; preserve interaction blocking for approval/restoration and keyboard focus when closing the field.
+- Expose single-line deletion on both surfaces and add exact-time insertion through the sidebar or timeline context menu, preserving existing rows and minting new identities. Reject occupied intervals instead of silently moving existing lyrics.
+
+### Added
+- Resize the lyric sidebar by dragging its divider or using the keyboard, with responsive bounds and double-click reset.
+- Offer optional text and duration corrections for later matching phrases. Keep each occurrence onset, require explicit timing selection, and revalidate source/target snapshots, audio bounds and collisions before applying. Text similarity proposes candidates; it does not assert acoustic equivalence.
 
 ## [1.1.181] - 2026-11-18
 
