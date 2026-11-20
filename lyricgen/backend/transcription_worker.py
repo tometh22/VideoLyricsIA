@@ -1813,16 +1813,47 @@ def run_transcription_job(
                 is_live=live or _looks_live(title, filename),
             )
 
+        async def _run_with_language_probe():
+            # Independent, lyric-free check of the SUNG language, in parallel
+            # with the ASR (it never feeds the ASR). Persisted below as
+            # transcription_quality.language_probe; the language contract
+            # compares it line by line with the delivered lyrics. Incident
+            # 2026-11-18: WhisperX auto-LID translated Spanish verses into
+            # English and no check fired without a reference.
+            from language_probe import enabled as _probe_enabled
+            from language_probe import probe_sung_languages
+            probe_task = (
+                asyncio.ensure_future(asyncio.to_thread(probe_sung_languages, audio_path))
+                if _probe_enabled() else None
+            )
+            try:
+                r = await _run_with_retime()
+            except BaseException:
+                if probe_task is not None:
+                    probe_task.cancel()
+                raise
+            if probe_task is not None and isinstance(r, dict):
+                try:
+                    probe = await asyncio.wait_for(probe_task, timeout=240)
+                except Exception as probe_exc:
+                    logger.warning("[LANGUAGE-PROBE] not available job=%s: %s",
+                                   job_id, type(probe_exc).__name__)
+                    probe = {"schema": "sung-language-probe-v1", "source": "gemini",
+                             "status": "unavailable", "reason": "worker_timeout",
+                             "main_language": None, "languages": [], "sections": []}
+                r["language_probe"] = probe
+            return r
+
         # Prueba prospectiva del aire mínimo (LYRIC_MIN_GAP_AB_ENABLED): el
         # brazo se fija una vez por job y viaja por ContextVar a los polish.
         _gap_assignment = _line_gap_assignment(job_id)
         if _gap_assignment is None:
-            result = asyncio.run(_run_with_retime())
+            result = asyncio.run(_run_with_language_probe())
         else:
             import lead_in as _gap_lead_in
             _gap_stats: dict = {}
             with _gap_lead_in.min_gap_override(int(_gap_assignment.get("gap_ms") or 0), _gap_stats):
-                result = asyncio.run(_run_with_retime())
+                result = asyncio.run(_run_with_language_probe())
             _record_line_gap_exposure(job_id, _gap_assignment, _gap_stats)
     except Exception as exc:
         error_type = _safe_exception_code(exc)
@@ -2041,6 +2072,8 @@ def run_transcription_job(
                 )
                 quality["machine_evidence_required"] = True
                 quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
+                if isinstance(result.get("language_probe"), dict):
+                    quality["language_probe"] = dict(result["language_probe"])
                 if reference_required:
                     candidate = result.get("reference_hypothesis_candidate") or {}
                     from reference_hypothesis import build_from_candidate
