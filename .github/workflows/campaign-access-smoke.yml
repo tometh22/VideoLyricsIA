@@ -6,6 +6,7 @@ on:
       - 'lyricgen/backend/admin.py'
       - 'lyricgen/backend/campaign_review_access.py'
       - 'lyricgen/backend/scripts/preflight/campaign_access_smoke.py'
+      - 'lyricgen/backend/tests/test_campaign_access_smoke.py'
       - 'lyricgen/frontend/src/components/admin/sections/usuarios/CampaignAccessModal*'
       - '.github/workflows/campaign-access-smoke.yml'
 permissions:

@@ -20,15 +20,22 @@ def main():
     session.headers["Origin"] = ORIGIN
     for _ in range(60):
         try:
-            response = session.get(API + "/health/deploy", timeout=20)
+            response = session.get(API + "/health/ready", timeout=20)
             data = response.json()
-            if response.ok and data.get("env") == "staging" and data.get("release") == expected:
+            if (
+                response.ok and data.get("env") == "staging"
+                and data.get("release") == expected
+                and data.get("fleet_release_match") is True
+                and data.get("quality_gates", {}).get("fleet_runtime_token_match") is True
+                and "fleet_runtime_token_mismatch" not in data.get("degraded_reasons", [])
+            ):
                 break
         except (requests.RequestException, ValueError):
             pass
         time.sleep(10)
     else:
-        raise RuntimeError("The expected staging API release is not ready")
+        session.close()
+        raise RuntimeError("The expected staging API release and fleet runtime are not ready")
 
     current_session_id = None
 
@@ -46,13 +53,14 @@ def main():
         assert r.headers.get("Access-Control-Allow-Origin") == ORIGIN, "Missing staging CORS response"
         return r.json()
 
-    admin = call("POST", "/auth/login", json={
-        "username": os.environ["PREFLIGHT_USERNAME"], "password": os.environ["PREFLIGHT_PASSWORD"],
-    })["token"]
     try:
+        admin = call("POST", "/auth/login", json={
+            "username": os.environ["PREFLIGHT_USERNAME"], "password": os.environ["PREFLIGHT_PASSWORD"],
+        })["token"]
         sessions = call("GET", "/auth/sessions", admin)["sessions"]
         current = [s for s in sessions if s.get("current") is True]
         assert len(current) == 1, "Cannot identify this smoke's login session"
+        assert type(current[0].get("id")) is int and current[0]["id"] > 0, "Invalid current session ID"
         current_session_id = current[0]["id"]
         me = call("GET", "/auth/me", admin)
         assert me["role"] == "admin"
@@ -68,11 +76,19 @@ def main():
         assert all(c["granted"] for c in grants["items"])
         print("PASS: authenticated read-only campaign-access listing, search, inherited permissions, grant filter and staging CORS")
     finally:
-        if current_session_id is not None:
-            closed = call("POST", f"/auth/sessions/{current_session_id}/revoke", admin)
-            assert closed.get("was_current") is True
-            print("Closed only this smoke's own login session; no business data changed")
-        session.close()
+        try:
+            if current_session_id is None:
+                print("Session revocation NOT verified: current session was not identified; no revocation attempted")
+            else:
+                try:
+                    closed = call("POST", f"/auth/sessions/{current_session_id}/revoke", admin)
+                    assert closed.get("was_current") is True
+                except Exception:
+                    print("Session revocation NOT verified: closing this smoke's own session failed")
+                    raise
+                print("Closed only this smoke's own login session; no business data changed")
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":
