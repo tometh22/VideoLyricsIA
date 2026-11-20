@@ -120,6 +120,15 @@ scenarios; no deployment, database, provider or queue access is involved. The
 six lists must remain identical, so adding a new API trigger cannot silently
 leave workers behind.
 
+Before publishing, verify that each staging service is actually linked to its
+matching `/railway/<service>.toml` and compare its effective watch patterns with
+the repository. The read-only baseline on 2026-11-20 matched the old patterns for
+all six services, but BatchWorker and BatchShortWorker deployment metadata had
+`configFile=null` and no file build/deploy manifest. Their source binding remains
+unverified; do not treat the repository change alone as activating their filters.
+Resolve that dependency with the release owner before rollout. This PR does not
+change Railway settings. Recheck all six effective lists after deployment.
+
 This intentionally increases worker rollouts for frontend-only changes. Preserve
 all existing queues, replicas and 1200-second draining settings, schedule one
 publication at a time, and let in-flight work finish. Watch-pattern selection is
