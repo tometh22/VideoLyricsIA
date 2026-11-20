@@ -6,11 +6,21 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile.worker"
+# Shared runtime cohort: the quality CAS token includes the Git release SHA.
+# Keep these repository-root triggers identical across API and all five workers.
 watchPatterns = [
+    "/VERSION",
     "lyricgen/backend/**",
+    "lyricgen/frontend/**",
     "lyricgen/assets/**",
+    "lyricgen/Dockerfile",
     "lyricgen/Dockerfile.worker",
+    "railway/api.toml",
+    "railway/worker.toml",
     "railway/short-worker.toml",
+    "railway/batch-worker.toml",
+    "railway/batch-short-worker.toml",
+    "railway/quality-worker.toml",
 ]
 
 [deploy]
