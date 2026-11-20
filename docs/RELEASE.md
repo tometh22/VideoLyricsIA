@@ -85,8 +85,55 @@ dashboards.
 - **No burst deploys** — kills in-flight renders. One at a time, wait for healthy.
 - **Build ~20–30 min** — plan around it; not instant.
 - **`RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`** on Worker — leave it; it's what lets a render finish across a deploy. Verify it's still set after any service recreation.
-- **`watchPatterns`** keep the Worker from redeploying on frontend-only changes — don't remove.
+- **One runtime deployment cohort** — API and all five worker services share watch patterns. Frontend-only releases must deploy the workers too; the quality CAS token includes the Git SHA.
 - **No native canary / percentage rollout** — staging soak is the substitute. For true canary/blue-green/SLO-driven auto-rollback you'd need a traffic proxy or a flag service (LaunchDarkly/Flagsmith); that's a separate investment, relevant around the ~50-user scale inflection.
+
+### SHA-bound runtime and watch-pattern contract
+
+`queue_jobs._transcription_quality_runtime_token()` binds quality work to the
+release SHA, policy, pipeline configuration and calibration. A worker with a
+different token discards the work before taking its snapshot. Equal backend code
+fingerprints alone therefore do not make different release SHAs compatible.
+
+The API, Worker, ShortWorker, BatchWorker, BatchShortWorker and quality-worker
+share the same watch paths. They cover root `/VERSION`, frontend, backend,
+assets, both Dockerfiles and the six runtime-service TOML files. This makes a
+frontend-only release select the complete cohort. Frontend tests or package
+changes without a version bump also select everyone: they used to deploy only
+the API. A version-only release or a change to one cohort config also selects all
+six. Normal application releases still update VERSION/package/changelog together.
+
+Paths are relative to the repository root even though the build root is
+`/lyricgen`; see [Railway watch-path semantics](https://docs.railway.com/builds/build-configuration#configure-watch-paths).
+Docs, CI-only files, and independent cost-collector/R2 service configs remain
+outside these triggers. Do not replace this list with `railway/**` or a global
+wildcard that restarts the runtime fleet for unrelated maintenance.
+
+The contract runs in the existing fast CI check:
+
+```sh
+python3.11 -m unittest discover -s ci/tests -p test_release_watch_contract.py -v
+```
+
+Tests parse the real TOML and use Git's gitignore matcher against changed-path
+scenarios; no deployment, database, provider or queue access is involved. The
+six lists must remain identical, so adding a new API trigger cannot silently
+leave workers behind.
+
+This intentionally increases worker rollouts for frontend-only changes. Preserve
+all existing queues, replicas and 1200-second draining settings, schedule one
+publication at a time, and let in-flight work finish. Watch-pattern selection is
+not proof of a completed rollout: before releasing the turn, verify every
+service's actual commit, healthy queue/service coverage, config/protocol parity
+and `quality_gates.fleet_runtime_token_match=true`. Do not accept a partial
+`SKIPPED` rollout on backend fingerprint equality alone. Stop and coordinate
+recovery if source identity or runtime tokens disagree; never hide the guard,
+change flags to equalize tokens, or publish a feature checkout manually.
+
+Railway's [Config-as-Code reference] (checked 2026-11-20)(https://docs.railway.com/config-as-code/reference)
+announces legacy TOML support through 2026-12-01. This patch repairs the existing
+files; migrating the same contract to Infrastructure as Code is separate,
+coordinated work before that deadline, not an infrastructure action in this PR.
 
 ### Veo cost-control rollout (schema + locking protocol)
 
