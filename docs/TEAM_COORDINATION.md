@@ -35,3 +35,13 @@ Las escrituras verifican tenant, pertenencia activa del destinatario, permiso y 
 - `npm run check` y `npm run build`.
 
 La demo aprobada permanece en `/team-prototype.html` con `npm run dev`; sus datos son ficticios y no se envían a la API. La entrada de demo no se agrega al build de producción.
+
+## Dar acceso a campañas a usuarios existentes
+
+Agus (con rol administrador) entra a **Administración → Gestión → Usuarios**, busca al operador y abre **Acceso a campañas** debajo de su nombre (también disponible en **⋯**). Puede buscar por campaña o equipo y usar **Dar acceso**. Para revocar, usa **Quitar acceso → Confirmar revocación**. El cambio queda guardado inmediatamente y auditado; el operador puede recargar Campañas.
+
+El permiso permite ver y revisar esa campaña de letras; no mueve al usuario de equipo ni le da administración. Los accesos por pertenecer al equipo o por ser administrador se indican como heredados y no se pueden quitar desde este panel. Un permiso adicional redundante sí se puede quitar, sin quitar el acceso heredado. Las campañas cerradas con permisos adicionales siguen visibles para poder revocarlos.
+
+Se conservan las habilitaciones existentes: `BATCH_CAMPAIGN_ENABLED` y el equipo/grupo autorizado en `BATCH_CAMPAIGN_SCOPES`. Si la cuenta está inactiva o su equipo no tiene campañas habilitadas, el panel lo informa y bloquea nuevas altas; permite revocaciones. No cambia flags ni habilita otros equipos implícitamente.
+
+**Acceso no es asignación de trabajo.** Para asignar responsables y ver avance se usa Mi equipo; sus miembros siguen siendo usuarios activos del mismo equipo.

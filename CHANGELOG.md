@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.194] - 2026-11-20
+
+### Added
+- Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
+- Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
+
 ## [1.1.193] - 2026-11-20
 
 ### Fixed
