@@ -603,8 +603,24 @@ def get_or_create_document(
     return document
 
 
-def attach_machine_provenance(db: Session, job_id: str, provenance: dict) -> bool:
-    """Complete the initial checkpoint lineage before its transaction commits."""
+def attach_machine_provenance(
+    db: Session, job_id: str, provenance: dict, *, revision: int | None = None,
+) -> bool:
+    """Complete the initial checkpoint lineage before its transaction commits.
+
+    ``revision`` targets the machine checkpoint installed by a reviewer
+    requested re-transcription; its request metadata is preserved.
+    """
+    if revision is not None:
+        version = db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.revision == int(revision),
+        ).with_for_update().first()
+        if version is None:
+            return False
+        version.provenance = {**dict(provenance), **dict(version.provenance or {})}
+        db.flush()
+        return True
     version = db.query(EditorVersion).filter(
         EditorVersion.job_id == job_id,
         EditorVersion.reason == "transcription",

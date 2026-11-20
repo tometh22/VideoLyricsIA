@@ -7709,6 +7709,7 @@ async def _run_transcription_for_job(
     workload_class: str = "interactive",
     parallel_audio_reference: bool = False,
     transcription_source: dict | None = None,
+    force_language: bool = False,
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -8524,7 +8525,16 @@ async def _run_transcription_for_job(
             # Whisper's language parameter is global. A Spanish verse plus
             # English chorus must stay provider-auto; forcing either language
             # would damage the other half of the song.
-            if len(_reference_languages) > 1:
+            if len(_reference_languages) > 1 and force_language and lang:
+                # A reviewer re-transcription chose this language after
+                # hearing the song (editor_retranscription). The machine
+                # reference that produced the wrong-language text must not
+                # overrule that human decision.
+                logger.info(
+                    "[LANGUAGE] mixed reference; keeping reviewer-forced %s job=%s",
+                    lang, job_id,
+                )
+            elif len(_reference_languages) > 1:
                 if lang:
                     logger.info(
                         "[LANGUAGE] mixed reference; ignoring single-language "
@@ -8548,7 +8558,7 @@ async def _run_transcription_for_job(
                     lang,
                     job_id,
                 )
-            elif len(_reference_languages) > 1:
+            elif len(_reference_languages) > 1 and not lang:
                 logger.info(
                     "[LANGUAGE] mixed reference %s; keeping provider-auto job=%s",
                     sorted(_reference_languages),
@@ -16638,6 +16648,132 @@ def _resolve_language_review_locked(job_id, body, current_user, db):
     ))
     db.commit()
     return {"ok": True, "revision": current_revision, "segments_hash": current_hash}
+
+
+class LanguageRetranscriptionRequest(BaseModel):
+    language: str = Field(..., min_length=1, max_length=16)
+    base_revision: int = Field(..., ge=0)
+
+
+def _retranscription_job_or_404(db, job_id: str, current_user: dict, *, lock: bool = True):
+    """Same grant as /language-resolution: platform admin or campaign reviewer."""
+    query = db.query(Job).filter(Job.job_id == job_id)
+    if lock:
+        query = query.populate_existing().with_for_update()
+    job = query.first()
+    if (not job or (not _is_platform_admin_user(current_user)
+                    and not can_review_campaign_job(db, job, current_user))):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
+
+
+def _language_retranscription_kwargs(db, job, language: str) -> dict:
+    """The same worker contract the job was originally transcribed with."""
+    if job.campaign_id and job.campaign_item_id:
+        from database import BatchCampaign, BatchCampaignItem
+        campaign = db.query(BatchCampaign).filter(
+            BatchCampaign.id == job.campaign_id,
+            BatchCampaign.tenant_id == job.tenant_id,
+        ).first()
+        item = db.query(BatchCampaignItem).filter(
+            BatchCampaignItem.id == job.campaign_item_id,
+        ).first()
+        if campaign is not None and item is not None:
+            from batch_campaigns import _batch_transcription_kwargs
+            return dict(_batch_transcription_kwargs(campaign, item), language=language)
+    return {
+        "language": language,
+        "artist": job.artist or "",
+        "title": job.song_title or "",
+        "filename": job.filename or "",
+        "tenant_id": job.tenant_id or "",
+        "live": _looks_live(job.song_title or "", job.filename or ""),
+        "anchor_lyrics": "",
+        "workload_class": str(job.workload_class or "interactive"),
+    }
+
+
+@app.post("/jobs/{job_id}/retranscribe-language")
+@limiter.limit("12/minute")
+async def retranscribe_job_language(
+    request: Request,
+    job_id: str,
+    body: LanguageRetranscriptionRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-hear the stored audio with a reviewer-chosen language.
+
+    Non-destructive: the current text stays in the editor history, the frozen
+    machine snapshot is archived in ``editor_retranscriptions`` and the new
+    result arrives as a new revision for review (editor_retranscription.py).
+    """
+    import editor_retranscription as retranscription
+    try:
+        job = _retranscription_job_or_404(db, job_id, current_user)
+        _audit_cross_tenant_access(
+            db, current_user, job, "retranscribe_language", commit=False,
+        )
+        language = str(body.language or "").strip().lower()
+        kwargs = _language_retranscription_kwargs(db, job, language)
+        audio_path = os.path.join(OUTPUTS_DIR, job.job_id, job.filename or "audio")
+        try:
+            row, event = retranscription.start(
+                db, job,
+                user_id=current_user.get("id"),
+                language=language,
+                base_revision=body.base_revision,
+                audio_path=audio_path,
+                transcription_kwargs=kwargs,
+                request_fingerprint=_request_fingerprint(
+                    "transcription.retranscribe_language.v1",
+                    {"job_id": job.job_id, "language": language,
+                     "base_revision": int(body.base_revision)},
+                ),
+            )
+        except retranscription.RetranscriptionRejected as rejected:
+            db.rollback()
+            return JSONResponse(
+                status_code=rejected.status_code, content=rejected.payload(),
+                headers={"Retry-After": "120"} if rejected.status_code == 503 else None,
+            )
+        payload = retranscription.status_payload(job, row)
+        event_id = event.id
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    background_tasks.add_task(_dispatch_outbox_after_response, event_id)
+    return JSONResponse(
+        status_code=202,
+        content={"ok": True, "job_id": job_id, **payload,
+                 "status_url": f"/jobs/{job_id}/retranscribe-language"},
+    )
+
+
+@app.get("/jobs/{job_id}/retranscribe-language")
+async def retranscribe_job_language_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Poll target for the editor while the forced-language attempt runs."""
+    import editor_retranscription as retranscription
+    try:
+        # Polled every few seconds: only lock the row when a failed attempt
+        # has to be returned to review.
+        job = _retranscription_job_or_404(db, job_id, current_user, lock=False)
+        if (job.status == "transcription_failed"
+                or job.status in retranscription.ACTIVE_TRANSCRIPTION_STATUSES):
+            job = _retranscription_job_or_404(db, job_id, current_user)
+            retranscription.settle_stalled(db, job)
+        payload = retranscription.status_payload(job, retranscription.latest(db, job_id))
+        db.commit()
+        return payload
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/jobs/{job_id}/transcription-quality/acknowledge")

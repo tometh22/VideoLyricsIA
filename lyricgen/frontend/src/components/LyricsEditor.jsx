@@ -61,6 +61,8 @@ import { findAlertLineIndex } from "../lib/heardWords";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 import LocalGenlyModelCandidate from "./LocalGenlyModelCandidate";
 import CatalogReference from "./CatalogReference";
+import LanguageRetranscribeDialog, { LanguageSelect } from "./LanguageRetranscribeDialog";
+import { languageLabel, suggestedRetranscribeLanguage } from "../lib/languageRetranscription";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -676,6 +678,10 @@ export default function LyricsEditor({
   outputReferenceDivergence = false, outputReferenceUnexplainedIndices = [],
   needsLanguageReview = false, languageReviewResolved = false,
   onResolveLanguageReview = null,
+  // Re-transcribe from the audio with a reviewer-chosen language
+  // (POST/GET /jobs/{id}/retranscribe-language). `languageProbe` is the
+  // optional {main_language, ...} the language probe heard, used to prefill.
+  onRetranscribeLanguage = null, onPollRetranscription = null, languageProbe = null,
   onApprove, onBack, onRegisterSafeExit = null,
   isBatch = false, batchProgress = "",
   user = null,
@@ -4481,6 +4487,54 @@ export default function LyricsEditor({
   const [languageResolutionBusy, setLanguageResolutionBusy] = useState(false);
   const [languageResolutionError, setLanguageResolutionError] = useState("");
   const languageResolutionFlight = useRef(false);
+  const retranscribeAvailable = Boolean(
+    onRetranscribeLanguage && onPollRetranscription && transcribeJobId,
+  );
+  const [retranscribeLanguage, setRetranscribeLanguage] = useState(() => suggestedRetranscribeLanguage(
+    languageProbe, transcriptionQuality?.language_probe,
+  ));
+  const [retranscribeDialog, setRetranscribeDialog] = useState(null);
+  useEffect(() => {
+    // Reopening the song while Genly is still listening resumes the progress.
+    if (!retranscribeAvailable) return undefined;
+    let cancelled = false;
+    Promise.resolve(onPollRetranscription()).then((result) => {
+      if (cancelled || !result?.ok) return;
+      if (result.status === "queued" || result.status === "running") {
+        if (result.language) setRetranscribeLanguage(result.language);
+        setRetranscribeDialog({ phase: "running", language: result.language || retranscribeLanguage });
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retranscribeAvailable, transcribeJobId]);
+  const openRetranscribe = (language = retranscribeLanguage) => {
+    setRetranscribeDialog({ phase: "confirm", language });
+  };
+  const prepareRetranscription = async () => {
+    const saved = await flushPendingSave(null, true);
+    if (!saved?.ok) return { ok: false };
+    if (Number.isInteger(saved.revision)) return { ok: true, revision: saved.revision };
+    // Nothing pending: the server still rejects a stale revision (409).
+    return { ok: true, revision: Number(segmentsRevision) || 0 };
+  };
+  const reloadAfterRetranscription = () => {
+    if (onReloadServer) onReloadServer({ draftKey, storeKey: _storeKey });
+    else window.location.reload();
+  };
+  const retranscribeInline = retranscribeAvailable ? (
+    <div className="mt-2 flex flex-wrap items-center gap-2" data-testid="retranscribe-inline">
+      <LanguageSelect value={retranscribeLanguage} onChange={setRetranscribeLanguage} />
+      <button
+        type="button"
+        data-testid="retranscribe-open"
+        onClick={() => openRetranscribe()}
+        className="rounded-lg bg-white/10 px-3 py-1 text-xs text-white ring-1 ring-white/20 hover:bg-white/15"
+      >
+        {`Volver a transcribir en ${languageLabel(retranscribeLanguage)}`}
+      </button>
+    </div>
+  ) : null;
   const unresolvedLanguage = !languageReviewResolved
     && (languageConflict || languageUncertain || needsLanguageReview);
   const confirmLanguageReview = async () => {
@@ -5426,6 +5480,19 @@ export default function LyricsEditor({
         </div>, document.body,
       )}
 
+      {retranscribeAvailable && (
+        <LanguageRetranscribeDialog
+          open={Boolean(retranscribeDialog)}
+          initialLanguage={retranscribeDialog?.language || retranscribeLanguage}
+          initialPhase={retranscribeDialog?.phase || "confirm"}
+          onClose={() => setRetranscribeDialog(null)}
+          onBeforeStart={prepareRetranscription}
+          onStart={onRetranscribeLanguage}
+          onPoll={onPollRetranscription}
+          onApplied={reloadAfterRetranscription}
+        />
+      )}
+
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
           <svg className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
@@ -5441,8 +5508,11 @@ export default function LyricsEditor({
       {languageConflict && (
         <div className="mb-4 rounded-2xl bg-red-400/[0.08] px-4 py-3 ring-1 ring-red-400/30">
           <p className="text-xs leading-relaxed text-red-100">
-            {t("editor.language_conflict") || "El idioma del audio y la transcripción no coincide. Volvé atrás, elegí el idioma de esta canción y reprocesá."}
+            {retranscribeAvailable
+              ? "El idioma del audio y la transcripción no coincide. Elegí el idioma de esta canción y volvé a transcribirla."
+              : (t("editor.language_conflict") || "El idioma del audio y la transcripción no coincide. Volvé atrás, elegí el idioma de esta canción y reprocesá.")}
           </p>
+          {retranscribeInline}
         </div>
       )}
       {outputReferenceDivergence && !languageConflict && (
@@ -5473,13 +5543,17 @@ export default function LyricsEditor({
               {t("editor.confirm_lyrics_correct") || "Ya lo revisé, la letra es correcta"}
             </button>
           ))}
+          {!languageReviewResolved && retranscribeInline}
         </div>
       )}
       {languageUncertain && !languageConflict && !outputReferenceDivergence && (
         <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
           <p className="text-xs leading-relaxed text-amber-100">
-            {t("editor.language_uncertain") || "No pudimos corroborar el idioma. Elegí el idioma de esta canción y reprocesá antes de aprobar."}
+            {retranscribeAvailable
+              ? "No pudimos corroborar el idioma. Si la letra salió en otro idioma, elegí el de esta canción y volvé a transcribirla antes de aprobar."
+              : (t("editor.language_uncertain") || "No pudimos corroborar el idioma. Elegí el idioma de esta canción y reprocesá antes de aprobar.")}
           </p>
+          {retranscribeInline}
         </div>
       )}
       {mixedLanguage && !languageConflict && (
@@ -6510,6 +6584,11 @@ export default function LyricsEditor({
                   {!syncMode && (
                     <button type="button" role="menuitem" data-tour="editor-sync-entry" onClick={() => { enterSyncMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
                       <span className="block font-medium">{t("editor.sync_enter_full") || "Re-anclar por tap (Modo Sync)"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Marcá entradas mientras escuchás</span>
+                    </button>
+                  )}
+                  {retranscribeAvailable && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="retranscribe-menu-item" onClick={() => { openRetranscribe(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
+                      <span className="block font-medium">Volver a transcribir en otro idioma</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Genly vuelve a escuchar el audio; la versión actual queda en el historial</span>
                     </button>
                   )}
                   {editorV2Enabled && (
