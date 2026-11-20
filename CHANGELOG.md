@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.195] - 2026-11-20
+
+### Fixed
+- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
+
 ## [1.1.194] - 2026-11-20
 
 ### Added
