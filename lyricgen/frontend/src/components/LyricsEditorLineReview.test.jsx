@@ -80,9 +80,21 @@ describe("LyricsEditor — aprobación por canción", () => {
 
     Object.defineProperty(audio, "paused", { configurable: true, value: true });
     fireEvent.pause(audio);
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(first).toHaveClass("bg-brand/20");
     await userEvent.click(second);
     expect(second).toHaveAttribute("aria-current", "true");
     expect(input).toHaveValue("Segunda línea");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: false });
+    fireEvent.play(audio);
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveAttribute("aria-current", "true");
+    Object.defineProperty(audio, "paused", { configurable: true, value: true });
+    fireEvent.ended(audio);
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(second).toHaveClass("bg-brand/20");
+    expect(first).not.toHaveClass("bg-brand/20");
   });
 
   it("no recorta ni persiste timings al abrir una campaña de 41 líneas", async () => {
