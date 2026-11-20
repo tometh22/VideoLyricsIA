@@ -1,13 +1,18 @@
 # Changelog
 
+## [1.1.195] - 2026-11-20
+
+### CI / automation
+- Report unverified smoke-session revocation on authentication or cleanup errors; never revoke another session. Require the exact staging release and fleet runtime parity before authenticated reads. This automation correction retains application version 1.1.195.
+
+### Fixed
+- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
+
 ## [1.1.194] - 2026-11-20
 
 ### Added
 - Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
-
-### CI / automation
-- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close only its identified login session. Report unverified revocation on authentication/session errors; never create reviewers or grant access to customer campaigns. Validate permission writes only in isolated tests.
-- Require the exact deployed staging SHA and matching fleet runtime before the smoke starts. Automation corrections do not consume a new application version.
+- Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
 
 ## [1.1.193] - 2026-11-20
 
