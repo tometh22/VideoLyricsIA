@@ -63,14 +63,28 @@ describe("LyricsEditor — aprobación por canción", () => {
     expect(first).toHaveClass("bg-brand/20");
 
     // Keep a text edit in progress as playback crosses to the next lyric.
-    fireEvent.focus(input);
+    act(() => { input.focus(); });
     fireEvent.change(input, { target: { value: "Primera corregida" } });
+    input.setSelectionRange(5, 5);
+
+    // An intro/seek with no active lyric must not claim the edit target is playing.
+    act(() => { audio.currentTime = 0; frame(); });
+    expect(first).not.toHaveAttribute("aria-current");
+    expect(second).not.toHaveAttribute("aria-current");
+    expect(first).not.toHaveClass("bg-brand/20");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
+
     act(() => { audio.currentTime = 5.5; frame(); });
     expect(second).toHaveAttribute("aria-current", "true");
     expect(second).toHaveClass("bg-brand/20");
     expect(first).not.toHaveClass("bg-brand/20");
     expect(first).toHaveAttribute("data-selected", "true");
     expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
     expect(screen.getByTestId("selected-line-panel")).toHaveTextContent("Línea 1");
 
     // Backward playback/seek follows the same clock rather than a row counter.
