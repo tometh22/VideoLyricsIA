@@ -17518,6 +17518,10 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
             merged.append(m)
         # Mismo contrato de orden monotónico que /save-segments.
         merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    # El re-anclado no pasa por lead_in.polish: sin esto cada línea re-timeada
+    # se apaga en el último fonema (REANCHOR_HOLD_MODE, default off).
+    import reanchor_hold as _reanchor_hold
+    merged, _hold_stats = _reanchor_hold.run(merged, prev_segs)
     _pasted_audit = {}
     if pasted_mode:
         import hashlib as _hashlib
@@ -17603,6 +17607,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                     "base_revision": current_revision,
                     "revision": int(row.segments_revision or 0),
                     **_pasted_audit,
+                    **({"hold": _hold_stats} if _hold_stats else {}),
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -17672,6 +17677,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
         "lines_replaced": lines_replaced,
         "locked_dropped": locked_dropped,
         "structure": structure,
+        **({"hold": _hold_stats} if _hold_stats else {}),
     }
 
 
