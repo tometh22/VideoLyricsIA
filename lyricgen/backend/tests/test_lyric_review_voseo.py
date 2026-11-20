@@ -264,3 +264,16 @@ def test_ambiguous_forms_are_flagged():
         assert lookup(word).ambiguous
     for word in ("quieres", "anótate", "quedes"):
         assert not lookup(word).ambiguous
+
+
+def test_voseo_keeps_enye_when_removing_accents():
+    """Revisión #1642: la ñ no se pierde al quitar la tilde del imperativo."""
+    import voseo_lexicon as vl
+    assert vl._strip_accents("enséñame") == "enseñame"
+    assert vl._strip_accents("extráñame") == "extrañame"
+    assert vl._strip_accents("pingüino") == "pingüino"
+    for form in ("enseñame", "extrañame"):
+        assert "n" + "a" not in form.replace("ñ", "")[:0]  # sanity: no-op
+    values = [v for v in vl.__dict__.values() if isinstance(v, dict)]
+    targets = {t for d in values for t in d.values() if isinstance(t, str)}
+    assert "ensename" not in targets and "extraname" not in targets

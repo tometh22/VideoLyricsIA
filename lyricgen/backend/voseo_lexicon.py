@@ -101,8 +101,10 @@ def _stress_penult(word: str) -> str:
 
 
 def _strip_accents(word: str) -> str:
+    """Quita sólo la tilde de las vocales (á→a). La ñ y la ü se conservan:
+    "enséñame" pasa a "enseñame", nunca a "ensename"."""
     return _nfc("".join(
-        ch for ch in unicodedata.normalize("NFD", word) if not unicodedata.combining(ch)))
+        ch for ch in unicodedata.normalize("NFD", word) if ch != "\u0301"))
 
 
 def _subj_stem_ar(stem: str) -> str:

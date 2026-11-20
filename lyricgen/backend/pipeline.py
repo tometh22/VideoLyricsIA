@@ -14835,6 +14835,10 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     scene["validation"]["hard_violation"] = bool(
                         _scene_validation.get("hard_violation")
                     )
+                    from delivery_background_qc import extended_qc_complete as _xqc_complete
+                    scene["validation"]["extended_complete"] = _xqc_complete(
+                        _scene_validation.get("extended_qc")
+                    )
                     scene["validation"]["observations"] = list(
                         _scene_validation.get("observations") or []
                     )[:12]

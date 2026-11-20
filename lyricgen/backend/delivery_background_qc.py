@@ -59,6 +59,15 @@ def _entries(rows: Any) -> list[tuple[str, str]]:
     return out
 
 
+def extended_qc_complete(summary: Mapping[str, Any] | None) -> bool:
+    """True sólo si el control extendido evaluó al menos un frame y ninguno
+    quedó sin evaluar, y no se salteó."""
+    if not isinstance(summary, Mapping) or summary.get("skipped"):
+        return False
+    evaluated = summary.get("frames_evaluated") or 0
+    return evaluated > 0 and not (summary.get("frames_unevaluated") or 0)
+
+
 def collect_background_findings(
     validation_result: Mapping[str, Any] | None,
     scene_plan: Mapping[str, Any] | None = None,
@@ -76,15 +85,25 @@ def collect_background_findings(
     for scene in ((scene_plan or {}).get("scenes") or []) if isinstance(scene_plan, Mapping) else []:
         if isinstance(scene, Mapping) and isinstance(scene.get("validation"), Mapping):
             sources.append(scene["validation"])
+    evaluated: list[bool] = []
     for source in sources:
-        if source.get("extended_qc") or "hard_violation" in source:
-            extended = True
+        if isinstance(source.get("extended_qc"), Mapping):
+            evaluated.append(extended_qc_complete(source["extended_qc"]))
+        elif "extended_complete" in source:
+            evaluated.append(source.get("extended_complete") is True)
+        elif "hard_violation" in source:
+            # Escena guardada sin el resumen: no prueba que se haya evaluado.
+            evaluated.append(False)
         for category, reason in (
             _entries(source.get("observations")) + _entries(source.get("observed_issues"))
         ):
             reasons = found.setdefault(category, [])
             if reason and reason not in reasons:
                 reasons.append(reason)
+    # Un fondo sólo cuenta como evaluado si TODAS sus fuentes (fondo y cada
+    # escena) completaron el control extendido. Llamadas fallidas, saltos o
+    # una línea de escenas a medias quedan como "no corrió", nunca como PASS.
+    extended = bool(evaluated) and all(evaluated)
     return {"findings": found, "extended_evaluated": extended}
 
 

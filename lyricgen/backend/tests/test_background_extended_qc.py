@@ -353,7 +353,7 @@ GUN_VALIDATION = {
         {"frame": 3, "type": "text: SALE"},
         {"frame": 3, "type": "atmospherics: fog"},
     ],
-    "extended_qc": {"mode": "observe"},
+    "extended_qc": {"mode": "observe", "frames_planned": 3, "frames_evaluated": 3, "frames_unevaluated": 0},
     "rejected_attempts": [{"observations": [{"type": "gore: sangre"}]}],
 }
 
@@ -463,3 +463,21 @@ def test_runtime_report_without_background_checks_when_off(monkeypatch, tmp_path
     ids = {row["check_id"] for row in report["checks"]}
     assert not ids & {"background_content", "background_letterbox"}
     assert not any(row["code"].startswith("BG_") for row in report["issues"])
+
+
+def test_failed_or_partial_extended_qc_is_not_reported_as_evaluated():
+    """Revisión #1642: sin frames evaluados (o a medias) no hay PASS."""
+    from delivery_background_qc import collect_background_findings, extended_qc_complete
+    failed = {"hard_violation": False, "extended_qc": {"frames_planned": 4, "frames_evaluated": 0, "frames_unevaluated": 4}}
+    assert collect_background_findings(failed)["extended_evaluated"] is False
+    partial = {"hard_violation": False, "extended_qc": {"frames_planned": 4, "frames_evaluated": 2, "frames_unevaluated": 2}}
+    assert collect_background_findings(partial)["extended_evaluated"] is False
+    skipped = {"hard_violation": False, "extended_qc": {"skipped": "base_verdict_rejects_asset", "frames_evaluated": 0}}
+    assert collect_background_findings(skipped)["extended_evaluated"] is False
+    ok = {"hard_violation": False, "extended_qc": {"frames_planned": 4, "frames_evaluated": 4, "frames_unevaluated": 0}}
+    assert extended_qc_complete(ok["extended_qc"]) is True
+    assert collect_background_findings(ok)["extended_evaluated"] is True
+    legacy_scene = {"scenes": [{"validation": {"hard_violation": False}}]}
+    assert collect_background_findings(ok, legacy_scene)["extended_evaluated"] is False
+    good_scene = {"scenes": [{"validation": {"hard_violation": False, "extended_complete": True}}]}
+    assert collect_background_findings(ok, good_scene)["extended_evaluated"] is True
