@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.192] - 2026-11-19
+
+### Fixed
+- Show complete lyric text in the timeline sidebar with matching row heights. Allow stable inline edits from sidebar and timeline; Enter flushes autosave and returns keyboard focus, while Space toggles playback outside text fields and preserves Sync mode. Keep editing stationary and preserve reconciled remote corrections. Cover long songs during playback: anchor the input outside scrollports, reserve the undo toolbar before typing, and keep playing-row text metrics stable; preserve interaction blocking for approval/restoration and keyboard focus when closing the field.
+- Expose single-line deletion on both surfaces and add exact-time insertion through the sidebar or timeline context menu, preserving existing rows and minting new identities. Reject occupied intervals instead of silently moving existing lyrics.
+
+### Added
+- Resize the lyric sidebar by dragging its divider or using the keyboard, with responsive bounds and double-click reset.
+- Offer optional text and duration corrections for later matching phrases. Keep each occurrence onset, require explicit timing selection, and revalidate source/target snapshots, audio bounds and collisions before applying. Text similarity proposes candidates; it does not assert acoustic equivalence.
+
 ## [1.1.181] - 2026-11-18
 
 ### Fixed

@@ -27,7 +27,7 @@ test("pointer focus preserves inline spaces, caret arrows and text deletion", as
   await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
   const second = page.getByTestId("timeline-segment").nth(1);
   await second.getByTestId("timeline-segment-body").dblclick();
-  const input = second.locator("input");
+  const input = page.getByRole("textbox", { name: "Letra de esta línea 2", exact: true });
   await expect(input).toBeFocused();
   await input.press("End");
   await input.pressSequentially(" con espacios");
