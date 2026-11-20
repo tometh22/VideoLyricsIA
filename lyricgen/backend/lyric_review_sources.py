@@ -343,9 +343,12 @@ def _content_key(document, job, official: str, pairs: dict, portal: str | None =
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
-def review_for_document(db, document, job=None) -> dict:
+def review_for_document(db, document, job=None, *, fetch_official: bool = True) -> dict:
     """Revisión rápida de la letra actual del documento. Nunca rompe la
-    transacción del request: las lecturas van en un savepoint."""
+    transacción del request: las lecturas van en un savepoint.
+
+    ``fetch_official=False`` no agenda la búsqueda en lrclib (la usa el
+    resumen al publicar, que sólo lee lo que ya hay)."""
     job_mode = effective_mode(job)
     if job_mode == "off":
         return {"schema": "lyric-review-v1", "mode": "off", "items": [],
@@ -366,7 +369,7 @@ def review_for_document(db, document, job=None) -> dict:
             raise
         if nested is not None and nested.is_active:
             nested.commit()
-        if job is not None and not text:
+        if job is not None and not text and fetch_official:
             schedule_official_fetch(job)
         key = _content_key(document, job, text, pairs, portal)
         cached = _review_cache.get_fresh(key)

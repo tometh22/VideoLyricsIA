@@ -151,3 +151,74 @@ describe("send to portal: client requests newer than the approved lyrics", () =>
     expect(onStarted).not.toHaveBeenCalled();
   });
 });
+
+describe("send to portal: summary before publishing", () => {
+  const summary = (jobId, patch = {}) => ({
+    job_id: jobId, title: jobId === "job1" ? "Canción 1" : "Canción 2", artist: "Artista",
+    listening_status: "measured", lines_total: 20, lines_unheard: 2,
+    unheard: [{ line_index: 4, start: 61, end: 64, text: "Una línea que nadie escuchó" }, { line_index: 9, start: 95, end: 98, text: "Otra más" }],
+    warnings_count: 1, warnings_by_category: { official: 1, two_ears: 0, style: 0 },
+    warnings: [{ id: "w1", category: "official", title: "Se escucha distinto", count: 1, occurrences: [{ start: 30, before: "dice mal", after: "dice bien" }] }],
+    needs_attention: true, token: `${jobId}-token`.padEnd(64, "0"), ...patch,
+  });
+
+  function mountReview({ preview, sendResponses }) {
+    const calls = [];
+    const queue = [...sendResponses];
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null });
+      if (url.includes("/publish-review")) return json(preview);
+      if (url.includes("/change-request-guard")) return json({ enabled: false, blocked: [] });
+      if (url.includes("/change-requests")) return json({ items: [] });
+      return queue.shift()();
+    }));
+    const onStarted = vi.fn();
+    render(<SendToPortalDialog campaignId="c1" videos={videos} lockedPortal="chile" onClose={vi.fn()} onStarted={onStarted} />);
+    return { calls, onStarted };
+  }
+
+  it("shows one summary with the total per song and sends the tokens it showed", async () => {
+    const { calls, onStarted } = mountReview({
+      preview: { mode: "prompt", available: true, summaries: [summary("job1")], totals: {} },
+      sendResponses: [() => json({ operation_id: "op-1", total_count: 2, scheduled: true }, 202)],
+    });
+    expect(await screen.findByText("2 líneas sin escuchar y 1 aviso sin mirar.")).toBeInTheDocument();
+    expect(screen.getByText("2 de 20 líneas sin escuchar · 1 aviso sin mirar")).toBeInTheDocument();
+    expect(screen.getByText("Una línea que nadie escuchó")).toBeInTheDocument();
+    expect(calls.find((call) => call.url.includes("/publish-review")).url).toContain("job_ids=job1%2Cjob2");
+    fireEvent.click(screen.getByRole("button", { name: "Publicar igual" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(sendBody(calls).publish_review_tokens).toEqual({ job1: summary("job1").token });
+  });
+
+  it("observe mode shows nothing and sends no tokens", async () => {
+    const { calls, onStarted } = mountReview({
+      preview: { mode: "observe", available: true, summaries: [], totals: {} },
+      sendResponses: [() => json({ operation_id: "op-1", total_count: 2, scheduled: true }, 202)],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Resumen antes de publicar")).toBeNull();
+    expect(sendBody(calls).publish_review_tokens).toBeUndefined();
+  });
+
+  it("a changed summary comes back from the send and needs one more confirmation", async () => {
+    const fresh = summary("job2", { lines_unheard: 5, token: "fresh".padEnd(64, "1") });
+    const { calls, onStarted } = mountReview({
+      preview: { mode: "prompt", available: true, summaries: [], totals: {} },
+      sendResponses: [
+        () => json({ detail: { code: "publish_review_required", summaries: [fresh], totals: { songs: 1, songs_needing_attention: 1, lines_unheard: 5, lines_total: 20, warnings: 1 } } }, 409),
+        () => json({ operation_id: "op-2", total_count: 2, scheduled: true }, 202),
+      ],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Confirmar envío" }));
+    expect(await screen.findByText(/Antes de enviar, mirá el resumen/)).toBeInTheDocument();
+    expect(onStarted).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Publicar igual" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    const posts = calls.filter((call) => call.method === "POST");
+    expect(posts[1].body.publish_review_tokens).toEqual({ job2: fresh.token });
+    expect(posts[1].body.idempotency_key).toBe(posts[0].body.idempotency_key);
+  });
+});
