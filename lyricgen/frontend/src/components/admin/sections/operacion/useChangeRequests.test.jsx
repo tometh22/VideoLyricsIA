@@ -659,3 +659,53 @@ it("exposes the exact text rejection and sends human review only on explicit con
   expect(result.current.crPublishNotice.text).toContain("revisión manual");
   expect(result.current.crPublishNotice.textReview).toBeUndefined();
 });
+
+const reviewSummary = { job_id: "job-85", title: "Canción", lines_total: 30, lines_unheard: 4, warnings_count: 1,
+  listening_status: "measured", needs_attention: true, token: "c".repeat(64), unheard: [], warnings: [] };
+const reviewRequired = () => Promise.reject(Object.assign(new Error("publish_review_required"), {
+  status: 409, code: "publish_review_required",
+  detail: { code: "publish_review_required", summaries: [reviewSummary], totals: { songs: 1, lines_unheard: 4, warnings: 1 } },
+}));
+
+it("shows the summary before publishing and resends the same publication with its token", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (!url.includes("/deliveries/from-job/")) return previous(url, opts);
+    return JSON.parse(opts.body).publish_review_token ? Promise.resolve({ ok: true, content_changed: true, revision: 3,
+      portal_id: "chile", job_id: "job-85", resolved_change_requests: [85] }) : reviewRequired();
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  const publication = { editor_revision: 4, render_fingerprint: "render4" };
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, publication));
+  const notice = result.current.crPublishNotice;
+  expect(notice).toMatchObject({ requestId: 85, tone: "wait" });
+  expect(notice.publishReview).toMatchObject({ action: "publish", summaries: [reviewSummary],
+    args: ["job-85", "chile", 85, publication, undefined] });
+  await act(() => result.current.publishDeliveryUpdate(...notice.publishReview.args, reviewSummary.token));
+  const posts = mocks.fetchJson.mock.calls.filter(([url]) => url.includes("/deliveries/from-job/"));
+  expect(posts).toHaveLength(2);
+  expect(JSON.parse(posts[1][1].body)).toMatchObject({ portal_id: "chile", change_request_id: 85,
+    publish_review_token: reviewSummary.token });
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok" });
+  expect(result.current.crPublishNotice.publishReview).toBeUndefined();
+});
+
+it("asks the same summary before closing by publication", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (!url.endsWith("/confirm-publication")) return previous(url, opts);
+    return JSON.parse(opts.body).publish_review_token
+      ? Promise.resolve({ ok: true, resolved_by_revision: 2 }) : reviewRequired();
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85, { render_fingerprint: "cut-2", editor_revision: 14 }, 3));
+  const notice = result.current.crPublishNotice;
+  expect(notice.publishReview).toMatchObject({ action: "confirm" });
+  await act(() => result.current.confirmChangeRequestPublication(...notice.publishReview.args, reviewSummary.token));
+  const posts = mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith("/confirm-publication"));
+  expect(JSON.parse(posts[1][1].body)).toEqual({ reviewed_render_fingerprint: "cut-2", reviewed_editor_revision: 14,
+    confirmed_items: 3, publish_review_token: reviewSummary.token });
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok" });
+});

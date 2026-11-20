@@ -102,6 +102,27 @@ describe("lyric review fixes", () => {
     expect(timing.segments[0].locked).toBe(true);
   });
 
+  it("moves a line to the measured voice only if it is still where the server saw it", () => {
+    const segments = [
+      { _id: 1, segment_id: "a", start: 80, end: 82, text: "Antes" },
+      { _id: 2, segment_id: "b", start: 82.3, end: 87.08, text: "El tiempo corría" },
+      { _id: 3, segment_id: "c", start: 87.22, end: 91.9, text: "Ella me dio un beso" },
+    ];
+    const fix = { type: "timing", start: 83.2, expect_start: 82.3 };
+    const moved = applyReviewItem(segments, { occurrences: [occ("b", fix, 82.3)] });
+    expect(moved.applied).toBe(1);
+    expect(moved.segments[1]).toMatchObject({ start: 83.2, end: 87.08, text: "El tiempo corría", locked: true });
+    expect(moved.segments[0]).toEqual(segments[0]);
+    expect(moved.segments[2]).toEqual(segments[2]);
+    // La revisora ya la movió a mano: el tiempo medido era para otra posición.
+    const touched = segments.map((s) => (s.segment_id === "b" ? { ...s, start: 82.9 } : s));
+    expect(applyReviewItem(touched, { occurrences: [occ("b", fix, 82.9)] }).applied).toBe(0);
+    // Alargar nunca pisa a la línea siguiente.
+    const longer = applyReviewItem(segments, {
+      occurrences: [occ("b", { type: "timing", end: 89, expect_end: 87.08 }, 82.3)] });
+    expect(longer.segments[1].end).toBeCloseTo(87.17);
+  });
+
   it("re-cutting moves word clocks with their words and the inner boundary to them", () => {
     // GBA Stage demo: "Senhor" belongs to the previous line.
     const w = (word, start, end) => ({ word, start, end });

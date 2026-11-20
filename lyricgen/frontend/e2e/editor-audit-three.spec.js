@@ -26,9 +26,9 @@ test("campaign refuses to open design after failed lyric save and retries withou
   await input.fill("Texto humano que debe sobrevivir");
   await page.getByRole("button", { name: "Diseño de esta canción", exact: true }).click();
   await expect.poll(() => attempts).toBeGreaterThan(0);
-  // A request starting does not mean the save-aware navigation has settled:
-  // autosave can still drain a trailing request. Keep the API failing until
-  // the editor confirms that leaving was blocked, then explicitly retry.
+  // Autosave can still drain a trailing request after the first PATCH starts.
+  // Keep returning 503 until the editor refuses navigation; flipping `fail`
+  // earlier can let the first exit succeed and detach the retry button.
   await expect(page.getByText("Tus cambios siguen en pantalla. Reintentá guardar antes de salir.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Volver a revisar letra", exact: true })).toHaveCount(0);
   await expect(page.getByTestId("campaign-line-workspace")).toBeVisible();
