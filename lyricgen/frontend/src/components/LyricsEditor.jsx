@@ -5902,7 +5902,7 @@ export default function LyricsEditor({
       ); return playerSlot ? createPortal(_conf, playerSlot) : _conf; })()}
 
       {/* Correction preview, review navigation and persistent undo. */}
-      {(fixCount > 0 || showReviewBanner || hasUndo) && (
+      {(viewMode === "advanced" || fixCount > 0 || showReviewBanner || hasUndo) && (
         <div className="mb-3 flex flex-wrap items-center gap-2" data-testid="editor-chip-row">
           {/* Both correction controls open the summary before applying. */}
           {fixCount > 0 && (
@@ -6003,13 +6003,14 @@ export default function LyricsEditor({
               )}
             </div>
           )}
-          {hasUndo && !(requireLineReview && !syncMode && viewMode !== "advanced") && (
+          {!(requireLineReview && !syncMode && viewMode !== "advanced") && (
             <button
               type="button"
               onClick={undoEdit}
               data-testid="editor-undo-button"
+              disabled={!hasUndo}
               title={t("editor.undo_hint") || "Cmd/Ctrl+Z"}
-              className="h-8 rounded-lg px-3 text-xs text-gray-300 ring-1 ring-white/[0.08] hover:bg-white/[0.05]"
+              className="h-8 rounded-lg px-3 text-xs text-gray-300 ring-1 ring-white/[0.08] hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-40"
             >
               {t("editor.undo") || "Deshacer"}
             </button>
@@ -6900,6 +6901,7 @@ export default function LyricsEditor({
                           onTextChange={updateText}
                           onTextEditStart={(id, text) => setTextEditStart({ id, text })}
                           onTextEditCommit={handleTextBlur}
+                          interactionBlocked={Boolean(draftRecovery || isApproving || historyRestoreBusy || editorInitializationBlocked || reanchoring || pasteBusy)}
                           onTogglePlayback={syncMode ? tapAnchor : togglePlay}
                           onAddAtTime={addLineAtTime}
                           repeatProposal={<>

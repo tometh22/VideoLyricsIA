@@ -12,6 +12,7 @@
  * interaction state; persistence and autosave remain in the parent.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import {
   clampResizeTiming,
@@ -144,6 +145,7 @@ export default function LyricsTimeline({
   onTextChange,
   onTextEditStart,
   onTextEditCommit,
+  interactionBlocked = false,
   onTogglePlayback,
   onAddAtTime,
   repeatProposal,
@@ -184,6 +186,7 @@ export default function LyricsTimeline({
   const [moreActionsOpen, setMoreActionsOpen] = useState(false);
   const [editingTextId, setEditingTextId] = useState(null);
   const [editingSurface, setEditingSurface] = useState("block");
+  const [editingPosition, setEditingPosition] = useState(null);
   const [textDraft, setTextDraft] = useState("");
   const textEditRef = useRef(null);
   const editingRowHeight = useRef(ROW_H);
@@ -236,7 +239,39 @@ export default function LyricsTimeline({
     return () => observer?.disconnect();
   }, [normalizedSegments, editingTextId]);
   useLayoutEffect(() => {
-    if (editingTextId == null) return;
+    if (!interactionBlocked) return;
+    // The field lives in a portal; preserve the parent's inert/approval gate.
+    // Current keystrokes are already in parent state and its save queue.
+    textEditRef.current = null;
+    setEditingTextId(null);
+    setEditingPosition(null);
+  }, [interactionBlocked]);
+  // Keep the editing field outside all scrollports. A focused input inside
+  // the sticky rail makes Chromium reveal its *unscrolled* layout position
+  // on caret/text changes, jumping the canvas and outer app scroll container.
+  useLayoutEffect(() => {
+    if (editingTextId == null) { setEditingPosition(null); return; }
+    const container = editingSurface === "label" ? labelRailRef.current : trackRef.current;
+    const anchor = Array.from(container?.children || []).find(node => node.dataset.lineId === String(editingTextId));
+    if (!anchor) { setEditingPosition(null); return; }
+    const place = () => {
+      const rect = anchor.getBoundingClientRect();
+      const width = Math.min(Math.max(160, editingSurface === "label" ? rect.width - 48 : Math.max(240, rect.width)), 480, Math.max(120, window.innerWidth - 16));
+      const next = {
+        left: clamp(rect.left + 8, 8, Math.max(8, window.innerWidth - width - 8)),
+        top: clamp(rect.top + (rect.height - 30) / 2, 80, Math.max(80, window.innerHeight - 126)),
+        width,
+      };
+      setEditingPosition(previous => previous && previous.left === next.left && previous.top === next.top && previous.width === next.width ? previous : next);
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => { window.removeEventListener("scroll", place, true); window.removeEventListener("resize", place); };
+  }, [editingTextId, editingSurface, normalizedSegments, rowHeights, labelWidth]);
+  const editingFieldReady = editingPosition != null;
+  useLayoutEffect(() => {
+    if (editingTextId == null || !editingFieldReady) return;
     const input = textInputRef.current;
     if (!input) return;
     // Make the field visible once, before typing. Native caret scrolling
@@ -253,7 +288,7 @@ export default function LyricsTimeline({
     }
     input.focus({ preventScroll: true });
     return () => { document.documentElement.style.scrollBehavior = previousBehavior; };
-  }, [editingTextId, editingSurface]);
+  }, [editingTextId, editingSurface, editingFieldReady]);
   const rowOfId = useMemo(() => new Map(normalizedSegments.map((s, index) => [s._id, index])), [normalizedSegments]);
   const activeRowIndex = activeId == null ? null : rowOfId.get(activeId);
   const ticks = useMemo(() => {
@@ -808,6 +843,7 @@ export default function LyricsTimeline({
     else { textEditRef.current = null; setEditingTextId(null); }
   }, [normalizedSegments, editingTextId]);
   const startTextEdit = (segment, surface = "block") => {
+    if (interactionBlocked) return;
     dragRef.current = null;
     marqueeRef.current = null;
     setPreview(null);
@@ -816,6 +852,7 @@ export default function LyricsTimeline({
     editingRowHeight.current = rowHeights[segment._id] || ROW_H;
     textEditRef.current = { id: segment._id, original: segment.text || "" };
     setTextDraft(segment.text || "");
+    setEditingPosition(null);
     setEditingSurface(surface);
     setEditingTextId(segment._id);
     onTextEditStart?.(segment._id, segment.text || "");
@@ -831,8 +868,9 @@ export default function LyricsTimeline({
     markInteraction();
     if (returnFocus) workspaceRef.current?.focus({ preventScroll: true });
   };
-  const textInput = (index) => (
-    <input ref={textInputRef} data-editor-task="text"
+  const textInput = (index) => editingPosition && createPortal(
+    <div className="fixed z-[100] pointer-events-auto" style={editingPosition}>
+    <input ref={textInputRef} disabled={interactionBlocked} data-editor-task="text"
       aria-label={`${t("review_workspace.text", "Letra de esta línea")} ${index + 1}`}
       type="text" value={textDraft}
       onChange={event => { setTextDraft(event.target.value); onTextChange?.(editingTextId, event.target.value); }}
@@ -841,12 +879,16 @@ export default function LyricsTimeline({
       onBlur={() => commitTextEdit()}
       onKeyDown={event => {
         if (event.nativeEvent.isComposing) return;
-        if (event.key === "Enter" || event.key === "Escape") event.stopPropagation();
+        if (["Enter", "Escape", "Tab"].includes(event.key)) event.stopPropagation();
+        // The portal is outside DOM tab order of the workspace. Finish there
+        // explicitly rather than stranding focus at the end of document.body.
+        if (event.key === "Tab") { event.preventDefault(); commitTextEdit(false, true); }
         if (event.key === "Enter") { event.preventDefault(); commitTextEdit(false, true); }
         if (event.key === "Escape") { event.preventDefault(); commitTextEdit(true, true); }
       }}
       className="pointer-events-auto min-w-0 w-full rounded border border-brand/50 bg-surface-1 px-2 py-1 text-xs text-white outline-none"
     />
+    </div>, document.body, `timeline-text-${editingTextId}`,
   );
 
   const clearSelection = useCallback(() => {
@@ -1253,8 +1295,8 @@ export default function LyricsTimeline({
                       }}>
                     {isActive && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" aria-hidden="true" />}
                     <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isActive ? "bg-cyan-300 text-slate-950" : isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{isActive ? (isPlaying ? "▶" : "•") : index + 1}</span>
-                    <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words py-2 text-[11px] leading-5 ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
-                    {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
+                    <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words py-2 text-[11px] font-medium leading-5 ${isActive ? "text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
+                    {isActive && <span className="absolute right-12 top-0.5 hidden text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
                     </button>}
                     <button
@@ -1309,6 +1351,7 @@ export default function LyricsTimeline({
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
                   data-testid="timeline-segment"
+                  data-line-id={segment._id}
                   tabIndex={editingTextId === segment._id ? -1 : 0}
                   role={editingTextId === segment._id ? undefined : "button"}
                   aria-pressed={editingTextId === segment._id ? undefined : isSelected}

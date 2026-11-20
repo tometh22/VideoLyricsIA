@@ -68,3 +68,26 @@ it('supports keyboard bounds and cancels an interrupted sidebar drag',()=>{
  fireEvent.pointerCancel(handle,{pointerId:7});expect(handle).toHaveAttribute('aria-valuenow','200');
  fireEvent.keyDown(handle,{key:'End'});expect(handle).toHaveAttribute('aria-valuenow',handle.getAttribute('aria-valuemax'));
 });
+
+it('removes the anchored editor when the parent blocks interaction without an extra commit',()=>{
+ const change=vi.fn(),commit=vi.fn();
+ const props={segments:rows,onTextChange:change,onTextEditCommit:commit};
+ const view=render(<LyricsTimeline {...props}/>);
+ fireEvent.doubleClick(screen.getByTestId('timeline-label-row').querySelector('button'));
+ fireEvent.change(screen.getByRole('textbox'),{target:{value:'Última edición humana'}});
+ view.rerender(<I18nProvider><LyricsTimeline {...props} interactionBlocked/></I18nProvider>);
+ expect(screen.queryByRole('textbox')).toBeNull();
+ expect(change).toHaveBeenCalledExactlyOnceWith(1,'Última edición humana');
+ expect(commit).not.toHaveBeenCalled();
+ fireEvent.doubleClick(screen.getByTestId('timeline-label-row').querySelector('button'));
+ expect(screen.queryByRole('textbox')).toBeNull();
+});
+
+it('commits the anchored editor on Tab and returns keyboard focus to the workspace',()=>{
+ const commit=vi.fn();render(<LyricsTimeline segments={rows} onTextEditCommit={commit}/>);
+ fireEvent.doubleClick(screen.getByTestId('timeline-label-row').querySelector('button'));
+ fireEvent.keyDown(screen.getByRole('textbox'),{key:'Tab'});
+ expect(commit).toHaveBeenCalledExactlyOnceWith(1,rows[0].text);
+ expect(screen.queryByRole('textbox')).toBeNull();
+ expect(screen.getByLabelText('Studio de tiempos')).toHaveFocus();
+});
