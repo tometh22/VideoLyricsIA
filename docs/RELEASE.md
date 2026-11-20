@@ -122,12 +122,22 @@ leave workers behind.
 
 Before publishing, verify that each staging service is actually linked to its
 matching `/railway/<service>.toml` and compare its effective watch patterns with
-the repository. The read-only baseline on 2026-11-20 matched the old patterns for
-all six services, but BatchWorker and BatchShortWorker deployment metadata had
-`configFile=null` and no file build/deploy manifest. Their source binding remains
-unverified; do not treat the repository change alone as activating their filters.
-Resolve that dependency with the release owner before rollout. This PR does not
-change Railway settings. Recheck all six effective lists after deployment.
+the repository. A direct read of `ServiceInstance` on 2026-11-20 at 15:34 UTC
+confirmed a blocking dependency on staging release `4d1d0adb`: BatchWorker and
+BatchShortWorker both have `railwayConfigFile=null`. Their `resolvedFileConfig`
+for that release also has no config file or file watch patterns. The other four
+services have their expected configured and resolved paths. All six effective
+watch lists match the old repository patterns, but matching values alone do not
+establish that the two batch TOMLs are read.
+
+The release owner must coordinate linking BatchWorker to
+`/railway/batch-worker.toml` and BatchShortWorker to
+`/railway/batch-short-worker.toml`, with a review of the complete file settings
+before applying them. Merely merging these file changes cannot activate the two
+unlinked configs. This PR does not change Railway settings and is blocked for
+publication until that dependency has an authorized activation plan. Recheck all
+six configured paths, resolved file manifests and effective watch lists during
+the rollout; repository tests cannot attest to provider-side binding.
 
 This intentionally increases worker rollouts for frontend-only changes. Preserve
 all existing queues, replicas and 1200-second draining settings, schedule one
