@@ -15000,6 +15000,36 @@ async def create_pilot_test_copy(
     }
 
 
+from editor_preview import TextPreviewRequest, build_text_preview, preview_font
+
+
+@app.get("/editor/preview/fonts/{filename}")
+def get_editor_preview_font(filename: str, current_user: dict = Depends(get_current_user)):
+    try:
+        path = preview_font(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path, media_type="font/ttf", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/editor/{job_id}/text-preview")
+def editor_text_preview(
+    job_id: str, body: TextPreviewRequest,
+    current_user: dict = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    job, _ = _editor_document_or_404(db, job_id, current_user)
+    from render_spec import RenderSpec
+    spec = (RenderSpec.umg_intermediate_master(job.umg_spec)
+            if job.delivery_profile in ("umg", "both") and job.umg_spec
+            else RenderSpec.youtube_default())
+    try:
+        result = build_text_preview(body.segments, body.settings.model_dump(exclude_unset=True),
+                                    render_params=job.render_params, job_id=job_id, spec=spec)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/editor/{job_id}")
 async def get_editor_document(
     job_id: str,

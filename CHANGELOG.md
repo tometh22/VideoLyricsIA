@@ -1,9 +1,29 @@
 # Changelog
 
-## [1.1.202] - 2026-11-20
+## [1.1.205] - 2026-11-20
 
 ### Fixed
-- Make the campaign lyric highlight follow audio playback instead of staying on the manually selected line. Keep the text edit target and caret stable; restore the selected-line highlight when playback pauses or ends. Preserve the existing audio follow and playing indicator.
+- Make the campaign lyric highlight follow audio playback instead of staying on the manually selected line. Keep the text edit target and caret stable; restore the selected-line highlight when playback pauses or ends. Preserve the existing audio follow, playing indicator, reordering and deletion controls.
+
+## [1.1.195] - 2026-11-20
+
+### CI / automation
+- Report unverified smoke-session revocation on authentication or cleanup errors; never revoke another session. Require the exact staging release and fleet runtime parity before authenticated reads. This automation correction retains application version 1.1.195.
+
+### Fixed
+- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
+
+## [1.1.194] - 2026-11-20
+
+### Added
+- Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
+- Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
+
+## [1.1.193] - 2026-11-20
+
+### Fixed
+- Insert campaign lyric lines immediately below the selected occurrence, including adjacent or overlapping phrases. Add row deletion and mouse, touch and keyboard reordering with immediate persistence and Undo; preserve neighbouring timings and flag the placed line for timing review.
+- Render the campaign editor's text preview with browser libass, the final video's shared ASS composer, bundled font files and output dimensions. Keep line breaks stable when the panel resizes, discard stale preview responses and expose retry on failure.
 
 ## [1.1.192] - 2026-11-19
 
