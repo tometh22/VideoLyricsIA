@@ -1,9 +1,19 @@
 # Changelog
 
-## [1.1.184] - 2026-11-18
+## [1.1.193] - 2026-11-20
 
 ### Fixed
 - Flag lyrics written in a language that is not sung. When WhisperX guesses the wrong language from an intro it translates verses instead of transcribing them ("Gran Ídolo De Asia", Gilda "Rompo Las Cadenas": Spanish verses delivered in English or Japanese), and the output passed as a bilingual song with no alert. Every transcription now asks Gemini, in parallel and without requesting lyrics, which languages are sung (`transcription_quality.language_probe`, ~US$0.01 per song, retried on Vertex 429). Two or more delivered lines confidently written in a language the probe did not hear, or in a non-Latin script, raise the existing language-conflict review with those lines highlighted. Bilingual songs, unavailable probes and unclassifiable languages abstain; nothing is forced or rewritten. The probe survives edits and quality replays, and the gate recomputes it from persisted data. `SUNG_LANGUAGE_PROBE_ENABLED=0` turns it off.
+
+## [1.1.192] - 2026-11-19
+
+### Fixed
+- Show complete lyric text in the timeline sidebar with matching row heights. Allow stable inline edits from sidebar and timeline; Enter flushes autosave and returns keyboard focus, while Space toggles playback outside text fields and preserves Sync mode. Keep editing stationary and preserve reconciled remote corrections. Cover long songs during playback: anchor the input outside scrollports, reserve the undo toolbar before typing, and keep playing-row text metrics stable; preserve interaction blocking for approval/restoration and keyboard focus when closing the field.
+- Expose single-line deletion on both surfaces and add exact-time insertion through the sidebar or timeline context menu, preserving existing rows and minting new identities. Reject occupied intervals instead of silently moving existing lyrics.
+
+### Added
+- Resize the lyric sidebar by dragging its divider or using the keyboard, with responsive bounds and double-click reset.
+- Offer optional text and duration corrections for later matching phrases. Keep each occurrence onset, require explicit timing selection, and revalidate source/target snapshots, audio bounds and collisions before applying. Text similarity proposes candidates; it does not assert acoustic equivalence.
 
 ## [1.1.181] - 2026-11-18
 
