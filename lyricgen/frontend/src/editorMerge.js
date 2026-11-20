@@ -109,11 +109,40 @@ function indexed(segments, keys) {
   return map;
 }
 
+// Legacy/backend replacement rows may arrive without any identity. The UI
+// assigns a local _id on hydration; treating the raw server row as a separate
+// insertion then doubles it on a rebase. Match occurrences one-to-one before
+// building maps. Never collapse rows or equate different explicit identities.
+function recoverMissingIdentities(segments, peers) {
+  const used = peers.map(() => new Set());
+  return segments.map((segment) => {
+    for (let side = 0; side < peers.length; side += 1) {
+      const index = peers[side].findIndex((candidate, i) =>
+        !used[side].has(i)
+        && candidate.text === segment.text
+        && quantizeTime(candidate.start) === quantizeTime(segment.start)
+        && quantizeTime(candidate.end) === quantizeTime(segment.end));
+      if (index < 0) continue;
+      used[side].add(index);
+      const candidate = peers[side][index];
+      const identity = candidate.segment_id ?? candidate.id ?? candidate._id;
+      if ((segment.segment_id ?? segment.id) == null && identity != null) {
+        return { ...segment, segment_id: String(identity) };
+      }
+    }
+    return segment;
+  });
+}
+
 /**
  * Merge base → local and base → remote. A field/document is only considered
  * conflicting when both sides changed the same stable segment differently.
  */
 export function mergeThreeWay(base = [], local = [], remote = []) {
+  const originalBase = base;
+  base = recoverMissingIdentities(base, [local, remote]);
+  remote = recoverMissingIdentities(remote, [local, originalBase]);
+  local = recoverMissingIdentities(local, [remote, base]);
   const baseKeys = occurrenceKeys(base);
   const localKeys = occurrenceKeys(local);
   const remoteKeys = occurrenceKeys(remote);
