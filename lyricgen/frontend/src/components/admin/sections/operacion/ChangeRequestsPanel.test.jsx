@@ -1088,3 +1088,35 @@ describe("verificación punto por punto antes de cerrar", () => {
     expect(screen.getAllByText("Reincidencia").length).toBeGreaterThan(0);
   });
 });
+
+describe("resumen antes de publicar", () => {
+  const summary = { job_id: "f7752c6feed4", title: "Yo vengo de San Rosendo", listening_status: "measured",
+    lines_total: 30, lines_unheard: 2, warnings_count: 0, needs_attention: true, token: "d".repeat(64),
+    unheard: [{ line_index: 3, start: 42, end: 45, text: "Una línea sin escuchar" }], warnings: [] };
+  const publication = { ...BASE_PUBLICATION, needs_publish: true, render_fingerprint: "cut", editor_revision: 9 };
+
+  it.each([
+    ["publish", "Publicar igual"],
+    ["confirm", "Dar por resuelto igual"],
+  ])("muestra el resumen (%s) en el pedido y reenvía la misma acción con su token", (action, label) => {
+    const publish = vi.fn();
+    const confirm = vi.fn();
+    const args = action === "publish" ? ["f7752c6feed4", "chile", 7, publication] : [7, publication, 2];
+    renderPanel({ publication }, {
+      publishDeliveryUpdate: publish,
+      confirmChangeRequestPublication: confirm,
+      crPublishNotice: { requestId: 7, tone: "wait", text: "Antes de publicar, mirá qué quedó sin escuchar y sin revisar.",
+        publishReview: { action, args, summaries: [summary],
+          totals: { songs: 1, songs_needing_attention: 1, lines_unheard: 2, lines_total: 30, warnings: 0 } } },
+    });
+    const section = screen.getByRole("region", { name: "Resumen antes de publicar" });
+    expect(within(section).getByText("2 líneas sin escuchar.")).toBeInTheDocument();
+    expect(within(section).getByText("Una línea sin escuchar")).toBeInTheDocument();
+    fireEvent.click(within(section).getByRole("button", { name: label }));
+    const called = action === "publish" ? publish : confirm;
+    const padded = [...args];
+    while (padded.length < 5) padded.push(undefined);
+    expect(called).toHaveBeenCalledExactlyOnceWith(...padded, summary.token);
+    expect(action === "publish" ? confirm : publish).not.toHaveBeenCalled();
+  });
+});

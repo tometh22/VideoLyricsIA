@@ -360,6 +360,116 @@ async def user_assignment_options(
     }
 
 
+class CampaignAccessChange(BaseModel):
+    enabled: bool
+    expected_granted: bool
+
+
+def _campaign_access_row(campaign, grant, user):
+    explicit = grant is not None and grant.revoked_at is None
+    inherited = "admin" if user.role == "admin" else (
+        "team" if user.tenant_id == campaign.tenant_id else None
+    )
+    return {
+        "id": campaign.id, "name": campaign.name, "tenant_id": campaign.tenant_id,
+        "status": campaign.status, "kind": campaign.kind,
+        "granted": explicit, "inherited": inherited,
+        "has_access": bool(explicit or inherited),
+    }
+
+
+@router.get("/users/{user_id}/campaign-access")
+def user_campaign_access(
+    user_id: int,
+    search: str = Query(default="", max_length=200),
+    granted_only: bool = False,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=30, ge=1, le=100),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import and_, or_
+    from database import BatchCampaign, BatchCampaignReviewer
+    from batch_campaigns import _scope_enabled
+
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "Usuario no encontrado")
+    grant = BatchCampaignReviewer
+    active_grant = and_(grant.user_id.isnot(None), grant.revoked_at.is_(None))
+    query = db.query(BatchCampaign, grant).outerjoin(grant, and_(
+        grant.campaign_id == BatchCampaign.id, grant.user_id == user.id,
+    )).filter(or_(
+        and_(BatchCampaign.kind == "lyric_video", BatchCampaign.status == "active"),
+        active_grant,
+    ))
+    if search.strip():
+        query = query.filter(or_(
+            BatchCampaign.name.icontains(search.strip(), autoescape=True),
+            BatchCampaign.tenant_id.icontains(search.strip(), autoescape=True),
+        ))
+    if granted_only:
+        query = query.filter(active_grant)
+    total = query.count()
+    rows = query.order_by(case((active_grant, 0), else_=1), BatchCampaign.name, BatchCampaign.id).offset(offset).limit(limit).all()
+    return {
+        "items": [_campaign_access_row(c, g, user) for c, g in rows],
+        "total": total, "offset": offset, "limit": limit,
+        "user_active": user.is_active,
+        "campaigns_enabled": _scope_enabled({
+            "id": user.id, "role": user.role, "tenant_id": user.tenant_id,
+            "billing_group": user.billing_group,
+        }),
+    }
+
+
+@router.put("/users/{user_id}/campaign-access/{campaign_id}")
+def change_user_campaign_access(
+    user_id: int, campaign_id: str, body: CampaignAccessChange,
+    admin: dict = Depends(require_admin), db: Session = Depends(get_db),
+):
+    from database import BatchCampaign, BatchCampaignReviewer
+    from batch_campaigns import _scope_enabled
+
+    # Serialize changes for the same recipient, including a first grant.
+    user = db.query(User).filter_by(id=user_id).with_for_update().first()
+    if user is None:
+        raise HTTPException(404, "Usuario no encontrado")
+    campaign = db.query(BatchCampaign).filter_by(id=campaign_id).with_for_update().first()
+    if campaign is None:
+        raise HTTPException(404, "Campaña no encontrada")
+    grant = db.get(BatchCampaignReviewer, (campaign_id, user_id))
+    granted = grant is not None and grant.revoked_at is None
+    if granted != body.expected_granted:
+        raise HTTPException(409, "El permiso cambió. Actualizá la lista antes de volver a intentarlo.")
+    if body.enabled:
+        if not user.is_active:
+            raise HTTPException(422, "Reactivá la cuenta antes de darle acceso")
+        if user.role == "admin" or user.tenant_id == campaign.tenant_id:
+            raise HTTPException(422, "Este usuario ya tiene acceso por su rol o equipo")
+        if campaign.kind != "lyric_video" or campaign.status != "active":
+            raise HTTPException(422, "Solo se puede dar acceso a campañas de letras activas")
+        if not _scope_enabled({"id": user.id, "role": user.role,
+                               "tenant_id": user.tenant_id, "billing_group": user.billing_group}):
+            raise HTTPException(422, "Las campañas no están habilitadas para el equipo de este usuario")
+    if body.enabled != granted:
+        now = datetime.now(timezone.utc)
+        if body.enabled:
+            if grant is None:
+                grant = BatchCampaignReviewer(campaign_id=campaign_id, user_id=user_id)
+                db.add(grant)
+            grant.granted_by = admin["id"]
+            grant.granted_at = now
+            grant.revoked_at = None
+        else:
+            grant.revoked_at = now
+        db.add(AuditLog(user_id=admin["id"], action="admin.user_campaign_access_changed", detail={
+            "target_user": user_id, "campaign_id": campaign_id, "enabled": body.enabled,
+        }))
+        db.commit()
+    return _campaign_access_row(campaign, grant, user)
+
+
 @router.post("/users")
 async def create_user_admin(
     body: CreateUserRequest,

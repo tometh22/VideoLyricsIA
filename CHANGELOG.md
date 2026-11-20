@@ -1,10 +1,56 @@
 # Changelog
 
-## [1.1.194] - 2026-11-20
+## [1.1.208] - 2026-11-20
 
 ### Added
 - Let a campaign reviewer re-transcribe a song from its audio in a chosen language (Spanish, English, Portuguese, French, Italian, German) from the editor's language alerts or the Tools menu. The current text stays in the version history ("Antes de volver a transcribir"), the previous pre-human machine snapshot, evidence and quality verdict are archived in the new append-only `editor_retranscriptions` table, and the new lyrics arrive as a new revision for review. No editor version or correction observation is deleted. The forced language reaches WhisperX and every post-pass, a mixed audio reference no longer demotes it to auto-detection, and a previous language attestation does not carry over to the new text.
 - Refuse the request with "Genly se está actualizando, probá en unos minutos" while any worker serving the target queue runs different backend code, and return any attempt that ends without a result (failure, reaper timeout, a worker on older code discarding it) to review with the previous text intact.
+
+## [1.1.207] - 2026-11-20
+
+### Fixed
+- Flag lyrics written in a language that is not sung. When WhisperX guesses the wrong language from an intro it translates verses instead of transcribing them ("Gran Ídolo De Asia", Gilda "Rompo Las Cadenas": Spanish verses delivered in English or Japanese), and the output passed as a bilingual song with no alert. Every transcription now asks Gemini, in parallel and without requesting lyrics, which languages are sung (`transcription_quality.language_probe`, ~US$0.01 per song, retried on Vertex 429). Two or more delivered lines confidently written in a language the probe did not hear, or in a non-Latin script, raise the existing language-conflict review with those lines highlighted. Bilingual songs, unavailable probes and unclassifiable languages abstain; nothing is forced or rewritten. The probe survives edits and quality replays, and the gate recomputes it from persisted data. A truncated probe answer (unparseable JSON or a non-STOP finish such as MAX_TOKENS) is kept as `status=incomplete` and never gates: a language missing from a cut-off list is not evidence of absence. `SUNG_LANGUAGE_PROBE_ENABLED=0` turns it off.
+
+## [1.1.206] - 2026-11-20
+
+### Added
+- Warn in Revisión rápida when a line is out of sync with the voice: it appears before the singing starts, stays on screen without voice, enters late, or leaves before the last word ends. Times come from the stored forced-alignment words and the whole-song WhisperX words; the whisper-1 witness only confirms. Each warning moves the line start or end to the measured time with one click, never past the neighbouring line, never touching text or line breaks, and is skipped if the line was moved by hand after the server saw it. Nothing changes timing on its own. `LYRIC_REVIEW_TIMING_MODE=observe` (default) shows them as suggestions; `enforce` marks the witness-confirmed ones as `required` (priority, listed first; like the rest of Revisión rápida they never block approval); `off` disables them. Measured on 201 UMG songs: 20 % of client timing points flagged near the cited time (3 % by chance), 0.21 warnings per accepted song. Replaces the disconnected whisper-1 `_rule_timing`. Details in `docs/LYRIC_TIMING_REVIEW_2026-11-18.md`; offline measurement in `scripts/measure_lyric_timing_review.py`.
+- Check AI backgrounds for what UMG rejected in its September–November change requests: guns and knives, blood or raw meat, human body parts without a face, burned-in overlays such as a "16:9" label, and black letterbox bars. Weapons, gore, body parts and overlays use a separate, capped Vision call (at most 8 frames per background) that leaves the existing people/brand/anatomy request untouched; letterbox bars are measured without AI from the effective aspect ratio of the picture. Any error, timeout or quota response from the new call counts as "not evaluated" and never fails a job. `BACKGROUND_EXTENDED_QC_MODE` defaults to `observe` (findings are recorded, nothing is rejected); `enforce` sends the categories in `BACKGROUND_EXTENDED_QC_ENFORCE` (default `weapon,gore,overlay,letterbox`) through the existing regenerate-once → safe-gradient recovery before the final render, with letterbox rejected before any Vision call is paid; `off` disables it.
+- Show background findings in the delivery review before publishing: what the validator observed on the current background and its scene clips (weapon, gore, body parts, people, malformed anatomy, brand, overlay, letterbox) plus a letterbox scan of the encoded video, as "review" items with a "Revisado" action and two new checks. `DELIVERY_QC_BACKGROUND_MODE` defaults to `observe` (never blocks); `enforce` requires a reviewer to acknowledge them before an UMG publication; `off` hides them.
+- Summarize, before a lyric video reaches the UMG portal, the lines nobody played in the editor (from the existing `editor_audio_played` telemetry: a line counts as heard when at least half of it played, by anyone, before publishing; lines are only listed when that telemetry is complete for the song: when the server heartbeat says someone listened but their played ranges never arrived, or nothing played, the summary says listening data is unavailable instead of claiming nobody listened) and the Quick Review points still pending from high-precision sources: the official lyrics, two ears agreeing, and the portal style rules (final period, unpaired ¿?, missing accents including voseo). Every publication path computes it: single publish from the video page and from Cambios, "confirm publication", and campaign sends (one confirmation for the whole send, with the count per song). No schema change.
+- `PUBLISH_REVIEW_SUMMARY=observe` (default) computes the summary and records it in the local audit log (`delivery.publish_review`: who, unheard lines, pending warnings) without showing anything. `prompt` shows it and requires one click on "Publicar igual", which resends the token of the summary seen and is recorded the same way. `off` skips it. It never blocks hard: a failure to compute it publishes and records `unavailable`. Art Tracks are excluded.
+- `scripts/report_listening_coverage.py` now shares its coverage math with the publication summary (`listening_coverage.py`).
+- `REANCHOR_HOLD_MODE=off|observe|apply` (default `off`): editor re-anchoring ("Re-sincronizar", pasted official lyrics) can apply the same reading hold as upload (`lead_in.apply_hold`, i.e. the fleet's `LYRIC_HOLD_S`/`LYRIC_MIN_GAP_MS`); re-anchored lines currently vanish on the last phoneme. Only extends, only lines this re-anchor re-timed that end on their last word, never locked lines. `observe` reports the would-be changes in the response and the audit log without touching segments. Offline bank (201 UMG songs): extend-the-end requests within 0.5 s of the accepted end go from 8 to 17 of 112, 32 move closer, 1 of 41 shorten requests is lengthened; 12.3% of accepted Argentina lines (+0.39 s mean, max +0.5) and 1.3% of Chile lines change.
+- `docs/UMG_AR_CRITERIO_FORMA_TIMING_2026-11-19.md`: Argentina's form/timing criterion measured on its change requests, what the pipeline contradicts, and a draft question for the client.
+
+### Fixed
+- Keep Argentine voseo in Revisión rápida (Argentina portal only): when the machine normalised "querés", "vení", "anotate", "No te quedés" or "Te llevás" to tú, propose the vos form with one click. Marked as priority (`required`, listed first; like the rest of Revisión rápida it never blocks approval) when two independent ears (witness, Gemini, official lyrics) wrote the vos form, or one did and the song already uses voseo in another line; a suggestion with a single ear or with only the song's own voseo. Ears are now compared with accents, so "llevas"/"llevás" is no longer invisible. Songs that really use tú (ballads, folklore, foreign artists) are left alone without evidence, official lyrics in tú win, forms that are also other words ("ven", "mira", "ganas") need an ear, and an ear that matches the voseo point is merged into it instead of showing a second card. Chile and portal-less UMG deliveries are never touched.
+- Add `scripts/measure_umg_voseo_bank.py`, an offline measurement of the voseo rule over exported UMG requests, delivered and final lyrics.
+
+## [1.1.205] - 2026-11-20
+
+### Fixed
+- Make the campaign lyric highlight follow audio playback instead of staying on the manually selected line. Keep the text edit target and caret stable; restore the selected-line highlight when playback pauses or ends. Preserve the existing audio follow, playing indicator, reordering and deletion controls.
+
+## [1.1.195] - 2026-11-20
+
+### CI / automation
+- Report unverified smoke-session revocation on authentication or cleanup errors; never revoke another session. Require the exact staging release and fleet runtime parity before authenticated reads. This automation correction retains application version 1.1.195.
+
+### Fixed
+- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
+
+## [1.1.194] - 2026-11-20
+
+### Added
+- Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
+- Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
+
+## [1.1.193] - 2026-11-20
+
+### Fixed
+- Insert campaign lyric lines immediately below the selected occurrence, including adjacent or overlapping phrases. Add row deletion and mouse, touch and keyboard reordering with immediate persistence and Undo; preserve neighbouring timings and flag the placed line for timing review.
+- Render the campaign editor's text preview with browser libass, the final video's shared ASS composer, bundled font files and output dimensions. Keep line breaks stable when the panel resizes, discard stale preview responses and expose retry on failure.
 
 ## [1.1.192] - 2026-11-19
 
@@ -20,7 +66,6 @@
 
 ### Fixed
 - Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
-
 ## [1.1.180] - 2026-11-18
 
 ### Fixed

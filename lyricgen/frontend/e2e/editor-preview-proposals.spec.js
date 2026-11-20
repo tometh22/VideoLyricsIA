@@ -34,7 +34,9 @@ test('many quality proposals stay compact and a live lyric preview remains next 
  await page.getByTestId('review-line-1').click();
  await page.locator('audio').evaluate(a=>a.pause());
  await field.fill('Letra corregida visible en la vista previa');
- await expect(preview).toContainText(/Letra corregida visible/i);
+ const native=preview.getByRole('img',{name:/Letra corregida visible/i});
+ await expect(native).toHaveAttribute('aria-busy','false');
+ await expect(native.locator('canvas')).toBeVisible();
  await expect(page.locator('audio')).toHaveCount(1);
  await page.getByRole('button',{name:'Escuchar 2 s antes',exact:true}).scrollIntoViewIfNeeded();
  await expect(page.getByRole('button',{name:'Escuchar 2 s antes',exact:true})).toBeInViewport();

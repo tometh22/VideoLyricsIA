@@ -15010,6 +15010,36 @@ async def create_pilot_test_copy(
     }
 
 
+from editor_preview import TextPreviewRequest, build_text_preview, preview_font
+
+
+@app.get("/editor/preview/fonts/{filename}")
+def get_editor_preview_font(filename: str, current_user: dict = Depends(get_current_user)):
+    try:
+        path = preview_font(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path, media_type="font/ttf", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/editor/{job_id}/text-preview")
+def editor_text_preview(
+    job_id: str, body: TextPreviewRequest,
+    current_user: dict = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    job, _ = _editor_document_or_404(db, job_id, current_user)
+    from render_spec import RenderSpec
+    spec = (RenderSpec.umg_intermediate_master(job.umg_spec)
+            if job.delivery_profile in ("umg", "both") and job.umg_spec
+            else RenderSpec.youtube_default())
+    try:
+        result = build_text_preview(body.segments, body.settings.model_dump(exclude_unset=True),
+                                    render_params=job.render_params, job_id=job_id, spec=spec)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/editor/{job_id}")
 async def get_editor_document(
     job_id: str,
@@ -17624,6 +17654,10 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
             merged.append(m)
         # Mismo contrato de orden monotónico que /save-segments.
         merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    # El re-anclado no pasa por lead_in.polish: sin esto cada línea re-timeada
+    # se apaga en el último fonema (REANCHOR_HOLD_MODE, default off).
+    import reanchor_hold as _reanchor_hold
+    merged, _hold_stats = _reanchor_hold.run(merged, prev_segs)
     _pasted_audit = {}
     if pasted_mode:
         import hashlib as _hashlib
@@ -17709,6 +17743,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                     "base_revision": current_revision,
                     "revision": int(row.segments_revision or 0),
                     **_pasted_audit,
+                    **({"hold": _hold_stats} if _hold_stats else {}),
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -17778,6 +17813,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
         "lines_replaced": lines_replaced,
         "locked_dropped": locked_dropped,
         "structure": structure,
+        **({"hold": _hold_stats} if _hold_stats else {}),
     }
 
 
@@ -21387,6 +21423,9 @@ class SendToUMGRequest(BaseModel):
     override_reason: str | None = Field(default=None, max_length=1000)
     # Justificación interna por punto ✘ del pedido que esta publicación cierra.
     change_request_point_overrides: dict[str, str] = Field(default_factory=dict)
+    # PUBLISH_REVIEW_SUMMARY=prompt: token del resumen (líneas sin escuchar y
+    # avisos sin mirar) que la persona vio antes de "Publicar igual".
+    publish_review_token: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -21434,6 +21473,14 @@ def admin_create_delivery_from_job(
     job = db.query(Job).filter(Job.job_id == job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY): líneas que nadie
+    # escuchó y avisos precisos sin mirar. En `prompt` se muestra una vez y
+    # "Publicar igual" reenvía su token; nunca frena de forma dura.
+    import publish_review as _publish_review
+    _review_tokens = {job_id: body.publish_review_token} if body and body.publish_review_token else {}
+    _review_decision = _publish_review.evaluate(db, [job], _review_tokens)
+    if _review_decision["pending"]:
+        raise HTTPException(status_code=409, detail=_publish_review.required_detail(_review_decision["pending"]))
     if body and body.change_request_id:
         cr, destination = _change_request_context(ddb, body.change_request_id)
         from delivery_replacement import target as correction_target
@@ -21847,6 +21894,11 @@ def admin_create_delivery_from_job(
             current_user["id"], job, _guard_override[0], _guard_override[1], "admin_publish",
             portal_id=portal_id, delivery_id=delivery.id,
         ))
+    for _row in _publish_review.audit_entries(
+            current_user["id"], _review_decision, _review_tokens, "admin_publish",
+            portal_id=portal_id, delivery_id=delivery.id,
+            change_request_id=(body.change_request_id if body else None)):
+        db.add(_row)
     import change_request_verification as _crv
     for _kept in kept_open_requests:
         db.add(_crv.kept_audit(
@@ -23417,6 +23469,8 @@ class ConfirmPublicationRequest(BaseModel):
     confirmed_published_review: bool = False
     # Justificación interna por punto ✘ de la verificación automática.
     point_overrides: dict[str, str] = Field(default_factory=dict)
+    # PUBLISH_REVIEW_SUMMARY=prompt: token del resumen visto antes de cerrar.
+    publish_review_token: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 @app.post('/admin/change-requests/{cr_id}/confirm-publication')
@@ -23458,6 +23512,18 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     document = (db.query(EditorDocument).filter(EditorDocument.job_id == delivery.job_id).first()
                 if job is not None else None)
+    # Dar por resuelto le dice al cliente que el corte publicado es el final:
+    # el mismo resumen que al publicar (PUBLISH_REVIEW_SUMMARY).
+    import publish_review as _publish_review
+    _review_tokens = ({delivery.job_id: body.publish_review_token}
+                      if body.publish_review_token and job is not None else {})
+    _review_decision = _publish_review.evaluate(db, [job] if job is not None else [], _review_tokens)
+
+    def _require_publish_review():
+        # Después de los controles propios del cierre: el resumen no debe
+        # mostrarse para terminar en otro rechazo.
+        if _review_decision["pending"]:
+            raise HTTPException(status_code=409, detail=_publish_review.required_detail(_review_decision["pending"]))
     if body.publication_review_token:
         from published_request_review import review_context
         context = review_context(job, delivery, cr)
@@ -23479,6 +23545,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         # point that the lyric check marks ✘ still needs its own reason: a
         # single "revisé todo" was how incomplete fixes got closed.
         verification_audit = _change_request_close_verification(db, ddb, cr, body.point_overrides, job=job)
+        _require_publish_review()
         now = datetime.now(timezone.utc)
         revision = context['published_revision']
         cr.resolved_at = now
@@ -23496,6 +23563,10 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
             'reason': reason, 'review_token': body.publication_review_token,
             **({'verification': verification_audit} if verification_audit else {}),
         }))
+        for _row in _publish_review.audit_entries(
+                current_user['id'], _review_decision, _review_tokens, 'confirm_publication',
+                delivery_id=delivery.id, change_request_id=cr_id):
+            db.add(_row)
         db.commit()
         return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
                 'resolved_by_revision': revision, 'human_review': True}
@@ -23553,6 +23624,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
                 })
             manual_text_review = {'reason': reason, 'missing': _kept[0]['missing'],
                                   'review_token': review_token}
+    _require_publish_review()
     now = datetime.now(timezone.utc)
     revision = delivery.published_revision or 1
     note = body.resolution_note.strip()
@@ -23573,6 +23645,10 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         **({'manual_text_review': manual_text_review} if manual_text_review else {}),
         **({'verification': verification_audit} if verification_audit else {}),
     }))
+    for _row in _publish_review.audit_entries(
+            current_user['id'], _review_decision, _review_tokens, 'confirm_publication',
+            delivery_id=delivery.id, change_request_id=cr_id):
+        db.add(_row)
     db.commit()
     return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
             'resolved_by_revision': revision}

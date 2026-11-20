@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { visualizer } from "rollup-plugin-visualizer";
 
 export default defineConfig({
+  worker: { format: "es" },
   plugins: [
     react(),
     // 2026-05-31 perf: write dist/stats.html on every build with the

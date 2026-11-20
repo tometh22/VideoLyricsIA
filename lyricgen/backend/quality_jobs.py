@@ -640,6 +640,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
         # any same-named field in the analytical result.
         for durable_key in (
             "reference_hypothesis",
+            "language_probe",
             "catalog_reference",
             "reviewer_campaign_status",
             "local_genly_model",

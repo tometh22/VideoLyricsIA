@@ -333,6 +333,9 @@ export default function LyricVideoPreview({
               fontFamily: font || undefined,
               lineHeight: 1.1,
               opacity: textOpacity,
+              // Explicit width avoids shrink-to-fit against the remaining
+              // space to the right of the absolute anchor (50% at center).
+              width: wrapMaxCqw,
               maxWidth: wrapMaxCqw,
               // `pre-line` honours `\n` (used when multiple overlapping
               // segments are stacked) but still wraps long single lines.

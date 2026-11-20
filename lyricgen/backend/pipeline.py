@@ -6771,9 +6771,15 @@ def _validation_observe_only() -> bool:
 
 
 def _has_anatomy_violation(result: dict) -> bool:
-    """Only affirmative anatomical evidence can override observation mode."""
+    """Only affirmative anatomical evidence can override observation mode.
+
+    ``hard_violation`` extends the same rule to extended background categories
+    (weapon/gore/letterbox…) ONLY when BACKGROUND_EXTENDED_QC_MODE=enforce lists
+    them — the validator sets it; in the default observe mode it is never True.
+    """
     return bool(
-        (result.get("detections") or {}).get("anatomy") is True
+        result.get("hard_violation") is True
+        or (result.get("detections") or {}).get("anatomy") is True
         or any(str(item.get("type", "")).startswith("anatomy:")
                for item in result.get("issues", []) if isinstance(item, dict))
     )
@@ -7220,6 +7226,8 @@ def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
             continue
         detections = validation.get("detections") or {}
         if any(detections.get(c) for c in ("people", "brand", "anatomy")):
+            return True
+        if validation.get("hard_violation") is True:
             return True
         blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
         if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
@@ -14821,6 +14829,19 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
+                if "extended_qc" in _scene_validation:
+                    # Extended background QC: keep the evidence on the clip so
+                    # Delivery QC can show it to the operator before publish.
+                    scene["validation"]["hard_violation"] = bool(
+                        _scene_validation.get("hard_violation")
+                    )
+                    from delivery_background_qc import extended_qc_complete as _xqc_complete
+                    scene["validation"]["extended_complete"] = _xqc_complete(
+                        _scene_validation.get("extended_qc")
+                    )
+                    scene["validation"]["observations"] = list(
+                        _scene_validation.get("observations") or []
+                    )[:12]
                 if _inherit_inconclusive_scene_verdict(
                     scene,
                     verdict=_scene_validation,
@@ -19007,9 +19028,6 @@ def _render_lyrics_ass(
                     look.font_file, effect or "-")
 
     scale = spec.text_scale
-    contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
-    outline = max(1.0, contrast["stroke_mult"] * scale)
-    shadow = max(1, int(round(3 * scale)))
 
     # 1) Background → looped file at the target dims (ffmpeg, C-level).
     #    Multi-escena: si el caller ya entregó un timeline del largo completo
@@ -19042,7 +19060,6 @@ def _render_lyrics_ass(
         #    historical look — artist in Montserrat ExtraBold, song in the lyric
         #    font. All live in one fontsdir so libass can \fn-switch between them
         #    without mis-matching across the pool.
-        family, bold = _ass.font_family(font_path)
         extrabold_font = os.path.join(_FONTS_DIR, "Montserrat-ExtraBold.ttf")
         if not os.path.exists(extrabold_font):
             extrabold_font = font_path  # graceful fallback
@@ -19068,34 +19085,9 @@ def _render_lyrics_ass(
             + (_looks.font_paths(look)[1:] if look is not None else [])
         )
 
-        # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
-        #    the artist/song title card overlay (same two layouts).
-        # Per-font visual-size normalization: libass scales \fs by the font's
-        # internal vertical metrics, so the SAME \fs renders a different cap-height
-        # per family (Poppins ~14% smaller than Montserrat → "muy chiquita").
-        # Equalize to the Montserrat reference so a size setting looks consistent
-        # across fonts. Keyed by the resolved family (works for explicit picks and
-        # the random "Auto" pool alike). See ass_render.font_size_factor.
-        font_factor = _ass.font_size_factor(family)
-        lines = _ass.segments_to_lines(
-            segments,
-            text_scale=scale,
-            font_scale=font_scale,
-            font_factor=font_factor,
-            lyric_transition=lyric_transition,
-            animation=lyrics_animation,
-            transition=line_transition,
-            case_fn=lambda t: _apply_case(t, text_case),
-        )
-        # Lyric color mapping para build_ass (style line + override karaoke):
-        # karaoke → primary = sung color, secondary = un-sung. Otras animaciones
-        # usan primary = lyric_color (texto único) y secondary irrelevante.
-        if lyrics_animation == "karaoke":
-            primary_for_lines = lyric_sung_color or ""
-            secondary_for_lines = lyric_color or ""
-        else:
-            primary_for_lines = lyric_color or ""
-            secondary_for_lines = ""
+        # The title card shares the output's font files and logical frame.
+        # Lyric typography/composition is built below by the shared composer
+        # used by both the native video render and the browser's WASM libass.
         first_lyric_start = segments[0]["start"] if segments else duration
         title_lines = _ass.title_card_lines(
             artist, song_title, first_lyric_start,
@@ -19118,33 +19110,17 @@ def _render_lyrics_ass(
             # individually.
             song_lines=(title_song_break.split("\n") if title_song_break else None),
         )
-        lines += title_lines
-        base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
-        # Reusamos el mapping primary/secondary computado arriba para
-        # segments_to_lines — mismo eje semántico (karaoke usa sung como
-        # PrimaryColour). Sin esto la palabra cantada se rendea con
-        # PrimaryColour blanco aunque el operador haya elegido otro color.
-        if look is not None:
-            ass_doc = _looks.build_look_ass(
-                segments, look,
-                width=spec.width, height=spec.height, duration=duration,
-                case_fn=lambda t: _apply_case(t, text_case),
-                font_scale=font_scale,
-                # With variant opts the text colour already lives in the
-                # resolved look; applying it again would undo look-specific
-                # rules (e.g. Neón keeps a white tube core for dark inks).
-                primary_override=_llr.primary_override(lyric_look_opts, lyric_color),
-                title_lines=title_lines,
-                beats=_look_beats(look, mp3_path),
-            )
-        else:
-            ass_doc = _ass.build_ass(
-                width=spec.width, height=spec.height,
-                font_name=family, base_fontsize=base_fs,
-                outline=outline, shadow=shadow, lines=lines, bold=bold,
-                primary_color=primary_for_lines,
-                secondary_color=secondary_for_lines,
-            )
+        from lyric_overlay import compose_lyric_overlay
+        ass_doc = compose_lyric_overlay(
+            segments, width=spec.width, height=spec.height, text_scale=scale,
+            font_path=font_path, case_fn=lambda t: _apply_case(t, text_case),
+            font_scale=font_scale, lyric_transition=lyric_transition,
+            lyrics_animation=lyrics_animation, line_transition=line_transition,
+            text_contrast=text_contrast, lyric_color=lyric_color,
+            lyric_sung_color=lyric_sung_color, look=look,
+            look_opts=lyric_look_opts, title_lines=title_lines, duration=duration,
+            beats=_look_beats(look, mp3_path) if look is not None else None,
+        )
         ass_path = os.path.join(job_dir, "lyrics.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_doc)
