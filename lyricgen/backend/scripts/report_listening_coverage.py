@@ -41,74 +41,29 @@ from collections import defaultdict
 import csv
 from datetime import datetime, timedelta, timezone
 import json
-import math
 import os
 import statistics
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-EVENT_NAME = "editor_audio_played"
-HEARTBEAT_NAME = "editor_activity_heartbeat"
-DEFAULT_LINE_MIN_FRACTION = 0.5
+from listening_coverage import (  # noqa: E402  (sys.path de arriba)
+    DEFAULT_LINE_MIN_FRACTION,
+    HEARTBEAT_EVENT as HEARTBEAT_NAME,
+    PLAYBACK_EVENT as EVENT_NAME,
+    covered_ms,
+    line_spans,
+    merge_intervals,
+)
+
 DEFAULT_GRACE_S = 5.0
 
+__all__ = ["merge_intervals", "line_spans", "covered_ms", "job_coverage", "summarize_operators", "collect"]
+
 
 # ---------------------------------------------------------------------------
-# Matemática de cobertura (pura, testeada)
+# Matemática de cobertura (pura, testeada; la base vive en listening_coverage)
 # ---------------------------------------------------------------------------
-
-def merge_intervals(ranges) -> list[tuple[int, int]]:
-    """Unión de intervalos ``[inicio_ms, fin_ms]``; descarta los inválidos."""
-    clean = []
-    for pair in ranges or []:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            continue
-        start, end = pair
-        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in pair):
-            continue
-        if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
-            continue
-        clean.append((int(round(start)), int(round(end))))
-    clean.sort()
-    merged: list[list[int]] = []
-    for start, end in clean:
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
-
-
-def line_spans(segments) -> list[tuple[int, int]]:
-    """``(start_ms, end_ms)`` de cada línea con duración; ignora el texto."""
-    spans = []
-    for segment in segments or []:
-        if not isinstance(segment, dict):
-            continue
-        try:
-            start = float(segment.get("start"))
-            end = float(segment.get("end"))
-        except (TypeError, ValueError):
-            continue
-        if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
-            continue
-        spans.append((int(round(start * 1000)), int(round(end * 1000))))
-    return spans
-
-
-def covered_ms(span: tuple[int, int], merged: list[tuple[int, int]]) -> int:
-    """Milisegundos de ``span`` cubiertos por intervalos ya fusionados."""
-    start, end = span
-    total = 0
-    for range_start, range_end in merged:
-        if range_end <= start:
-            continue
-        if range_start >= end:
-            break
-        total += min(end, range_end) - max(start, range_start)
-    return total
-
 
 def _pct(part: float, whole: float) -> float | None:
     return round(100.0 * part / whole, 1) if whole > 0 else None

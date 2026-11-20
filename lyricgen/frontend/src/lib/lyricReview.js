@@ -179,10 +179,19 @@ function relayout(segments, fix) {
   });
 }
 
+// Si la línea ya no empieza/termina donde la vio el servidor (la movieron a
+// mano después del último guardado), el arreglo de sincronización no se
+// aplica: el tiempo medido era para otra posición.
+const TIMING_EXPECT_TOLERANCE_S = 0.05;
+
 function retime(segments, index, fix) {
   const line = segments[index];
   const prev = segments[index - 1];
   const next = segments[index + 1];
+  for (const field of ["start", "end"]) {
+    const expected = fix[`expect_${field}`];
+    if (expected != null && Math.abs(Number(line[field]) - Number(expected)) > TIMING_EXPECT_TOLERANCE_S) return null;
+  }
   const start = fix.start != null ? Math.max(Number(fix.start), prev ? Number(prev.end) + 0.05 : 0) : Number(line.start);
   const end = fix.end != null ? Math.min(Number(fix.end), next ? Number(next.start) - 0.05 : Infinity) : Number(line.end);
   if (!(end > start)) return null;

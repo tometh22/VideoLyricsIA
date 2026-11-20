@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { campaignPost, campaignRequest } from "../../lib/campaignApi";
 import { PORTALS, portalLabel } from "../../lib/campaignPipeline";
 import { Banner, Button, Field, Modal, inputClass } from "./ui";
+import PublishReviewSummary from "../PublishReviewSummary";
+import { PUBLISH_REVIEW_CODE, publishReviewFrom, tokensOf, totalsOf } from "../../lib/publishReview";
 
 const GUARD_CODE = "change_request_newer_than_version";
 
@@ -32,6 +34,10 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
   const [guardBlocked, setGuardBlocked] = useState([]);
   const [publishAnyway, setPublishAnyway] = useState(false);
   const [overrideReason, setOverrideReason] = useState("");
+  // Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY=prompt): por canción,
+  // líneas que nadie escuchó y avisos precisos sin mirar. Una sola
+  // confirmación para todo el envío; el backend exige los tokens vistos.
+  const [reviewSummaries, setReviewSummaries] = useState([]);
   const localKeys = useRef(new Map());
   const keys = idempotencyKeys || localKeys.current;
   // Requests this send could close: the backend decides with the same rule the
@@ -53,11 +59,21 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
       .catch(() => { if (!abort.signal.aborted) setGuardBlocked([]); });
     return () => abort.abort();
   }, [campaignId, jobList]);
+  useEffect(() => {
+    if (!jobList || kind === "art_track") return undefined;
+    const abort = new AbortController();
+    campaignRequest(`/batch/campaigns/${encodeURIComponent(campaignId)}/deliveries/publish-review?job_ids=${encodeURIComponent(jobList)}`, { signal: abort.signal })
+      .then((result) => { if (!abort.signal.aborted) setReviewSummaries(result?.mode === "prompt" && Array.isArray(result.summaries) ? result.summaries : []); })
+      .catch(() => { if (!abort.signal.aborted) setReviewSummaries([]); });
+    return () => abort.abort();
+  }, [campaignId, jobList, kind]);
   const selectedJobs = new Set(videos.map((video) => video.job_id));
   const blocked = guardBlocked.filter((entry) => selectedJobs.has(entry.job_id));
   const blockedJobs = new Set(blocked.map((entry) => entry.job_id));
   const sendable = publishAnyway ? videos.length : videos.filter((video) => !blockedJobs.has(video.job_id)).length;
   const overrideMissingReason = publishAnyway && blocked.length > 0 && !overrideReason.trim();
+  const reviewShown = reviewSummaries.filter((summary) => selectedJobs.has(summary.job_id)
+    && (publishAnyway || !blockedJobs.has(summary.job_id)));
   const songIds = new Set(videos.map((video) => video.item_id));
   const closable = candidates.filter((item) => songIds.has(item.song_id) && item.portal_id === portal);
   const chosen = closable.filter((item) => ticked.has(item.id));
@@ -81,6 +97,7 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
     const override = overriding
       ? { publish_anyway: true, override_reason: overrideReason.trim(), override_job_ids: blocked.map((entry) => entry.job_id) }
       : {};
+    const reviewTokens = reviewShown.length ? { publish_review_tokens: tokensOf(reviewShown) } : {};
     const signature = JSON.stringify([kind, portal, [...ids].sort(), resolve, closing ? note.trim() : "", override]);
     if (!keys.has(signature)) keys.set(signature, newKey(campaignId));
     try {
@@ -88,6 +105,7 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
         ...selection, destination_portal: portal, idempotency_key: keys.get(signature),
         ...(closing ? { resolve_requests: resolve, ...(note.trim() ? { resolution_note: note.trim() } : {}) } : {}),
         ...override,
+        ...reviewTokens,
       });
       // The key exists to make a LOST response safe to retry. Once the operation
       // is confirmed, forget it: sending the same selection later (after a partial
@@ -95,6 +113,14 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
       keys.delete(signature);
       onStarted?.(operation, portal, ids.length);
     } catch (sendError) {
+      if (sendError.code === PUBLISH_REVIEW_CODE) {
+        // Cambió algo desde que se abrió el envío (o el resumen no había
+        // cargado): mostrar el resumen actual y pedir otra confirmación.
+        const review = publishReviewFrom(sendError.detail);
+        if (review) setReviewSummaries(review.summaries);
+        setError("Antes de enviar, mirá el resumen de líneas sin escuchar y avisos sin mirar. Si está bien, confirmá «Publicar igual».");
+        return;
+      }
       if (sendError.code === GUARD_CODE) {
         // Llegó un pedido entre la consulta y el envío: mostrar las canciones.
         if (Array.isArray(sendError.detail?.blocked)) setGuardBlocked(sendError.detail.blocked);
@@ -163,10 +189,13 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
           <textarea aria-label="Qué cambió" className={`${inputClass} mt-1 min-h-[64px]`} maxLength={2000} value={note} disabled={busy} onChange={(event) => setNote(event.target.value)} placeholder="Ej.: Corregimos la palabra del segundo verso." />
         </label>}
       </fieldset>}
+      {reviewShown.length > 0 && <div className="rounded-xl bg-amber-400/[0.06] p-3 ring-1 ring-amber-300/20">
+        <PublishReviewSummary embedded hideActions summaries={reviewShown} totals={totalsOf(reviewShown)} />
+      </div>}
       {error && <Banner tone="danger">{error}</Banner>}
       <div className="flex flex-wrap justify-end gap-2">
         <Button variant="ghost" disabled={busy} onClick={onClose}>Cancelar</Button>
-        <Button variant="primary" disabled={busy || !portal || !videos.length || sendable === 0 || overrideMissingReason} onClick={send}>{busy ? "Enviando…" : "Confirmar envío"}</Button>
+        <Button variant="primary" disabled={busy || !portal || !videos.length || sendable === 0 || overrideMissingReason} onClick={send}>{busy ? "Enviando…" : reviewShown.length ? "Publicar igual" : "Confirmar envío"}</Button>
       </div>
     </div>
   </Modal>;

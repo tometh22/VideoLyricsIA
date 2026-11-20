@@ -14,6 +14,7 @@ import EmptyState from "../../primitives/EmptyState";
 import FilterBar from "../../primitives/FilterBar";
 import SectionHeader from "../../layout/SectionHeader";
 import CreateUserModal from "./CreateUserModal";
+import CampaignAccessModal from "./CampaignAccessModal";
 import useGestion from "./useGestion";
 
 const PLANS = ["free", "100", "250", "500", "1000", "unlimited"];
@@ -24,7 +25,7 @@ const badge = (text, classes) => (
 
 // Menú de acciones por fila (kebab "⋯"). Cierra al clickear afuera o al
 // ejecutar una acción.
-function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleActive, onDelete }) {
+function RowActions({ user, onCampaigns, onWorkspace, onToggleAI, onToggleOverage, onToggleActive, onDelete }) {
   const [open, setOpen] = useState(false);
   // El menú se renderiza en un PORTAL a document.body con position:fixed.
   // Por qué: el contenedor .glass usa backdrop-filter, y un ancestro con
@@ -58,7 +59,10 @@ function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleAc
     e.stopPropagation();
     const rect = e.currentTarget.getBoundingClientRect();
     // 224px = w-56. Alineado al borde derecho del botón; nunca fuera de pantalla.
-    setPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 224) });
+    setPos({
+      top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 280)),
+      left: Math.max(8, Math.min(rect.right - 224, window.innerWidth - 232)),
+    });
     setOpen((v) => !v);
   };
 
@@ -92,6 +96,7 @@ function RowActions({ user, onWorkspace, onToggleAI, onToggleOverage, onToggleAc
           className="fixed z-50 w-56 py-1 rounded-button bg-surface-2 ring-1 ring-white/[0.08] shadow-depth-lg"
           style={{ top: pos.top, left: pos.left }}
         >
+          {item("Acceso a campañas…", onCampaigns)}
           {item("Cambiar workspace…", onWorkspace)}
           {item(user.ai_authorized ? "Revocar autorización de IA" : "Autorizar IA", onToggleAI)}
           {item(user.allow_overage ? "Frenar overage" : "Permitir overage", onToggleOverage)}
@@ -267,6 +272,7 @@ export default function GestionView() {
   } = useGestion();
 
   const [showCreate, setShowCreate] = useState(false);
+  const [campaignUser, setCampaignUser] = useState(null);
   const [workspaceUser, setWorkspaceUser] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   // Las cuentas eliminadas (deleted_N) y desactivadas son ruido — ocultas
@@ -298,6 +304,10 @@ export default function GestionView() {
             <span className="block text-label text-gray-500 truncate">
               {u.email && u.email !== u.username ? u.email : `creado ${fmtDate(u.created_at)}`}
             </span>
+            <button type="button" onClick={(e) => { e.stopPropagation(); setCampaignUser(u); }}
+              className="block mt-1 text-label text-brand-light hover:underline">
+              Acceso a campañas
+            </button>
           </div>
         </div>
       ),
@@ -342,6 +352,7 @@ export default function GestionView() {
         <RowActions
           user={u}
           onWorkspace={() => setWorkspaceUser(u)}
+          onCampaigns={() => setCampaignUser(u)}
           onToggleAI={() => toggleAI(u.id, u.ai_authorized)}
           onToggleOverage={() => toggleOverage(u.id, u.allow_overage)}
           onToggleActive={() => toggleActive(u.id, u.is_active)}
@@ -388,6 +399,7 @@ export default function GestionView() {
         />
       </div>
 
+      {campaignUser && <CampaignAccessModal user={campaignUser} onClose={() => setCampaignUser(null)} />}
       {showCreate && (
         <CreateUserModal onCreate={createUser} onClose={() => setShowCreate(false)} />
       )}
