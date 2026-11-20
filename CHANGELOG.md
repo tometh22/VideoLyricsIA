@@ -5,6 +5,11 @@
 ### Fixed
 - Flag lyrics written in a language that is not sung. When WhisperX guesses the wrong language from an intro it translates verses instead of transcribing them ("Gran Ídolo De Asia", Gilda "Rompo Las Cadenas": Spanish verses delivered in English or Japanese), and the output passed as a bilingual song with no alert. Every transcription now asks Gemini, in parallel and without requesting lyrics, which languages are sung (`transcription_quality.language_probe`, ~US$0.01 per song, retried on Vertex 429). Two or more delivered lines confidently written in a language the probe did not hear, or in a non-Latin script, raise the existing language-conflict review with those lines highlighted. Bilingual songs, unavailable probes and unclassifiable languages abstain; nothing is forced or rewritten. The probe survives edits and quality replays, and the gate recomputes it from persisted data. `SUNG_LANGUAGE_PROBE_ENABLED=0` turns it off.
 
+## [1.1.181] - 2026-11-18
+
+### Fixed
+- Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
+
 ## [1.1.180] - 2026-11-18
 
 ### Fixed
