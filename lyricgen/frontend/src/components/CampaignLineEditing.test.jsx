@@ -28,6 +28,12 @@ describe("campaign list structure editing", () => {
     expect(screen.getByLabelText("Letra de esta línea")).toHaveValue("");
     expect(screen.getByLabelText("Letra de esta línea")).toHaveFocus();
   });
+  it("keeps the legacy add button anchored to its focused row", () => {
+    open({ requireLineReview: false });
+    fireEvent.focus(screen.getByDisplayValue("Segunda"));
+    fireEvent.click(screen.getByRole("button", { name: "Agregar línea", exact: true }));
+    expect(texts()).toEqual(["Primera", "Segunda", "", "Tercera"]);
+  });
   it("inserts below a long overlapping phrase without moving its neighbours", () => {
     const overlapping = [{ ...rows[0], end: 5 }, rows[1], rows[2]];
     open({ segments: overlapping });

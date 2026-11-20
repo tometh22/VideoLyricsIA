@@ -23,7 +23,7 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("guided-timing-review")).toHaveCount(0);
     const second = page.getByTestId("timeline-segment").nth(1);
     await second.locator('[data-testid="timeline-segment-body"]').dblclick();
-    const input = second.locator('input');
+    const input = page.getByRole("textbox", { name: "Letra de esta línea 2", exact: true });
     await input.press("End");
     await input.pressSequentially(" con espacios");
     await expect(input).toHaveValue("Segunda línea con espacios");

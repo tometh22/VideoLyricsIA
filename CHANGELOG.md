@@ -1,10 +1,25 @@
 # Changelog
 
-## [1.1.185] - 2026-11-18
+## [1.1.193] - 2026-11-20
 
 ### Fixed
 - Insert campaign lyric lines immediately below the selected occurrence, including adjacent or overlapping phrases. Add row deletion and mouse, touch and keyboard reordering with immediate persistence and Undo; preserve neighbouring timings and flag the placed line for timing review.
 - Render the campaign editor's text preview with browser libass, the final video's shared ASS composer, bundled font files and output dimensions. Keep line breaks stable when the panel resizes, discard stale preview responses and expose retry on failure.
+
+## [1.1.192] - 2026-11-19
+
+### Fixed
+- Show complete lyric text in the timeline sidebar with matching row heights. Allow stable inline edits from sidebar and timeline; Enter flushes autosave and returns keyboard focus, while Space toggles playback outside text fields and preserves Sync mode. Keep editing stationary and preserve reconciled remote corrections. Cover long songs during playback: anchor the input outside scrollports, reserve the undo toolbar before typing, and keep playing-row text metrics stable; preserve interaction blocking for approval/restoration and keyboard focus when closing the field.
+- Expose single-line deletion on both surfaces and add exact-time insertion through the sidebar or timeline context menu, preserving existing rows and minting new identities. Reject occupied intervals instead of silently moving existing lyrics.
+
+### Added
+- Resize the lyric sidebar by dragging its divider or using the keyboard, with responsive bounds and double-click reset.
+- Offer optional text and duration corrections for later matching phrases. Keep each occurrence onset, require explicit timing selection, and revalidate source/target snapshots, audio bounds and collisions before applying. Text similarity proposes candidates; it does not assert acoustic equivalence.
+
+## [1.1.181] - 2026-11-18
+
+### Fixed
+- Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
 
 ## [1.1.180] - 2026-11-18
 

@@ -83,7 +83,7 @@ def test_api_checks_auth_job_scope_and_input(client, user_token, db, monkeypatch
     monkeypatch.setenv("EDITOR_V2_GLOBALLY_ENABLED", "1")
     headers = {"Authorization": f"Bearer {user_token}"}
     user = client.get("/auth/me", headers=headers).json()
-    job_id = "preview_" + uuid.uuid4().hex[:10]
+    job_id = uuid.uuid4().hex[:12]
     db.add(Job(job_id=job_id, user_id=user["id"], tenant_id=user["tenant_id"],
                filename="test.wav", artist="Test", style="oscuro", status="transcribed_pending",
                segments_json=[{"start": 0, "end": 1, "text": TEXT}]))
