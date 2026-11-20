@@ -1,0 +1,33 @@
+name: Campaign access smoke (staging)
+on:
+  push:
+    branches: [staging]
+    paths:
+      - 'lyricgen/backend/admin.py'
+      - 'lyricgen/backend/campaign_review_access.py'
+      - 'lyricgen/backend/scripts/preflight/campaign_access_smoke.py'
+      - 'lyricgen/frontend/src/components/admin/sections/usuarios/CampaignAccessModal*'
+      - '.github/workflows/campaign-access-smoke.yml'
+permissions:
+  contents: read
+concurrency:
+  group: campaign-access-smoke-staging
+  cancel-in-progress: false
+jobs:
+  campaign-access-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Preview
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests==2.32.3
+      - name: Verify authenticated campaign access and revocation on the deployed release
+        working-directory: lyricgen/backend
+        env:
+          EXPECTED_RELEASE: ${{ github.sha }}
+          PREFLIGHT_USERNAME: ${{ secrets.PREFLIGHT_USERNAME }}
+          PREFLIGHT_PASSWORD: ${{ secrets.PREFLIGHT_PASSWORD }}
+        run: python -m scripts.preflight.campaign_access_smoke
