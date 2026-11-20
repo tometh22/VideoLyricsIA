@@ -45,6 +45,8 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
   const [composing, setComposing] = useState(false);
   const focusAfterChange = useRef(false);
   const selected = segments.find((line) => line._id === focusedId) || segments[0];
+  // Playback follows the audio clock without redirecting an in-progress edit.
+  const highlightedId = isPlaying ? activeId : selected?._id;
   const captureSelection = (input) => setSelection({
     id: selected?._id, text: input.value,
     start: input.selectionStart, end: input.selectionEnd,
@@ -163,14 +165,15 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
             onPointerUp={(event) => { if (event.pointerType === "touch") drop(); }}
             onPointerCancel={cancelDrag}><span aria-hidden="true">⠿</span></button>}
           <button type="button" ref={(node) => { rowRefs.current[line._id] = node; }}
-          data-testid={`review-line-${segments.indexOf(line) + 1}`} data-playing={isPlaying && line._id === activeId ? "true" : undefined} aria-current={selected?._id === line._id ? "true" : undefined}
+          data-testid={`review-line-${segments.indexOf(line) + 1}`} data-playing={isPlaying && line._id === activeId ? "true" : undefined} aria-current={highlightedId === line._id ? "true" : undefined}
+          data-selected={selected?._id === line._id ? "true" : "false"}
           onClick={() => navigate(line)} onKeyDown={(event) => {
             if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
             event.preventDefault(); event.stopPropagation();
             const next = visible[visible.indexOf(line) + (event.key === "ArrowDown" ? 1 : -1)];
             if (next) { navigate(next); rowRefs.current[next._id]?.focus(); }
           }}
-          className={`mb-1 flex min-w-0 flex-1 items-start gap-3 rounded-xl px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${selected?._id === line._id ? "bg-brand/20 ring-1 ring-brand/50" : "hover:bg-white/5"} ${isPlaying && line._id === activeId ? "border-l-4 border-emerald-300 bg-emerald-300/10" : "border-l-4 border-transparent"}`}>
+          className={`mb-1 flex min-w-0 flex-1 items-start gap-3 rounded-xl px-3 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${highlightedId === line._id ? "bg-brand/20 ring-1 ring-brand/50" : selected?._id === line._id ? "ring-1 ring-white/20 hover:bg-white/5" : "hover:bg-white/5"} ${isPlaying && line._id === activeId ? "border-l-4 border-emerald-300" : "border-l-4 border-transparent"}`}>
           <span className="w-6 shrink-0 pt-0.5 text-xs tabular-nums text-ink-secondary">{segments.indexOf(line) + 1}</span>
           <span className="min-w-0 flex-1">
             <span className="block break-words text-base leading-snug">{line.text || (t("review_workspace.empty_line") || "Línea sin texto")}</span>
