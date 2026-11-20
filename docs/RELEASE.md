@@ -120,24 +120,57 @@ scenarios; no deployment, database, provider or queue access is involved. The
 six lists must remain identical, so adding a new API trigger cannot silently
 leave workers behind.
 
-Before publishing, verify that each staging service is actually linked to its
-matching `/railway/<service>.toml` and compare its effective watch patterns with
-the repository. A direct read of `ServiceInstance` on 2026-11-20 at 15:34 UTC
-confirmed a blocking dependency on staging release `4d1d0adb`: BatchWorker and
-BatchShortWorker both have `railwayConfigFile=null`. Their `resolvedFileConfig`
-for that release also has no config file or file watch patterns. The other four
-services have their expected configured and resolved paths. All six effective
-watch lists match the old repository patterns, but matching values alone do not
-establish that the two batch TOMLs are read.
+Staging activation has two sources. API, Worker, ShortWorker and quality-worker
+read their existing `/railway/<service>.toml` files. BatchWorker and
+BatchShortWorker have `railwayConfigFile=null` and use persisted service watch
+settings. A new TOML binding was rejected by Railway with `BAD_USER_INPUT`
+(Config as Code deprecated); do not retry the legacy mutation or claim those
+services read the TOML. [Railway's documented restriction](https://docs.railway.com/config-as-code)
+was checked on 2026-11-20.
 
-The release owner must coordinate linking BatchWorker to
-`/railway/batch-worker.toml` and BatchShortWorker to
-`/railway/batch-short-worker.toml`, with a review of the complete file settings
-before applying them. Merely merging these file changes cannot activate the two
-unlinked configs. This PR does not change Railway settings and is blocked for
-publication until that dependency has an authorized activation plan. Recheck all
-six configured paths, resolved file manifests and effective watch lists during
-the rollout; repository tests cannot attest to provider-side binding.
+On 2026-11-20 the release owner authorized a staging-only watch-pattern change.
+An `environmentPatchCommit` with `skipDeploys=true` set only the two batch
+`build.watchPatterns` arrays to the same 12 entries as this repository. Direct
+`ServiceInstance.watchPatterns` reads confirmed persistence. The complete staging
+configuration differed only in those arrays; production configuration, all six
+active/latest deployment IDs and SHAs (`979b2c44`), regional capacity (6/8 batch
+replicas) and health/runtime identity were unchanged. Before/after, the exact
+request and guarded rollback are retained in the release workspace receipt
+`release-watch-patterns979/after.json` (patch
+`38ad8e50-896a-4ce1-b802-52a6da4b1563`). This is an effective trigger-setting
+change, not a new deployment or server-side file binding.
+
+Before every publication that changes cohort patterns, synchronize the two batch
+settings from the reviewed TOML arrays using a separately reviewed staging patch.
+Use only those two `build.watchPatterns` keys, explicit staging environment ID,
+and `skipDeploys=true`; capture old arrays for rollback and verify the complete
+before/after config has no other delta. Do not change `configFile`, environment
+variables, source, capacity, queues, or production. Pattern drift must fail the
+read-only gate, even when the last deployment's manifest looks correct:
+
+```sh
+python3.11 ci/verify_staging_runtime_watches.py --phase before
+# After the authorized automatic staging rollout (substitute its exact merge SHA):
+python3.11 ci/verify_staging_runtime_watches.py --phase after --release-sha "$MERGE_SHA"
+```
+
+The pre-merge gate checks persisted batch triggers and the other four bindings.
+The post-rollout gate additionally checks all six successful deployments, exact
+release SHA and effective watch lists. Neither replaces the full health/runtime,
+queue coverage and authenticated smoke checks below. CLI credentials stay outside
+source; CI tests use synthetic provider records and make no live calls. No new
+live credential or privileged workflow is introduced.
+
+This explicit synchronization is transitional. The supported permanent successor
+is one staging IaC authoring file: import the environment with variables preserved,
+translate the six cohort filters/build/deploy settings, and preview a reviewed
+plan before cutover. Pin project/environment to staging, preserve every imported
+resource and current regional capacity, and reject any delete or unrelated delta.
+Four existing file bindings require coordinated staging-only cutover; the two
+unbound batch services do not. Use the installed CLI's supported import/plan
+commands and the [official migration procedure](https://docs.railway.com/infrastructure-as-code#migrating-from-config-as-code).
+Do not run a whole-project apply containing only six services: omitted resources
+can be deleted. This PR does not perform IaC adoption or production changes.
 
 This intentionally increases worker rollouts for frontend-only changes. Preserve
 all existing queues, replicas and 1200-second draining settings, schedule one
