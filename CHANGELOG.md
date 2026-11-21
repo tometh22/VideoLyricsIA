@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.211] - 2026-11-21
+
+### Changed
+- ProRes workers can ask Linux to release cached pages after uploading a validated export and saving its R2 key. The export stays on disk. `PRORES_RELEASE_PAGE_CACHE` is off by default so the change can be measured on staging independently.
+
 ## [1.1.210] - 2026-11-21
 
 ### Added
