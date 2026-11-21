@@ -42,6 +42,14 @@ def _bool_env(name: str, default: bool = False) -> bool:
     }
 
 
+_VOICE_END_MODES = ("off", "observe", "apply")
+
+
+def _mode_env(name: str, choices: tuple[str, ...], default: str) -> str:
+    value = (os.environ.get(name) or default).strip().lower()
+    return value if value in choices else default
+
+
 def runtime_timing_config() -> dict[str, float | int | bool | str]:
     """Canonical timing knobs that must agree across transcription services."""
     from display_segmentation import runtime_config_fingerprint as display_fingerprint
@@ -53,6 +61,9 @@ def runtime_timing_config() -> dict[str, float | int | bool | str]:
         "lyric_min_gap_ms": _int_env("LYRIC_MIN_GAP_MS"),
         "lyric_min_gap_ab_enabled": _bool_env("LYRIC_MIN_GAP_AB_ENABLED"),
         "lyric_min_gap_ab_arm_b_ms": _int_env("LYRIC_MIN_GAP_AB_ARM_B_MS", 300),
+        # Fin de línea = fin de la voz (voice_end_timing.mode). Cambia el fin
+        # de las líneas: tiene que ser el mismo en los 6 servicios.
+        "voice_end_timing_mode": _mode_env("VOICE_END_TIMING_MODE", _VOICE_END_MODES, "off"),
         "display_segmentation": display_fingerprint(),
     }
 
@@ -73,6 +84,8 @@ TIMING_ENV = (
      "line_gap_experiment.enabled"),
     ("lyric_min_gap_ab_arm_b_ms", "LYRIC_MIN_GAP_AB_ARM_B_MS", "int", 300,
      "line_gap_experiment.arm_b_ms"),
+    ("voice_end_timing_mode", "VOICE_END_TIMING_MODE", "mode", "off",
+     "voice_end_timing.mode"),
 )
 _LEAD_IN_S_CAP = 0.15        # lead_in._MAX_LEAD_S
 
@@ -95,6 +108,10 @@ def runtime_timing_config_effective() -> dict[str, dict]:
             try:
                 if kind == "bool":
                     value = text.lower() in {"1", "true", "yes", "on"}
+                elif kind == "mode":
+                    if text.lower() not in _VOICE_END_MODES:
+                        raise ValueError(text)
+                    value = text.lower()
                 elif kind == "int":
                     value = max(0, int(float(text)))
                 else:
