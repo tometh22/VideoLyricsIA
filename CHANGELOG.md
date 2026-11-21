@@ -1,10 +1,17 @@
 # Changelog
 
-## [1.1.209] - 2026-11-21
+## [1.1.210] - 2026-11-21
 
 ### Added
 - Warn in Revisión rápida when a song's timing as a whole is not reliable ("El timing de esta canción no es confiable: revisala completa"), listing the most suspicious lines first. It combines five signals already stored (median word score, singing without a line on screen, stretched words, whisper-1 witness words outside every line, agreement with the Gemini control transcript); cross-validated on 220 approved UMG songs: AUC 0.75, 16 % of songs flagged, precision 0.34, recall 0.39 (32 bad songs). Priority only: it never blocks approval.
 - `SONG_TIMING_TRUST_MODE=observe|shadow|apply|off` (default `observe`): the transcription worker stores the verdict in `transcription_quality.song_timing_trust`; `shadow` also re-aligns an unreliable song against attested official lyrics and records what would move; `apply` copies that timing (text untouched). Measured with audio on 30 songs, re-alignment did not fix the badly placed lines of the bad songs (1 of 8 measurable applied, 0 lines fixed), so `apply` is not recommended. Details in `docs/SONG_TIMING_TRUST_2026-11-20.md`.
+
+## [1.1.209] - 2026-11-20
+
+### Added
+- `VOICE_END_TIMING_MODE=off|observe|apply` (default `off`): end each line where the voice ends, measured on the cached `mdx_extra` vocal stem (energy 250-4000 Hz, 10 ms step; anchor = p75 of the last 0.3 s of the last word; release when energy stays under 0.35 x anchor for more than 0.10 s; end = release + 0.20 s; floor = last word, cap = next line start - 0.05 s and last word + 4 s; no stem or inaudible anchor keeps the current 0.5 s hold). The ~25 ms late stem clock is corrected. Offline on 71 approved Argentina songs (40-song holdout, frozen parameters): lines within 0.3 s of the operator's end 63% -> ~79%, lines the operator lengthened 43% -> 70%, early cuts 10% -> 5%; `STABLE_PITCH_TAIL_ENABLED=1` reaches 65% and `VOCAL_CONTINUITY_MODE=apply` 64%. Only moves `end`, never text, words or locked lines. `observe` records per-line evidence (`transcription_quality.voice_end_timing`, `/reanchor` response and audit `voice_end`) without changing times. Runs at upload (after display segmentation) and in "Re-sincronizar" (after `REANCHOR_HOLD_MODE`, only on lines that re-anchor re-timed).
+- With `apply`, this rule is the single owner of the line end: `VOCAL_CONTINUITY_MODE` and `STABLE_PITCH_TAIL_ENABLED` are skipped (reported as `superseded_by_voice_end_timing`). Part of `runtime_timing_config` fleet parity: it must be loaded as a SHARED variable in all 6 Railway services before deploy.
+- `scripts/backtest_voice_end_timing.py`: read-only backtest of the rule against approved versions over a list of jobs.
 
 ## [1.1.208] - 2026-11-20
 

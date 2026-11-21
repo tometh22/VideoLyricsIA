@@ -668,7 +668,16 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # operator-locked boundaries.
             from timing_review_suggestions import automatic_tail_enabled
             from vocal_continuity import continuity_mode
-            if (allow_timing_mutation and continuity_mode() == "off"
+            import voice_end_timing as _voice_end
+            # VOICE_END_TIMING_MODE=apply es el dueño del fin de línea: la cola
+            # de pitch no corre (ver _finalize_voice_end_timing).
+            if (allow_timing_mutation and _voice_end.owns_line_end()
+                    and _stem and automatic_tail_enabled()):
+                r.setdefault("postpass_stats", {})["stable_pitch_tail"] = {
+                    "status": "skipped", "reason": "superseded_by_voice_end_timing",
+                    "extended_count": 0,
+                }
+            elif (allow_timing_mutation and continuity_mode() == "off"
                     and _stem and automatic_tail_enabled()):
                 try:
                     from pathlib import Path
@@ -947,6 +956,17 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
     mode = continuity_mode()
     if mode == "off":
         return r
+    import voice_end_timing as _voice_end
+    if _voice_end.owns_line_end():
+        # Precedencia: con VOICE_END_TIMING_MODE=apply el fin de línea lo
+        # decide la regla de energía del stem, en toda la flota por igual.
+        # VOCAL_CONTINUITY_MODE no está en la paridad (en staging sólo lo
+        # tienen api/ShortWorker/BatchShortWorker), así que dejarlo correr
+        # haría depender el fin de qué servicio tomó el job.
+        return {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
+                "vocal_continuity": {"status": "skipped", "mode": mode,
+                    "reason": "superseded_by_voice_end_timing", "applied_count": 0,
+                    "mutated_segments": False, "automatic_apply_allowed": False}}}
     if mode == "apply" and not fresh_transcription:
         return {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
                 "vocal_continuity": {"status": "skipped", "mode": mode,
@@ -967,6 +987,53 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
                 os.unlink(stem)
             except OSError:
                 pass
+
+
+def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription: bool) -> dict:
+    """Fin de línea = fin de la voz (VOICE_END_TIMING_MODE), sobre las tarjetas finales.
+
+    Corre después de la segmentación de pantalla y de vocal continuity, antes
+    de la evaluación final y del snapshot inmutable del editor. ``observe``
+    sólo registra; ``apply`` reemplaza el hold de ``lead_in`` donde el stem da
+    evidencia. Nunca levanta.
+    """
+    import voice_end_timing as _voice_end
+    from vocal_continuity import _protected_document
+    current = _voice_end.mode()
+    if current == "off":
+        return r
+
+    def _with(report: dict, segments=None) -> dict:
+        out = {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
+                                       "voice_end_timing": report}}
+        if segments is not None:
+            out["segments"] = segments
+        return out
+
+    base = {"policy_version": _voice_end.POLICY_VERSION, "mode": current,
+            "applied_count": 0, "mutated_segments": False}
+    try:
+        if _protected_document(r):
+            return _with({**base, "status": "skipped", "reason": "approved_document_reused"})
+        effective = current
+        if current == "apply" and not fresh_transcription:
+            # Un re-proceso sobre una revisión existente puede pisar fines que
+            # dejó el revisor: sólo se observa.
+            effective = "observe"
+        envelope, reason = _voice_end.envelope_for_audio(audio_path)
+        if envelope is None:
+            return _with({**base, "status": "skipped", "reason": reason})
+        segments, report = _voice_end.run(
+            list(r.get("segments") or []), envelope, current_mode=effective,
+        )
+        report = {**(report or {}), "mode": current}
+        if effective != current:
+            report["reason"] = "fresh_transcription_required"
+        return _with(report, segments if report.get("mutated_segments") else None)
+    except Exception as exc:
+        logger.info("[VOICE_END] abstained error_type=%s", _safe_exception_code(exc))
+        return _with({**base, "status": "abstained",
+                      "error_type": _safe_exception_code(exc)})
 
 
 async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
@@ -1374,13 +1441,22 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
 
     # Segmentation has finished. Extend only these final cards, then rebuild
     # the quality metrics without enabling another timing mutation pass.
+    _fresh_endpoint_owner = bool(
+        fresh_transcription and source_segments_revision == 0
+        and len(source_audio_sha256) == 64 and source_audio_revision > 0
+    )
     r = _finalize_vocal_continuity(
-        r, audio_path,
-        fresh_transcription=bool(fresh_transcription and source_segments_revision == 0
-                                 and len(source_audio_sha256) == 64 and source_audio_revision > 0),
+        r, audio_path, fresh_transcription=_fresh_endpoint_owner,
     )
     continuity_report = (r.get("postpass_stats") or {}).get("vocal_continuity") or {}
-    if continuity_report.get("applied_count"):
+    # Fin de línea = fin de la voz. Con `apply` es el único dueño del fin
+    # (vocal continuity y la cola de pitch quedan `superseded`); con
+    # `observe` mide sobre el resultado final sin tocarlo.
+    r = _finalize_voice_end_timing(
+        r, audio_path, fresh_transcription=_fresh_endpoint_owner,
+    )
+    voice_end_report = (r.get("postpass_stats") or {}).get("voice_end_timing") or {}
+    if continuity_report.get("applied_count") or voice_end_report.get("applied_count"):
         r = _medir_cobertura_final(
             r, job_id, antes_fmt, audio_path, strip_internal=False,
             live_hint=live_hint, allow_timing_mutation=False,
@@ -1461,6 +1537,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         pass
     if isinstance(post.get("vocal_continuity"), dict):
         final["vocal_continuity"] = dict(post["vocal_continuity"])
+    if isinstance(post.get("voice_end_timing"), dict):
+        # Evidencia por línea (observe/apply): queda en transcription_quality.
+        final["voice_end_timing"] = dict(post["voice_end_timing"])
     final["metrics"] = final_metrics
     # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
     # escritas sobre los segmentos finales antes de congelar la versión 0.
@@ -2191,9 +2270,11 @@ def run_transcription_job(
                 }
             display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
             continuity_trace = (result.get("transcription_quality") or {}).get("vocal_continuity") or {}
+            voice_end_trace = (result.get("transcription_quality") or {}).get("voice_end_timing") or {}
             if (
                 retranscription is None
-                and (display_trace.get("applied_count") or continuity_trace.get("applied_count"))
+                and (display_trace.get("applied_count") or continuity_trace.get("applied_count")
+                     or voice_end_trace.get("applied_count"))
             ):
                 from display_segmentation_policy import fresh_job
                 if current_revision != source_segments_revision or not fresh_job(_persist_db, row):

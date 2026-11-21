@@ -77,6 +77,24 @@ def _clock(seg: dict) -> tuple[float, float] | None:
     return round(start, 3), round(end, 3)
 
 
+def retimed_indices(segments: list[dict], previous: list[dict] | None = None) -> list[int]:
+    """Índices de las líneas que este re-anclado re-timeó y no están bloqueadas.
+
+    Mismo criterio que ``plan`` (el par inicio/fin no existía antes), sin
+    exigir que el fin esté en la última palabra: lo usa
+    ``voice_end_timing``, que recalcula el fin desde la última palabra.
+    """
+    before = {c for c in (_clock(s) for s in previous or [] if isinstance(s, dict)) if c}
+    out = []
+    for index, seg in enumerate(segments or []):
+        if not isinstance(seg, dict) or any(seg.get(key) for key in _LOCK_KEYS):
+            continue
+        clock = _clock(seg)
+        if clock is not None and clock not in before:
+            out.append(index)
+    return out
+
+
 def plan(segments: list[dict], previous: list[dict] | None = None,
          hold_s: float | None = None) -> tuple[list[dict], dict]:
     """Devuelve ``(segmentos_con_hold, stats)`` sin decidir si se aplican."""
