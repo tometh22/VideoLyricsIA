@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.209] - 2026-11-21
+
+### Added
+- Warn in Revisión rápida when a song's timing as a whole is not reliable ("El timing de esta canción no es confiable: revisala completa"), listing the most suspicious lines first. It combines five signals already stored (median word score, singing without a line on screen, stretched words, whisper-1 witness words outside every line, agreement with the Gemini control transcript); cross-validated on 220 approved UMG songs: AUC 0.75, 16 % of songs flagged, precision 0.34, recall 0.39 (32 bad songs). Priority only: it never blocks approval.
+- `SONG_TIMING_TRUST_MODE=observe|shadow|apply|off` (default `observe`): the transcription worker stores the verdict in `transcription_quality.song_timing_trust`; `shadow` also re-aligns an unreliable song against attested official lyrics and records what would move; `apply` copies that timing (text untouched). Measured with audio on 30 songs, re-alignment did not fix the badly placed lines of the bad songs (1 of 8 measurable applied, 0 lines fixed), so `apply` is not recommended. Details in `docs/SONG_TIMING_TRUST_2026-11-20.md`.
+
 ## [1.1.208] - 2026-11-20
 
 ### Added

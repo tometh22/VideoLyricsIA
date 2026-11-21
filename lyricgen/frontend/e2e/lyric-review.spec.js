@@ -54,6 +54,23 @@ function lyricReview(segments, official) {
   };
 }
 
+test("an unreliable-timing song shows the song-level warning without blocking approval", async ({ page }) => {
+  const withWarning = (segments, official) => ({
+    ...lyricReview(segments, official),
+    timing_trust: {
+      schema: "song-timing-trust-v1", unreliable: true, score: 1.4,
+      reasons: ["hay canto sin cartel"],
+      lines: [{ line: 2, line_segment_id: "seg-c", start: 2.0, end: 2.6, reasons: ["stretched_words"] }],
+    },
+  });
+  const harness = await installEditorHarness(page, { editorV2: true, segments: SEGMENTS, lyricReview: withWarning });
+  await harness.open();
+  const warning = page.getByTestId("lyric-review-timing-trust");
+  await expect(warning).toContainText("El timing de esta canción no es confiable: revisala completa");
+  await expect(warning).toContainText("líneas marcadas (1)");
+  await expect(page.getByRole("button", { name: /Aprobar cambios y generar video/i })).toBeEnabled();
+});
+
 test("optional suggestions can still be applied, undone and dismissed from the keyboard", async ({ page }) => {
   const harness = await installEditorHarness(page, { editorV2: true, segments: SEGMENTS, lyricReview });
   await harness.open();

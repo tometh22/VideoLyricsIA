@@ -1868,6 +1868,48 @@ def build_review(
             **({"official_window": official_window} if official_window else {}),
         },
         "risk": _risk(witness, similarity, pending, len(segments)),
+        "timing_trust": _song_timing_trust(segments, original_segments, machine_evidence, witness),
+    }
+
+
+def _song_timing_trust(segments: list[dict], original_segments: Any,
+                       machine_evidence: Any, witness: list[dict]) -> dict | None:
+    """Aviso de canción: el timing de la máquina no es confiable entero
+    (``song_timing_trust``). Se mide sobre la versión 0 (la de la máquina) y
+    las líneas sospechosas se ubican en la letra actual. Sólo ordena: nunca
+    bloquea la aprobación."""
+    import song_timing_trust as stt
+
+    if stt.mode() == "off":
+        return None
+    original = [s for s in (original_segments or []) if isinstance(s, dict)] \
+        if isinstance(original_segments, list) else []
+    if not original:
+        return None
+    try:
+        verdict = stt.assess(original, None, witness=witness,
+                             control_text=gemini_text(machine_evidence))
+    except Exception:  # pragma: no cover - un detector nunca tumba el editor
+        return None
+    lines: list[dict] = []
+    seen: set[int] = set()
+    for row in verdict.get("lines") or []:
+        current = _map_to_current(segments, original[row["line"]])
+        if current is None or current in seen:
+            continue
+        seen.add(current)
+        seg = segments[current]
+        lines.append({
+            "line": current, "line_segment_id": _seg_id(segments, current),
+            "start": round(_f(seg.get("start")), 2), "end": round(_f(seg.get("end")), 2),
+            "reasons": list(row.get("reasons") or []),
+        })
+    return {
+        "schema": verdict["schema"],
+        "unreliable": bool(verdict.get("unreliable")),
+        "score": verdict.get("score"),
+        "reasons": list(verdict.get("reason_text") or []),
+        "lines": lines,
     }
 
 
