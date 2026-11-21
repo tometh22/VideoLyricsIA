@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.209] - 2026-11-20
+
+### Fixed
+- Restore the campaign editor text preview when the lyric variant is automatic: accept the existing empty-string Auto sentinel as null in the preview request only, retaining numeric bounds and job/auth checks. Cover the real editor payload at the authenticated API boundary and keep synthetic WASM retry coverage.
+
 ## [1.1.208] - 2026-11-20
 
 ### Added
