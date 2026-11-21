@@ -1,7 +1,7 @@
 """Authenticated, stateless subtitle previews. Never render video or call AI."""
 from pathlib import Path
 import math
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal
 from lyric_overlay import compose_lyric_overlay
 
@@ -24,6 +24,13 @@ class PreviewSettings(BaseModel):
     lyric_font_key: str = Field(default="", max_length=64)
     lyric_alt_color: str = Field(default="", max_length=7)
     lyric_accent_color: str = Field(default="", max_length=7)
+
+    @field_validator("lyric_variant", mode="before")
+    @classmethod
+    def automatic_variant(cls, value):
+        # buildResolveBody uses the empty string for the editor's Auto choice.
+        # Normalize only that sentinel; retain the existing integer/bounds checks.
+        return None if value == "" else value
 
 
 class TextPreviewRequest(BaseModel):
