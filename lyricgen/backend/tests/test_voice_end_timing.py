@@ -105,6 +105,15 @@ def test_inaudible_anchor_falls_back():
     assert evidence["status"] == "fallback_inaudible_anchor"
 
 
+def test_zero_energy_anchor_on_sparse_stem_falls_back():
+    """Revisión #1645: con el stem casi mudo el piso inaudible puede ser 0 y un
+    ancla en silencio pasaba; el umbral 0 trataba todo como voz y alargaba la línea."""
+    env = envelope([(0.0, 0.5, 1.0)], duration=20.0, floor=0.0)
+    end, evidence = ve.line_voice_end(2.0, 3.0, 12.0, env)
+    assert end is None
+    assert evidence["status"] == "fallback_inaudible_anchor"
+
+
 def test_too_short_anchor_window_falls_back():
     env = envelope([(1.0, 5.0, 1.0)])
     end, evidence = ve.line_voice_end(2.99, 3.01, 9.0, env)

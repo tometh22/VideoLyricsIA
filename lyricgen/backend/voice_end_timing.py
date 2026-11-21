@@ -191,7 +191,7 @@ def line_voice_end(word_start: float, word_end: float, next_start: float | None,
         return None, evidence
     anchor = float(np.percentile(energy[a0:a1 + 1], ANCHOR_PERCENTILE))
     evidence["anchor"] = round(anchor, 5)
-    if anchor < envelope.inaudible_floor:
+    if anchor <= 0.0 or anchor < envelope.inaudible_floor:
         evidence["status"] = "fallback_inaudible_anchor"
         return None, evidence
     threshold = RELEASE_RATIO * anchor
