@@ -324,3 +324,28 @@ def test_review_without_original_or_off(monkeypatch):
     assert build_review(segs, original_segments=None)["timing_trust"] is None
     monkeypatch.setenv("SONG_TIMING_TRUST_MODE", "off")
     assert build_review(segs, original_segments=broken_song())["timing_trust"] is None
+
+
+def test_refresh_measures_voiced_gaps_after_line_signals(monkeypatch):
+    """El veredicto persistido usa el canto sin cartel que adjunta
+    line_signals_v2, igual que el editor (regresión: antes se imputaba)."""
+    from transcription_worker import _refresh_song_timing_trust
+    segs = healthy_song()
+    before = stt.assess(segs, witness=[], control_text="")
+    assert before["signals"]["voiced_gap_log"] == 0.0 or before["signals"]["voiced_gap_log"] is not None
+    for s in segs:
+        s["line_signals_v2"] = {"voiced_gap_after_s": 6.0}
+    r = {"segments": segs, "song_timing_trust": {"mode": "observe", "realign": {"status": "not_needed"},
+                                                  "signals": {"voiced_gap_log": None}, "unreliable": False}}
+    _refresh_song_timing_trust(r, "job1")
+    trust = r["song_timing_trust"]
+    assert trust["voiced_gaps_measured"] is True
+    assert trust["signals"]["voiced_gap_log"] > before["signals"]["voiced_gap_log"]
+    assert trust["realign"] == {"status": "not_needed"} and trust["mode"] == "observe"
+
+
+def test_refresh_without_summary_is_noop():
+    from transcription_worker import _refresh_song_timing_trust
+    r = {"segments": healthy_song()}
+    _refresh_song_timing_trust(r, "job1")
+    assert "song_timing_trust" not in r

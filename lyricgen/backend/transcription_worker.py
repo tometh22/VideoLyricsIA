@@ -489,6 +489,33 @@ async def _maybe_song_timing_trust(
     return out
 
 
+def _refresh_song_timing_trust(r: dict, job_id: str) -> None:
+    """Re-mide el veredicto con ``line_signals_v2`` ya adjuntado.
+
+    La evaluación previa al gate (necesaria para decidir el re-alineado, que
+    cambia los segmentos) no tiene todavía los huecos con voz; acá se
+    recalcula con las mismas señales que ve el editor, así el veredicto
+    persistido coincide con el de la Revisión rápida. Conserva el resultado
+    del re-alineado. Nunca rompe el job."""
+    summary = r.get("song_timing_trust")
+    if not isinstance(summary, dict):
+        return
+    try:
+        import song_timing_trust as stt
+        verdict = stt.assess(r.get("segments") or [], _song_timing_trust_evidence(r))
+        summary.update(
+            {key: verdict.get(key) for key in
+             ("unreliable", "score", "threshold", "signals", "reasons")},
+            suspicious_lines=[row["line"] for row in verdict.get("lines") or []],
+            voiced_gaps_measured=any(
+                isinstance(seg, dict) and seg.get("line_signals_v2")
+                for seg in (r.get("segments") or [])),
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetría
+        logger.warning("[SONG-TIMING-TRUST] refresh failed job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+
+
 async def _song_timing_realign(result: dict, audio_path: str, job_id: str, *,
                                mode: str, live: bool, aligner, official_lookup) -> dict:
     import song_timing_trust as stt
@@ -1557,6 +1584,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
         logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
                        job_id, _safe_exception_code(exc))
+    _refresh_song_timing_trust(r, job_id)
     if auto_trace["status"] == "authorized":
         auto_trace["status"] = (
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"

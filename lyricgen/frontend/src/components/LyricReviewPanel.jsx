@@ -356,8 +356,6 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       {review.timing_trust?.unreliable && (
         <p data-testid="lyric-review-timing-trust" className="mx-4 mt-3 text-xs leading-relaxed text-amber-200/90">
           El timing de esta canción no es confiable: revisala completa.
-          {Array.isArray(review.timing_trust.lines) && review.timing_trust.lines.length > 0
-            && ` Empezá por las líneas marcadas (${review.timing_trust.lines.length}).`}
         </p>
       )}
 

@@ -67,7 +67,8 @@ test("an unreliable-timing song shows the song-level warning without blocking ap
   await harness.open();
   const warning = page.getByTestId("lyric-review-timing-trust");
   await expect(warning).toContainText("El timing de esta canción no es confiable: revisala completa");
-  await expect(warning).toContainText("líneas marcadas (1)");
+  // No promete líneas marcadas que el editor no resalta.
+  await expect(warning).not.toContainText("marcadas");
   await expect(page.getByRole("button", { name: /Aprobar cambios y generar video/i })).toBeEnabled();
 });
 
