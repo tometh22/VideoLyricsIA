@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+from pydantic import ValidationError
 import pytest
 import ass_render as ass
 from editor_preview import build_text_preview, preview_font, TextPreviewRequest
@@ -88,7 +90,7 @@ def test_api_checks_auth_job_scope_and_input(client, user_token, db, monkeypatch
                filename="test.wav", artist="Test", style="oscuro", status="transcribed_pending",
                segments_json=[{"start": 0, "end": 1, "text": TEXT}]))
     db.commit()
-    body = {"segments": [{"start": 0, "end": 1, "text": TEXT}], "settings": {"font_scale": 1.5}}
+    body = json.loads((Path(__file__).parents[2] / "frontend/e2e/fixtures/native-preview-auto-request.json").read_text())
     path = f"/editor/{job_id}/text-preview"
     assert client.post(path, json=body).status_code == 401
     result = client.post(path, json=body, headers=headers)
@@ -117,3 +119,22 @@ def test_preview_respects_the_umg_master_dimensions():
     assert result["height"] == spec.height
     assert f"PlayResX: {spec.width}" in result["ass"]
     assert f"PlayResY: {spec.height}" in result["ass"]
+
+
+def test_preview_accepts_the_actual_editor_automatic_variant_payload():
+    # Shared with the browser test: buildResolveBody uses "" for automatic.
+    path = Path(__file__).parents[2] / "frontend/e2e/fixtures/native-preview-auto-request.json"
+    payload = json.loads(path.read_text())
+    parsed = TextPreviewRequest.model_validate(payload)
+    assert parsed.settings.lyric_variant is None
+    assert parsed.settings.model_dump(exclude_unset=True)["lyric_variant"] is None
+    result = build_text_preview(parsed.segments, parsed.settings.model_dump(exclude_unset=True))
+    assert "[Events]" in result["ass"]
+    assert result["fonts"] == ["Montserrat-Bold.ttf"]
+    assert TextPreviewRequest(segments=[]).settings.model_dump(exclude_unset=True) == {}
+
+
+@pytest.mark.parametrize("variant", [-1, 10000, "arbitrary", 1.5, [], {}])
+def test_preview_still_rejects_invalid_variants(variant):
+    with pytest.raises(ValidationError):
+        TextPreviewRequest(segments=[], settings={"lyric_variant": variant})

@@ -1,6 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import NativeLyricPreview from "./NativeLyricPreview";
+import { buildResolveBody } from "../lib/lyricLookVariants";
+import automaticRequest from "../../e2e/fixtures/native-preview-auto-request.json";
 import { createSubtitleRenderer } from "../lib/nativeSubtitleRenderer";
 
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => undefined }) }));
@@ -59,4 +61,18 @@ it("shows an explicit retry when preview fails instead of a differently wrapped 
     : { ok: true, arrayBuffer: async () => new ArrayBuffer(4) });
   fireEvent.click(screen.getByRole("button", { name: "Reintentar" }));
   await waitFor(() => expect(createSubtitleRenderer).toHaveBeenCalled());
+});
+
+
+it("sends the shared real editor payload with the automatic variant sentinel", async () => {
+  const settings = { ...buildResolveBody({}), font: "", text_case: "upper",
+    text_contrast: "medium", font_scale: 1, lyrics_animation: "none", line_transition: "none" };
+  const request = vi.fn(async url => url.endsWith("text-preview")
+    ? reply(track("automatic ASS", "automatic.ttf"))
+    : { ok: true, arrayBuffer: async () => new ArrayBuffer(4) });
+  render(<NativeLyricPreview {...props(request)} segments={automaticRequest.segments} settings={settings} />);
+  await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("aria-busy", "false"));
+  const [, options] = request.mock.calls.find(([url]) => url.endsWith("text-preview"));
+  expect(JSON.parse(options.body)).toEqual(automaticRequest);
+  expect(JSON.parse(options.body).settings.lyric_variant).toBe("");
 });
