@@ -154,6 +154,7 @@ def ensure_prores_exists(
     tenant_id: str,
     *,
     require_r2_upload: bool = False,
+    release_page_cache: bool = False,
 ) -> str:
     """Materialise the .mov for `file_type` (umg_master | umg_short).
 
@@ -168,6 +169,11 @@ def ensure_prores_exists(
     ProResSourceMissing if the source MP4 is unavailable. Any other
     exception (ffmpeg failure, validator rejection) is re-raised by the
     underlying _transcode_to_prores.
+
+    Only prewarm workers opt into release_page_cache. The additional
+    PRORES_RELEASE_PAGE_CACHE flag defaults off. Fresh uploads can then shed
+    their retained .mov page cache after durable key persistence; API callers,
+    source MP4s and local hits without a new upload keep their existing behavior.
     """
     require_r2_upload = require_r2_upload or bool(job.get("_require_r2_upload"))
     if file_type not in FILE_MAP_PRORES:
@@ -280,6 +286,12 @@ def ensure_prores_exists(
             else:
                 from delivery_snapshots import pin_legacy_deliveries
                 pin_legacy_deliveries(job_id)
+                cache_identity = None
+                if release_page_cache and os.environ.get(
+                    "PRORES_RELEASE_PAGE_CACHE", "0",
+                ).strip().lower() in {"1", "true", "yes", "on"}:
+                    from file_page_cache import snapshot_file_identity
+                    cache_identity = snapshot_file_identity(file_path)
                 key = storage.upload_master(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )
@@ -333,7 +345,10 @@ def ensure_prores_exists(
                     # 2026-05-12: 8/18 jobs UMG perdieron una key,
                     # reconciliado a mano por SQL.
                     from jobs import merge_s3_keys
-                    merge_s3_keys(job_id, file_type, key)
+                    persisted = merge_s3_keys(job_id, file_type, key)
+                    if persisted and cache_identity is not None:
+                        from file_page_cache import release_file_page_cache
+                        release_file_page_cache(file_path, cache_identity)
         except ProResSuperseded:
             raise
         except Exception as e:  # pragma: no cover
@@ -392,6 +407,7 @@ def prewarm_prores(
         path = ensure_prores_exists(
             job_id, file_type, job, tenant_id,
             require_r2_upload=require_r2_upload,
+            release_page_cache=True,
         )
         logger.info("[PRORES] prewarm: %s/%s ready at %s", job_id, file_type, path)
         return path
