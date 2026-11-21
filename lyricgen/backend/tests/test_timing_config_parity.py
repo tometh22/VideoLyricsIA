@@ -25,6 +25,7 @@ def test_runtime_timing_config_normalizes_equivalent_values(monkeypatch):
     monkeypatch.delenv("LYRIC_MIN_GAP_MS", raising=False)
     monkeypatch.delenv("LYRIC_MIN_GAP_AB_ENABLED", raising=False)
     monkeypatch.delenv("LYRIC_MIN_GAP_AB_ARM_B_MS", raising=False)
+    monkeypatch.setenv("VOICE_END_TIMING_MODE", " OFF ")
 
     config = runtime_timing_config()
     display_fingerprint = config.pop("display_segmentation")
@@ -37,6 +38,7 @@ def test_runtime_timing_config_normalizes_equivalent_values(monkeypatch):
         "lyric_min_gap_ms": 0,
         "lyric_min_gap_ab_enabled": False,
         "lyric_min_gap_ab_arm_b_ms": 300,
+        "voice_end_timing_mode": "off",
     }
 
 
@@ -133,6 +135,8 @@ def test_effective_defaults_match_the_consumers(monkeypatch):
     assert effective["lyric_hold_s"]["value"] == lead_in.hold_seconds()
     assert effective["lyric_lead_in_s"]["value"] == lead_in.lead_seconds()
     assert effective["lyric_min_gap_ms"]["value"] / 1000 == lead_in.min_gap_seconds()
+    import voice_end_timing
+    assert effective["voice_end_timing_mode"]["value"] == voice_end_timing.mode()
     assert effective["lyric_min_gap_ab_enabled"]["value"] == line_gap_experiment.enabled()
     assert effective["lyric_min_gap_ab_arm_b_ms"]["value"] == line_gap_experiment.arm_b_ms()
     source = (Path(__file__).resolve().parents[1] / "whisperx_transcribe.py").read_text()
