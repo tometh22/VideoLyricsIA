@@ -402,6 +402,177 @@ async def _maybe_apply_catalog_reference(
     return aligned
 
 
+def _song_timing_trust_evidence(result: dict) -> dict | None:
+    """Vista de sólo lectura de la evidencia de máquina ANTES de congelarla:
+    de acá salen el testigo whisper-1 y la transcripción de control de
+    Gemini. No toca ``result`` ni la colección de proveniencia."""
+    try:
+        from machine_evidence import build_machine_evidence
+        from recognition_provenance import snapshot_into_result
+        probe = dict(result)
+        snapshot_into_result(probe)
+        return build_machine_evidence(probe)
+    except Exception:  # noqa: BLE001 — sin evidencia, las señales se imputan
+        return None
+
+
+def _official_text_for_timing(job_id: str) -> tuple[str, str]:
+    """La misma letra oficial que ve la Revisión rápida (pegada por el
+    operador, planilla de la campaña o lrclib ya en caché). Sólo lee la
+    base: nunca sale a la red desde el worker."""
+    from database import Job, SessionLocal
+    from lyric_review_sources import official_text
+
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if job is None:
+            return "", ""
+        return official_text(db, job)
+    finally:
+        db.close()
+
+
+async def _maybe_song_timing_trust(
+    result: dict,
+    audio_path: str,
+    job_id: str,
+    *,
+    live: bool,
+    aligner,
+    official_lookup=None,
+) -> dict:
+    """Detector de canción con timing no confiable + re-alineado opcional.
+
+    ``observe`` (default): evalúa la canción y, si sale no confiable, se fija
+    si hay letra oficial certificada contra el audio; guarda todo en
+    ``song_timing_trust`` y no cambia nada. ``shadow``: además corre el
+    alineado contra la letra oficial y guarda cuánto movería. ``apply``:
+    usa ese tiempo. El texto de cada línea nunca cambia. Nunca rompe el job.
+    """
+    import song_timing_trust as stt
+
+    current = stt.mode()
+    if current == "off" or not isinstance(result, dict) or not result.get("segments"):
+        return result
+    try:
+        evidence = _song_timing_trust_evidence(result)
+        assessment = stt.assess(result.get("segments") or [], evidence)
+    except Exception as exc:  # noqa: BLE001 — telemetría
+        logger.warning("[SONG-TIMING-TRUST] assess failed job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+        return result
+    summary = {
+        key: assessment.get(key)
+        for key in ("schema", "unreliable", "score", "threshold", "signals", "reasons")
+    }
+    summary["mode"] = current
+    summary["suspicious_lines"] = [row["line"] for row in assessment.get("lines") or []]
+    realign: dict = {"status": "not_needed"}
+    out = result
+    if assessment.get("unreliable"):
+        realign = await _song_timing_realign(
+            result, audio_path, job_id, mode=current, live=live, aligner=aligner,
+            official_lookup=official_lookup or _official_text_for_timing,
+        )
+        applied = realign.pop("_segments", None)
+        if applied is not None:
+            out = dict(result)
+            out["segments"] = applied
+        logger.info(
+            "[SONG-TIMING-TRUST] unreliable score=%.2f mode=%s realign=%s job=%s",
+            assessment.get("score") or 0.0, current, realign.get("status"), job_id,
+        )
+    summary["realign"] = realign
+    out = out if out is not result else dict(result)
+    out["song_timing_trust"] = summary
+    return out
+
+
+def _refresh_song_timing_trust(r: dict, job_id: str) -> None:
+    """Re-mide el veredicto con ``line_signals_v2`` ya adjuntado.
+
+    La evaluación previa al gate (necesaria para decidir el re-alineado, que
+    cambia los segmentos) no tiene todavía los huecos con voz; acá se
+    recalcula con las mismas señales que ve el editor, así el veredicto
+    persistido coincide con el de la Revisión rápida. Conserva el resultado
+    del re-alineado. Nunca rompe el job."""
+    summary = r.get("song_timing_trust")
+    if not isinstance(summary, dict):
+        return
+    try:
+        import song_timing_trust as stt
+        verdict = stt.assess(r.get("segments") or [], _song_timing_trust_evidence(r))
+        summary.update(
+            {key: verdict.get(key) for key in
+             ("unreliable", "score", "threshold", "signals", "reasons")},
+            suspicious_lines=[row["line"] for row in verdict.get("lines") or []],
+            voiced_gaps_measured=any(
+                isinstance(seg, dict) and seg.get("line_signals_v2")
+                for seg in (r.get("segments") or [])),
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetría
+        logger.warning("[SONG-TIMING-TRUST] refresh failed job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+
+
+async def _song_timing_realign(result: dict, audio_path: str, job_id: str, *,
+                               mode: str, live: bool, aligner, official_lookup) -> dict:
+    import song_timing_trust as stt
+
+    if result.get("timing_source") == "anchor_ctc":
+        return {"status": "already_official"}
+    if live:
+        return {"status": "live_not_supported"}
+    try:
+        text, origin = await asyncio.to_thread(official_lookup, job_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "official_lookup_failed", "error_type": _safe_exception_code(exc)}
+    text = str(text or "").strip()
+    if not text:
+        return {"status": "no_official_text"}
+    from reference_attestation import assess_reference_attestation
+    report = assess_reference_attestation(
+        text, result.get("segments") or [], reference_source="catalog_unverified",
+        is_live=live,
+    )
+    certified, reason = stt.timing_reference_certified(report, is_live=live)
+    metrics = report.get("metrics") or {}
+    base = {
+        "official_origin": str(origin or "")[:20],
+        "official_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "certified": certified,
+        "certification": {
+            "reason": reason,
+            "reference_token_coverage": metrics.get("reference_token_coverage"),
+            "asr_token_containment": metrics.get("asr_token_containment"),
+            "attestation_score": metrics.get("attestation_score"),
+        },
+    }
+    if not certified:
+        return {**base, "status": "not_certified"}
+    if mode == "observe":
+        return {**base, "status": "would_realign"}
+    try:
+        aligned = await aligner(
+            copy.deepcopy(result), audio_path, job_id, text,
+            content_source="catalog_reference", enabled=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "status": "alignment_failed", "error_type": _safe_exception_code(exc)}
+    alignment = (aligned or {}).get("anchor_alignment") if isinstance(aligned, dict) else None
+    if not isinstance(alignment, dict) or alignment.get("status") != "applied":
+        return {**base, "status": "alignment_declined",
+                "reason": str((alignment or {}).get("reason") or "declined")[:80]}
+    segments, stats = stt.transfer_timing(result.get("segments") or [], aligned.get("segments") or [])
+    out = {**base, "timing_source": str(alignment.get("timing_source") or "")[:40], "transfer": stats}
+    if not stats.get("applied"):
+        return {**out, "status": "transfer_declined"}
+    if mode != "apply":
+        return {**out, "status": "shadow"}
+    return {**out, "status": "applied", "_segments": segments}
+
+
 def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
     """Remove known subtitle/training credits created by late post-passes.
 
@@ -524,7 +695,16 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # operator-locked boundaries.
             from timing_review_suggestions import automatic_tail_enabled
             from vocal_continuity import continuity_mode
-            if (allow_timing_mutation and continuity_mode() == "off"
+            import voice_end_timing as _voice_end
+            # VOICE_END_TIMING_MODE=apply es el dueño del fin de línea: la cola
+            # de pitch no corre (ver _finalize_voice_end_timing).
+            if (allow_timing_mutation and _voice_end.owns_line_end()
+                    and _stem and automatic_tail_enabled()):
+                r.setdefault("postpass_stats", {})["stable_pitch_tail"] = {
+                    "status": "skipped", "reason": "superseded_by_voice_end_timing",
+                    "extended_count": 0,
+                }
+            elif (allow_timing_mutation and continuity_mode() == "off"
                     and _stem and automatic_tail_enabled()):
                 try:
                     from pathlib import Path
@@ -803,6 +983,17 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
     mode = continuity_mode()
     if mode == "off":
         return r
+    import voice_end_timing as _voice_end
+    if _voice_end.owns_line_end():
+        # Precedencia: con VOICE_END_TIMING_MODE=apply el fin de línea lo
+        # decide la regla de energía del stem, en toda la flota por igual.
+        # VOCAL_CONTINUITY_MODE no está en la paridad (en staging sólo lo
+        # tienen api/ShortWorker/BatchShortWorker), así que dejarlo correr
+        # haría depender el fin de qué servicio tomó el job.
+        return {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
+                "vocal_continuity": {"status": "skipped", "mode": mode,
+                    "reason": "superseded_by_voice_end_timing", "applied_count": 0,
+                    "mutated_segments": False, "automatic_apply_allowed": False}}}
     if mode == "apply" and not fresh_transcription:
         return {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
                 "vocal_continuity": {"status": "skipped", "mode": mode,
@@ -823,6 +1014,53 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
                 os.unlink(stem)
             except OSError:
                 pass
+
+
+def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription: bool) -> dict:
+    """Fin de línea = fin de la voz (VOICE_END_TIMING_MODE), sobre las tarjetas finales.
+
+    Corre después de la segmentación de pantalla y de vocal continuity, antes
+    de la evaluación final y del snapshot inmutable del editor. ``observe``
+    sólo registra; ``apply`` reemplaza el hold de ``lead_in`` donde el stem da
+    evidencia. Nunca levanta.
+    """
+    import voice_end_timing as _voice_end
+    from vocal_continuity import _protected_document
+    current = _voice_end.mode()
+    if current == "off":
+        return r
+
+    def _with(report: dict, segments=None) -> dict:
+        out = {**r, "postpass_stats": {**(r.get("postpass_stats") or {}),
+                                       "voice_end_timing": report}}
+        if segments is not None:
+            out["segments"] = segments
+        return out
+
+    base = {"policy_version": _voice_end.POLICY_VERSION, "mode": current,
+            "applied_count": 0, "mutated_segments": False}
+    try:
+        if _protected_document(r):
+            return _with({**base, "status": "skipped", "reason": "approved_document_reused"})
+        effective = current
+        if current == "apply" and not fresh_transcription:
+            # Un re-proceso sobre una revisión existente puede pisar fines que
+            # dejó el revisor: sólo se observa.
+            effective = "observe"
+        envelope, reason = _voice_end.envelope_for_audio(audio_path)
+        if envelope is None:
+            return _with({**base, "status": "skipped", "reason": reason})
+        segments, report = _voice_end.run(
+            list(r.get("segments") or []), envelope, current_mode=effective,
+        )
+        report = {**(report or {}), "mode": current}
+        if effective != current:
+            report["reason"] = "fresh_transcription_required"
+        return _with(report, segments if report.get("mutated_segments") else None)
+    except Exception as exc:
+        logger.info("[VOICE_END] abstained error_type=%s", _safe_exception_code(exc))
+        return _with({**base, "status": "abstained",
+                      "error_type": _safe_exception_code(exc)})
 
 
 async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
@@ -1230,13 +1468,22 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
 
     # Segmentation has finished. Extend only these final cards, then rebuild
     # the quality metrics without enabling another timing mutation pass.
+    _fresh_endpoint_owner = bool(
+        fresh_transcription and source_segments_revision == 0
+        and len(source_audio_sha256) == 64 and source_audio_revision > 0
+    )
     r = _finalize_vocal_continuity(
-        r, audio_path,
-        fresh_transcription=bool(fresh_transcription and source_segments_revision == 0
-                                 and len(source_audio_sha256) == 64 and source_audio_revision > 0),
+        r, audio_path, fresh_transcription=_fresh_endpoint_owner,
     )
     continuity_report = (r.get("postpass_stats") or {}).get("vocal_continuity") or {}
-    if continuity_report.get("applied_count"):
+    # Fin de línea = fin de la voz. Con `apply` es el único dueño del fin
+    # (vocal continuity y la cola de pitch quedan `superseded`); con
+    # `observe` mide sobre el resultado final sin tocarlo.
+    r = _finalize_voice_end_timing(
+        r, audio_path, fresh_transcription=_fresh_endpoint_owner,
+    )
+    voice_end_report = (r.get("postpass_stats") or {}).get("voice_end_timing") or {}
+    if continuity_report.get("applied_count") or voice_end_report.get("applied_count"):
         r = _medir_cobertura_final(
             r, job_id, antes_fmt, audio_path, strip_internal=False,
             live_hint=live_hint, allow_timing_mutation=False,
@@ -1317,6 +1564,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         pass
     if isinstance(post.get("vocal_continuity"), dict):
         final["vocal_continuity"] = dict(post["vocal_continuity"])
+    if isinstance(post.get("voice_end_timing"), dict):
+        # Evidencia por línea (observe/apply): queda en transcription_quality.
+        final["voice_end_timing"] = dict(post["voice_end_timing"])
     final["metrics"] = final_metrics
     # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
     # escritas sobre los segmentos finales antes de congelar la versión 0.
@@ -1334,6 +1584,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
         logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
                        job_id, _safe_exception_code(exc))
+    _refresh_song_timing_trust(r, job_id)
     if auto_trace["status"] == "authorized":
         auto_trace["status"] = (
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
@@ -1794,6 +2045,15 @@ def run_transcription_job(
             _record_reconcile_result(r, "post:_fmt")
             r = _drop_final_credit_hallucinations(r, job_id)
             _record_reconcile_result(r, "post:_drop_final_credit_hallucinations")
+            # Canción con el timing caído entero (SONG_TIMING_TRUST_MODE,
+            # observe por defecto): se mide y, sólo en shadow/apply, se
+            # re-alinea contra la letra oficial certificada, copiando el
+            # TIEMPO a las líneas de la máquina sin tocar su texto. Va antes
+            # del invariante final para que éste también lo normalice.
+            r = await _maybe_song_timing_trust(
+                r, audio_path, job_id, live=_effective_live, aligner=_maybe_anchor_align,
+            )
+            _record_reconcile_result(r, "post:_maybe_song_timing_trust")
             # Último post-pase: re-encuadra cada cartel a sus propias palabras
             # (audit 2026-08-13). Va al final porque todas las etapas de
             # arriba pueden haber movido start/end o words de forma
@@ -1818,6 +2078,10 @@ def run_transcription_job(
             if isinstance(r.get("approved_text_reuse"), dict):
                 quality = dict(r.get("transcription_quality") or {})
                 quality["approved_text_reuse"] = dict(r["approved_text_reuse"])
+                r["transcription_quality"] = quality
+            if isinstance(r.get("song_timing_trust"), dict):
+                quality = dict(r.get("transcription_quality") or {})
+                quality["song_timing_trust"] = dict(r.pop("song_timing_trust"))
                 r["transcription_quality"] = quality
             from delivery_repair_shadow import attach_delivery_repair_shadow
             return attach_delivery_repair_shadow(
@@ -2034,9 +2298,11 @@ def run_transcription_job(
                 }
             display_trace = (result.get("transcription_quality") or {}).get("display_segmentation") or {}
             continuity_trace = (result.get("transcription_quality") or {}).get("vocal_continuity") or {}
+            voice_end_trace = (result.get("transcription_quality") or {}).get("voice_end_timing") or {}
             if (
                 retranscription is None
-                and (display_trace.get("applied_count") or continuity_trace.get("applied_count"))
+                and (display_trace.get("applied_count") or continuity_trace.get("applied_count")
+                     or voice_end_trace.get("applied_count"))
             ):
                 from display_segmentation_policy import fresh_job
                 if current_revision != source_segments_revision or not fresh_job(_persist_db, row):

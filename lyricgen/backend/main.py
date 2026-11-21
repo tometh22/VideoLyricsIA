@@ -6559,7 +6559,9 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     raise RuntimeError("transcription_source_audio_changed")
                 display_trace = (finalized.get("transcription_quality") or {}).get("display_segmentation") or {}
                 continuity_trace = (finalized.get("transcription_quality") or {}).get("vocal_continuity") or {}
-                if (display_trace.get("applied_count") or continuity_trace.get("applied_count")) and (
+                voice_end_trace = (finalized.get("transcription_quality") or {}).get("voice_end_timing") or {}
+                if (display_trace.get("applied_count") or continuity_trace.get("applied_count")
+                        or voice_end_trace.get("applied_count")) and (
                         revision != inline_segments_revision or not _display_fresh_job(_quality_db, row)):
                     raise RuntimeError("display_segmentation_source_changed")
                 if revision > 0 and segments != row.segments_json:
@@ -17657,7 +17659,33 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
     # El re-anclado no pasa por lead_in.polish: sin esto cada línea re-timeada
     # se apaga en el último fonema (REANCHOR_HOLD_MODE, default off).
     import reanchor_hold as _reanchor_hold
+    _retimed = _reanchor_hold.retimed_indices(merged, prev_segs)
     merged, _hold_stats = _reanchor_hold.run(merged, prev_segs)
+    # Fin de línea = fin de la voz (VOICE_END_TIMING_MODE, default off). Corre
+    # DESPUÉS del hold y sólo sobre las líneas que este re-anclado re-timeó:
+    # con `apply`, donde el stem da evidencia el fin lo pone la voz (pisa el
+    # hold); donde no (sin stem, ancla inaudible) queda lo que dejó
+    # REANCHOR_HOLD_MODE. `observe` sólo reporta en la respuesta y el audit.
+    import voice_end_timing as _voice_end
+    _voice_end_stats = None
+    if _voice_end.mode() != "off" and _retimed:
+        try:
+            _ve_envelope, _ve_reason = await asyncio.to_thread(
+                _voice_end.envelope_for_audio, audio_path,
+            )
+            _ve_segments, _voice_end_stats = _voice_end.run(
+                merged, _ve_envelope, eligible=_retimed,
+            )
+            if _voice_end_stats is not None and _ve_envelope is None:
+                _voice_end_stats["reason"] = _ve_reason
+            if _voice_end_stats and _voice_end_stats.get("mutated_segments"):
+                merged = _ve_segments
+        except Exception as e:  # noqa: BLE001 — nunca rompe el re-anclado
+            logger.warning("[REANCHOR] voice_end_timing abstained job=%s: %s",
+                           job_id, type(e).__name__)
+            _voice_end_stats = {"mode": _voice_end.mode(), "status": "abstained",
+                                "applied_count": 0, "mutated_segments": False}
+    _voice_end_summary = _voice_end.summary(_voice_end_stats)
     _pasted_audit = {}
     if pasted_mode:
         import hashlib as _hashlib
@@ -17744,6 +17772,8 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                     "revision": int(row.segments_revision or 0),
                     **_pasted_audit,
                     **({"hold": _hold_stats} if _hold_stats else {}),
+                    # Con detalle por línea (observe/apply de VOICE_END_TIMING_MODE).
+                    **({"voice_end": _voice_end_stats} if _voice_end_stats else {}),
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -17814,6 +17844,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
         "locked_dropped": locked_dropped,
         "structure": structure,
         **({"hold": _hold_stats} if _hold_stats else {}),
+        **({"voice_end": _voice_end_summary} if _voice_end_summary else {}),
     }
 
 

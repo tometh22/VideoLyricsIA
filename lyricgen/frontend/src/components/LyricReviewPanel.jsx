@@ -353,6 +353,12 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
         </p>
       )}
 
+      {review.timing_trust?.unreliable && (
+        <p data-testid="lyric-review-timing-trust" className="mx-4 mt-3 text-xs leading-relaxed text-amber-200/90">
+          El timing de esta canción no es confiable: revisala completa.
+        </p>
+      )}
+
       {active && (
         <div className="px-3 pt-3">
           <ActiveCard item={active} failed={failedIds?.has(active.id)} playing={playingId === active.id}
