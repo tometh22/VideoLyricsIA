@@ -130,3 +130,69 @@ describe("filas con segment_id duplicado (incidente f866cbcf0e49)", () => {
     expect(result.conflicts[0].key).toBe("4");
   });
 });
+
+it('merges a local start and a remote text without mixing opposing timing edges', () => {
+  const base=[{segment_id:'one',start:1,end:3,text:'Original',locked:false}];
+  const merged=mergeThreeWay(base,[{...base[0],start:2,locked:true}],[{...base[0],text:'Remote correction'}]);
+  expect(merged.conflicts).toHaveLength(0);
+  expect(merged.merged[0]).toMatchObject({start:2,end:3,text:'Remote correction',locked:true});
+  const conflict=mergeThreeWay(base,[{...base[0],start:2}],[{...base[0],end:1.5}]);
+  expect(conflict.conflicts[0].fields).toContain('timing');
+  expect(conflict.merged[0]).toMatchObject({start:2,end:3});
+});
+
+it('preserves concurrent additions with the same historical ID but different content', () => {
+  const local=[{segment_id:'16',start:1,end:2,text:'Local addition'}];
+  const remote=[{segment_id:'16',start:3,end:4,text:'Remote addition'}];
+  expect(mergeThreeWay([],local,remote).merged.map(row=>row.text)).toEqual(['Local addition','Remote addition']);
+});
+
+it('keeps a remote correction when a previous duplicate was removed on either side', () => {
+  const base=[{segment_id:'16',start:1,end:2,text:'First'}, {segment_id:'16',start:5,end:6,text:'Survivor'}];
+  const local=[{...base[1],text:'Survivor corrected locally'}];
+  expect(mergeThreeWay(base,local,base).merged.map(row=>row.text)).toEqual(['Survivor corrected locally']);
+  expect(mergeThreeWay(base,base,[{...base[1],text:'Survivor corrected remotely'}]).merged.map(row=>row.text)).toEqual(['Survivor corrected remotely']);
+});
+
+it('compares semantic fields independently from JSON property order', () => {
+  expect(segmentsEquivalent([{start:1,end:2,text:'Frase',pos:{x:.2,y:.5}}],
+    [{pos:{y:.5,x:.2},text:'Frase',end:2,start:1}])).toBe(true);
+});
+
+it('retains both corrections when a legacy occurrence has no safe base match', () => {
+  const base=[{segment_id:'16',start:1,end:2,text:'First'}, {segment_id:'16',start:5,end:6,text:'Second'}];
+  const local=[{segment_id:'16',start:7,end:8,text:'Moved and rewritten'}];
+  const remote=[base[0],{...base[1],text:'Remote correction with evidence'}];
+  const result=mergeThreeWay(base,local,remote);
+  expect(result.merged.map(row=>row.text)).toEqual(['Remote correction with evidence','Moved and rewritten']);
+  expect(result.conflicts.some(conflict=>conflict.reason==='ambiguous-identity')).toBe(true);
+});
+
+it('keeps independent corrections through deletions across many legacy groups', () => {
+  for (let count=1;count<=40;count++) {
+    const base=Array.from({length:count*4},(_,i)=>({segment_id:String(Math.floor(i/4)),start:i*2,end:i*2+1,text:`Line ${i}`}));
+    const local=base.filter((_,i)=>i%4!==0).map(row=>Number(row.start/2)%4===2?{...row,text:row.text+' local'}:row);
+    const remote=base.map((row,i)=>i%4===1?{...row,end:row.end+.2}:i%4===3?{...row,text:row.text+' remote'}:row);
+    const expected=remote.filter((_,i)=>i%4!==0).map(row=>Number(row.start/2)%4===2?{...row,text:row.text+' local'}:row);
+    const result=mergeThreeWay(base,local,remote);
+    expect(result.conflicts).toHaveLength(0);
+    expect(result.merged.map(({_id,...row})=>row)).toEqual(expected);
+  }
+});
+
+it('matches ID-less server rows to local React IDs without minting persisted identities', () => {
+  const base=[{start:1,end:2,text:'First'},{start:3,end:4,text:'Second'}];
+  const local=base.map((row,i)=>({...row,_id:i,text:i===0?'First local':row.text}));
+  const remote=base.map((row,i)=>i===1?{...row,text:'Second remote'}:row);
+  const result=mergeThreeWay(base,local,remote);
+  expect(result.conflicts).toHaveLength(0);
+  expect(result.merged.map(row=>row.text)).toEqual(['First local','Second remote']);
+  expect(result.merged.every(row=>row.segment_id===undefined)).toBe(true);
+});
+
+it('keeps an ID-less survivor bound to its base after its previous sibling was deleted', () => {
+  const base=[{start:1,end:2,text:'First'},{start:3,end:4,text:'Survivor'}];
+  const local=[{...base[1],_id:1}];
+  const remote=[base[0],{...base[1],text:'Survivor remote'}];
+  expect(mergeThreeWay(base,local,remote).merged).toEqual([expect.objectContaining({text:'Survivor remote',start:3,end:4})]);
+});

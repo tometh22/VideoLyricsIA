@@ -1,5 +1,6 @@
 // Text equality identifies candidates, never acoustic equivalence. Every copy
 // requires an explicit selection and is bound to the source/target snapshots.
+import { updateSegmentTiming } from "./segmentWords";
 const textKey = value => String(value || "").trim().replace(/\s+/g, " ");
 export const repeatTimingSnapshot = row => JSON.stringify([row?._id, row?.segment_id, row?.text, row?.start, row?.end, row?.locked, row?.words]);
 export function proposeRepeatTiming(rows, id, start, end, duration, gap = 0.05) {
@@ -14,7 +15,9 @@ export function proposeRepeatTiming(rows, id, start, end, duration, gap = 0.05) 
         && (!duration || proposedEnd <= duration)
         && !rows.some(other => other._id !== row._id && other.start < proposedEnd + gap && other.end > row.start);
     }).map(row => ({ id: row._id, start: row.start, end: row.start + length, snapshot: repeatTimingSnapshot(row) }));
-  return candidates.length ? { sourceId: id, sourceSnapshot: repeatTimingSnapshot({ ...source, start, end, locked: true }), length, candidates } : null;
+  return candidates.length ? { sourceId: id,
+    sourceSnapshot: repeatTimingSnapshot({ ...updateSegmentTiming(source, start, end), locked: true }),
+    length, candidates } : null;
 }
 export function repeatTimingChanges(rows, proposal, ids, duration, gap = 0.05) {
   if (!proposal || repeatTimingSnapshot(rows.find(row => row._id === proposal.sourceId)) !== proposal.sourceSnapshot) return [];

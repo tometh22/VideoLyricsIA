@@ -1,0 +1,20 @@
+import { test, expect } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
+import { installEditorHarness, createSyntheticWav } from './editor-harness';
+test('campaign sidebar Space pauses rather than restarting the selected line',async({page},testInfo)=>{
+ const jobId='synthetic-audit-space';const segments=[{segment_id:'one',start:0,end:10,text:'Primera frase'},{segment_id:'two',start:12,end:20,text:'Segunda frase'}];
+ await installEditorHarness(page,{jobId,role:'admin',editorV2:true,segments});
+ await page.route('**/e2e/audio.wav',route=>route.fulfill({body:createSyntheticWav({durationSeconds:30}),contentType:'audio/wav'}));
+ await page.route(`**/status/${jobId}`,route=>route.fulfill({json:{job_id:jobId,status:'transcribed_pending',campaign_id:'synthetic',campaign_item_id:'one',filename:'Synthetic.wav',segments_revision:0,segments_json:segments}}));
+ await page.goto(`/review/${jobId}`);
+ await expect(page.getByTestId('campaign-line-workspace')).toBeVisible();
+ await page.waitForFunction(()=>document.querySelector('audio')?.readyState>=1);
+ await page.getByTestId('review-line-1').click();
+ await expect.poll(()=>page.locator('audio').evaluate(a=>a.paused)).toBe(false);
+ await page.locator('audio').evaluate(a=>{a.currentTime=3;});
+ const before=await page.locator('audio').evaluate(a=>({paused:a.paused,time:a.currentTime,focused:document.activeElement?.dataset.testid}));
+ await page.keyboard.press('Space');
+ const after=await page.locator('audio').evaluate(a=>({paused:a.paused,time:a.currentTime,focused:document.activeElement?.dataset.testid}));
+ await writeFile(testInfo.outputPath('space-result.json'),JSON.stringify({before,after},null,2));
+ expect(after.paused).toBe(true);
+});

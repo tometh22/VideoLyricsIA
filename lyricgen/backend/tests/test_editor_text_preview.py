@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+from pydantic import ValidationError
 import pytest
 import ass_render as ass
 from editor_preview import build_text_preview, preview_font, TextPreviewRequest
@@ -117,3 +119,25 @@ def test_preview_respects_the_umg_master_dimensions():
     assert result["height"] == spec.height
     assert f"PlayResX: {spec.width}" in result["ass"]
     assert f"PlayResY: {spec.height}" in result["ass"]
+
+
+def test_preview_accepts_the_actual_editor_automatic_variant_payload():
+    path = Path(__file__).parents[2] / "frontend/e2e/fixtures/native-preview-auto-request.json"
+    payload = json.loads(path.read_text())
+    parsed = TextPreviewRequest.model_validate(payload)
+    assert parsed.settings.lyric_variant is None
+    result = build_text_preview(parsed.segments, parsed.settings.model_dump(exclude_unset=True))
+    assert "[Events]" in result["ass"]
+    assert result["fonts"] == ["Montserrat-Bold.ttf"]
+
+
+@pytest.mark.parametrize("variant", [-1, 10000, "arbitrary", 1.5, [], {}])
+def test_preview_still_rejects_invalid_variants(variant):
+    with pytest.raises(ValidationError):
+        TextPreviewRequest(segments=[], settings={"lyric_variant": variant})
+
+
+def test_preview_keeps_document_limit_bounded():
+    from editor import MAX_SEGMENTS
+    with pytest.raises(ValidationError):
+        TextPreviewRequest(segments=[{}] * (MAX_SEGMENTS + 1))

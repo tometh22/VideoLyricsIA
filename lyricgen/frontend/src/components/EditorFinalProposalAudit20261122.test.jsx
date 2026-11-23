@@ -1,0 +1,40 @@
+import {act,cleanup,fireEvent,render,screen,waitFor} from '@testing-library/react';
+import {afterEach,expect,it,vi} from 'vitest';
+import LyricsEditor from './LyricsEditor';
+import {segmentsStore} from '../state/segmentsStore';
+vi.mock('../i18n',()=>({useI18n:()=>({t:()=>undefined})}));
+vi.mock('./OnboardingTour',()=>({EditorTour:()=>null}));
+vi.mock('./ToastProvider',()=>({useToast:()=>({toast:vi.fn(),dismiss:vi.fn()})}));
+vi.mock('./QualityProposalPanel',()=>({default:({onApplySelected,proposal,applying})=><button disabled={applying} onClick={()=>onApplySelected(['w'],proposal)}>Aplicar propuesta de prueba</button>}));
+afterEach(()=>{cleanup();segmentsStore._clearAll();localStorage.clear();vi.restoreAllMocks();});
+const reply=(body,status=200)=>({ok:status<400,status,clone:()=>({json:async()=>body})});
+it.each(['success','conflict','network'])('keeps unrelated typing made while quality proposal is pending: %s',async mode=>{
+ const job='final-proposal-race';
+ const rows=[{segment_id:'a',start:0,end:1,text:'Primera original'},{segment_id:'b',start:2,end:3,text:'Segunda original'}];
+ let finish;let phase='initial';const writes=[];
+ const proposal={id:'synthetic-p',status:'pending',base_revision:1,expires_at:'2099-01-01T00:00:00Z',windows:[{id:'w',start:0,end:1,current_segments:[rows[0]],proposed_segments:[{...rows[0],text:'Primera propuesta'}]}]};
+ const request=vi.fn(async(path,opts={})=>{
+  if(path.endsWith('/lock/heartbeat'))return reply({acquired:true});
+  if(path===`/editor/${job}`&&opts.method==='PATCH'){writes.push(JSON.parse(opts.body));return reply({revision:3,applied:true});}
+  if(path.endsWith('/apply'))return new Promise((resolve,reject)=>{finish=()=>{phase='after';mode==='network'?reject(new Error('synthetic network loss')):resolve(reply({},mode==='conflict'?409:200));};});
+  if(path===`/editor/${job}`&&!opts.method)return reply({job_id:job,revision:phase==='initial'?1:2,segments:phase==='initial'?rows:[{...rows[0],text:'Primera propuesta'},rows[1]],original_segments:rows,quality_proposal:phase==='initial'?proposal:{...proposal,status:'applied',windows:[]},lock:{active:false}});
+  return reply({});
+ });
+ render(<LyricsEditor segments={rows} transcribeJobId={job} filename='synthetic.wav' user={{id:42,tenant_id:'local-audit',features:{editor_v2:true}}} editorRequest={request} disableBeforeUnload onApprove={vi.fn()} onBack={vi.fn()}/>);
+ await screen.findByDisplayValue('Segunda original');
+ await waitFor(()=>expect(screen.getByTestId('lyrics-editor')).toHaveAttribute('aria-busy','false'));
+ fireEvent.click(await screen.findByRole('button',{name:'Aplicar propuesta de prueba'}));
+ await waitFor(()=>expect(finish).toBeTypeOf('function'));
+ const input=screen.getByDisplayValue('Segunda original');
+ expect(input).toBeEnabled();
+ expect(screen.getByTestId('lyrics-editor')).not.toHaveAttribute('inert');
+ fireEvent.change(input,{target:{value:'Segunda corregida durante la espera'}});
+ expect(segmentsStore.get(job).find(x=>x.segment_id==='b').text).toBe('Segunda corregida durante la espera');
+ await act(async()=>{finish();});
+ await waitFor(()=>expect(screen.getByDisplayValue('Primera propuesta')).toBeInTheDocument());
+ const first=screen.getByDisplayValue('Primera propuesta');
+ fireEvent.change(first,{target:{value:'Primera propuesta con otra corrección'}});
+ fireEvent.blur(first);
+ await waitFor(()=>expect(writes.length).toBeGreaterThan(0),{timeout:2500});
+ expect(writes.at(-1).segments.find(x=>x.segment_id==='b').text).toBe('Segunda corregida durante la espera');
+});

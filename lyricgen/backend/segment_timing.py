@@ -251,13 +251,12 @@ def timing_anomalies(segments: Any) -> dict[str, int]:
 
 
 def normalize_editor_segments(segments: Any) -> list[dict]:
-    """Canonicalize user-edited segments for persistence/rendering.
+    """Order user-edited rows without modifying their timings or count.
 
-    Normal regions retain their individual timings, including legitimate
-    overlaps. Only an overlapping region with a source-order regression is
-    repaired by ``canonicalize_editor_segments``.
+    Pipeline alignment repair remains in normalize_segments_timing. A saved
+    correction or a newly inserted overlap is not permission to repair audio.
     """
-    return canonicalize_editor_segments(segments)
+    return sort_segments_chronologically(segments)
 
 
 def normalize_segments_timing(

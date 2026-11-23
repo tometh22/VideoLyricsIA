@@ -1474,7 +1474,7 @@ def test_historical_revision_is_used_for_lazy_document(client):
     assert response.json()["segments"] == segments
 
 
-def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
+def test_equal_revision_legacy_order_is_migrated_without_deleting_or_retiming_rows():
     first, _, job_id = _users_and_job("editor_timing_repair")
     malformed = [
         {"_id": 9, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
@@ -1493,9 +1493,9 @@ def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
         db.commit()
         repaired = get_or_create_document(db, job_id, job.tenant_id, malformed)
         db.commit()
-        assert [row["_id"] for row in repaired.current_segments] == [9, 10, 11, 22]
-        assert repaired.current_segments[2]["start"] == 46.5773
+        assert repaired.current_segments == sorted(malformed, key=lambda row: row["start"])
         assert job.segments_revision == repaired.revision == 2
+        assert get_or_create_document(db, job_id, job.tenant_id, malformed).revision == 2
     finally:
         db.close()
 

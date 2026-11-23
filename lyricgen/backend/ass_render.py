@@ -39,6 +39,7 @@ ASS reference notes:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -701,7 +702,7 @@ def _word_timings(
     if not tokens:
         return []
     seg_start = float(seg_start)
-    seg_end = max(seg_start + 0.05, float(seg_end))
+    seg_end = max(seg_start + 1e-6, float(seg_end))
 
     # --- Try real word data, validated against the display tokens ----------
     if isinstance(raw_words, list) and len(raw_words) == len(tokens):
@@ -714,10 +715,20 @@ def _word_timings(
             if _strip_for_match(str(rw.get("word", ""))) != _strip_for_match(tok):
                 ok = False
                 break
-            ws = max(seg_start, float(rw["start"]))
-            we = min(seg_end, float(rw["end"]))
+            try:
+                raw_start = float(rw["start"])
+                raw_end = float(rw["end"])
+            except (TypeError, ValueError, OverflowError):
+                ok = False
+                break
+            if not (math.isfinite(raw_start) and math.isfinite(raw_end)):
+                ok = False
+                break
+            ws = max(seg_start, raw_start)
+            we = min(seg_end, raw_end)
             if we <= ws:
-                we = min(seg_end, ws + 0.05)
+                ok = False
+                break
             cand.append({"word": tok, "start": ws, "end": we})
         if ok:
             # enforce monotonic non-overlap
@@ -725,8 +736,10 @@ def _word_timings(
                 if cand[i]["start"] < cand[i - 1]["end"]:
                     cand[i]["start"] = cand[i - 1]["end"]
                 if cand[i]["end"] <= cand[i]["start"]:
-                    cand[i]["end"] = min(seg_end, cand[i]["start"] + 0.05)
-            return cand
+                    ok = False
+                    break
+            if ok:
+                return cand
 
     # --- Synthesize: split the window proportional to token length ---------
     weights = [len(t) + 1 for t in tokens]  # +1 so 1-char words still get time
