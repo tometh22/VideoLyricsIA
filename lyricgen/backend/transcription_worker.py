@@ -1016,7 +1016,34 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
                 pass
 
 
-def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription: bool) -> dict:
+def _prefetch_voice_end_stem(audio_path: str) -> bool:
+    """Pide UNA vez el stem (misma caché R2 que el resto) para voice_end_timing.
+
+    Bloqueante (Demucs en Replicate en un miss, ~60-180 s, ~US$0,02-0,05);
+    llamar con ``asyncio.to_thread``. Deja el stem en la caché y borra el
+    temporal: ``envelope_for_audio`` lo lee después con ``cache_only``, así que
+    no hay segunda corrida de Demucs. Nunca levanta. True = hay stem.
+    """
+    stem = None
+    try:
+        import vocal_sep
+        if not audio_path or not os.path.exists(audio_path):
+            return False
+        stem = vocal_sep.separate_vocals(audio_path)
+        return bool(stem)
+    except Exception as exc:
+        logger.info("[VOICE_END] stem prefetch error_type=%s", _safe_exception_code(exc))
+        return False
+    finally:
+        if stem:
+            try:
+                os.unlink(stem)
+            except OSError:
+                pass
+
+
+def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription: bool,
+                               stem_attempted: bool = False) -> dict:
     """Fin de línea = fin de la voz (VOICE_END_TIMING_MODE), sobre las tarjetas finales.
 
     Corre después de la segmentación de pantalla y de vocal continuity, antes
@@ -1049,6 +1076,8 @@ def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription:
             effective = "observe"
         envelope, reason = _voice_end.envelope_for_audio(audio_path)
         if envelope is None:
+            if stem_attempted and reason == "cached_stem_unavailable":
+                reason = "stem_unavailable_after_attempt"
             return _with({**base, "status": "skipped", "reason": reason})
         segments, report = _voice_end.run(
             list(r.get("segments") or []), envelope, current_mode=effective,
@@ -1479,8 +1508,28 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     # Fin de línea = fin de la voz. Con `apply` es el único dueño del fin
     # (vocal continuity y la cola de pitch quedan `superseded`); con
     # `observe` mide sobre el resultado final sin tocarlo.
+    _stem_attempted = False
+    try:
+        import voice_end_timing as _ve
+        from vocal_continuity import _protected_document as _prot
+        if (_fresh_endpoint_owner and _ve.mode() in ("observe", "apply")
+                and not _prot(r)):
+            # La regla sólo lee el stem cacheado; en una subida nueva todavía
+            # no existe. Se pide una vez (misma clave de caché) y, si falla,
+            # se sigue con el hold fijo sin bloquear la transcripción.
+            import vocal_sep as _vsep
+            if _vsep.is_enabled():
+                _stem_attempted = True
+                await asyncio.wait_for(
+                    asyncio.to_thread(_prefetch_voice_end_stem, audio_path),
+                    timeout=_vsep.thread_budget_s(),
+                )
+    except Exception as exc:
+        logger.info("[VOICE_END] stem prefetch abstained error_type=%s",
+                    _safe_exception_code(exc))
     r = _finalize_voice_end_timing(
         r, audio_path, fresh_transcription=_fresh_endpoint_owner,
+        stem_attempted=_stem_attempted,
     )
     voice_end_report = (r.get("postpass_stats") or {}).get("voice_end_timing") or {}
     if continuity_report.get("applied_count") or voice_end_report.get("applied_count"):

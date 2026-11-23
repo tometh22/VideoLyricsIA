@@ -478,3 +478,55 @@ def test_reanchor_voice_end_wins_over_hold_where_it_has_evidence(client, monkeyp
         # Sin stem la regla se abstiene y queda el hold de REANCHOR_HOLD_MODE.
         assert body["voice_end"]["reason"] == "cached_stem_unavailable"
         assert first["end"] == pytest.approx(1.99)
+
+
+# --- prefetch del stem en transcripciones nuevas ---------------------------
+
+def test_prefetch_calls_separation_once_and_cleans_temp(monkeypatch, tmp_path):
+    import transcription_worker as tw
+    import vocal_sep
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"x")
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"s")
+    calls = []
+    monkeypatch.setattr(vocal_sep, "separate_vocals",
+                        lambda p, *a, **k: calls.append(k) or str(stem))
+    assert tw._prefetch_voice_end_stem(str(audio)) is True
+    assert len(calls) == 1 and not calls[0].get("cache_only") and not stem.exists()
+
+
+def test_prefetch_failure_is_false_and_never_raises(monkeypatch, tmp_path):
+    import transcription_worker as tw
+    import vocal_sep
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"x")
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(vocal_sep, "separate_vocals", boom)
+    assert tw._prefetch_voice_end_stem(str(audio)) is False
+
+
+def test_finalizer_reports_stem_unavailable_after_attempt(monkeypatch):
+    import transcription_worker as tw
+    import vocal_sep
+    monkeypatch.setenv("VOICE_END_TIMING_MODE", "apply")
+    monkeypatch.setattr(ve, "envelope_for_audio", lambda p: (None, "cached_stem_unavailable"))
+    monkeypatch.setattr(vocal_sep, "separate_vocals",
+                        lambda *a, **k: pytest.fail("el finalizador no separa"))
+    source = _result()
+    out = tw._finalize_voice_end_timing(source, "a.wav", fresh_transcription=True,
+                                        stem_attempted=True)
+    rep = out["postpass_stats"]["voice_end_timing"]
+    assert rep["status"] == "skipped" and rep["reason"] == "stem_unavailable_after_attempt"
+    assert out["segments"] == source["segments"]
+
+
+def test_finalizer_without_attempt_keeps_cached_reason(monkeypatch):
+    import transcription_worker as tw
+    monkeypatch.setenv("VOICE_END_TIMING_MODE", "apply")
+    monkeypatch.setattr(ve, "envelope_for_audio", lambda p: (None, "cached_stem_unavailable"))
+    out = tw._finalize_voice_end_timing(_result(), "a.wav", fresh_transcription=True)
+    assert out["postpass_stats"]["voice_end_timing"]["reason"] == "cached_stem_unavailable"

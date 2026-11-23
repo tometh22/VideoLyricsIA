@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.214] - 2026-11-23
+
+### Fixed
+- In new transcriptions with `VOICE_END_TIMING_MODE` set to `observe` or `apply`, request the vocal stem once (same R2 cache key, no second Demucs run) before the rule runs, so line ends follow the voice instead of the fixed hold. If separation fails the transcription continues with the hold and the report says `stem_unavailable_after_attempt`. Costs one Demucs run (about 1-3 minutes, a few cents) only when the stem was not already cached.
+
 ## [1.1.213] - 2026-11-23
 
 ### Added
