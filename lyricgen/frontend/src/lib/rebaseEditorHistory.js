@@ -16,9 +16,23 @@ export function rebaseFocusedSegmentId(before, after, focusedId) {
   const focusedIndex = before.findIndex(row => row._id === focusedId);
   const focused = before[focusedIndex];
   if (!focused) return null;
+  const durable = row => row.segment_id ?? row.id;
+  const candidates = after.filter(row => durable(focused) == null
+    ? durable(row) == null : String(durable(row)) === String(durable(focused)));
+  // Local React IDs change on reseed, and deleting a previous legacy copy
+  // shifts occurrence ordinals. Prefer unique snapshot evidence for focus.
+  for (const matches of [
+    candidates.filter(row => Math.abs(row.start - focused.start) < 1e-3
+      && Math.abs(row.end - focused.end) < 1e-3),
+    candidates.filter(row => row.text === focused.text),
+  ]) {
+    if (matches.length === 1) return matches[0]._id;
+  }
+  if (durable(focused) == null) return null;
   const occurrence = before.slice(0, focusedIndex)
     .filter(row => identity(row) === identity(focused)).length;
-  return after.filter(row => identity(row) === identity(focused))[occurrence]?._id ?? null;
+  const previousCount = before.filter(row => identity(row) === identity(focused)).length;
+  return candidates.length === previousCount ? candidates[occurrence]?._id ?? null : null;
 }
 
 /**

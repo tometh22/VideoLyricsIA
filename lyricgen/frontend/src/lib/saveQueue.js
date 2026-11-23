@@ -78,7 +78,7 @@ export function createSaveQueue(persist, opts = {}) {
   function run(jobId, { keepalive = false, persistOpts = null } = {}) {
     const j = ensure(jobId);
     const segments = typeof j.provider === "function" ? j.provider() : null;
-    if (!Array.isArray(segments) || segments.length === 0) return Promise.resolve({ ok: false, reason: "no-data" });
+    if (!Array.isArray(segments)) return Promise.resolve({ ok: false, reason: "no-data" });
 
     // keepalive (pagehide/unload) es best-effort y NO sigue la serialización
     // ni toca el status: la página se está yendo, disparamos y listo.

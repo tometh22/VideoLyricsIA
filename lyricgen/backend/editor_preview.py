@@ -1,9 +1,10 @@
 """Authenticated, stateless subtitle previews. Never render video or call AI."""
 from pathlib import Path
 import math
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal
 from lyric_overlay import compose_lyric_overlay
+from editor import MAX_SEGMENTS
 
 FONTS = Path(__file__).parent / "fonts"
 
@@ -25,9 +26,16 @@ class PreviewSettings(BaseModel):
     lyric_alt_color: str = Field(default="", max_length=7)
     lyric_accent_color: str = Field(default="", max_length=7)
 
+    @field_validator("lyric_variant", mode="before")
+    @classmethod
+    def automatic_variant(cls, value):
+        # Auto is encoded as an empty string by the editor. All non-sentinel
+        # values still pass through the existing integer/bounds validation.
+        return None if value == "" else value
+
 
 class TextPreviewRequest(BaseModel):
-    segments: list[dict] = Field(max_length=500)
+    segments: list[dict] = Field(max_length=MAX_SEGMENTS)
     settings: PreviewSettings = Field(default_factory=PreviewSettings)
 
 

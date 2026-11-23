@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import AuditLog, EditorDocument, EditorVersion, Job, User
-from segment_timing import canonicalize_editor_segments
+from segment_timing import sort_segments_chronologically
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
@@ -169,11 +169,10 @@ def normalize_segments(value: Any) -> list[dict]:
             "end": round(end, 4),
             "text": text,
         })
-    # Canonicalize appended rows by timestamp, but preserve semantic source
-    # order inside an anomalous overlap region and repair only that region.
-    # This prevents a post-alignment regression from making playback jump to
-    # a later lyric and then back to an earlier one.
-    normalized = canonicalize_editor_segments(normalized)
+    # Editor rows are an operator-owned snapshot. A rebase/insert can append
+    # a row whose time precedes its neighbours: sort it, never reinterpret
+    # that array order as an alignment defect or silently delete occurrences.
+    normalized = sort_segments_chronologically(normalized)
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise ValueError(f"segments payload cannot exceed {MAX_PAYLOAD_BYTES} bytes")
     return normalized

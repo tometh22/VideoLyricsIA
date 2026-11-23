@@ -132,6 +132,7 @@ def test_individual_pin_and_partial_bulk_keep_contract_group(db, setup):
     result = creative.save_individual(campaign.id, item.id, creative.IndividualRequest(revision=1, settings={"font": "anton"}), actor, db)
     assert result["revision"] == 2
     assert creative.save_individual(campaign.id, item.id, creative.IndividualRequest(revision=2, settings={"font": "anton"}), actor, db)["unchanged"]
+    assert not db.in_transaction(), "A no-op design save must release locks before returning"
     body = creative.PlanRequest(revision=2, item_ids=[i.id for i in items[:2]], reason="Tamaño común", groups=[creative.Group(id="size", name="Grande", weight=100, settings={"font_scale": 1.3})])
     preview = creative.preview(campaign.id, body, actor, db)
     assert preview["skipped"] == [item.id]
@@ -165,6 +166,7 @@ def test_individual_design_starts_at_zero_without_assignment_and_rejects_stale_r
         creative.save_individual(campaign.id, item.id,
             creative.IndividualRequest(revision=0, settings={"font": "anton"}), actor, db)
     assert stale.value.status_code == 409
+    assert not db.in_transaction(), "A stale design save must release locks before raising"
     db.rollback(); db.refresh(persisted)
     assert persisted.render_overrides["font"] == "poppins-bold"
 

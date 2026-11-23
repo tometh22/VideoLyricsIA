@@ -16,6 +16,19 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
     expect(login.ok()).toBeTruthy();
     const token = (await login.json()).token;
     const headers = { Authorization: `Bearer ${token}` };
+    const campaignStatus = async () => {
+      const response = await request.get(`${API}/status/${JOB}`, { headers });
+      expect(response.ok()).toBeTruthy();
+      const status = await response.json();
+      // The disposable song must have the same batch identity as a real
+      // campaign job. Otherwise reload drops its design revision and every
+      // subsequent creative save correctly fails CAS at revision zero.
+      expect(status.workload_class).toBe("batch");
+      expect(status.campaign?.campaign_id).toBe(CAMPAIGN);
+      expect(status.campaign?.campaign_item_id).toBe("e2erevieweritem");
+      return status;
+    };
+    await campaignStatus();
     const document = async () => {
       const response = await request.get(`${API}/editor/${JOB}`, { headers });
       expect(response.ok()).toBeTruthy();
@@ -53,6 +66,8 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       const announcement = page.getByRole("dialog");
       if (await announcement.isVisible()) await announcement.getByRole("button", { name: "Cancelar", exact: true }).click();
       await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+      await expect(page.getByTestId("native-lyric-preview").getByRole("img")).toHaveAttribute("aria-busy", "false");
+      await expect.poll(async () => (await campaignStatus()).campaign.render_overrides?.creative_assignment?.revision || 0).toBeGreaterThan(0);
       const companion = page.getByRole("region", { name: "Revisión acústica completa" });
       await expect(companion).toBeVisible();
       await companion.getByText(/Ver letra y timing de toda la candidata/).click();
@@ -88,6 +103,7 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       await page.reload();
       await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
       await expect(page.getByRole("textbox", { name: "Letra de esta línea", exact: true })).toHaveValue("Canto aquí con espacios");
+      expect((await campaignStatus()).campaign.render_overrides.creative_assignment.revision).toBeGreaterThan(0);
 
       const approveResponse = page.waitForResponse(response => response.url().endsWith(`/batch/campaigns/${CAMPAIGN}/jobs/${JOB}/approve-lyrics`)
         && response.request().method() === "POST");

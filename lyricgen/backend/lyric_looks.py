@@ -1895,6 +1895,8 @@ def build_look_ass(
         base_fs = fs_for(len(display))
         if look.layout == "kinetic":
             timings = _ass._word_timings(display, start, end, seg.get("words"))
+            if not timings:
+                continue
             events.extend(_kinetic_events(look, n, tokens, timings, start, end,
                                           base_fs, width, height, sc, measure,
                                           second or measure, second_family,
@@ -1902,6 +1904,8 @@ def build_look_ass(
             continue
         if look.layout in ("build", "block", "arc"):
             timings = _ass._word_timings(display, start, end, seg.get("words"))
+            if not timings:
+                continue
             if look.layout == "build":
                 events.extend(_build_events(look, n, tokens, timings, start, end,
                                             base_fs, width, height, measure))

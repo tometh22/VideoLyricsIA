@@ -1,0 +1,28 @@
+{
+  "segments": [
+    {
+      "segment_id": "synthetic-line",
+      "start": 0,
+      "end": 3,
+      "text": "Una frase de prueba"
+    }
+  ],
+  "settings": {
+    "lyric_look": "",
+    "lyric_genre": "",
+    "lyric_variant": "",
+    "lyric_font_main": "",
+    "lyric_font_key": "",
+    "lyric_color": "",
+    "lyric_alt_color": "",
+    "lyric_accent_color": "",
+    "artist": "",
+    "song_title": "",
+    "font": "",
+    "text_case": "upper",
+    "text_contrast": "medium",
+    "font_scale": 1,
+    "lyrics_animation": "none",
+    "line_transition": "none"
+  }
+}

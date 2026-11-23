@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { expect, test } from "@playwright/test";
 import { createSyntheticWav } from "./editor-harness.js";
 
@@ -159,13 +160,20 @@ test("advanced edits and intentional duplicates survive real API reload", async 
     const copies = saved.segments.filter(row => row.text === "Persistencia real con espacios");
     expect(copies).toHaveLength(2);
     expect(copies[0].segment_id).not.toBe(copies[1].segment_id);
+    const remaining = saved.segments.filter(row => row.text !== "Persistencia real con espacios")
+      .map(({ _id, ...durable }) => durable);
+    expect(remaining).toHaveLength(before.segments.length - 1);
     for (const untouched of before.segments.slice(1)) {
       // _id is a browser-local row handle and can change across hydration.
       // Compare every durable field, including segment_id, text and timing.
       const { _id: previousLocalId, ...expected } = untouched;
-      const { _id: savedLocalId, ...actual } = saved.segments.find(row => row.segment_id === untouched.segment_id);
-      expect(actual).toEqual(expected);
+      // Legacy rows have no segment_id; undefined is not a unique identity.
+      // Consume exact durable matches so every occurrence is preserved once.
+      const index = remaining.findIndex(row => isDeepStrictEqual(row, expected));
+      expect(index, `Untouched durable row: ${JSON.stringify(expected)}`).toBeGreaterThanOrEqual(0);
+      expect(remaining.splice(index, 1)[0]).toEqual(expected);
     }
+    expect(remaining).toEqual([]);
     await page.reload();
     await page.getByRole("button", { name: /4 Lyrics/ }).click();
     await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");

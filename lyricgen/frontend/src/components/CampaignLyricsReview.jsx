@@ -11,7 +11,7 @@ const timestamp = value => {
 /** One selected line owns the text, playback and timing actions. */
 export default function CampaignLyricsReview({ segments, focusedId, markedIds, audioAvailable, activeId = null, isPlaying = false,
   preview = null, startAtWorkspace = false, onSelect, onTextChange, onListen, onAdvanced, onDuplicate, onDelete, onAdd, onMove, onSplit,
-  getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs,
+  getSplitPlan, onUndo, canUndo, onMerge, onMergePrevious, onTextFocus, onTextBlur, rowRefs, onTogglePlayback,
   suggestionsById = {}, onApplySuggestion, propagationPrompt, onApplyPropagation, onDismissPropagation, onTogglePropagation }) {
   const { t } = useI18n();
   const [markedOnly, setMarkedOnly] = useState(false);
@@ -168,6 +168,13 @@ export default function CampaignLyricsReview({ segments, focusedId, markedIds, a
           data-testid={`review-line-${segments.indexOf(line) + 1}`} data-playing={isPlaying && line._id === activeId ? "true" : undefined} aria-current={highlightedId === line._id ? "true" : undefined}
           data-selected={selected?._id === line._id ? "true" : "false"}
           onClick={() => navigate(line)} onKeyDown={(event) => {
+            if (event.code === "Space" || event.key === " ") {
+              // Only navigation rows own this shortcut. Ordinary buttons and
+              // text inputs retain native keyboard activation/space entry.
+              event.preventDefault(); event.stopPropagation();
+              if (!event.repeat && audioAvailable) onTogglePlayback?.();
+              return;
+            }
             if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
             event.preventDefault(); event.stopPropagation();
             const next = visible[visible.indexOf(line) + (event.key === "ArrowDown" ? 1 : -1)];

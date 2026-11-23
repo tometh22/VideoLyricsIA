@@ -33,10 +33,11 @@ import { useLookVariant } from "../hooks/useLookVariant";
 import LookVariantPanel from "./LookVariantPanel";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
+import { updateSegmentTiming } from "../lib/segmentWords";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
-  canonicalizeEditorSegments,
+  sortSegmentsChronologically,
   selectActiveSegmentId,
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
@@ -466,7 +467,7 @@ function sanitizeSegmentTiming(segment, fallbackStart = 0) {
   const end = parsedEnd == null
     ? start + 1
     : Math.max(start + MIN_SEGMENT_DURATION_S, parsedEnd);
-  return { ...segment, start, end };
+  return updateSegmentTiming(segment, start, end);
 }
 
 function sanitizeSegments(segments) {
@@ -477,7 +478,10 @@ function sanitizeSegments(segments) {
     fallbackStart = sanitized.start;
     return sanitized;
   });
-  return canonicalizeEditorSegments(sanitized);
+  // A user's snapshot may contain intentional overlaps or a remotely added
+  // row appended out of order. Saving/hydration must never repair its timing
+  // or discard an occurrence. Alignment repair belongs to the pipeline.
+  return sortSegmentsChronologically(sanitized);
 }
 
 function sanitizeSegmentsForPersistence(segments) {
@@ -1603,14 +1607,14 @@ export default function LyricsEditor({
     // Mounting or hydrating a server snapshot is not an edit. Scheduling it
     // would bump the revision unnecessarily and, more importantly, could
     // erase a stale recovery draft before the conflict UI has protected it.
-    if (!isDirty) return undefined;
-    if (!Array.isArray(edited) || edited.length === 0) return undefined;
+    if (!isDirty || !hasLiveEditorStore()) return undefined;
+    if (!Array.isArray(edited)) return undefined;
     const queue = saveQueueRef.current;
     queue.prime(transcribeJobId, Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
     queue.schedule(transcribeJobId, () =>
-      sanitizeSegmentsForPersistence(editedRef.current));
+      hasLiveEditorStore() ? sanitizeSegmentsForPersistence(editedRef.current) : null);
     return undefined;
-  }, [edited, isDirty, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision, editorV2Enabled]);
+  }, [edited, isDirty, transcribeJobId, onPersistSegments, disableAutosave, segmentsRevision, editorV2Enabled, hasLiveEditorStore]);
 
   // The queue is the single status source for debounce, drag, retry and
   // navigation flushes.  A trailing snapshot is coalesced while a request is
@@ -1685,7 +1689,7 @@ export default function LyricsEditor({
     const state = queue._peek(transcribeJobId);
     if (!dirtyRef.current || (!state?.debounceTimer && !state?.pending)) return;
     queue.flush(transcribeJobId, {
-      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
+      provider: () => hasLiveEditorStore() ? sanitizeSegmentsForPersistence(editedRef.current) : null,
     });
   }, [disableAutosave, editorV2Enabled, onPersistSegments, transcribeJobId, hasLiveEditorStore]);
 
@@ -1798,7 +1802,7 @@ export default function LyricsEditor({
     }
     if (disableAutosave || !onPersistSegments || !transcribeJobId) return undefined;
     saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
+      provider: () => hasLiveEditorStore() ? sanitizeSegmentsForPersistence(editedRef.current) : null,
     });
     return undefined;
     // Only react to the flush trigger — `edited` is intentionally read fresh
@@ -1812,10 +1816,10 @@ export default function LyricsEditor({
       return Promise.resolve({ ok: true, skipped: true });
     }
     return saveQueueRef.current.flush(transcribeJobId, {
-      provider: () => sanitizeSegmentsForPersistence(editedRef.current),
+      provider: () => hasLiveEditorStore() ? sanitizeSegmentsForPersistence(editedRef.current) : null,
       persistOpts,
     });
-  }, [disableAutosave, editorV2Enabled, flushDurableSave, onPersistSegments, transcribeJobId]);
+  }, [disableAutosave, editorV2Enabled, flushDurableSave, onPersistSegments, transcribeJobId, hasLiveEditorStore]);
 
   // PR E (2026-07): acá vivía el espejo sincrónico por keystroke
   // (onEditedChange → App.setCurrentReview). Eliminado — era la mitad del
@@ -2193,7 +2197,7 @@ export default function LyricsEditor({
     markLinesReviewedByEdit(id);
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
-      s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
+      s._id === id ? { ...updateSegmentTiming(s, newStart, newEnd), locked: true } : s
     ));
     setHighlightedIds((prev) => {
       const next = new Set(prev);
@@ -2224,7 +2228,7 @@ export default function LyricsEditor({
     setEdited((prev) => prev.map((s) => {
       const change = byId.get(s._id);
       return change
-        ? { ...s, start: change.start, end: change.end, locked: true }
+        ? { ...updateSegmentTiming(s, change.start, change.end), locked: true }
         : s;
     }));
     setHighlightedIds((prev) => {
@@ -2538,7 +2542,16 @@ export default function LyricsEditor({
     const prevSeg = idx > 0 ? edited[idx - 1] : null;
     const nextSeg = idx >= 0 && idx < edited.length - 1 ? edited[idx + 1] : null;
     const minAllowed = prevSeg ? prevSeg.end : 0;
-    const maxAllowed = nextSeg ? Math.max(minAllowed, nextSeg.start - 0.1) : (duration || parsed);
+    const upperBound = nextSeg ? Math.min(nextSeg.start, duration || nextSeg.start) : duration;
+    // Reserve positive duration before changing state, rather than letting
+    // the persistence sanitizer extend a zero-length row past the audio.
+    const lastStart = upperBound > 0 ? upperBound - MIN_SEGMENT_DURATION_S : parsed;
+    const maxAllowed = nextSeg ? Math.min(nextSeg.start - 0.1, lastStart) : lastStart;
+    if (maxAllowed < minAllowed) {
+      setEditingId(null);
+      setEditValue("");
+      return;
+    }
     const newStart = Math.max(minAllowed, Math.min(parsed, maxAllowed));
 
     // No-op edits (clamped value identical to current) shouldn't pollute
@@ -2553,9 +2566,8 @@ export default function LyricsEditor({
       // unless that would push end past audio_duration or the next row.
       const segDur = Math.max(0.5, s.end - s.start);
       let newEnd = newStart + segDur;
-      const upperBound = nextSeg ? Math.min(nextSeg.start, duration || nextSeg.start) : duration;
       if (upperBound && newEnd > upperBound) newEnd = upperBound;
-      return { ...s, start: newStart, end: newEnd };
+      return updateSegmentTiming(s, newStart, newEnd);
     }));
     setEditingId(null);
     setEditValue("");
@@ -3262,18 +3274,22 @@ export default function LyricsEditor({
     requestAnimationFrame(() => document.getElementById(`timing-workspace-tab-${next}`)?.focus());
   }, [selectTimingWorkspace, timingWorkspaceMode]);
 
-  const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false } = {}) => {
+  const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false, localBase = null } = {}) => {
     const nextDocument = await durableEditor.load({ replaceSegments: syncSegments });
     if (syncSegments && Array.isArray(nextDocument?.segments)) {
+      const remote = sanitizeSegments(nextDocument.segments);
+      const before = editedRef.current;
+      // Applying a proposal is asynchronous. Preserve everything typed since
+      // its request began, even when a failed response requires a reload.
+      const next = localBase ? mergeThreeWay(localBase, before, remote).merged : remote;
       setEdited(reseedPreservingIds(
-        editedRef.current,
-        sanitizeSegments(nextDocument.segments),
+        before, next,
       ));
-      setEditHistory([]);
+      setEditHistory(history => rebaseEditorHistory(history, before, next));
       setSyncHistory([]);
       setPropagationPrompt(null);
       setTextEditStart(null);
-      setIsDirty(false);
+      setIsDirty(!segmentsEquivalent(next, remote));
     }
     return nextDocument;
   }, [durableEditor.load, setEdited]);
@@ -3285,6 +3301,7 @@ export default function LyricsEditor({
       return;
     }
     setQualityProposalBusy({ applying: true, dismissing: false, observing: false });
+    const localBase = editedRef.current;
     try {
       const idempotencyKey = await qualityProposalIdempotencyKey({
         action: "apply",
@@ -3306,7 +3323,7 @@ export default function LyricsEditor({
         },
       );
       if (!response?.ok) {
-        const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true });
+        const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true, localBase });
         const appliedRemotely = qualityProposalReachedStatus(
           nextDocument, proposal.id, "applied",
         );
@@ -3320,14 +3337,14 @@ export default function LyricsEditor({
         });
         return;
       }
-      await reconcileQualityProposalDocument({ syncSegments: true });
+      await reconcileQualityProposalDocument({ syncSegments: true, localBase });
       toast({ message: "Correcciones aplicadas como una nueva versión.", tone: "success" });
     } catch {
       // The POST may have committed even if its response was lost. Keep the
       // operation busy until the durable document has been reloaded, then
       // either acknowledge the committed state or allow a safe retry with
       // the same deterministic idempotency key.
-      const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true });
+      const nextDocument = await reconcileQualityProposalDocument({ syncSegments: true, localBase });
       const appliedRemotely = qualityProposalReachedStatus(
         nextDocument, proposal.id, "applied",
       );
@@ -7011,6 +7028,7 @@ export default function LyricsEditor({
               <CampaignLyricsReview
                 segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
                 activeId={activeId} isPlaying={isPlaying}
+                onTogglePlayback={togglePlay}
                 startAtWorkspace={startAtWorkspace && (!editorV2Enabled || durableHydrated)}
                 preview={!hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
                   <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>

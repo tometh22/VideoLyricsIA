@@ -22,3 +22,12 @@ describe('optional repeated timing corrections', () => {
   expect(repeatTimingChanges([...current,{_id:4,start:9.5,end:10.5}],proposal,[2],20)).toEqual([]);
  });
 });
+
+it('binds the retimed source after an incompatible word window was invalidated', async () => {
+ const {updateSegmentTiming}=await import('./segmentWords');
+ const original=rows.map(row=>row._id===1?{...row,words:[{word:'mismo',start:1,end:1.4},{word:'estribillo',start:1.4,end:2}]}:row);
+ const proposal=proposeRepeatTiming(original,1,1,1.5,20);
+ const current=original.map(row=>row._id===1?{...updateSegmentTiming(row,1,1.5),locked:true}:row);
+ expect(current[0].words).toBeUndefined();
+ expect(repeatTimingChanges(current,proposal,[2],20)).toMatchObject([{id:2,start:8,end:8.5}]);
+});

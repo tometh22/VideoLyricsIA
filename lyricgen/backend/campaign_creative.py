@@ -577,39 +577,46 @@ class IndividualRequest(Strict):
 @router.post("/{campaign_id}/creative/items/{item_id}")
 def save_individual(campaign_id: str, item_id: str, body: IndividualRequest,
                     current_user=Depends(get_current_user), db: Session = Depends(get_db)):
-    campaign = _campaign(db, campaign_id, current_user)
-    campaign = db.query(BatchCampaign).filter_by(id=campaign.id).populate_existing().with_for_update().one()
-    item = db.query(BatchCampaignItem).filter_by(id=item_id, campaign_id=campaign.id).first()
-    job = db.query(Job).filter_by(campaign_item_id=item_id, campaign_id=campaign.id).with_for_update().first()
-    if not item or not job:
-        fail("Canción no encontrada", 404)
-    if job.status not in {"transcribed_pending", "transcribed", "lyrics_approved"}:
-        fail("La canción ya avanzó a generación", 409)
-    doc = db.query(EditorDocument).filter_by(job_id=job.job_id).first()
-    if doc and doc.lock_expires_at and _aware(doc.lock_expires_at) > datetime.now(timezone.utc) and doc.lock_user_id != current_user["id"]:
-        fail("Otra persona está revisando esta canción", 409)
-    before = copy.deepcopy(item.render_overrides or {})
-    assignment = before.get(ASSIGNMENT) or {}
-    if assignment.get("revision", 0) != body.revision:
-        fail("La configuración individual cambió; reabrí el editor", 409)
-    patch = normalize_settings(body.settings)
-    effective = effective_settings(campaign, {**before, **patch})
-    group = Group(id=assignment.get("group_id", "individual"), name=assignment.get("group_name", "Individual"),
-                  weight=100, requirement=assignment.get("requirement", "creative"), model=assignment.get("model", ""))
-    validate_combination(db, campaign, effective, group, current_user)
-    # Idempotent autosave/approval retry; an unchanged choice isn't an exception.
-    if all(effective.get(k) == effective_settings(campaign, before).get(k) for k in patch):
-        return {"revision": body.revision, "unchanged": True}
-    plan = _plan(campaign)
-    plan["revision"] += 1
-    assignment = {**assignment, "group_id": group.id, "group_name": group.name,
-                  "requirement": group.requirement, "model": group.model, "revision": plan["revision"], "pinned": True}
-    item.render_overrides = {**before, **patch, ASSIGNMENT: assignment}
-    campaign.default_render_params = {**(campaign.default_render_params or {}), KEY: plan}
-    _log(db, campaign, "individual", current_user["id"], {"item_id": item.id, "before": before,
-          "after": item.render_overrides, "revision": plan["revision"]})
-    db.commit()
-    return {"revision": plan["revision"]}
+    try:
+        campaign = _campaign(db, campaign_id, current_user)
+        campaign = db.query(BatchCampaign).filter_by(id=campaign.id).populate_existing().with_for_update().one()
+        item = db.query(BatchCampaignItem).filter_by(id=item_id, campaign_id=campaign.id).first()
+        job = db.query(Job).filter_by(campaign_item_id=item_id, campaign_id=campaign.id).with_for_update().first()
+        if not item or not job:
+            fail("Canción no encontrada", 404)
+        if job.status not in {"transcribed_pending", "transcribed", "lyrics_approved"}:
+            fail("La canción ya avanzó a generación", 409)
+        doc = db.query(EditorDocument).filter_by(job_id=job.job_id).first()
+        if doc and doc.lock_expires_at and _aware(doc.lock_expires_at) > datetime.now(timezone.utc) and doc.lock_user_id != current_user["id"]:
+            fail("Otra persona está revisando esta canción", 409)
+        before = copy.deepcopy(item.render_overrides or {})
+        assignment = before.get(ASSIGNMENT) or {}
+        if assignment.get("revision", 0) != body.revision:
+            fail("La configuración individual cambió; reabrí el editor", 409)
+        patch = normalize_settings(body.settings)
+        effective = effective_settings(campaign, {**before, **patch})
+        group = Group(id=assignment.get("group_id", "individual"), name=assignment.get("group_name", "Individual"),
+                      weight=100, requirement=assignment.get("requirement", "creative"), model=assignment.get("model", ""))
+        validate_combination(db, campaign, effective, group, current_user)
+        # Idempotent autosave/approval retry; an unchanged choice isn't an exception.
+        if all(effective.get(k) == effective_settings(campaign, before).get(k) for k in patch):
+            # No-op saves still hold the locked campaign/job rows. Release
+            # before ASGI dependency teardown can yield to another editor request.
+            db.commit()
+            return {"revision": body.revision, "unchanged": True}
+        plan = _plan(campaign)
+        plan["revision"] += 1
+        assignment = {**assignment, "group_id": group.id, "group_name": group.name,
+                      "requirement": group.requirement, "model": group.model, "revision": plan["revision"], "pinned": True}
+        item.render_overrides = {**before, **patch, ASSIGNMENT: assignment}
+        campaign.default_render_params = {**(campaign.default_render_params or {}), KEY: plan}
+        _log(db, campaign, "individual", current_user["id"], {"item_id": item.id, "before": before,
+              "after": item.render_overrides, "revision": plan["revision"]})
+        db.commit()
+        return {"revision": plan["revision"]}
+    except Exception:
+        db.rollback()
+        raise
 
 
 def campaign_jobs(db, campaign, *, job_id=None):

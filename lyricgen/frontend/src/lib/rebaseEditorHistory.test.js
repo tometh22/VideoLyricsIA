@@ -46,3 +46,15 @@ describe("undo history after durable merges", () => {
     expect(rebased.focusedId).toBeNull();
   });
 });
+
+it('keeps focus on a corrected legacy survivor after an earlier occurrence is deleted', () => {
+  const before=[{_id:0,segment_id:'16',start:1,end:2,text:'First'},{_id:1,segment_id:'16',start:3,end:4,text:'Second'}];
+  const after=[{...before[1],_id:9,text:'Second corrected'}];
+  expect(rebaseFocusedSegmentId(before,after,1)).toBe(9);
+});
+
+it('uses snapshot evidence instead of a new local React ID for an ID-less corrected row', () => {
+  const before=[{_id:1,start:3,end:4,text:'Second'}];
+  const after=[{_id:9,start:3,end:4,text:'Second corrected'}];
+  expect(rebaseFocusedSegmentId(before,after,1)).toBe(9);
+});
