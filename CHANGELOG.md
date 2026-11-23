@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.213] - 2026-11-23
+
+### Added
+- Report reused word timestamps, duplicate lyric captions and possible unrelated text during transcription and delivery review. The editor links each observation to the corresponding audio in the analyzed revision.
+- Add a read-only replay against verified UMG cuts and campaign snapshots.
+
 ## [1.1.212] - 2026-11-22
 
 ### Fixed
