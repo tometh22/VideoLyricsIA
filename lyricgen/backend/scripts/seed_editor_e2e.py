@@ -48,6 +48,7 @@ def seed_reviewer_candidate(db, user):
     db.flush()
     db.add(Job(job_id=job_id, user_id=user.id, tenant_id=TENANT_ID,
         campaign_id=campaign_id, campaign_item_id="e2erevieweritem",
+        workload_class="batch",
         artist="E2E Artist", song_title="Synthetic candidate", filename="reviewer.wav",
         style="oscuro", status="transcribed_pending", current_step="editing", progress=100,
         delivery_profile="youtube", segments_json=rows, segments_revision=0,
