@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.214] - 2026-11-23
+
+### Fixed
+- Keep structural lyric observations in the stored final-render review.
+- Recompute final-render QC once when background analysis updates only transcription quality during inspection. A different render, revision or operator decision still invalidates the report.
+
 ## [1.1.213] - 2026-11-23
 
 ### Added

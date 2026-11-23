@@ -2683,7 +2683,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             from delivery_qc_runtime import run_delivery_qc_for_job
             _delivery_qc_report = run_delivery_qc_for_job(
                 job_id, os.path.join(job_dir, "lyric_video.mp4"),
-                segments=segments,
+                segments=segments, retry_quality_change=True,
             )
             if _delivery_qc_report:
                 logger.info(
@@ -22476,7 +22476,7 @@ def run_edit_pipeline(
             from delivery_qc_runtime import run_delivery_qc_for_job
             _delivery_qc_report = run_delivery_qc_for_job(
                 job_id, os.path.join(job_dir, "lyric_video.mp4"),
-                segments=segments,
+                segments=segments, retry_quality_change=True,
             )
             if _delivery_qc_report:
                 logger.info(

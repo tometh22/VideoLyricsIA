@@ -184,6 +184,35 @@ def test_detector_input_change_discards_result(
     assert _stored(db, job_id) == initial_report
 
 
+@pytest.mark.parametrize("asset_changes", [False, True], ids=["same-video", "video-changed"])
+def test_render_worker_retries_once_with_fresh_quality(client, user_token, db, monkeypatch, asset_changes):
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    job_id = _job(client, user_token, db)
+    initial_report = _stored(db, job_id)
+    fresh_quality = {"decision": "review_required"}
+    snapshots = []
+
+    def build(**kwargs):
+        snapshots.append(kwargs["job"].transcription_quality)
+        if len(snapshots) == 1:
+            with database.SessionLocal() as concurrent:
+                job = concurrent.query(Job).filter(Job.job_id == job_id).one()
+                job.transcription_quality = fresh_quality
+                concurrent.commit()
+        artifact = "changed" if asset_changes and len(snapshots) > 1 else "same"
+        return {**_report(f"report-{len(snapshots)}"), "artifact_sha256": artifact}
+
+    monkeypatch.setattr(runtime, "build_runtime_report", build)
+    if asset_changes:
+        with pytest.raises(RuntimeError, match="^delivery_qc_input_changed$"):
+            runtime.run_delivery_qc_for_job(job_id, "unused.mp4", retry_quality_change=True)
+        assert _stored(db, job_id) == initial_report
+    else:
+        result = runtime.run_delivery_qc_for_job(job_id, "unused.mp4", retry_quality_change=True)
+        assert result["report_id"] == _stored(db, job_id)["report_id"] == "report-2"
+    assert len(snapshots) == 2 and snapshots[-1] == fresh_quality
+
+
 def test_concurrent_human_review_wins_over_detector_result(
     client, user_token, db, monkeypatch,
 ):
