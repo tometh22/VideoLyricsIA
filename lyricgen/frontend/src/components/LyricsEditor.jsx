@@ -4263,6 +4263,10 @@ export default function LyricsEditor({
   // enforce workflow.
   const campaignQualityReview = false;
   const qualityConfirmationActive = focusedQualityReview;
+  const lyricObservation = !isDirty && !qualityAnalysisPending && segmentsRevision != null
+    && transcriptionQuality?.evaluated_revision === segmentsRevision
+    ? transcriptionQuality.lyric_observation?.findings
+    : null;
   useEffect(() => {
     if (viewMode === "advanced" && !qualityGuidanceAvailable) {
       setTimingWorkspaceMode("timeline");
@@ -5643,6 +5647,24 @@ export default function LyricsEditor({
           onActivate={activateReviewItem}
           onOpenOfficial={editorRequest ? openPasteLyrics : null}
         />
+      )}
+
+      {lyricObservation?.length > 0 && (
+        <details className="mb-4 rounded-xl bg-white/[0.04] px-4 py-3 text-xs text-ink-secondary ring-1 ring-white/10">
+          <summary className="cursor-pointer font-semibold">
+            {t("editor.lyric_observation_title")} ({lyricObservation.length})
+          </summary>
+          <ul className="mt-2 space-y-1">
+            {lyricObservation.map(({ code, start, end, segment_indices: indices }) => (
+              <li key={`${code}-${indices.join("-")}`}>
+                <button type="button" className="rounded px-1 py-1 text-left hover:bg-white/10"
+                  onClick={() => seekTo(start, true)}>
+                  {formatTimestamp(start)}–{formatTimestamp(end)} · {t(`editor.lyric_observation_${code}`)}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
 
       {durableEditor.document?.quality_proposal && (

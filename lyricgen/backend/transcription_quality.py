@@ -14,6 +14,7 @@ from copy import deepcopy
 from typing import Iterable
 
 from evidence_attestation import verify_artifact
+from lyric_observation import build_lyric_observation
 
 
 POLICY_VERSION = "lyrics-quality-v6"
@@ -972,6 +973,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         "acoustic_evidence": acoustic_evidence,
         "reference_attestation": reference_attestation or None,
         "evidence_lineage": evidence_lineage,
+        "lyric_observation": build_lyric_observation(segments),
         "segments_hash": segments_hash(segments),
         **runtime_identity(),
     }

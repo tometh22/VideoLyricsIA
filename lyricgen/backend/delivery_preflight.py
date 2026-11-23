@@ -20,6 +20,8 @@ import re
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
+from lyric_observation import build_lyric_observation
+
 
 SCHEMA_VERSION = "genly-delivery-qc-v1"
 
@@ -889,5 +891,6 @@ def build_delivery_preflight(
         "upstream_quality": dict(quality or {}),
         "reference_health": dict(reference_health or {}),
         "acoustic_finding_count": len(acoustic_findings or []),
+        "lyric_observation": build_lyric_observation(segment_rows),
     }
     return _json_safe(report)
