@@ -15034,9 +15034,15 @@ def editor_text_preview(
     spec = (RenderSpec.umg_intermediate_master(job.umg_spec)
             if job.delivery_profile in ("umg", "both") and job.umg_spec
             else RenderSpec.youtube_default())
+    render_params = dict(job.render_params or {})
+    # Document lookup may migrate a legacy document and locks its rows.
+    # Release those locks before composing/returning: another async editor
+    # request can otherwise block the event loop waiting for dependency
+    # teardown to release this synchronous route's transaction.
+    db.commit()
     try:
         result = build_text_preview(body.segments, body.settings.model_dump(exclude_unset=True),
-                                    render_params=job.render_params, job_id=job_id, spec=spec)
+                                    render_params=render_params, job_id=job_id, spec=spec)
     except (ValueError, TypeError, OverflowError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return JSONResponse(result, headers={"Cache-Control": "no-store"})

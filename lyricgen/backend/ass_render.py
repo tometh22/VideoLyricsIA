@@ -697,7 +697,8 @@ def _word_timings(
     karaoke / word_reveal working on every song with a smooth, believable
     sweep instead of falling back to a different template.
 
-    Returns [] only for an empty/zero-length line (caller skips it)."""
+    Returns [] for empty lines or aligned words wholly outside the line's
+    window: known late/early audio must not be invented at the line start."""
     tokens = [t for t in (display or "").split() if t]
     if not tokens:
         return []
@@ -724,11 +725,16 @@ def _word_timings(
             if not (math.isfinite(raw_start) and math.isfinite(raw_end)):
                 ok = False
                 break
+            if raw_end <= raw_start:
+                ok = False
+                break
             ws = max(seg_start, raw_start)
             we = min(seg_end, raw_end)
             if we <= ws:
-                ok = False
-                break
+                # Valid absolute alignment outside this window is different
+                # from missing/malformed metadata. Keep the established
+                # conservative behavior instead of synthesizing early words.
+                return []
             cand.append({"word": tok, "start": ws, "end": we})
         if ok:
             # enforce monotonic non-overlap
@@ -799,6 +805,8 @@ def segments_to_lines(
             # Real timing if it survives the token-match guard, else synthesize
             # from the line window so the sweep works on every song.
             words = _word_timings(display, seg_start, seg_end, seg.get("words"))
+            if not words:
+                continue
         lines.append(AssLine(
             text=display,
             start_s=perceptual_start(seg_start, fade_dur),

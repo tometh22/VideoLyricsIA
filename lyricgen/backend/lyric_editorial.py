@@ -77,6 +77,10 @@ class EditorialRenderer:
         display = seg['display']
         tokens = display.split()
         timings = A._word_timings(display, seg['start'], seg['end'], seg.get('words'))
+        if not timings:
+            # Known alignment outside the line window has no audible words
+            # here. Keep row indexing stable without inventing an early onset.
+            return tokens, [seg['end']] * len(tokens)
         # Preserve alignment, including late/short words. Never jump a late word
         # back to the start of the phrase.
         starts = [max(seg['start'], min(seg['end'], float(t['start']) - .035)) for t in timings]

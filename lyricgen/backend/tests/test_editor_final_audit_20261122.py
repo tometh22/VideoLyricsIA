@@ -1,16 +1,39 @@
 """Local synthetic audit regressions; no live services or paid calls."""
-import math
 import pytest
 import ass_render
 
 
-def test_word_timing_survives_valid_line_move_without_out_of_window_words():
+def test_stale_absolute_word_clock_does_not_invent_an_early_word():
     row = {"segment_id": "moved", "text": "hola mundo", "start": 0, "end": 1,
            "words": [{"word": "hola", "start": 5, "end": 6},
                      {"word": "mundo", "start": 6, "end": 7}]}
-    line = ass_render.segments_to_lines([row], text_scale=1, animation="word_reveal")[0]
-    assert all(math.isfinite(w["start"]) and math.isfinite(w["end"])
-               and row["start"] <= w["start"] < w["end"] <= row["end"] for w in line.words), line.words
+    assert ass_render.segments_to_lines([row], text_scale=1, animation="word_reveal") == []
+
+
+def test_preview_releases_editor_transaction_before_composing(client, monkeypatch):
+    import main
+    from tests.test_editor_documents import _users_and_job, _token_for
+    monkeypatch.setenv("EDITOR_V2_GLOBALLY_ENABLED", "1")
+    user, _, job_id = _users_and_job("synthetic_preview_transaction")
+    lookup, compose = main._editor_document_or_404, main.build_text_preview
+    sessions = []
+
+    def record_session(db, *args):
+        result = lookup(db, *args)
+        assert db.in_transaction()
+        sessions.append(db)
+        return result
+
+    def compose_without_locks(*args, **kwargs):
+        assert sessions and not sessions[-1].in_transaction()
+        return compose(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_editor_document_or_404", record_session)
+    monkeypatch.setattr(main, "build_text_preview", compose_without_locks)
+    response = client.post(f"/editor/{job_id}/text-preview",
+        headers={"Authorization": f"Bearer {_token_for(user)}"},
+        json={"segments": [{"text": "Preview sintético", "start": 0, "end": 1}]})
+    assert response.status_code == 200, response.text
 
 
 @pytest.mark.parametrize("bad_start", [None, "missing-time"])

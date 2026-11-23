@@ -3,6 +3,7 @@
 ## [1.1.212] - 2026-11-22
 
 ### Fixed
+- Release document locks before composing a text preview so simultaneous editor saves/proposal adoption cannot deadlock the API; preserve conservative handling of aligned words outside their line window across every animated look.
 - Preserve lyric occurrences and independent text/timing corrections during concurrent editor saves: collision-free internal keys, base-aware matching for duplicated or missing legacy IDs, atomic timing intervals and conservative handling of ambiguous identities. Reconciliation retains typing made while a quality proposal is pending, including after a failed or lost response.
 - Persist intentional deletion of the final legacy line and recover versioned empty drafts without treating an evicted editor store as a deletion. Never replay a stale empty draft without its base over newly saved remote rows. Keep Space playback working from campaign navigation rows.
 - Keep editor snapshots in chronological order without deleting rows or repairing operator timings. Bound manual start edits inside the audio; move absolute word clocks with a line and invalidate incompatible word timing after trims while retaining optional repeat-timing suggestions.
