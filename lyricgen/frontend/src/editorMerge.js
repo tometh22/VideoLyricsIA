@@ -98,19 +98,35 @@ function identityGroup(segment) {
 // literal ID. Match legacy occurrences against BASE rather than renumbering
 // each snapshot after a delete. Only unique evidence authorizes a match;
 // ambiguous rows remain distinct additions instead of overwriting a survivor.
-function alignOccurrences(base, rows, baseKeys) {
+function alignOccurrences(base, rows, baseKeys, peerRows) {
   const keys = Array(rows.length);
   const ambiguousBase = new Set();
   const baseGroups = new Map();
   const groups = new Map();
+  const peerCounts = new Map();
   const group = (map, id, index) => {
     if (!map.has(id)) map.set(id, []);
     map.get(id).push(index);
   };
   base.forEach((row, index) => group(baseGroups, identityGroup(row), index));
   rows.forEach((row, index) => group(groups, identityGroup(row), index));
+  peerRows.forEach(row => {
+    const id = identityGroup(row);
+    peerCounts.set(id, (peerCounts.get(id) || 0) + 1);
+  });
   const fingerprint = row => JSON.stringify(stableValue(comparable(row)));
   for (const [id, indices] of groups) {
+    // A newly minted durable identity can already exist remotely after a
+    // committed save whose response was lost. Further typing changes its
+    // fingerprint, not its identity. Only pair IDs unique in BOTH snapshots
+    // and absent from base; known historical collisions retain occurrence
+    // matching below. Never pair ID-less additions by this rule.
+    const durable = rows[indices[0]]?.segment_id ?? rows[indices[0]]?.id;
+    if (durable != null && !baseGroups.has(id)
+      && indices.length === 1 && peerCounts.get(id) === 1) {
+      keys[indices[0]] = JSON.stringify([id, "added-durable"]);
+      continue;
+    }
     const available = new Set(baseGroups.get(id) || []);
     const pending = new Set(indices);
     const match = (index, baseIndex) => {
@@ -210,8 +226,8 @@ function indexed(segments, keys) {
  */
 export function mergeThreeWay(base = [], local = [], remote = []) {
   const baseKeys = base.map((row, index) => JSON.stringify([keyOf(row, index), "base", index]));
-  const localAlignment = alignOccurrences(base, local, baseKeys);
-  const remoteAlignment = alignOccurrences(base, remote, baseKeys);
+  const localAlignment = alignOccurrences(base, local, baseKeys, remote);
+  const remoteAlignment = alignOccurrences(base, remote, baseKeys, local);
   const localKeys = localAlignment.keys;
   const remoteKeys = remoteAlignment.keys;
   const baseMap = indexed(base, baseKeys);

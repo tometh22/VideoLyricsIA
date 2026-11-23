@@ -43,3 +43,30 @@ it('merges a local text correction with a remote timing correction on the same r
  expect(patches).toHaveLength(2);expect(patches[1].base_revision).toBe(2);
  expect(stored[0]).toMatchObject({text:'Una frase corregida',start:1,end:4});
 });
+
+it('reconciles further typing on an inserted line after its save commits but the response is lost',async()=>{
+ const base=[{segment_id:'existing',text:'Existing line',start:1,end:2}];
+ const inserted={segment_id:'n-synthetic-insertion-1',text:'Initial insertion',start:3,end:4};
+ let stored=base,revision=1;const patches=[];
+ const request=vi.fn(async(path,options={})=>{
+  if(path.endsWith('/lock/heartbeat'))return reply({acquired:true});
+  if(options.method==='DELETE')return reply({released:true});
+  if(!options.method)return reply({job_id:'synthetic-lost-insertion',revision,segments:stored});
+  const body=JSON.parse(options.body);patches.push(body);
+  expect(body.base_revision).toBe(revision);
+  stored=body.segments;revision++;
+  if(patches.length===1)throw new TypeError('Synthetic response lost after commit');
+  return reply({revision,applied:true});
+ });
+ const {result}=renderHook(()=>useEditorDocument({jobId:'synthetic-lost-insertion',enabled:true,request}));
+ await waitFor(()=>expect(result.current.loading).toBe(false));
+ let save,recovery;
+ await act(async()=>{save=await result.current.save([...base,inserted]);});
+ expect(save.ok).toBe(false);
+ await act(async()=>{recovery=await result.current.reconcile([...base,{...inserted,text:'Further typing after insertion'}]);});
+ expect(recovery.mergedSegments).toHaveLength(2);
+ await act(async()=>{expect((await result.current.save(recovery.mergedSegments)).ok).toBe(true);});
+ expect(patches.map(body=>body.base_revision)).toEqual([1,2]);
+ expect(stored.filter(row=>row.segment_id===inserted.segment_id)).toEqual([expect.objectContaining({...inserted,text:'Further typing after insertion'})]);
+ expect(stored[0]).toMatchObject(base[0]);
+});

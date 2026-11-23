@@ -142,9 +142,26 @@ it('merges a local start and a remote text without mixing opposing timing edges'
 });
 
 it('preserves concurrent additions with the same historical ID but different content', () => {
-  const local=[{segment_id:'16',start:1,end:2,text:'Local addition'}];
-  const remote=[{segment_id:'16',start:3,end:4,text:'Remote addition'}];
-  expect(mergeThreeWay([],local,remote).merged.map(row=>row.text)).toEqual(['Local addition','Remote addition']);
+  const base=[{segment_id:'16',start:0,end:.5,text:'Existing historical identity'}];
+  const local=[...base,{segment_id:'16',start:1,end:2,text:'Local addition'}];
+  const remote=[...base,{segment_id:'16',start:3,end:4,text:'Remote addition'}];
+  expect(mergeThreeWay(base,local,remote).merged.map(row=>row.text)).toEqual(['Existing historical identity','Local addition','Remote addition']);
+});
+
+it('matches a unique inserted identity after a committed response was lost', () => {
+  const inserted={segment_id:'n-synthetic-1',start:1,end:2,text:'Initial insertion'};
+  const result=mergeThreeWay([], [{...inserted,text:'Further local typing'}], [inserted]);
+  expect(result.merged).toHaveLength(1);
+  expect(result.merged[0]).toMatchObject({...inserted,text:'Further local typing'});
+  expect(result.conflicts).toHaveLength(1);
+});
+
+it('preserves genuinely duplicated added identities absent from base', () => {
+  const original=[{segment_id:'16',start:1,end:2,text:'First legacy copy'},
+    {segment_id:'16',start:3,end:4,text:'Second legacy copy'}];
+  const result=mergeThreeWay([], original, original);
+  expect(result.merged.map(row=>row.text)).toEqual(original.map(row=>row.text));
+  expect(result.conflicts).toHaveLength(0);
 });
 
 it('keeps a remote correction when a previous duplicate was removed on either side', () => {
