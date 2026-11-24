@@ -52,6 +52,9 @@ MAX_MEDIA_MS = 86_400_000
 SIGNED_NUMBERS = {"delta_ms", "proposed_delta_ms", "chosen_delta_ms", "distance_to_proposal_ms"}
 BOOLEANS = {"unsaved_changes", "quality_acknowledged", "automatic_recovery_available"}
 ENUMS = {
+    "choice": {"current", "proposed", "neither"},
+    "variant_a": {"current", "proposed"},
+    "first_heard": {"current", "proposed"},
     "line_context": {"target", "selected", "none"},
     "review_marker": {"review", "quality_window", "both", "none", "unknown"},
     "kind": {"generated", "shown", "examined", "active_seconds"},
