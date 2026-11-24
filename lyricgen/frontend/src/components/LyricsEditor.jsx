@@ -1256,8 +1256,8 @@ export default function LyricsEditor({
   }
   const telemetryFailureReportedRef = useRef(false);
   const trackEditorEvent = useCallback((name, properties = {}, { keepalive = false, sessionId = editorSessionIdRef.current } = {}) => {
-    if (!editorRequest || !transcribeJobId) return;
-    editorRequest("/analytics/events", {
+    if (!editorRequest || !transcribeJobId) return Promise.resolve(false);
+    return editorRequest("/analytics/events", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       ...(keepalive ? { keepalive: true } : {}),
@@ -1274,12 +1274,15 @@ export default function LyricsEditor({
       if (!response.ok || receipt.accepted !== 1 || receipt.rejected !== 0) {
         throw new Error("editor_telemetry_not_accepted");
       }
+      return true;
     }).catch(() => {
       // Once per mounted editor, with no event payload/lyrics in diagnostics.
       // Analytics failure must never interrupt playback or human editing.
-      if (telemetryFailureReportedRef.current) return;
-      telemetryFailureReportedRef.current = true;
-      captureHandledError(new Error("editor_telemetry_not_accepted"), { event_name: name });
+      if (!telemetryFailureReportedRef.current) {
+        telemetryFailureReportedRef.current = true;
+        captureHandledError(new Error("editor_telemetry_not_accepted"), { event_name: name });
+      }
+      return false;
     });
   }, [editorRequest, transcribeJobId]);
   const shownOperatorProposalRef = useRef("");
@@ -4420,6 +4423,25 @@ export default function LyricsEditor({
   )), [maskedCandidateSegmentIds, sanitizedEdited, t]);
 
   const selectedPreviewSegment = previewSegments.find(segment => segment._id === focusedSegId) || previewSegments[0];
+  const nativePreviewSettings = {
+    ...buildResolveBody({ look: selectedLook,
+      genre: variantValues.lyricGenre, variant: variantValues.lyricVariant,
+      fontMain: variantValues.lyricFontMain, fontKey: variantValues.lyricFontKey,
+      color: variantValues.lyricColor, altColor: variantValues.lyricAltColor,
+      accentColor: variantValues.lyricAccentColor }),
+    font: selectedFont, text_case: selectedCase, text_contrast: selectedContrast,
+    font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
+  };
+  const comparisonSource = durableEditor.document?.quality_proposal && editorRequest && transcribeJobId
+    && !isDirty && audioUrl && audioMetadataReady && !audioError
+    && new URLSearchParams(window.location.search).get("timing_ab") === "1"
+    ? {
+      segments: durableEditor.document.segments, duration, jobId: transcribeJobId, audioUrl,
+      backgroundUrl: previewBgUrl, settings: nativePreviewSettings, request: editorRequest,
+      onOpen: stopGuidedPlayback,
+      onDecision: (properties) => trackEditorEvent("editor_timing_ab_decided", properties, { keepalive: true }),
+    }
+    : undefined;
 
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
@@ -5678,6 +5700,7 @@ export default function LyricsEditor({
             onObserve={observeQualityProposal}
             onRejectWindow={rejectQualityProposalWindow}
             onReviewTelemetry={(properties) => trackEditorEvent("editor_reviewer_candidate", properties)}
+            comparisonSource={comparisonSource}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}
@@ -7060,14 +7083,7 @@ export default function LyricsEditor({
                     currentTime={isPlaying ? currentTime : (selectedPreviewSegment ? selectedPreviewSegment.start + Math.min(0.5, (selectedPreviewSegment.end - selectedPreviewSegment.start) / 2) : currentTime)}
                     isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
                     jobId={transcribeJobId} request={editorRequest}
-                    settings={{ ...buildResolveBody({ look: selectedLook,
-                      genre: variantValues.lyricGenre, variant: variantValues.lyricVariant,
-                      fontMain: variantValues.lyricFontMain, fontKey: variantValues.lyricFontKey,
-                      color: variantValues.lyricColor, altColor: variantValues.lyricAltColor,
-                      accentColor: variantValues.lyricAccentColor }),
-                      font: selectedFont, text_case: selectedCase, text_contrast: selectedContrast,
-                      font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
-                    }}
+                    settings={nativePreviewSettings}
                     onFontResolved={(code) => { if (!selectedFont) { setSelectedFont(code); onFontChange?.(code); } }}
                   /> : <>
                   <LyricVideoPreview segments={isPlaying ? previewSegments : (selectedPreviewSegment ? [selectedPreviewSegment] : [])} currentTime={isPlaying ? currentTime : (selectedPreviewSegment?.start ?? currentTime)} isPlaying={isPlaying}

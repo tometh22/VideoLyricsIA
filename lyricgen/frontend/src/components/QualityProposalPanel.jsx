@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import useReviewerCandidateTelemetry from "./useReviewerCandidateTelemetry";
+import QualityComparisonDialog from "./QualityComparisonDialog";
+import { buildQualityComparison } from "../lib/qualityComparison";
 
 const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled", "observed"]);
 
@@ -119,6 +121,7 @@ export default function QualityProposalPanel({
   onObserve,
   onRejectWindow,
   onReviewTelemetry,
+  comparisonSource,
   applying = false,
   dismissing = false,
   observing = false,
@@ -127,6 +130,7 @@ export default function QualityProposalPanel({
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
   const [hiddenUnavailableKey, setHiddenUnavailableKey] = useState(null);
   const [clock, setClock] = useState(() => Date.now());
+  const [comparisonId, setComparisonId] = useState(null);
   const telemetryRoot = useReviewerCandidateTelemetry(proposal, onReviewTelemetry);
 
   const windows = useMemo(
@@ -155,10 +159,23 @@ export default function QualityProposalPanel({
     && String(currentRevision) !== String(proposal.base_revision)
   );
   const unavailable = stale || expired || closed;
+  const comparisonSegments = comparisonSource?.segments;
+  const comparisonDuration = comparisonSource?.duration;
+  const comparisons = useMemo(() => {
+    if (!comparisonSegments || unavailable) return new Map();
+    return new Map(windows.filter(window => window?.id != null).map(window => [
+      window.id, buildQualityComparison(comparisonSegments, window, comparisonDuration),
+    ]).filter(([, comparison]) => comparison));
+  }, [comparisonDuration, comparisonSegments, unavailable, windows]);
 
   useEffect(() => {
     setSelectedKeys(new Set());
+    setComparisonId(null);
   }, [proposal?.id, proposal?.base_revision]);
+
+  useEffect(() => {
+    if (!comparisons.has(comparisonId)) setComparisonId(null);
+  }, [comparisonId, comparisons]);
 
   useEffect(() => {
     const validKeys = new Set(windowEntries.map((entry) => entry.key));
@@ -309,17 +326,11 @@ export default function QualityProposalPanel({
           const currentEnd = asFiniteNumber(proposalWindow?.current_end);
           const proposedEnd = asFiniteNumber(proposalWindow?.proposed_end);
           const previewStart = asFiniteNumber(proposalWindow?.preview_start ?? proposalWindow?.start);
+          const comparison = comparisons.get(proposalWindow?.id);
 
-          return (
-            <article
-              key={key}
-              data-reviewer-receipt={proposalWindow.telemetry_id || undefined}
-              className={`rounded-2xl border p-3 transition-colors sm:p-4 ${
-                checked ? "border-cyan-300/50 bg-cyan-950/20" : "border-white/10 bg-white/[0.025]"
-              }`}
-              data-testid={`quality-proposal-window-${key}`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
+          const details = (
+            <>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                 <label className="flex min-w-0 items-center gap-3 text-sm font-semibold text-white">
                   {!observationOnly && <input
                     type="checkbox"
@@ -455,6 +466,31 @@ export default function QualityProposalPanel({
                   </button>
                 </div>
               )}
+            </>
+          );
+          return (
+            <article key={key} data-reviewer-receipt={proposalWindow.telemetry_id || undefined}
+              className={`rounded-2xl border p-3 transition-colors sm:p-4 ${
+                checked ? "border-cyan-300/50 bg-cyan-950/20" : "border-white/10 bg-white/[0.025]"
+              }`}
+              data-testid={`quality-proposal-window-${key}`}>
+              {comparison ? (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className="text-sm font-semibold text-white">{label}</span>
+                    <button type="button" disabled={busy}
+                      className="rounded-lg border border-cyan-300/40 px-3 py-1.5 text-xs font-semibold text-cyan-100 disabled:opacity-50"
+                      onClick={() => {
+                        comparisonSource.onOpen();
+                        setComparisonId(proposalWindow.id);
+                      }}>Comparar A/B</button>
+                  </div>
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-xs text-gray-300">Ver valores de la propuesta</summary>
+                    {details}
+                  </details>
+                </>
+              ) : details}
             </article>
           );
         })}
@@ -487,6 +523,23 @@ export default function QualityProposalPanel({
         </div>
       </div>}
       </details>
+      {comparisons.has(comparisonId) && (
+        <QualityComparisonDialog
+          key={JSON.stringify([proposal.id, proposal.base_revision, comparisonId])}
+          comparison={comparisons.get(comparisonId)}
+          jobId={comparisonSource.jobId}
+          audioUrl={comparisonSource.audioUrl}
+          backgroundUrl={comparisonSource.backgroundUrl}
+          settings={comparisonSource.settings}
+          request={comparisonSource.request}
+          onClose={() => setComparisonId(null)}
+          onDecision={properties => comparisonSource.onDecision({
+            ...properties, proposal_id: proposal.id, window_id: comparisonId, revision: proposal.base_revision,
+          })}
+          onApply={!observationOnly && onApplySelected ? () => onApplySelected([comparisonId], proposal) : undefined}
+          applying={busy}
+        />
+      )}
     </section>
   );
 }

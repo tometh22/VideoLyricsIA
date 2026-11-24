@@ -15799,7 +15799,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
     "editor_reviewer_candidate", "editor_auto_repair_undone",
-    "editor_line_structure_changed", "editor_audio_played",
+    "editor_line_structure_changed", "editor_audio_played", "editor_timing_ab_decided",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -15815,6 +15815,10 @@ _EDITOR_SEEK_PROPERTIES = {
     "segment_id", "line_index",
 }
 _PRODUCT_EVENT_PROPERTIES = {
+    "editor_timing_ab_decided": {
+        "proposal_id", "window_id", "revision", "choice", "variant_a",
+        "first_heard", "position_ms", "duration_ms", "event_id",
+    },
     "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
     "editor_auto_repair_undone": {"to_revision"},
     # Partir/unir: cuántas líneas usaron el timing real por palabra y cuántas

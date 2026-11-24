@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.217] - 2026-11-24
+
+### Added
+- Opt-in blind A/B review for bounded, revision-matched lyric proposals. Compare both versions on the same audio and native subtitle preview, record the reviewer's choice, then apply a selected proposal explicitly.
+
 ## [1.1.216] - 2026-11-24
 
 ### Fixed

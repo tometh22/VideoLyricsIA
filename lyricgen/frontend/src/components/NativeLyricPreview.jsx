@@ -18,7 +18,7 @@ async function loadFont(request, filename) {
 // track built by compose_lyric_overlay and the very same bundled font files.
 // Always draw at the video resolution; CSS only scales the finished image.
 export default function NativeLyricPreview({ segments, settings, jobId, request, currentTime,
-  backgroundUrl = null, isPlaying = false, onFontResolved }) {
+  backgroundUrl = null, isPlaying = false, onFontResolved, onStateChange }) {
   const { t } = useI18n();
   const frame = useRef(null);
   const host = useRef(null);
@@ -31,14 +31,18 @@ export default function NativeLyricPreview({ segments, settings, jobId, request,
   const chain = useRef(Promise.resolve());
   const clock = useRef(currentTime);
   const resolved = useRef(onFontResolved);
+  const notifyState = useRef(onStateChange);
   clock.current = currentTime;
   resolved.current = onFontResolved;
+  notifyState.current = onStateChange;
   const [state, setState] = useState("loading");
   const [retry, setRetry] = useState(0);
   const body = JSON.stringify({ segments, settings });
   const spokenText = segments.filter(line => currentTime >= Number(line.start) && currentTime < Number(line.end))
     .map(line => applyCase(line.text || "", settings.text_case || "upper")).join(" / ");
   const imageLabel = `${t("review_workspace.render_preview") || "Vista previa del texto del video"}${spokenText ? `: ${spokenText}` : ""}`;
+
+  useEffect(() => { notifyState.current?.(state); }, [state]);
 
   useEffect(() => {
     let alive = true;
