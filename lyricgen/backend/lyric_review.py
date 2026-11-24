@@ -134,7 +134,7 @@ KIND_GROUP = {
     "chorus_propagate": "chorus", "question_marks": "style",
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
-    "timing": "timing", "phrase_structure": "layout",
+    "timing": "timing", "phrase_structure": "layout", "reference_boundary": "layout",
     "timing_early_start": "timing", "timing_late_start": "timing",
     "timing_early_end": "timing", "timing_no_voice": "timing",
     "terminal_period": "style", "parentheses": "style", "accent_missing": "style",
@@ -1714,6 +1714,7 @@ def build_review(
     official_text: str | None = None,
     memory_pairs: dict[str, str] | None = None,
     portal: str | None = None,
+    official_origin: str = "",
 ) -> dict:
     """Todos los puntos de la letra actual, listos para el editor.
 
@@ -1840,6 +1841,16 @@ def build_review(
     items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_clean), vocabulary))
     items.extend(_rule_orphans(segments))
     items.extend(_rule_phrase_structure(segments))
+    if official_origin in {"operator", "sheet"}:
+        from reference_lines import crossed_reference_boundaries
+
+        items.extend({
+            "kind": "reference_boundary", "line": line, "required": True,
+            "title": "Corte de verso pendiente",
+            "why": "Este cartel une palabras de dos versos consecutivos de la letra oficial. Escuchá el tramo y corregí el corte.",
+            "sources": {"official"}, "fix": {"type": "inspect_structure"},
+            "listen": True, "action": "Escuchar", "dismiss": "Está bien así",
+        } for line in crossed_reference_boundaries(segments, official_text or ""))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
     # Sincronización: detrás de LYRIC_REVIEW_TIMING_MODE (observe por defecto).

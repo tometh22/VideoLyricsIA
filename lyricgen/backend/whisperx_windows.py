@@ -7,9 +7,11 @@ independently, without a lyric prompt or a language inherited from a neighbor.
 from __future__ import annotations
 
 from copy import deepcopy
+from itertools import groupby
 import logging
 import math
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -18,6 +20,25 @@ logger = logging.getLogger("genly.whisperx.windows")
 POLICY = "vocal-windows-v1"
 MAX_WINDOW_S = 26.0
 MIN_LANGUAGE_PROBABILITY = 0.60
+_CHARACTER_LOOP = re.compile(r"([^\W\d_])\1{29,}", re.IGNORECASE)
+
+
+def _pathological_repetition(row: dict) -> bool:
+    """Catch decoder loops that lack word timing, preserving timed refrains."""
+    text = str(row.get("text") or "")
+    if _CHARACTER_LOOP.search(text):
+        return True
+    if row.get("words"):
+        return False
+    try:
+        duration = float(row["end"]) - float(row["start"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not math.isfinite(duration) or duration <= 0:
+        return False
+    tokens = re.findall(r"[^\W_]+", text.casefold())
+    return any(count >= 20 and count / duration > 4.0
+               for count in (sum(1 for _ in group) for _, group in groupby(tokens)))
 
 
 def plan_windows(regions, duration: float) -> list[tuple[float, float]]:
@@ -166,7 +187,17 @@ def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: flo
                     family="openai/whisper-1", events=retry, view="bounded_vocal_window",
                     transformation=f"language_retry_raw:offset={start:.3f};end={end:.3f};language={retry_language}",
                 )
-                raw = retry
+                if any(_pathological_repetition(row) for row in retry):
+                    original = absolute_segments(raw, start, end)
+                    if (not original or len(original) != len(raw) or any(
+                        not row.get("words") or _pathological_repetition(row)
+                        or _is_whisper_hallucination(str(row.get("text") or ""))
+                        for row in original
+                    )):
+                        raise RuntimeError("Vocal window recovery produced a repetition loop; refusing partial transcription")
+                    logger.warning("[WHISPERX-WINDOW] structurally invalid retry at %.2f-%.2f; keeping timed evidence", start, end)
+                else:
+                    raw = retry
             # Credits generated on silence are not lyrics. Empty neural-VAD
             # windows are legitimate; transport errors above are not silence.
             raw = [s for s in raw if not _is_whisper_hallucination(str(s.get("text") or ""))]
