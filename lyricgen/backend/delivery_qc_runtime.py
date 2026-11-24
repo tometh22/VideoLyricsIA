@@ -794,6 +794,7 @@ def build_runtime_report(
         "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
         "summary": summary, "check_summary": check_summary,
         "checks": checks, "issues": issues,
+        "lyric_observation": base["lyric_observation"],
         # Missing automation is explicit in each check as NOT_RUN. It can no
         # longer masquerade as a failed video or silently become a pass.
         "abstentions": [],
@@ -817,20 +818,22 @@ def build_runtime_report(
     return report
 
 
-def qc_input_identity(job):
+def qc_input_identity(job, *, include_quality=True):
     from delivery_freshness import render_fingerprint
     return (render_fingerprint(job), getattr(job, "segments_revision", 0),
             segments_hash(getattr(job, "segments_json", None) or []), getattr(job, "audio_revision", 0),
             getattr(job, "input_audio_sha256", None), deepcopy(getattr(job, "umg_spec", None)), getattr(job, "artist", None), getattr(job, "song_title", None),
-            deepcopy(getattr(job, "transcription_quality", None)), getattr(job, "filename", None), getattr(job, "workload_class", "interactive"),
+            deepcopy(getattr(job, "transcription_quality", None)) if include_quality else None,
+            getattr(job, "filename", None), getattr(job, "workload_class", "interactive"),
             (getattr(job, "s3_keys", None) or {}).get('video') if isinstance(getattr(job, "s3_keys", None), dict) else None,
             effective_delivery_qc_mode())
 
 
 def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
                             expected_input=None, expected_source_fingerprint=None,
-                            mode_override=None, force=False) -> dict[str, Any] | None:
-    """Run and persist QC from a render worker. Never raises in observe mode."""
+                            mode_override=None, force=False,
+                            retry_quality_change=False) -> dict[str, Any] | None:
+    """Persist QC only while its inputs and prior review still match."""
     from database import Job, SessionLocal
     from types import SimpleNamespace
     db = SessionLocal()
@@ -851,37 +854,56 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
             return None
         rows = list(segments if segments is not None else (job.segments_json or []))
         previous = deepcopy(job.delivery_qc) if isinstance(job.delivery_qc, Mapping) else None
-        expected = qc_input_identity(job)
-        snapshot = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
-            'artist', 'song_title', 'filename', 'status', 'umg_spec', 'segments_revision',
-            'edit_count', 'transcription_quality', 'workload_class',
-            'audio_revision', 'input_audio_sha256', 'delivery_profile', 'prores_ready',
-            's3_keys', 'segments_json', 'render_params', 'scene_plan', 'background_key',
-            'job_id', 'previous_versions', 'completed_at', 'validation_result')})
-        db.rollback()
-        report = build_runtime_report(job=snapshot, video_path=video_path, segments=rows, previous=previous, mode_override=mode_override)
-        from delivery_acoustic_qc import build_acoustic_checks
-        acoustic, acoustic_issues = build_acoustic_checks(snapshot, rows, video_path)
-        if acoustic:
-            report["acoustic"] = acoustic
-            report["issues"].extend(_normalise_issue(item, fps=30.0) for item in acoustic_issues)
-            report["summary"]["issue_count"] = len(report["issues"])
-            report["summary"]["open_count"] = sum(item.get("status") == "OPEN" for item in report["issues"])
-            report["summary"]["fail_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "FAIL" for item in report["issues"])
-            report["summary"]["warn_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "REVIEW" for item in report["issues"])
-            report["approval"] = delivery_readiness_gate(
-                snapshot, report,
-                for_umg_delivery=(mode_override == "enforce" or is_umg_delivery_job(snapshot)),
+        can_retry = retry_quality_change and expected_input is None and expected_source_fingerprint is None
+        stable_inputs = (qc_input_identity(job, include_quality=False), delivery_qc_visual_fingerprint(job))
+        initial_artifact = None
+        while True:
+            expected = qc_input_identity(job)
+            snapshot = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
+                'artist', 'song_title', 'filename', 'status', 'umg_spec', 'segments_revision',
+                'edit_count', 'transcription_quality', 'workload_class',
+                'audio_revision', 'input_audio_sha256', 'delivery_profile', 'prores_ready',
+                's3_keys', 'segments_json', 'render_params', 'scene_plan', 'background_key',
+                'job_id', 'previous_versions', 'completed_at', 'validation_result')})
+            db.rollback()
+            report = build_runtime_report(
+                job=snapshot, video_path=video_path, segments=rows, previous=previous, mode_override=mode_override,
             )
-        job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
-        if job is None or expected != qc_input_identity(job):
-            raise RuntimeError('delivery_qc_input_changed')
-        if job.delivery_qc != previous:
-            # A concurrent human decision/recheck wins over this stale run.
-            raise RuntimeError('delivery_qc_review_changed')
-        job.delivery_qc = report
-        db.commit()
-        return report
+            artifact = report.get("artifact_sha256")
+            if initial_artifact is not None and artifact != initial_artifact:
+                raise RuntimeError('delivery_qc_input_changed')
+            from delivery_acoustic_qc import build_acoustic_checks
+            acoustic, acoustic_issues = build_acoustic_checks(snapshot, rows, video_path)
+            if acoustic:
+                report["acoustic"] = acoustic
+                report["issues"].extend(_normalise_issue(item, fps=30.0) for item in acoustic_issues)
+                report["summary"]["issue_count"] = len(report["issues"])
+                report["summary"]["open_count"] = sum(item.get("status") == "OPEN" for item in report["issues"])
+                report["summary"]["fail_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "FAIL" for item in report["issues"])
+                report["summary"]["warn_count"] = sum(item.get("status") == "OPEN" and _issue_result_status(item) == "REVIEW" for item in report["issues"])
+                report["approval"] = delivery_readiness_gate(
+                    snapshot, report,
+                    for_umg_delivery=(mode_override == "enforce" or is_umg_delivery_job(snapshot)),
+                )
+            job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+            if job is None:
+                raise RuntimeError('delivery_qc_input_changed')
+            if job.delivery_qc != previous:
+                # A concurrent human decision/recheck wins over this stale run.
+                raise RuntimeError('delivery_qc_review_changed')
+            current_inputs = (qc_input_identity(job, include_quality=False), delivery_qc_visual_fingerprint(job))
+            if current_inputs != stable_inputs:
+                raise RuntimeError('delivery_qc_input_changed')
+            if expected == qc_input_identity(job):
+                job.delivery_qc = report
+                db.commit()
+                return report
+            # A quality worker may finish during final-render QC. Recalculate
+            # once using the fresh evidence and the exact same encoded file.
+            if not can_retry or not artifact:
+                raise RuntimeError('delivery_qc_input_changed')
+            initial_artifact = artifact
+            can_retry = False
     except Exception:
         db.rollback()
         raise
