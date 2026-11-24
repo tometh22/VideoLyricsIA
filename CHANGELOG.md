@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.216] - 2026-11-24
+
+### Fixed
+- Preserve timed vocal evidence when an independent language retry returns an extreme decoder loop.
+- Prioritize caption boundaries that cross verified consecutive lines of an operator or workbook lyric reference, including partial references.
+
 ## [1.1.215] - 2026-11-23
 
 ### Fixed
