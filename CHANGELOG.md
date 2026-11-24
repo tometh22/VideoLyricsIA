@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Use the final-render lyric compositor, bundled fonts and real editor clock in the individual wizard’s lyric review, matching campaign review. Keep masked text and pending hydration inside the editor’s ownership; retain illustrative previews before a persisted editor job exists. The background remains a reference until generation.
+
 ## [1.1.213] - 2026-11-23
 
 ### Added

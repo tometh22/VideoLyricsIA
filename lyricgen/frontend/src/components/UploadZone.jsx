@@ -253,6 +253,8 @@ export default function UploadZone({
   // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
   // bar, así la columna de la letra queda full y se scrollea menos.
   onPlayerSlotRef = null,
+  onPreviewSlotRef = null,
+  nativeReviewPreview = false,
   // Post-render edit mode (App.jsx EditLyricsRoute):
   // - lockedSteps: IDs de pasos no navegables (típicamente [1,2,3,5] en
   //   modo edición de un job ya renderizado — esos cambios requieren
@@ -4299,6 +4301,8 @@ export default function UploadZone({
               )}
               <span className="absolute top-2 left-2 text-[10px] uppercase tracking-[0.18em] text-white/70">{t("upload.video_type_art") || "Art Track"}</span>
             </div>
+          ) : isStep6 && nativeReviewPreview ? (
+            <div data-testid="editor-native-preview-slot" ref={onPreviewSlotRef} className="min-w-0 rounded-xl overflow-hidden bg-surface-2" />
           ) : (bgMode === "auto" || bgMode === "library" || (bgMode === "custom" && customPreviewUrl)) ? (
             <WizardLivePreview
               style={style}
@@ -4405,7 +4409,7 @@ export default function UploadZone({
           )}
           <p className="text-[10px] text-gray-600 px-1">
             {isStep6
-              ? "La letra resaltada sigue el reproductor; esta vista muestra la línea activa durante la reproducción."
+              ? (nativeReviewPreview ? "Letra y cortes del render final. El fondo es de referencia hasta generarlo." : "La letra resaltada sigue el reproductor; esta vista muestra la línea activa durante la reproducción.")
               : (_previewLyric
                 ? `Referencia de letra: ${_previewLyric}${files.length > 1 ? ` · +${files.length - 1}` : ""}`
                 : (t("upload.preview_disclaimer") || "Aproximación del mood y el movimiento. El fondo final lo genera la IA."))}

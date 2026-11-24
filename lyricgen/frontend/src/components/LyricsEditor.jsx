@@ -841,6 +841,7 @@ export default function LyricsEditor({
   // El estado del audio (isPlaying/currentTime/etc.) NO se mueve — solo el
   // DOM del control, vía React portal.
   playerSlot = null,
+  previewSlot = null,
 }) {
   const { t } = useI18n();
   const [transcriptionQuality, setTranscriptionQuality] = useState(transcriptionQualityProp);
@@ -4421,6 +4422,26 @@ export default function LyricsEditor({
 
   const selectedPreviewSegment = previewSegments.find(segment => segment._id === focusedSegId) || previewSegments[0];
 
+  // Render from the editor's masked live snapshot and clock, including when
+  // the wizard hosts the preview in a separate column. Never use raw App rows.
+  const nativePreview = editorRequest && transcribeJobId ? (
+    <NativeLyricPreview
+      segments={previewSegments}
+      currentTime={isPlaying ? currentTime : (selectedPreviewSegment ? selectedPreviewSegment.start + Math.min(0.5, (selectedPreviewSegment.end - selectedPreviewSegment.start) / 2) : currentTime)}
+      isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
+      jobId={transcribeJobId} request={editorRequest}
+      settings={{ ...buildResolveBody({ look: selectedLook,
+        genre: variantValues.lyricGenre, variant: variantValues.lyricVariant,
+        fontMain: variantValues.lyricFontMain, fontKey: variantValues.lyricFontKey,
+        color: variantValues.lyricColor, altColor: variantValues.lyricAltColor,
+        accentColor: variantValues.lyricAccentColor }),
+        font: selectedFont, text_case: selectedCase, text_contrast: selectedContrast,
+        font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
+      }}
+      onFontResolved={(code) => { if (!selectedFont) { setSelectedFont(code); onFontChange?.(code); } }}
+    />
+  ) : null;
+
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
     setTimingWorkspaceMode("timeline");
@@ -5074,6 +5095,7 @@ export default function LyricsEditor({
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
     <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery || isApproving || historyRestoreBusy ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy || isApproving || historyRestoreBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {previewSlot && nativePreview && createPortal(editorInitializationBlocked ? <div role="status" className="aspect-video grid place-items-center text-xs text-ink-secondary">Preparando vista previa…</div> : nativePreview, previewSlot)}
       {historyRestoreBusy && createPortal(<div role="status" aria-live="polite" className="fixed bottom-6 left-1/2 z-[100] -translate-x-1/2 rounded-xl bg-surface-1 px-4 py-3 text-sm text-white shadow-xl">{t("editor.restore_busy", "Restaurando versión…")}</div>, document.body)}
       {isApproving && createPortal(<div role="status" aria-live="polite"
         className="pointer-events-none fixed left-1/2 top-4 z-[95] -translate-x-1/2 rounded-xl bg-surface-1 px-5 py-3 text-sm text-white shadow-xl ring-1 ring-white/20">
@@ -7052,24 +7074,10 @@ export default function LyricsEditor({
                 activeId={activeId} isPlaying={isPlaying}
                 onTogglePlayback={togglePlay}
                 startAtWorkspace={startAtWorkspace && (!editorV2Enabled || durableHydrated)}
-                preview={!hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
+                preview={!previewSlot && !hideInternalPreview && <div className="mx-auto w-full max-w-[320px]">
                   <p className="mb-2 text-xs text-ink-secondary">{isPlaying ? (t("review_workspace.live_preview") || "Vista previa de la letra · sincronizada con el audio") : (t("review_workspace.selected_preview") || "Vista previa de la línea seleccionada")}</p>
                   {!previewBgUrl && <p className="mb-2 text-xs text-ink-secondary">Fondo de referencia; el fondo final se genera después.</p>}
-                  {editorRequest && transcribeJobId ? <NativeLyricPreview
-                    segments={previewSegments}
-                    currentTime={isPlaying ? currentTime : (selectedPreviewSegment ? selectedPreviewSegment.start + Math.min(0.5, (selectedPreviewSegment.end - selectedPreviewSegment.start) / 2) : currentTime)}
-                    isPlaying={isPlaying} backgroundUrl={previewBgUrl || null}
-                    jobId={transcribeJobId} request={editorRequest}
-                    settings={{ ...buildResolveBody({ look: selectedLook,
-                      genre: variantValues.lyricGenre, variant: variantValues.lyricVariant,
-                      fontMain: variantValues.lyricFontMain, fontKey: variantValues.lyricFontKey,
-                      color: variantValues.lyricColor, altColor: variantValues.lyricAltColor,
-                      accentColor: variantValues.lyricAccentColor }),
-                      font: selectedFont, text_case: selectedCase, text_contrast: selectedContrast,
-                      font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
-                    }}
-                    onFontResolved={(code) => { if (!selectedFont) { setSelectedFont(code); onFontChange?.(code); } }}
-                  /> : <>
+                  {editorRequest && transcribeJobId ? nativePreview : <>
                   <LyricVideoPreview segments={isPlaying ? previewSegments : (selectedPreviewSegment ? [selectedPreviewSegment] : [])} currentTime={isPlaying ? currentTime : (selectedPreviewSegment?.start ?? currentTime)} isPlaying={isPlaying}
                     backgroundUrl={previewBgUrl || null} backgroundStyle={backgroundStyle || "default"}
                     font={FONT_CSS_BY_CODE[selectedFont] || undefined} textCase={selectedCase}
