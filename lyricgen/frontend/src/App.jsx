@@ -2056,6 +2056,7 @@ export default function App() {
   // de useState) → re-render → LyricsEditor recibe el elemento y portalea. En
   // el /edit modal no se pasa nada → el player va inline como siempre.
   const [playerSlotEl, setPlayerSlotEl] = useState(null);
+  const [previewSlotEl, setPreviewSlotEl] = useState(null);
 
   // Phase 2 (2026-05-25): sync de typography settings cuando el operador
   // cambia font/case/animation desde el paso 4 del wizard MIENTRAS está
@@ -5908,6 +5909,8 @@ export default function App() {
         beatsJobId={currentReview?.editingJobId || currentReview?.parentJobId || currentReview?.transcribeJobId || null}
         // 2026-07-16: callback ref para el slot del player bar bajo el video.
         onPlayerSlotRef={setPlayerSlotEl}
+        onPreviewSlotRef={setPreviewSlotEl}
+        nativeReviewPreview={Boolean(user?.features?.editor_v2 && currentReview && (currentReview.editingJobId || currentReview.transcribeJobId))}
         // Post-render edit (EditLyricsRoute): el wizard se monta sobre un
         // job ya renderizado. QA fix 2026-05-27: bajamos los locks de
         // [1, 2, 3, 5] a [1, 5] — solo file upload (paso 1) y delivery
@@ -6338,6 +6341,7 @@ export default function App() {
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
             // player bar se portalea ahí; null (modal/inline) → inline.
             playerSlot={dedicatedCampaignReview ? null : playerSlotEl}
+            previewSlot={dedicatedCampaignReview ? null : previewSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
