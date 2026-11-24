@@ -1016,24 +1016,28 @@ def _finalize_vocal_continuity(r: dict, audio_path: str, *, fresh_transcription:
                 pass
 
 
-def _prefetch_voice_end_stem(audio_path: str) -> bool:
-    """Pide UNA vez el stem (misma caché R2 que el resto) para voice_end_timing.
+def _prefetch_voice_end_stem(audio_path: str):
+    """Pide UNA vez el stem y devuelve su envolvente ya calculada (o None).
 
-    Bloqueante (Demucs en Replicate en un miss, ~60-180 s, ~US$0,02-0,05);
-    llamar con ``asyncio.to_thread``. Deja el stem en la caché y borra el
-    temporal: ``envelope_for_audio`` lo lee después con ``cache_only``, así que
-    no hay segunda corrida de Demucs. Nunca levanta. True = hay stem.
+    Bloqueante (Demucs en Replicate en un miss, ~60-180 s); llamar con
+    ``asyncio.to_thread``. ``separate_vocals`` devuelve un stem local válido
+    aunque no lo haya podido cachear (R2 apagado, lookup caído, presupuesto), así
+    que la envolvente se calcula acá, sobre el temporal, y el temporal se borra
+    después del análisis. No depende de releer la caché. Nunca levanta.
     """
     stem = None
     try:
         import vocal_sep
+        import voice_end_timing as _ve
         if not audio_path or not os.path.exists(audio_path):
-            return False
+            return None
         stem = vocal_sep.separate_vocals(audio_path)
-        return bool(stem)
+        if not stem:
+            return None
+        return _ve.load_voice_envelope(stem, audio_path)
     except Exception as exc:
         logger.info("[VOICE_END] stem prefetch error_type=%s", _safe_exception_code(exc))
-        return False
+        return None
     finally:
         if stem:
             try:
@@ -1043,7 +1047,8 @@ def _prefetch_voice_end_stem(audio_path: str) -> bool:
 
 
 def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription: bool,
-                               stem_attempted: bool = False) -> dict:
+                               stem_attempted: bool = False,
+                               prefetched_envelope=None) -> dict:
     """Fin de línea = fin de la voz (VOICE_END_TIMING_MODE), sobre las tarjetas finales.
 
     Corre después de la segmentación de pantalla y de vocal continuity, antes
@@ -1074,7 +1079,10 @@ def _finalize_voice_end_timing(r: dict, audio_path: str, *, fresh_transcription:
             # Un re-proceso sobre una revisión existente puede pisar fines que
             # dejó el revisor: sólo se observa.
             effective = "observe"
-        envelope, reason = _voice_end.envelope_for_audio(audio_path)
+        if prefetched_envelope is not None:
+            envelope, reason = prefetched_envelope, None
+        else:
+            envelope, reason = _voice_end.envelope_for_audio(audio_path)
         if envelope is None:
             if stem_attempted and reason == "cached_stem_unavailable":
                 reason = "stem_unavailable_after_attempt"
@@ -1509,6 +1517,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     # (vocal continuity y la cola de pitch quedan `superseded`); con
     # `observe` mide sobre el resultado final sin tocarlo.
     _stem_attempted = False
+    _prefetched_env = None
     try:
         import voice_end_timing as _ve
         from vocal_continuity import _protected_document as _prot
@@ -1520,7 +1529,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             import vocal_sep as _vsep
             if _vsep.is_enabled():
                 _stem_attempted = True
-                await asyncio.wait_for(
+                _prefetched_env = await asyncio.wait_for(
                     asyncio.to_thread(_prefetch_voice_end_stem, audio_path),
                     timeout=_vsep.thread_budget_s(),
                 )
@@ -1529,7 +1538,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                     _safe_exception_code(exc))
     r = _finalize_voice_end_timing(
         r, audio_path, fresh_transcription=_fresh_endpoint_owner,
-        stem_attempted=_stem_attempted,
+        stem_attempted=_stem_attempted, prefetched_envelope=_prefetched_env,
     )
     voice_end_report = (r.get("postpass_stats") or {}).get("voice_end_timing") or {}
     if continuity_report.get("applied_count") or voice_end_report.get("applied_count"):

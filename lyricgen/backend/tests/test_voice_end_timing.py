@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 
 import numpy as np
+import os
 import pytest
 
 import voice_end_timing as ve
@@ -492,8 +493,23 @@ def test_prefetch_calls_separation_once_and_cleans_temp(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(vocal_sep, "separate_vocals",
                         lambda p, *a, **k: calls.append(k) or str(stem))
-    assert tw._prefetch_voice_end_stem(str(audio)) is True
-    assert len(calls) == 1 and not calls[0].get("cache_only") and not stem.exists()
+    seen = []
+    monkeypatch.setattr(ve, "load_voice_envelope",
+                        lambda sp, mp=None: seen.append(os.path.exists(sp)) or song_env())
+    # Stem local devuelto SIN cachear: se analiza y recién después se borra.
+    assert tw._prefetch_voice_end_stem(str(audio)) is not None
+    assert len(calls) == 1 and not calls[0].get("cache_only")
+    assert seen == [True] and not stem.exists()
+
+
+def test_prefetched_envelope_is_used_without_cache_roundtrip(monkeypatch):
+    import transcription_worker as tw
+    monkeypatch.setenv("VOICE_END_TIMING_MODE", "apply")
+    monkeypatch.setattr(ve, "envelope_for_audio",
+                        lambda p: pytest.fail("no debe releer la caché"))
+    out = tw._finalize_voice_end_timing(_result(), "a.wav", fresh_transcription=True,
+                                        stem_attempted=True, prefetched_envelope=song_env())
+    assert out["postpass_stats"]["voice_end_timing"]["applied_count"] == 2
 
 
 def test_prefetch_failure_is_false_and_never_raises(monkeypatch, tmp_path):
@@ -506,7 +522,7 @@ def test_prefetch_failure_is_false_and_never_raises(monkeypatch, tmp_path):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(vocal_sep, "separate_vocals", boom)
-    assert tw._prefetch_voice_end_stem(str(audio)) is False
+    assert tw._prefetch_voice_end_stem(str(audio)) is None
 
 
 def test_finalizer_reports_stem_unavailable_after_attempt(monkeypatch):
