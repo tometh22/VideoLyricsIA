@@ -104,7 +104,9 @@ def test_runtime_uses_visible_value_when_ocr_swaps_identity_kinds(tmp_path, monk
         umg_spec=None, segments_revision=1, edit_count=0,
         transcription_quality={},
     )
-    report = build_runtime_report(job=job, video_path=str(asset), segments=[])
+    report = build_runtime_report(job=job, video_path=str(asset), segments=[
+        {"start": 1.0, "end": 1.5, "text": "Thanks for watching"},
+    ])
     assert not any(
         row["code"] in {"METADATA_TITLE_MISMATCH", "METADATA_ARTIST_MISMATCH"}
         for row in report["issues"]
@@ -112,6 +114,8 @@ def test_runtime_uses_visible_value_when_ocr_swaps_identity_kinds(tmp_path, monk
     checks = {row["check_id"]: row for row in report["checks"]}
     assert checks["metadata_title"]["status"] == "PASS"
     assert checks["metadata_artist"]["status"] == "PASS"
+    assert report["lyric_observation"]["findings"][0]["code"] == "possible_outro_caption"
+    assert report["approval"]["blocked"] is False
 
 
 @pytest.mark.parametrize("observation", [
