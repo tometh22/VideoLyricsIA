@@ -59,6 +59,7 @@ NATIVE = {
     "cosmico": "urban", "cine": "soft", "pincel": "heavy", "pop70": "pop",
     "pelicula": "soft", "cinetico": "pop", "neon": "urban", "chat": "pop",
     "cuaderno": "pop", "bloque": "urban", "arco": "urban", "perspectiva": "urban",
+    "escalera": "heavy", "una_por_una": "urban", "ventana": "soft",
     "duotono": "pop", "romantico": "soft", "degrade": "pop", "y2k": "pop",
     "golpe": "heavy", "recorte": "heavy", "diptico": "heavy",
     "diario": "pop", "nube": "pop", "puntada": "soft",
@@ -66,11 +67,15 @@ NATIVE = {
 
 # Looks shown first in the wizard for each family.
 RECOMMENDED = {
-    "heavy": ("golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"),
+    "heavy": ("golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "escalera", "una_por_una", "cosmico"),
     "pop": ("diario", "nube", "cinetico", "pop70", "chat", "cuaderno", "y2k", "degrade", "duotono", "neon"),
-    "urban": ("bloque", "neon", "cinetico", "y2k", "perspectiva", "cosmico", "arco", "duotono"),
-    "soft": ("puntada", "diario", "cine", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"),
+    "urban": ("bloque", "neon", "cinetico", "una_por_una", "escalera", "y2k", "perspectiva", "cosmico", "arco", "duotono"),
+    "soft": ("puntada", "diario", "cine", "ventana", "romantico", "pelicula", "cuaderno", "arco", "degrade", "cosmico", "chat"),
 }
+
+# Designed for one typography (Oswald + Knewave green, "Amigos"): picking them
+# keeps that design unless the operator asks for another variant.
+_ORIGINAL_AUTO_LOOKS = (*L.EDITORIAL_LAYOUTS, "escalera", "una_por_una", "ventana")
 
 # --- Font catalogue ------------------------------------------------------------------
 # id → (file, label, css family, css weight, families, roles)
@@ -260,7 +265,7 @@ def recipe_for(look_id: str, genre: str, seed_key: str, variant: int) -> Recipe:
     look = L.LOOKS[look_id]
     family = family_of(genre) or NATIVE.get(look_id, "pop")
     variant = max(0, int(variant or 0))
-    if variant == 0 and (family == NATIVE.get(look_id) or look_id in L.EDITORIAL_LAYOUTS):
+    if variant == 0 and (family == NATIVE.get(look_id) or look_id in _ORIGINAL_AUTO_LOOKS):
         main = _FONT_BY_FILE.get(look.font_file, "montserrat")
         key = _FONT_BY_FILE.get(look.key_font or look.font_file, main)
         return Recipe(family, look_id, 0, (main, key), "original",
@@ -328,14 +333,14 @@ def choose_auto_variant(look_id: str, genre: str, seed_key: str,
     for ≥ 1."""
     # These explicitly selected designs keep their approved appearance.
     # Manual "another variant" remains available through recipe_for.
-    if look_id in L.EDITORIAL_LAYOUTS and not fresh:
+    if look_id in _ORIGINAL_AUTO_LOOKS and not fresh:
         return 0
     used = used_signatures or set()
     min_variant = max(0, min(int(min_variant or 0), limit - 1))
     # Start each song at its own offset so a batch resolved before any sibling
     # has rendered (a campaign, a wizard batch) still spreads across variants
     # instead of all landing on variant 0.
-    start = 0 if look_id in L.EDITORIAL_LAYOUTS else job_seed(seed_key) % 6
+    start = 0 if look_id in _ORIGINAL_AUTO_LOOKS else job_seed(seed_key) % 6
     span = limit - min_variant
     start = min_variant + (max(start - min_variant, 0) % span)
     for i in range(span):

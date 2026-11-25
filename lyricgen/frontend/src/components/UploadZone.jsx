@@ -11,11 +11,11 @@ import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
 import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookFontLockedNote, lookOwnsBackground, lookBeatSync } from "../lib/lyricLooks";
-import { catalogFamily, genreFamily, makeLookResolvedPin, orderLooksForFamily } from "../lib/lyricLookVariants";
+import { catalogFamily, genreFamily, lookWithVariant, makeLookResolvedPin, orderLooksForFamily } from "../lib/lyricLookVariants";
 import { useLookVariant } from "../hooks/useLookVariant";
 import LookVariantPanel from "./LookVariantPanel";
 import { useJobBeats } from "../hooks/useJobBeats";
-import { DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
+import { stairRows, DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -1104,6 +1104,55 @@ export default function UploadZone({
     const w0 = words[0];
     const wl = words[words.length - 1];
     const own = p.forceCase === "original" ? t("upload.sample_words").split(" ") : words;
+    if (p.motion === "one_word") {
+      // Una por una: una palabra por vez, con golpe de entrada.
+      const shown = words.slice(0, 3);
+      return (
+        <span className="inline-grid">
+          {shown.map((w, i) => (
+            <span
+              key={i}
+              style={{
+                ...base, gridArea: "1 / 1", justifySelf: "center", fontSize: "24px",
+                ...(i === shown.length - 1 ? { fontFamily: p.keyFont.css, fontWeight: p.keyFont.weight, color: p.accent } : {}),
+                animation: `lcard-oneword 2.7s ${i * 0.9}s infinite both`,
+              }}
+            >{w}</span>
+          ))}
+        </span>
+      );
+    }
+    if (p.motion === "word_window") {
+      // Ventana: la palabra anterior se apaga, la nueva entra.
+      return (
+        <span className="flex items-baseline gap-1.5">
+          <span style={{ ...base, fontSize: "15px", color: "#9A9A9A", opacity: 0.6 }}>{words[Math.max(0, words.length - 2)]}</span>
+          <span style={{ ...base, fontSize: "18px", fontFamily: p.keyFont.css, fontWeight: p.keyFont.weight, color: p.accent, animation: "lcard-wordpop 2.6s infinite both" }}>{wl}</span>
+        </span>
+      );
+    }
+    if (p.motion === "stack") {
+      // Escalera: una palabra por fila en escalón, la clave en verde.
+      const rows = stairRows(words, words.length - 1);
+      return (
+        <span className="flex flex-col items-center leading-none">
+          {rows.map((row, r) => {
+            const key = row.includes(words.length - 1);
+            return (
+              <span
+                key={r}
+                style={{
+                  ...base, fontSize: key ? "17px" : "14px",
+                  transform: `translateX(${(r - (rows.length - 1) / 2) * 16}px)`,
+                  ...(key ? { fontFamily: p.keyFont.css, fontWeight: p.keyFont.weight, color: p.accent } : {}),
+                  animation: `lcard-wordpop 2.6s ${r * 0.4}s infinite both`,
+                }}
+              >{row.map((i) => words[i]).join(" ")}</span>
+            );
+          })}
+        </span>
+      );
+    }
     if (p.layout === "kinetic") {
       const [, alt, accent] = p.cardPalettes[0];
       return (
@@ -1589,6 +1638,13 @@ export default function UploadZone({
     api: API,
     authHeaders,
   });
+  const titleLook = previewFace === "title" ? lookWithVariant(activeLook, {
+    resolved: lookVariant.resolved,
+    fontMain: batchDefaults.lyricFontMain,
+    fontKey: batchDefaults.lyricFontKey,
+    accentColor: batchDefaults.lyricAccentColor,
+    catalog: lookVariant.catalog,
+  }) : null;
   // Lo que /resolve eligió para ESTA canción viaja con la review (no con el
   // batch: es por canción). Al enviar, si el operador dejó variante/género
   // en automático, se manda ese número/género → el render es el preview.
@@ -4227,6 +4283,9 @@ export default function UploadZone({
               artist={titlePreviewArtist}
               song={titlePreviewSong}
               font={batchDefaults.font || ""}
+              lookArtistFont={lookVariant.resolved?.legacy ? null : (titleLook?.preview.keyFont || titleLook?.font)}
+              lookSongFont={titleLook?.font}
+              lookArtistColor={lookVariant.resolved?.legacy || !titleLook?.preview.keyFont ? undefined : titleLook.preview.accent}
               textCase={batchDefaults.textCase || "upper"}
               frameFormat={batchDefaults.frameFormat || "full"}
               template={batchDefaults.titleTemplate || "auto"}
@@ -4884,6 +4943,7 @@ export default function UploadZone({
                 @keyframes lcard-chat { 0%,10%{transform:translateY(8px);opacity:0} 22%,100%{transform:none;opacity:1} }
                 @keyframes lcard-write { 0%,6%{clip-path:inset(-30% 100% -30% -5%)} 45%,100%{clip-path:inset(-30% -5% -30% -5%)} }
                 @keyframes lcard-spin { to{transform:rotate(360deg)} }
+                @keyframes lcard-oneword { 0% { opacity: 0; transform: scale(1.25); } 4% { opacity: 1; transform: none; } 30% { opacity: 1; } 33%, 100% { opacity: 0; } }
                 @keyframes lcard-floor { 0%{transform:perspective(120px) rotateX(48deg) translateY(-14px) scale(.7);opacity:0} 15%,85%{opacity:1} 100%{transform:perspective(120px) rotateX(48deg) translateY(12px) scale(1.2);opacity:0} }
                 @keyframes lcard-boil { 0%{transform:rotate(-2deg)} 25%{transform:rotate(1.5deg) scale(1.02)} 50%{transform:rotate(-1deg)} 75%{transform:rotate(2deg) scale(1.01)} }
                 @keyframes lcard-ghost-l { 0%,6%{transform:translateX(-12px);opacity:0} 14%{opacity:.45} 30%,100%{transform:none;opacity:0} }

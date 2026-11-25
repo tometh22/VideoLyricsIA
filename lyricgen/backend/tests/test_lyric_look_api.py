@@ -184,6 +184,7 @@ def test_resolve_previews_a_legacy_job_as_designed(client):
     r = client.post("/lyric-looks/resolve", json={"lyric_look": "cinetico", "job_id": job_id},
                     headers=auth(token)).json()
     assert r["variant"] == 0 and r["genre"] == "" and r["background"] == "flat"
+    assert r["legacy"] is True
 
 
 @pytest.mark.parametrize("look_id", ["neon", "golpe", "recorte", "diptico", "diario", "nube", "puntada"])
@@ -241,6 +242,22 @@ def test_resolve_previews_the_original_for_an_automatic_variant(client, user_tok
             "lyric_variant": ""}, headers=auth(user_token)).json()
         assert r["variant"] == 0 and r["genre"] == "", (look_id, r)
         assert r["description"] == "Diseño original", (look_id, r)
+
+
+@pytest.mark.parametrize("look_id", ["escalera", "una_por_una", "ventana"])
+def test_amigos_looks_keep_their_type_when_selected_for_rock(client, user_token, look_id):
+    response = client.post("/lyric-looks/resolve", json={
+        "lyric_look": look_id,
+        "lyric_genre": "rock",
+        "artist": "Los Enanitos Verdes",
+        "song_title": "Amigos",
+    }, headers=auth(user_token))
+    assert response.status_code == 200
+    look = response.json()
+    assert look["variant"] == 0 and look["background"] == "source"
+    assert look["fonts"]["main"]["id"] == "oswald"
+    assert look["fonts"]["key"]["id"] == "knewave"
+    assert look["colors"]["accent"] == "#77ED59"
 
 
 def test_resolve_fresh_automatic_variant_is_never_the_original(client):
