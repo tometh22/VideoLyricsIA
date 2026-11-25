@@ -4,9 +4,9 @@ Run in a separate process from the API:
 
     REDIS_URL=redis://localhost:6379 python worker.py
 
-Pre-loads the Whisper model at startup so the first job doesn't pay the
-model-load cost, and installs SIGTERM/SIGINT handlers so an in-flight job
-finishes cleanly when the container is recycled.
+Whisper is loaded on first use unless WHISPER_PRELOAD=1 (interactive and
+batch-short workers only). SIGTERM/SIGINT handlers let an in-flight job
+finish cleanly when the container is recycled.
 """
 
 import json
@@ -105,6 +105,72 @@ def _release_heartbeat_ttl_seconds() -> int:
         return _DEFAULT_RELEASE_HEARTBEAT_TTL_SECONDS
 
 
+def _worker_shutdown_requested(worker) -> bool:
+    return bool(
+        getattr(worker, "_stop_requested", False)
+        or getattr(worker, "_shutdown_requested_date", None) is not None
+    )
+
+
+def _sleep_until_shutdown(worker, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _worker_shutdown_requested(worker):
+            return
+        time.sleep(min(0.1, deadline - time.monotonic()))
+
+
+def _queue_length(connection, name: str) -> int:
+    from rq import Queue
+    try:
+        return int(Queue(name, connection=connection).count)
+    except Exception:
+        return 0
+
+
+def _head_inputs_ready(queue, job_cls, ready) -> bool:
+    if queue is None:
+        return False
+    try:
+        ids = queue.job_ids
+        if not ids:
+            return False
+        job = job_cls.fetch(ids[0], connection=queue.connection)
+    except Exception:
+        return False
+    return bool(ready(job))
+
+
+def _whisper_preload_enabled() -> bool:
+    """Default off: the model loads on the first job that needs it.
+
+    Interactive (short) and batch-short workers set WHISPER_PRELOAD=1.
+    Render, ProRes and quality workers must not pay the 1.5 GB load.
+    """
+    return os.environ.get("WHISPER_PRELOAD", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _maybe_preload_whisper(loader) -> str:
+    """Return skipped, skipped_api, loaded, or failed. ``loader`` is injected."""
+    if not _whisper_preload_enabled():
+        logger.info("[WORKER] WHISPER_PRELOAD off; Whisper loads on first job")
+        return "skipped"
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        logger.info("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
+        return "skipped_api"
+    try:
+        loader()
+    except Exception as exc:
+        logger.warning(
+            "[WORKER] Whisper preload failed (%s); will load on first job", exc,
+        )
+        return "failed"
+    logger.info("[WORKER] Whisper model preloaded")
+    return "loaded"
+
+
 class WarmOnlyWorker(_RQWorker):
     """RQ Worker that NEVER cold-kills an in-flight job.
 
@@ -154,6 +220,151 @@ class WarmOnlyWorker(_RQWorker):
         # Intentionally do NOT escalate to cold shutdown: no kill_horse(), no
         # SystemExit. The warm-shutdown flag set by the first signal still makes
         # the worker exit cleanly once the current job completes.
+
+    def dequeue_job_and_maintain_ttl(  # type: ignore[override]
+        self, timeout, max_idle_time=None,
+    ):
+        """Dedicated ProRes workers dequeue only when the host slot allows it.
+
+        Stock RQ would pop a prewarm job and the job would then block on a
+        lock. That occupied the worker and hid portal jobs still queued in
+        Redis. Here the process sleeps *without* a job until a portal export
+        can run, or until prewarm is allowed. The encode flock is taken
+        inside the job, around ffmpeg only, so a probe that finds a free
+        slot does not keep that slot through the R2 upload.
+        """
+        from prores_capacity import gate_enabled_for
+
+        if not gate_enabled_for(self.queue_names()):
+            return super().dequeue_job_and_maintain_ttl(timeout, max_idle_time)
+        return self._dequeue_prores_gated()
+
+    def _dequeue_prores_gated(self):
+        from prores_capacity import (
+            decide_admission, host_portal_waiting, max_concurrency,
+            portal_queue_name, prewarm_queue_name, refresh_portal_markers,
+            rq_job_inputs_ready, try_acquire_slot,
+        )
+        from rq.job import Job
+
+        poll = 0.5
+        while True:
+            if _worker_shutdown_requested(self):
+                return None
+            try:
+                self.heartbeat()
+                by_name = {queue.name: queue for queue in self.queues}
+                portal_name = portal_queue_name()
+                prewarm_name = prewarm_queue_name()
+                portal_n = _queue_length(self.connection, portal_name)
+                prewarm_n = _queue_length(self.connection, prewarm_name)
+                portal_queue = by_name.get(portal_name)
+                if portal_n and portal_queue is not None:
+                    try:
+                        refresh_portal_markers(portal_queue.job_ids[:100])
+                    except Exception:
+                        logger.warning("[PRORES] could not refresh portal markers", exc_info=True)
+                limit = max_concurrency()
+                decision = decide_admission(
+                    gate_enabled=True,
+                    portal_queued=portal_n,
+                    prewarm_queued=prewarm_n,
+                    host_portal_waiting=host_portal_waiting(),
+                    portal_head_ready=_head_inputs_ready(portal_queue, Job, rq_job_inputs_ready),
+                    prewarm_head_ready=_head_inputs_ready(
+                        by_name.get(prewarm_name), Job, rq_job_inputs_ready,
+                    ),
+                    concurrency_limit=limit,
+                    # The flock, not this hint, is the real cap. slots_free=1
+                    # asks decide() for an encode; try_acquire_slot confirms it.
+                    slots_free=None if limit is None else 1,
+                )
+                if decision.action == "wait":
+                    _sleep_until_shutdown(self, poll)
+                    continue
+                target_name = portal_name if decision.queue == "portal" else prewarm_name
+                if target_name not in by_name:
+                    # This process does not consume that class. Leave the job
+                    # queued for a worker that does.
+                    _sleep_until_shutdown(self, poll)
+                    continue
+                if decision.takes_slot:
+                    # Probe only. Holding the fd across execute_job would
+                    # keep the CPU permit through the upload that follows
+                    # ffmpeg. A race that loses the slot raises ProResDefer
+                    # and the job returns to the front of its queue.
+                    slot = try_acquire_slot()
+                    if slot is None:
+                        _sleep_until_shutdown(self, poll)
+                        continue
+                    slot.release()
+                result = self.queue_class.dequeue_any(
+                    [by_name[target_name]],
+                    None,
+                    connection=self.connection,
+                    job_class=self.job_class,
+                    serializer=self.serializer,
+                    death_penalty_class=self.death_penalty_class,
+                )
+                if result is None:
+                    _sleep_until_shutdown(self, poll)
+                    continue
+                job, queue = result
+                try:
+                    self.reorder_queues(reference_queue=queue)
+                except Exception:
+                    logger.warning("[PRORES] queue reorder failed", exc_info=True)
+                return job, queue
+            except Exception:
+                logger.exception("[PRORES] admission loop failed; retrying")
+                self._release_prores_slot()
+                _sleep_until_shutdown(self, poll)
+
+    def _release_prores_slot(self) -> None:
+        slot = getattr(self, "_prores_slot", None)
+        self._prores_slot = None
+        os.environ.pop("PRORES_SLOT_HELD", None)
+        if slot is not None:
+            slot.release()
+
+    def execute_job(self, job, queue):  # type: ignore[override]
+        try:
+            return super().execute_job(job, queue)
+        finally:
+            self._release_prores_slot()
+
+    def handle_job_failure(  # type: ignore[override]
+        self, job, queue, started_job_registry=None, exc_string="",
+    ):
+        if exc_string and "ProResDefer" in exc_string:
+            self._requeue_deferred_prores(job, queue, started_job_registry)
+            return None
+        return super().handle_job_failure(
+            job, queue, started_job_registry=started_job_registry, exc_string=exc_string,
+        )
+
+    def _requeue_deferred_prores(self, job, queue, started_job_registry) -> None:
+        """Put an encode-ready job back at the head without a failure."""
+        logger.info(
+            "[PRORES] encode slot busy; requeueing %s at the front of %s",
+            getattr(job, "id", "?"), getattr(queue, "name", "?"),
+        )
+        try:
+            if started_job_registry is None:
+                started_job_registry = queue.started_job_registry
+            started_job_registry.remove(job)
+        except Exception:
+            logger.warning("[PRORES] could not leave the started registry", exc_info=True)
+        try:
+            self.set_current_job_id(None)
+        except Exception:
+            pass
+        try:
+            job.ended_at = None
+            job.exc_info = None
+        except Exception:
+            pass
+        queue.enqueue_job(job, at_front=True)
 
     def prepare_job_execution(  # type: ignore[override]
         self, job, remove_from_intermediate_queue=False,
@@ -509,20 +720,14 @@ def main():
     from redis import Redis
     from rq import Queue  # the worker itself is WarmOnlyWorker (module-level)
 
-    # Warm the Whisper model so the first job does not pay the load cost.
-    # SKIP this when OPENAI_API_KEY is set — transcription routes through the
-    # OpenAI Whisper API and the local 1.5 GB model is just dead weight that
-    # increases worker RAM and starts the container into immediate OOM
-    # territory on small instances.
-    if os.environ.get("OPENAI_API_KEY", "").strip():
-        logger.info("[WORKER] OPENAI_API_KEY set; skipping local Whisper preload")
-    else:
-        try:
-            from pipeline import _get_whisper_model
-            _get_whisper_model("turbo")
-            logger.info("[WORKER] Whisper model preloaded")
-        except Exception as e:
-            logger.warning("[WORKER] Whisper preload failed (%s); will load on first job", e)
+    # Whisper preload is opt-in. The historical startup load pulled a 1.5 GB
+    # model into every worker, including ProRes and render processes that
+    # never transcribe. OPENAI_API_KEY still skips the local model.
+    def _load_turbo():
+        from pipeline import _get_whisper_model
+        _get_whisper_model("turbo")
+
+    _maybe_preload_whisper(_load_turbo)
 
     conn = Redis.from_url(redis_url, **_redis_connect_kwargs())
     # Priority order:

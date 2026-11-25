@@ -231,6 +231,24 @@ def _init_redis():
         return None, None, None
 
 
+def prores_rq_queue(kind: str):
+    """Queue for a ProRes job.
+
+    ``kind`` is ``portal`` (customer-facing) or ``prewarm`` (background).
+    Unset env keeps both on ``enterprise``, which is what Railway workers
+    already consume. A dedicated name is a real RQ queue on the same Redis.
+    """
+    redis, _default, enterprise = _init_redis()
+    if redis is None:
+        return None
+    from prores_capacity import portal_queue_name, prewarm_queue_name
+    name = portal_queue_name() if kind == "portal" else prewarm_queue_name()
+    if name == "enterprise":
+        return enterprise
+    from rq import Queue
+    return Queue(name, connection=redis)
+
+
 # Tenant IDs that always route to the enterprise queue regardless of
 # the operator's stated `plan`. These are the B2B customers whose
 # batches are time-sensitive (UMG release schedules, OMG delivery
@@ -620,10 +638,17 @@ def cancel_rq_job(job_id: str) -> bool:
         # terminal state, and jobs.update_job's terminal-state guard would
         # silently discard the result (incident 2026-05-26).
         all_queues = [q_default, q_enterprise]
-        for extra_name in (
+        extra_names = [
             "transcription", "transcription_batch", "transcription_quality",
             "bg_preview", "batch_render", "campaign_control",
-        ):
+            "prores_portal", "prores_prewarm",
+        ]
+        try:
+            from prores_capacity import dedicated_queue_names
+            extra_names.extend(dedicated_queue_names())
+        except Exception:
+            pass
+        for extra_name in extra_names:
             try:
                 all_queues.append(_Q(extra_name, connection=r))
             except Exception:
@@ -2029,19 +2054,22 @@ def enqueue_prores_prewarm(
     if file_type not in ("umg_master", "umg_short"):
         logger.warning("[PRORES] prewarm: unsupported file_type %r", file_type)
         return None
-    _, _, q_enterprise = _init_redis()
-    if q_enterprise is None:
+    # Customer clicks (force) share the portal queue so they run before
+    # background prewarm. Opportunistic prewarm stays on its own queue.
+    # Both default to enterprise when the split is not configured.
+    target_queue = prores_rq_queue("portal" if force else "prewarm")
+    if target_queue is None:
         if force:
             raise RuntimeError("ProRes queue unavailable")
         logger.info("[PRORES] prewarm: queue unavailable; skipping")
         return None
-    # Backpressure: if the enterprise queue is already deep, skip the
+    # Backpressure: if the prewarm queue is already deep, skip the
     # prewarm. The lazy /download path will produce the .mov when UMG
     # actually clicks (with the toast/poll UX). Deep queue = many UMG
     # batch jobs landing concurrently; better to keep the queue moving
-    # for renders than to pile prewarms behind them.
+    # than to pile prewarms behind them.
     try:
-        depth = q_enterprise.count
+        depth = target_queue.count
     except Exception:
         depth = 0
     if depth > PRORES_PREWARM_MAX_QUEUE_DEPTH and not force:
@@ -2054,31 +2082,40 @@ def enqueue_prores_prewarm(
         return None
     rq_id = f"prewarm:{job_id}:{file_type}"
     if dedupe_live:
-        live = _live_prewarm_job(q_enterprise, rq_id)
+        live = _live_prewarm_job(target_queue, rq_id)
         if live is not None:
             logger.info("[PRORES] prewarm already %s for %s/%s; not enqueuing a duplicate",
                         live.get_status(), job_id, file_type)
             return live.id
-        _evict_stale_prewarm_job(q_enterprise, rq_id)
-    rq_job = q_enterprise.enqueue(
-        "prores.prewarm_prores",
-        args=(job_id, file_type),
-        job_timeout=PRORES_PREWARM_TIMEOUT,
-        result_ttl=RESULT_TTL,
-        failure_ttl=FAILURE_TTL,
-        meta={
-            **rq_payload_metadata("prores_prewarm"),
-            "portal_require_r2_upload": bool(require_r2_upload),
-        },
-        # Deterministic id: collapses concurrent double-enqueues to one
-        # QUEUED entry. NOTE: RQ (1.16.2) does NOT no-op a re-enqueue of a
-        # FINISHED id — enqueue overwrites the job hash and re-pushes the id,
-        # so it RE-RUNS. run_edit_pipeline relies on exactly that to force a
-        # fresh transcode after an edit (it cancel_rq_job's the old one first
-        # for hygiene). If RQ is ever upgraded, re-verify this re-run
-        # behavior or the post-edit re-warm silently stops firing.
-        job_id=rq_id,
-    )
+        _evict_stale_prewarm_job(target_queue, rq_id)
+    if force:
+        from prores_capacity import clear_portal_demand, mark_portal_demand
+        mark_portal_demand(rq_id)
+    try:
+        rq_job = target_queue.enqueue(
+            "prores.prewarm_prores",
+            args=(job_id, file_type),
+            job_timeout=PRORES_PREWARM_TIMEOUT,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            meta={
+                **rq_payload_metadata("prores_prewarm"),
+                "portal_require_r2_upload": bool(require_r2_upload),
+            },
+            # Deterministic id: collapses concurrent double-enqueues to one
+            # QUEUED entry. NOTE: RQ (1.16.2) does NOT no-op a re-enqueue of a
+            # FINISHED id — enqueue overwrites the job hash and re-pushes the id,
+            # so it RE-RUNS. run_edit_pipeline relies on exactly that to force a
+            # fresh transcode after an edit (it cancel_rq_job's the old one first
+            # for hygiene). If RQ is ever upgraded, re-verify this re-run
+            # behavior or the post-edit re-warm silently stops firing.
+            job_id=rq_id,
+        )
+    except Exception:
+        if force:
+            from prores_capacity import clear_portal_demand
+            clear_portal_demand(rq_id)
+        raise
     prewarm_enqueued_total += 1
     return rq_job.id
 
@@ -2108,8 +2145,8 @@ def enqueue_delivery_prores_prewarm(
     if file_type not in ("umg_master", "umg_short"):
         raise ValueError(f"Unsupported ProRes file type: {file_type!r}")
 
-    _, _, q_enterprise = _init_redis()
-    if q_enterprise is None:
+    target_queue = prores_rq_queue("portal")
+    if target_queue is None:
         raise RuntimeError("ProRes queue unavailable")
 
     safe_tenant = storage._safe_filename(tenant_id)
@@ -2130,19 +2167,25 @@ def enqueue_delivery_prores_prewarm(
         "_require_r2_upload": True,
     }
     rq_id = f"portal-prewarm:{job_id}:{file_type}"
-    live = _live_prewarm_job(q_enterprise, rq_id)
+    live = _live_prewarm_job(target_queue, rq_id)
     if live is not None:
         return live.id
-    _evict_stale_prewarm_job(q_enterprise, rq_id)
-    rq_job = q_enterprise.enqueue(
-        "prores.ensure_prores_exists",
-        args=(job_id, file_type, job_snapshot, tenant_id),
-        job_timeout=PRORES_PREWARM_TIMEOUT,
-        result_ttl=RESULT_TTL,
-        failure_ttl=FAILURE_TTL,
-        meta=rq_payload_metadata("prores_prewarm"),
-        job_id=rq_id,
-    )
+    _evict_stale_prewarm_job(target_queue, rq_id)
+    from prores_capacity import clear_portal_demand, mark_portal_demand
+    mark_portal_demand(rq_id)
+    try:
+        rq_job = target_queue.enqueue(
+            "prores.ensure_prores_exists",
+            args=(job_id, file_type, job_snapshot, tenant_id),
+            job_timeout=PRORES_PREWARM_TIMEOUT,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            meta=rq_payload_metadata("prores_prewarm"),
+            job_id=rq_id,
+        )
+    except Exception:
+        clear_portal_demand(rq_id)
+        raise
     prewarm_enqueued_total += 1
     return rq_job.id
 
@@ -2413,6 +2456,13 @@ def queue_depth() -> dict:
         "batch_render", "campaign_control",
     ):
         result[name] = len(Queue(name, connection=redis))
+    try:
+        from prores_capacity import dedicated_queue_names
+        for name in dedicated_queue_names():
+            if name not in result:
+                result[name] = len(Queue(name, connection=redis))
+    except Exception:
+        pass
     result["backend"] = "redis"
     return result
 

@@ -5,6 +5,9 @@ version: "3.9"
 #   docker compose logs -f worker
 #   docker compose down
 #
+# Workers are split so a ProRes encode cannot sit in front of `default`.
+# See docs/OVH_WORKERS.md for the bare-metal layout.
+#
 # Set REDIS_URL, R2_*, SENTRY_DSN, JWT_SECRET etc in an .env file alongside
 # this compose file (docker compose reads it automatically).
 
@@ -40,9 +43,15 @@ services:
       - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
       - GENIUS_TOKEN=${GENIUS_TOKEN:-}
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+      - PRORES_PORTAL_QUEUE=${PRORES_PORTAL_QUEUE:-prores_portal}
+      - PRORES_PREWARM_QUEUE=${PRORES_PREWARM_QUEUE:-prores_prewarm}
+      - PRORES_MAX_CONCURRENCY=${PRORES_MAX_CONCURRENCY:-}
+      - PRORES_SEMAPHORE_NAME=${PRORES_SEMAPHORE_NAME:-prores}
+      - PRORES_SEMAPHORE_DIR=/var/lock/genly-prores
     volumes:
       - ./secrets:/secrets:ro
       - outputs:/app/../outputs
+      - /var/lock/genly-prores:/var/lock/genly-prores
     ports:
       - "8000:8000"
     depends_on:
@@ -75,9 +84,59 @@ services:
       - GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex_credentials.json
       - GENIUS_TOKEN=${GENIUS_TOKEN:-}
       - WHISPER_FALLBACK_ENABLED=${WHISPER_FALLBACK_ENABLED:-1}
+      - QUEUES=enterprise,canary
+      - PRORES_PORTAL_QUEUE=${PRORES_PORTAL_QUEUE:-prores_portal}
+      - PRORES_PREWARM_QUEUE=${PRORES_PREWARM_QUEUE:-prores_prewarm}
+      - PRORES_SEMAPHORE_NAME=${PRORES_SEMAPHORE_NAME:-prores}
+      - PRORES_SEMAPHORE_DIR=/var/lock/genly-prores
     volumes:
       - ./secrets:/secrets:ro
       - outputs:/app/../outputs
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker-default:
+    build: ./lyricgen/backend
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      - ENV=${ENV:-prod}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=${JWT_SECRET}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - QUEUES=default
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker-prores:
+    build: ./lyricgen/backend
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      - ENV=${ENV:-prod}
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=${JWT_SECRET}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_ENDPOINT_URL=${R2_ENDPOINT_URL:-}
+      - R2_BUCKET=${R2_BUCKET:-}
+      - QUEUES=prores_portal,prores_prewarm
+      - PRORES_PORTAL_QUEUE=${PRORES_PORTAL_QUEUE:-prores_portal}
+      - PRORES_PREWARM_QUEUE=${PRORES_PREWARM_QUEUE:-prores_prewarm}
+      - PRORES_MAX_CONCURRENCY=${PRORES_MAX_CONCURRENCY:-}
+      - PRORES_SEMAPHORE_NAME=${PRORES_SEMAPHORE_NAME:-prores}
+      - PRORES_SEMAPHORE_DIR=/var/lock/genly-prores
+      - PRORES_DOWNLOAD_INACTIVITY_SECONDS=${PRORES_DOWNLOAD_INACTIVITY_SECONDS:-45}
+      - PRORES_DOWNLOAD_TOTAL_SECONDS=${PRORES_DOWNLOAD_TOTAL_SECONDS:-420}
+      - PRORES_DOWNLOAD_MAX_ATTEMPTS=${PRORES_DOWNLOAD_MAX_ATTEMPTS:-2}
+    volumes:
+      - outputs:/app/../outputs
+      - /var/lock/genly-prores:/var/lock/genly-prores
     depends_on:
       redis:
         condition: service_healthy

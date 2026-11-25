@@ -82,11 +82,12 @@ def task_state(task_id):
 def enqueue(delivery_id, portal_id, file_type, source_key, etag):
     from queue_jobs import (
         _init_redis, _require_submissions_open, _evict_stale_rq_job, rq_payload_metadata,
-        PRORES_PREWARM_TIMEOUT, RESULT_TTL, FAILURE_TTL,
+        PRORES_PREWARM_TIMEOUT, RESULT_TTL, FAILURE_TTL, prores_rq_queue,
     )
     from rq import Retry
     _require_submissions_open()
-    connection, _, queue = _init_redis()
+    connection, _, _enterprise = _init_redis()
+    queue = prores_rq_queue("portal")
     if connection is None or queue is None:
         raise RuntimeError("ProRes queue unavailable")
     task_id, target = export_identity(source_key, etag, file_type)
@@ -100,16 +101,22 @@ def enqueue(delivery_id, portal_id, file_type, source_key, etag):
             raise QueueBusy("Hay varios archivos en preparación. Reintentá en unos minutos.")
         if state != "not_found":
             _evict_stale_rq_job(connection, task_id)
-        queue.enqueue(
-            "portal_prores.materialize",
-            args=(delivery_id, portal_id, file_type, source_key, etag, target),
-            job_id=task_id,
-            job_timeout=PRORES_PREWARM_TIMEOUT,
-            result_ttl=RESULT_TTL,
-            failure_ttl=FAILURE_TTL,
-            retry=Retry(max=2, interval=[30, 60]),
-            meta=rq_payload_metadata("portal_prores"),
-        )
+        from prores_capacity import clear_portal_demand, mark_portal_demand
+        mark_portal_demand(task_id)
+        try:
+            queue.enqueue(
+                "portal_prores.materialize",
+                args=(delivery_id, portal_id, file_type, source_key, etag, target),
+                job_id=task_id,
+                job_timeout=PRORES_PREWARM_TIMEOUT,
+                result_ttl=RESULT_TTL,
+                failure_ttl=FAILURE_TTL,
+                retry=Retry(max=2, interval=[30, 60]),
+                meta=rq_payload_metadata("portal_prores"),
+            )
+        except Exception:
+            clear_portal_demand(task_id)
+            raise
     return task_id
 
 
@@ -144,8 +151,20 @@ def materialize(delivery_id, portal_id, file_type, source_key, etag, target):
     """RQ worker: transcode the validated published source into a separate key."""
     from database import Delivery, DeliveriesSessionLocal
     from pipeline import _transcode_to_prores
-    if file_type not in SOURCES or export_identity(source_key, etag, file_type)[1] != target:
-        raise ValueError("Invalid portal export")
+    from prores_capacity import release_portal_demand_on_terminal
+    with release_portal_demand_on_terminal():
+        if file_type not in SOURCES or export_identity(source_key, etag, file_type)[1] != target:
+            raise ValueError("Invalid portal export")
+        return _materialize_body(
+            delivery_id, portal_id, file_type, source_key, etag, target,
+            Delivery, DeliveriesSessionLocal, _transcode_to_prores,
+        )
+
+
+def _materialize_body(
+    delivery_id, portal_id, file_type, source_key, etag, target,
+    Delivery, DeliveriesSessionLocal, _transcode_to_prores,
+):
     source_type = SOURCES[file_type]
 
     def current(db, *, lock=False):
@@ -169,20 +188,40 @@ def materialize(delivery_id, portal_id, file_type, source_key, etag, target):
     if target_status == "unavailable":
         raise RuntimeError("No se pudo verificar el almacenamiento del ProRes.")
     if target_status != "exists":
-        # A unique temp directory prevents editor/prewarm/replica cache races,
-        # and cleanup removes the multi-GB local MOV on success or failure.
+        # Download finishes before the encode slot. When the host cap can
+        # defer us, the source lives in a stable cache so the requeued job
+        # does not pull the multi-GB object again. The MOV stays in a temp
+        # dir and is always removed.
+        from prores_capacity import (
+            ProResDefer, cached_input_path, discard_cached_input,
+            download_prores_source, max_concurrency, coordination_enabled,
+            remember_inputs, transcode_slot,
+        )
+        deferral = coordination_enabled() and max_concurrency() is not None
+        source_path = cached_input_path(source_key) if deferral else None
         with tempfile.TemporaryDirectory(prefix="portal-prores-") as directory:
-            source_path = os.path.join(directory, "source.mp4")
+            if source_path is None:
+                source_path = os.path.join(directory, "source.mp4")
+            else:
+                os.makedirs(os.path.dirname(source_path), exist_ok=True)
             output_path = os.path.join(directory, "master.mov")
-            if not storage.download_object(source_key, source_path):
+            already = os.path.exists(source_path) and os.path.getsize(source_path) > 0
+            if not already and not download_prores_source(source_key, source_path):
                 raise RuntimeError("No se pudo leer el video publicado.")
+            remember_inputs(source_path)
             if storage.object_etag(source_key) != etag:
                 raise RuntimeError("El video publicado cambió durante la descarga.")
-            _transcode_to_prores(source_path, output_path, _source_spec(source_path))
+            try:
+                with transcode_slot():
+                    _transcode_to_prores(source_path, output_path, _source_spec(source_path))
+            except ProResDefer:
+                raise
             if storage.object_etag(source_key) != etag:
                 raise RuntimeError("El video publicado cambió durante la preparación.")
             if not storage.upload_file(output_path, target):
                 raise RuntimeError("No se pudo guardar el ProRes.")
+            if deferral:
+                discard_cached_input(source_key)
 
     # Hold no DB session during download, ffmpeg or multi-GB upload. A correction
     # that publishes while we render must not acquire this old cut's MOV.
