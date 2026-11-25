@@ -198,7 +198,7 @@ def _materialize_body(
             remember_inputs, transcode_slot,
         )
         deferral = coordination_enabled() and max_concurrency() is not None
-        source_path = cached_input_path(source_key) if deferral else None
+        source_path = cached_input_path(source_key, etag) if deferral else None
         with tempfile.TemporaryDirectory(prefix="portal-prores-") as directory:
             if source_path is None:
                 source_path = os.path.join(directory, "source.mp4")
@@ -210,6 +210,8 @@ def _materialize_body(
                 raise RuntimeError("No se pudo leer el video publicado.")
             remember_inputs(source_path)
             if storage.object_etag(source_key) != etag:
+                if deferral:
+                    discard_cached_input(source_key, etag)
                 raise RuntimeError("El video publicado cambió durante la descarga.")
             try:
                 with transcode_slot():
@@ -217,11 +219,13 @@ def _materialize_body(
             except ProResDefer:
                 raise
             if storage.object_etag(source_key) != etag:
+                if deferral:
+                    discard_cached_input(source_key, etag)
                 raise RuntimeError("El video publicado cambió durante la preparación.")
             if not storage.upload_file(output_path, target):
                 raise RuntimeError("No se pudo guardar el ProRes.")
             if deferral:
-                discard_cached_input(source_key)
+                discard_cached_input(source_key, etag)
 
     # Hold no DB session during download, ffmpeg or multi-GB upload. A correction
     # that publishes while we render must not acquire this old cut's MOV.

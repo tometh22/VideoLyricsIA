@@ -1890,6 +1890,47 @@ def enqueue_quality_proposal_validation(proposal_id: str,
     return queued.id
 
 
+def _promote_queued_prewarm(live, portal_queue, prewarm_queue, *, require_r2_upload: bool) -> str:
+    """Move a not-yet-started background prewarm onto the portal queue.
+
+    ``Job.fetch`` is global, so a customer click can see a job that is still
+    sitting in ``prores_prewarm``. Returning it there leaves the click behind
+    every other background transcode and publishes no portal-demand marker.
+    A job that already started stays where it is: the worker has it.
+    """
+    from prores_capacity import mark_portal_demand
+
+    mark_portal_demand(getattr(live, "id", "") or "")
+    origin = getattr(live, "origin", None)
+    status = live.get_status(refresh=False)
+    value = str(getattr(status, "value", status) or "").lower()
+    if origin == getattr(portal_queue, "name", None) or value != "queued":
+        return live.id
+    if require_r2_upload:
+        meta = dict(getattr(live, "meta", None) or {})
+        meta["portal_require_r2_upload"] = True
+        live.meta = meta
+        try:
+            live.save_meta()
+        except Exception:
+            logger.warning(
+                "[PRORES] could not mark %s as a portal upload", live.id, exc_info=True,
+            )
+    if prewarm_queue is not None and getattr(prewarm_queue, "name", None) == origin:
+        try:
+            prewarm_queue.remove(live.id)
+        except Exception:
+            logger.warning("[PRORES] could not leave the prewarm queue", exc_info=True)
+    try:
+        portal_queue.enqueue_job(live, at_front=True)
+    except Exception:
+        from prores_capacity import clear_portal_demand
+        clear_portal_demand(live.id)
+        raise
+    logger.info("[PRORES] promoted queued prewarm %s onto %s", live.id, portal_queue.name)
+    return live.id
+
+
 def _live_prewarm_job(queue, rq_id: str):
     """The RQ job for ``rq_id`` when it is still going to run (or is running).
 
@@ -2084,6 +2125,12 @@ def enqueue_prores_prewarm(
     if dedupe_live:
         live = _live_prewarm_job(target_queue, rq_id)
         if live is not None:
+            from prores_capacity import coordination_enabled
+            if force and coordination_enabled():
+                return _promote_queued_prewarm(
+                    live, target_queue, prores_rq_queue("prewarm"),
+                    require_r2_upload=require_r2_upload,
+                )
             logger.info("[PRORES] prewarm already %s for %s/%s; not enqueuing a duplicate",
                         live.get_status(), job_id, file_type)
             return live.id

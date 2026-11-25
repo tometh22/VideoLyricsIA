@@ -551,15 +551,23 @@ def run_attempts(operation, attempts: int) -> None:
     raise last
 
 
-def cached_input_path(key: str) -> str:
+def cached_input_path(key: str, etag: str | None = None) -> str:
+    """Stable path for one object version.
+
+    The ETag is part of the identity. A correction overwrites the same R2
+    key with new bytes; keying only by the key would transcode the previous
+    cut and the later ETag check would still pass, because it reads the
+    current remote object.
+    """
     root = os.environ.get("PRORES_INPUT_CACHE", "/tmp/genly-prores-inputs").strip()
     root = root or "/tmp/genly-prores-inputs"
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    material = key if not etag else f"{key}\0{etag}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return os.path.join(root, digest, "source.bin")
 
 
-def discard_cached_input(key: str) -> None:
-    path = cached_input_path(key)
+def discard_cached_input(key: str, etag: str | None = None) -> None:
+    path = cached_input_path(key, etag)
     try:
         os.unlink(path)
     except FileNotFoundError:

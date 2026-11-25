@@ -137,6 +137,71 @@ def test_marker_survives_a_retryable_failure(monkeypatch, tmp_path):
     assert cap.host_portal_waiting() == 0
 
 
+def test_input_cache_is_keyed_by_source_and_etag(monkeypatch, tmp_path):
+    monkeypatch.setenv("PRORES_INPUT_CACHE", str(tmp_path))
+    first = cap.cached_input_path("tenant/job/lyric_video.mp4", "etag-v1")
+    second = cap.cached_input_path("tenant/job/lyric_video.mp4", "etag-v2")
+    assert first != second
+    os.makedirs(os.path.dirname(first))
+    with open(first, "wb") as handle:
+        handle.write(b"v1")
+    cap.discard_cached_input("tenant/job/lyric_video.mp4", "etag-v2")
+    assert os.path.exists(first)
+    cap.discard_cached_input("tenant/job/lyric_video.mp4", "etag-v1")
+    assert not os.path.exists(first)
+    portal = (BACKEND / "portal_prores.py").read_text()
+    assert "cached_input_path(source_key, etag)" in portal
+    assert "discard_cached_input(source_key, etag)" in portal
+
+
+def test_customer_click_promotes_a_queued_background_prewarm(monkeypatch, tmp_path):
+    import queue_jobs
+    from unittest.mock import Mock
+
+    _dedicated(monkeypatch, tmp_path)
+    live = type("Live", (), {})()
+    live.id = "prewarm:job1:umg_master"
+    live.origin = "prores_prewarm"
+    live.meta = {}
+    live.get_status = lambda refresh=True: "queued"
+    live.save_meta = lambda: None
+    portal = type("Q", (), {"name": "prores_portal", "count": 0})()
+    portal.connection = object()
+    portal.enqueue = Mock()
+    portal.enqueue_job = Mock()
+    prewarm = type("Q", (), {"name": "prores_prewarm", "count": 0})()
+    prewarm.remove = Mock()
+
+    monkeypatch.setattr(
+        queue_jobs, "prores_rq_queue",
+        lambda kind: portal if kind == "portal" else prewarm,
+    )
+    monkeypatch.setattr(queue_jobs, "_live_prewarm_job", lambda *_a, **_k: live)
+    monkeypatch.setattr(queue_jobs, "_require_submissions_open", lambda: None)
+
+    job_id = queue_jobs.enqueue_prores_prewarm(
+        "job1", "umg_master", force=True, dedupe_live=True,
+    )
+    assert job_id == live.id
+    prewarm.remove.assert_called_once_with(live.id)
+    portal.enqueue_job.assert_called_once()
+    assert portal.enqueue_job.call_args.kwargs["at_front"] is True
+    portal.enqueue.assert_not_called()
+    assert live.meta["portal_require_r2_upload"] is True
+    assert cap.host_portal_waiting() == 1
+
+    live.origin = "prores_portal"
+    live.get_status = lambda refresh=True: "started"
+    prewarm.remove.reset_mock()
+    portal.enqueue_job.reset_mock()
+    again = queue_jobs.enqueue_prores_prewarm(
+        "job1", "umg_master", force=True, dedupe_live=True,
+    )
+    assert again == live.id
+    prewarm.remove.assert_not_called()
+    portal.enqueue_job.assert_not_called()
+
+
 def test_host_marker_is_visible_to_the_other_stack(monkeypatch, tmp_path):
     _dedicated(monkeypatch, tmp_path)
     cap.mark_portal_demand("portal-prores-abc")
@@ -372,3 +437,5 @@ def test_ovh_layout_separates_prores_from_default():
     assert "QUEUES=prores_portal,prores_prewarm" in root
     assert "QUEUES=default" in root
     assert "QUEUES=enterprise,canary" in root
+    assert "QUEUES=transcription,bg_preview,audio_preview" in root
+    assert "WHISPER_PRELOAD=1" in root
