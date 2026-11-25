@@ -22,6 +22,7 @@ import {
 const FRAME_W = 1920;
 const FRAME_H = 1080;
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
+export const LOOK_LOOP_S = 3.2;
 
 /** Momento (s) en que entra la palabra i en el loop de muestra. */
 export const sampleWordDelay = (i) => 0.15 + i * 0.32;
@@ -162,7 +163,195 @@ export const KINETIC_FROM = {
 };
 const KINETIC_KINDS = ["left", "right", "drop", "pop", "spin", "stretch"];
 
+// ── Looks palabra por palabra ("Amigos": Una por una, Ventana, Escalera) ──
+// Espejo de lyric_looks._one_word_events / _word_window_events /
+// _stack_events. Sin `filter` (el blur por tick titila en vivo): opacidad y
+// transform alcanzan para reconocerlos.
+export const WORD_MOTION_KEYFRAMES = `
+  @keyframes wlp-slot { 0%, 100% { visibility: visible; } }
+  @keyframes wlp-one-word { 0% { opacity: 0; transform: scale(1.18); } 25% { opacity: 1; } 35%, 100% { opacity: 1; transform: none; } }
+  @keyframes wlp-window-in { 0% { opacity: 0; transform: translateY(.35em); } 100% { opacity: 1; transform: none; } }
+  @keyframes wlp-window-dim { to { opacity: .45; color: #9A9A9A; } }
+  @keyframes wlp-window-fade { to { opacity: .45; } }
+  @keyframes wlp-type-in { 0% { opacity: 0; transform: translateY(-.35em) scale(.55); } 100% { opacity: 1; transform: none; } }
+  @keyframes wlp-burst { 0% { opacity: 1; transform: none; } 100% { opacity: 0; transform: translate(var(--bx), var(--by)) rotate(var(--br)) scale(.4); } }
+`;
+
+const keyFaceOf = (lp) => (lp.keyFont ? { fontFamily: lp.keyFont.css, fontWeight: lp.keyFont.weight } : {});
+
+/** Igual que lyric_looks._jitter: [-1, 1] determinístico. */
+const jitter = (i, salt) => (((i * 2654435761 + salt * 40503) % 2001) / 1000) - 1;
+
+/** Ventana de la muestra: palabra i visible entre su entrada y la de i+1. */
+function sampleSlot(i, n, loopS) {
+  const d = sampleWordDelay(i);
+  const end = i + 1 < n ? sampleWordDelay(i + 1) : loopS - 0.25;
+  return { d, len: Math.max(0.05, end - d) };
+}
+
+function oneWordLayout(ctx) {
+  const { lp, tokens, live, basePx, toCqw, sungIdx, loopS } = ctx;
+  const key = pickKeyword(tokens);
+  const face = (i) => (i === key ? { ...keyFaceOf(lp), color: lp.accent, fontSize: `${lp.keyScale || 1}em` } : {});
+  const word = (i, style) => (
+    <span
+      key={i}
+      data-look-word={i}
+      data-look-key={i === key ? "true" : undefined}
+      style={{ gridArea: "1 / 1", justifySelf: "center", whiteSpace: "nowrap", ...face(i), ...style }}
+    >{tokens[i]}</span>
+  );
+  const box = { display: "inline-grid", fontSize: toCqw(basePx), maxWidth: "84cqw" };
+  if (live) {
+    const i = Math.min(tokens.length - 1, Math.max(0, sungIdx ?? 0));
+    return {
+      body: <span style={box}>{word(i, { animation: "wlp-one-word .32s ease-out both" })}</span>,
+      wrapStyle: {},
+      frame: false,
+    };
+  }
+  const body = (
+    <span style={box}>
+      {tokens.map((_, i) => {
+        const { d, len } = sampleSlot(i, tokens.length, loopS);
+        return word(i, {
+          visibility: "hidden",
+          animation: `wlp-slot ${len}s ${d}s, wlp-one-word .32s ${d}s ease-out both`,
+        });
+      })}
+    </span>
+  );
+  return { body, wrapStyle: {}, frame: false };
+}
+
+function wordWindowLayout(ctx) {
+  const { lp, tokens, live, basePx, toCqw, sungIdx, loopS } = ctx;
+  const key = pickKeyword(tokens);
+  const keyFace = { ...keyFaceOf(lp), color: lp.accent, fontSize: `${lp.keyScale || 1}em` };
+  const state = (s, delay, extra) => (
+    <span
+      key={s}
+      data-look-window={s}
+      style={{ gridArea: "1 / 1", justifySelf: "center", display: "inline-flex", alignItems: "baseline", gap: "0.28em", whiteSpace: "nowrap", ...extra }}
+    >
+      {s > 0 && (
+        <span
+          data-look-word={s - 1}
+          data-look-dim="true"
+          style={{ ...(s - 1 === key ? keyFace : {}), animation: `${s - 1 === key ? "wlp-window-fade" : "wlp-window-dim"} .24s ${delay + 0.2}s both` }}
+        >{tokens[s - 1]}</span>
+      )}
+      <span
+        data-look-word={s}
+        data-look-key={s === key ? "true" : undefined}
+        style={{ ...(s === key ? keyFace : {}), animation: `wlp-window-in .22s ${delay}s ease-out both` }}
+      >{tokens[s]}</span>
+    </span>
+  );
+  const box = { display: "inline-grid", fontSize: toCqw(basePx) };
+  if (live) {
+    const s = Math.min(tokens.length - 1, Math.max(0, sungIdx ?? 0));
+    return { body: <span style={box}>{state(s, 0, {})}</span>, wrapStyle: {}, frame: false };
+  }
+  const body = (
+    <span style={box}>
+      {tokens.map((_, s) => {
+        const { d, len } = sampleSlot(s, tokens.length, loopS);
+        return state(s, d, { visibility: "hidden", animation: `wlp-slot ${len}s ${d}s` });
+      })}
+    </span>
+  );
+  return { body, wrapStyle: {}, frame: false };
+}
+
+/** Filas de la Escalera: una palabra por fila, los conectores cortos van con
+ * la siguiente (lyric_looks._stair_rows). */
+export function stairRows(tokens, key) {
+  const rows = [];
+  let cur = [];
+  tokens.forEach((tok, i) => {
+    cur.push(i);
+    const short = tok.length <= 3 && i !== key && i + 1 < tokens.length;
+    if (!short || cur.length >= 3) { rows.push(cur); cur = []; }
+  });
+  if (cur.length) rows.push(cur);
+  while (rows.length > 4) {
+    const j = rows.findIndex((r, k) => k + 1 < rows.length && !r.includes(key) && !rows[k + 1].includes(key));
+    if (j < 0) break;
+    rows.splice(j, 2, [...rows[j], ...rows[j + 1]]);
+  }
+  return rows;
+}
+
+function stackLayout(ctx) {
+  const { lp, tokens, live, lineIdx, basePx, toCqw, sungIdx, elapsed, dur, loopS } = ctx;
+  const key = pickKeyword(tokens);
+  const rows = stairRows(tokens, key);
+  const dir = lineIdx % 2 === 0 ? 1 : -1;
+  const step = 7 * dir;
+  const total = tokens.reduce((a, t) => a + t.length, 0);
+  const exitS = Math.min(0.42, Math.max(0.12, (live ? dur : loopS) * 0.22));
+  const leaving = live && elapsed > dur - exitS;
+  let g = 0;
+  const body = (
+    <span data-look-stack="true" style={{ display: "inline-block", fontSize: toCqw(basePx), lineHeight: 1.05 }}>
+      {rows.map((row, r) => {
+        const isKeyRow = row.includes(key);
+        return (
+          <span
+            key={r}
+            data-look-row={r}
+            data-look-key={isKeyRow ? "true" : undefined}
+            style={{
+              display: "block",
+              whiteSpace: "nowrap",
+              transform: `translateX(${((r - (rows.length - 1) / 2) * step).toFixed(2)}cqw)`,
+              ...(isKeyRow ? { ...keyFaceOf(lp), color: lp.accent, fontSize: `${(lp.keyScale || 1) * 1.15}em` } : {}),
+            }}
+          >
+            {row.map((i, j) => (
+              <span key={i} data-look-word={i} data-look-visible={live ? String(i <= (sungIdx ?? -1)) : undefined}>
+                {j > 0 ? " " : ""}
+                {[...tokens[i]].map((ch, k) => {
+                  const n = g;
+                  g += 1;
+                  const burstVars = {
+                    "--bx": `${(jitter(n, 1) * 10).toFixed(2)}cqw`,
+                    "--by": `${(-Math.abs(jitter(n, 2)) * 9 + jitter(n, 5) * 2).toFixed(2)}cqw`,
+                    "--br": `${Math.round(jitter(n, 3) * 70)}deg`,
+                  };
+                  const order = n / Math.max(1, total - 1);
+                  let style;
+                  if (live) {
+                    const typed = i <= (sungIdx ?? -1);
+                    style = !typed
+                      ? { visibility: "hidden" }
+                      : leaving
+                        ? { animation: `wlp-burst ${exitS}s ${(order * exitS * 0.45).toFixed(3)}s ease-in forwards` }
+                        : { animation: `wlp-type-in .11s ${(k * 0.04).toFixed(2)}s ease-out both` };
+                  } else {
+                    const d = sampleWordDelay(i) + k * 0.04;
+                    const b = loopS - exitS - 0.05 + order * exitS * 0.45;
+                    style = {
+                      animation: `wlp-type-in .11s ${d.toFixed(2)}s ease-out both, wlp-burst ${exitS}s ${b.toFixed(2)}s ease-in forwards`,
+                    };
+                  }
+                  return (
+                    <span key={k} data-look-letter="" style={{ display: "inline-block", whiteSpace: "pre", ...burstVars, ...style }}>{ch}</span>
+                  );
+                })}
+              </span>
+            ))}
+          </span>
+        );
+      })}
+    </span>
+  );
+  return { body, wrapStyle: {}, frame: false };
+}
+
 export const LOOK_LAYOUT_KEYFRAMES = `
+  ${WORD_MOTION_KEYFRAMES}
   @keyframes wlp-kin-left { 0% { transform: ${KINETIC_FROM.left}; opacity: 0; } 50% { opacity: 1; } 100% { transform: none; opacity: 1; } }
   @keyframes wlp-kin-right { 0% { transform: ${KINETIC_FROM.right}; opacity: 0; } 50% { opacity: 1; } 100% { transform: none; opacity: 1; } }
   @keyframes wlp-kin-drop { 0% { transform: ${KINETIC_FROM.drop}; opacity: 0; } 55% { transform: translateY(0) scaleY(1.2); opacity: 1; } 75% { transform: scaleY(.86); } 100% { transform: none; opacity: 1; } }
@@ -457,6 +646,9 @@ export function renderLookLayout(ctx) {
     case "floor": return floorLayout(ctx);
     default: break;
   }
+  if (lp.motion === "one_word") return oneWordLayout(ctx);
+  if (lp.motion === "word_window") return wordWindowLayout(ctx);
+  if (lp.motion === "stack") return stackLayout(ctx);
   if (lp.layout === "line" && (lp.motion === "boil" || lp.motion === "write_on")) {
     return lineInkLayout(ctx);
   }

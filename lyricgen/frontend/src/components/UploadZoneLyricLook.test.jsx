@@ -33,7 +33,15 @@ vi.mock("./WizardLivePreview", () => ({
     />
   ),
 }));
-vi.mock("./TitleCardPreview", () => ({ default: () => null }));
+vi.mock("./TitleCardPreview", () => ({
+  default: ({ lookArtistFont, lookSongFont }) => (
+    <div
+      data-testid="title-preview"
+      data-artist-font={lookArtistFont?.css}
+      data-song-font={lookSongFont?.css}
+    />
+  ),
+}));
 vi.mock("./HelpCenter/HelpTip", () => ({ default: () => null }));
 vi.mock("../lib/telemetryTrack", () => ({ track: () => {} }));
 
@@ -101,13 +109,13 @@ afterEach(() => {
 });
 
 describe("paso 4: picker de looks", () => {
-  it("muestra los 22 looks arriba de la tipografía, con 'sin look' primero", () => {
+  it("muestra los looks arriba de la tipografía, con 'sin look' primero", () => {
     render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "" }} />);
     goStep(4);
     const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')];
     expect(cards.map((c) => c.dataset.lyricLook)).toEqual([
       "none", "cosmico", "cine", "pincel", "pop70", "pelicula",
-      "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
+      "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "escalera", "una_por_una", "ventana",
       "duotono", "romantico", "degrade", "y2k",
       "golpe", "recorte", "diptico", "diario", "nube", "puntada",
     ]);
@@ -250,9 +258,9 @@ describe("paso 4: variante del look por género", () => {
     expect(resolveBodies.at(-1)).toMatchObject({ lyric_look: "cinetico", job_id: "job-1", artist: "Almafuerte", song_title: "Toro y Pampa" });
     // Familia heavy: recomendados primero (sin look siempre primero) con su marca.
     const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')].map((c) => c.dataset.lyricLook);
-    expect(cards.slice(0, 12)).toEqual(["none", "golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "cosmico"]);
+    expect(cards.slice(0, 14)).toEqual(["none", "golpe", "recorte", "diptico", "cinetico", "pincel", "bloque", "neon", "cine", "duotono", "perspectiva", "escalera", "una_por_una", "cosmico"]);
     const badges = screen.getAllByTestId("look-recommended");
-    expect(badges).toHaveLength(11);
+    expect(badges).toHaveLength(13);
     // (t mockeado devuelve la key; el texto real interpola {family}.)
     expect(badges[0].textContent).toBe("upload.variant_recommended_for");
     expect(badges[0].closest("[data-lyric-look]").dataset.lyricLook).toBe("golpe");
@@ -260,6 +268,18 @@ describe("paso 4: variante del look por género", () => {
     await waitFor(() => expect(reviews.some((r) => r.lookResolved?.variant === 3)).toBe(true));
     // La tipografía queda bloqueada: se elige en «Variante».
     expect(screen.getByTestId("look-font-locked").textContent).toBe("upload.look_font_locked_note");
+  });
+
+  it("shows the resolved highlight and main fonts in the title preview", async () => {
+    mockApi();
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "perspectiva" }} artist="Los Enanitos Verdes" song="Amigos" />);
+    goStep(4);
+    fireEvent.click(screen.getByRole("button", { name: "preview.face_title" }));
+    await waitFor(() => {
+      const title = screen.getByTestId("title-preview");
+      expect(title.dataset.artistFont).toContain("Metal Mania");
+      expect(title.dataset.songFont).toContain("Rubik Dirt");
+    });
   });
 
   it("'Otra variante' y los overrides viajan al review; 'Restaurar' los limpia", async () => {

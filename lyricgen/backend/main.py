@@ -14489,6 +14489,7 @@ def lyric_looks_resolve(request: Request, body: _LookResolveReq,
         _look, info = lyric_recipes.resolve(look_id, genre="", variant=0, seed_key=seed_key,
                                             overrides={"ink": _ov["ink"]})
         info["genre_source"] = "none"
+        info["legacy"] = True
         return info
     # The default of a look is its ORIGINAL design (lyric_look_runtime.
     # wants_original — the same rule the render applies): automatic genre +

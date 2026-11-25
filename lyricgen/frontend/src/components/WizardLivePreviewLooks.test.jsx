@@ -122,7 +122,7 @@ describe("WizardLivePreview — looks de letra", () => {
   });
 });
 
-const NEW_LOOKS = ["cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "duotono", "romantico", "degrade", "y2k"];
+const NEW_LOOKS = ["cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "escalera", "una_por_una", "ventana", "duotono", "romantico", "degrade", "y2k"];
 
 async function playLine(refOut, tick) {
   await act(async () => {
@@ -140,6 +140,52 @@ const LIVE_TICK = {
 };
 
 describe("WizardLivePreview — looks nuevos", () => {
+  it("Una por una shows only the word being sung, the key word in green Knewave", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="una_por_una" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    expect(lyric.style.fontFamily).toContain("Oswald");
+    const shown = [...lyric.querySelectorAll("[data-look-word]")];
+    expect(shown.map((w) => w.dataset.lookWord)).toEqual(["3"]);
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.7 });
+    const key = lyric.querySelector('[data-look-key="true"]');
+    expect(key).not.toBeNull();
+    expect(key.style.fontFamily).toContain("Knewave");
+    expect(key.style.color).toBe("rgb(119, 237, 89)");
+  });
+
+  it("Ventana keeps the last two sung words and dims the older one", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="ventana" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    const shown = [...lyric.querySelectorAll("[data-look-word]")];
+    expect(shown.map((w) => w.dataset.lookWord)).toEqual(["2", "3"]);
+    expect(shown[0].dataset.lookDim).toBe("true");
+    expect(shown[1].dataset.lookDim).toBeUndefined();
+  });
+
+  it("Escalera types the sung words letter by letter and bursts them at the end", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="escalera" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    const rows = [...lyric.querySelectorAll("[data-look-row]")];
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows[0].style.transform).not.toBe(rows[1].style.transform);
+    const word = (i) => lyric.querySelector(`[data-look-word="${i}"]`);
+    expect(word(3).dataset.lookVisible).toBe("true");
+    expect(word(4).dataset.lookVisible).toBe("false");
+    const letters = (i) => [...word(i).querySelectorAll("[data-look-letter]")];
+    expect(letters(3).every((l) => l.style.animation.includes("wlp-type-in"))).toBe(true);
+    expect(letters(4).every((l) => l.style.visibility === "hidden")).toBe(true);
+    const keyRow = lyric.querySelector('[data-look-row][data-look-key="true"]');
+    expect(keyRow.style.fontFamily).toContain("Knewave");
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.95 });
+    expect(letters(8).every((l) => l.style.animation.includes("wlp-burst"))).toBe(true);
+  });
+
   it.each(NEW_LOOKS)("%s renderiza en el loop de muestra y nombra el look", (code) => {
     const { container } = renderLook({ lyricLook: code });
     expect(container.querySelector(`[data-lyric-look="${code}"]`)).not.toBeNull();

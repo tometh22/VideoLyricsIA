@@ -4,12 +4,8 @@ import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 /**
  * Live, faithful preview of the intro title card (artist over song) as it
  * will render in the lyric video. Mirrors the backend `title_card_lines`
- * layout AND fonts:
- *   - artist: Montserrat ExtraBold (weight 800), UPPERCASE — hardcoded in the
- *     backend at pipeline.py (Montserrat-ExtraBold.ttf).
- *   - song:   the operator's chosen lyric font, resolved through the SAME
- *     shared catalog (fontCatalog.FONT_BY_CODE) the WizardLivePreview uses, so
- *     what the operator sees here matches what the worker burns via libass.
+ * layout and fonts. With a lyric look, the artist uses the display face
+ * and the song uses the main face. Either line can be overridden.
  *
  * It also mirrors the backend's "shrink, then wrap" fitting
  * (ass_render.fit_title_text): measure the real text at the base size, shrink
@@ -120,12 +116,15 @@ export default function TitleCardPreview({
   artist = "",
   song = "",
   font = "",            // song font fallback (the lyric font, backward-compat)
+  lookArtistFont = null,
+  lookSongFont = null,
+  lookArtistColor = "#FFFFFF",
   textCase = "upper",
   // Full Rotor v1 controls. Defaults reproduce the historical hero look.
   template = "auto",
   titleSize = 1.0,
-  artistFont = "",      // "" → Montserrat ExtraBold (backend default)
-  songFont = "",        // "" → falls back to `font` (the lyric font)
+  artistFont = "",
+  songFont = "",
   // UI v1.1 (2026-05-30): explicit line break for the song. When the operator
   // chose to split the title manually, songLines holds the 2 lines exactly as
   // they will be rendered (no auto-wrap). null/undefined or single entry =>
@@ -173,17 +172,14 @@ export default function TitleCardPreview({
     : null;
   const useManualSplit = !!(manualSongLines && manualSongLines.length >= 2);
 
-  // Per-element fonts: artist → chosen font or Montserrat ExtraBold (800);
-  // song → chosen font or the lyric font (`font`). Mirrors the backend's
-  // _render_lyrics_ass resolution.
-  const artistResolved = FONT_BY_CODE[artistFont];
+  const artistResolved = (artistFont && FONT_BY_CODE[artistFont]) || lookArtistFont;
   const artistFamily = artistResolved?.css || ARTIST_FONT;
   const artistWeight = artistResolved?.weight || 800;
   // FONT_BY_CODE[""] is a real (truthy) entry with css:undefined, so guard on
   // the code being non-empty before using it; otherwise fall back to `font`
   // (the lyric font), then to the catalog default.
   const songResolved =
-    (songFont && FONT_BY_CODE[songFont]) || FONT_BY_CODE[font] || FONT_BY_CODE[""];
+    (songFont && FONT_BY_CODE[songFont]) || lookSongFont || FONT_BY_CODE[font] || FONT_BY_CODE[""];
   const songFamily = songResolved.css || ARTIST_FONT;
   const songWeight = songResolved.weight || 700;
 
@@ -247,7 +243,7 @@ export default function TitleCardPreview({
                 maxWidth={maxWidth}
                 fontFamily={artistFamily}
                 weight={artistWeight}
-                color="#FFFFFF"
+                color={artistFont && FONT_BY_CODE[artistFont] ? "#FFFFFF" : lookArtistColor}
                 opacity={0.97}
               />
               {useManualSplit ? (

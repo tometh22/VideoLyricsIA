@@ -11,12 +11,12 @@ import {
 import { lookWithVariant } from "../lib/lyricLookVariants";
 import {
   lookLineMotionStyle, renderLookLayout, LookBackdrop, LOOK_LAYOUT_KEYFRAMES,
-  buildWordParts, BuildDoodles, LIVE_LINE_TRANSITION,
+  buildWordParts, BuildDoodles, LIVE_LINE_TRANSITION, LOOK_LOOP_S,
 } from "./lookPreviewLayouts";
 
 // Movimientos de línea en vivo: viven con los layouts de los looks; se
 // re-exportan acá porque es la API histórica del preview.
-export { lookLineMotionStyle };
+export { lookLineMotionStyle, LOOK_LOOP_S };
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -114,8 +114,6 @@ function hexToRgba(hex, alpha) {
 //     Pop 70s).
 //   - en vivo (audio del editor): el progreso de la línea real se calcula en
 //     JS a partir de currentTime, así entrada/salida caen donde el render.
-export const LOOK_LOOP_S = 3.2;
-
 // Ruido de película (SVG feTurbulence) como textura repetida.
 const GRAIN_URI = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='.6'/></svg>\")";
 

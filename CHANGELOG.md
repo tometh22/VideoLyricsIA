@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.219] - 2026-11-25
+
+### Added
+- Three word-synced lyric looks in Oswald with the key word in green Knewave: Escalera (each word typed letter by letter down a staircase, then the letters burst apart), Una por una (only the sung word, huge and centered) and Ventana (the last two sung words, the older one dimming).
+
+### Fixed
+- Look posters and the title-card preview use the look's display face and accent for the artist and its main face for the song, matching the render.
+
 ## [1.1.218] - 2026-11-25
 
 ### Fixed
