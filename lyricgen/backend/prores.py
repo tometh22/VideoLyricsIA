@@ -213,6 +213,9 @@ def ensure_prores_exists(
         release_portal_demand_on_terminal, clear_current_portal_demand,
     )
     if not os.path.exists(source_path):
+        # Downloading is not waiting for the encode slot. Drop the marker
+        # so the other deployment's prewarm can use a free CPU.
+        clear_current_portal_demand()
         source_key = (job.get("s3_keys") or {}).get(source_key_name)
         if source_key and storage.is_enabled():
             os.makedirs(os.path.dirname(source_path), exist_ok=True)

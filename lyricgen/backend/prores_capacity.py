@@ -409,6 +409,23 @@ def _current_rq_job():
         return None
 
 
+def abandon_rq_retries() -> None:
+    """Stop RQ from running this job again.
+
+    A download that already used its inactivity and total budget must not
+    be multiplied by ``Retry(max=2)``. Three passes of two 420 s attempts
+    is about 42 minutes of a portal job sitting in front of the host.
+    """
+    job = _current_rq_job()
+    if job is None:
+        return
+    try:
+        job.retries_left = 0
+        job.save()
+    except Exception:
+        logger.warning("[PRORES] could not clear RQ retries", exc_info=True)
+
+
 def clear_current_portal_demand() -> None:
     job = _current_rq_job()
     if job is not None:
@@ -598,6 +615,9 @@ def download_prores_source(key: str, dest: str) -> bool:
     try:
         _download_r2(key, dest)
     except DownloadTimeout as exc:
+        # The attempts inside this job are the whole budget. RQ Retry would
+        # start them over.
+        abandon_rq_retries()
         logger.warning(
             "[PRORES] source download stopped key=%s reason=%s after %s attempt(s)",
             key, exc.reason, download_max_attempts(),

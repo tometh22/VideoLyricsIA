@@ -1900,11 +1900,27 @@ def _promote_queued_prewarm(live, portal_queue, prewarm_queue, *, require_r2_upl
     """
     from prores_capacity import mark_portal_demand
 
-    mark_portal_demand(getattr(live, "id", "") or "")
     origin = getattr(live, "origin", None)
     status = live.get_status(refresh=False)
     value = str(getattr(status, "value", status) or "").lower()
     if origin == getattr(portal_queue, "name", None) or value != "queued":
+        # Already on the portal queue, or a worker already has it.
+        mark_portal_demand(getattr(live, "id", "") or "")
+        return live.id
+    removed = 0
+    if prewarm_queue is not None and getattr(prewarm_queue, "name", None) == origin:
+        try:
+            removed = int(prewarm_queue.remove(live.id) or 0)
+        except Exception:
+            logger.warning("[PRORES] could not leave the prewarm queue", exc_info=True)
+            return live.id
+    if removed <= 0:
+        # A worker LMOVEd the job between the status check and the remove.
+        # Enqueueing again would run it twice.
+        logger.info(
+            "[PRORES] %s left %s before promotion; not enqueueing a second copy",
+            live.id, origin,
+        )
         return live.id
     if require_r2_upload:
         meta = dict(getattr(live, "meta", None) or {})
@@ -1916,11 +1932,7 @@ def _promote_queued_prewarm(live, portal_queue, prewarm_queue, *, require_r2_upl
             logger.warning(
                 "[PRORES] could not mark %s as a portal upload", live.id, exc_info=True,
             )
-    if prewarm_queue is not None and getattr(prewarm_queue, "name", None) == origin:
-        try:
-            prewarm_queue.remove(live.id)
-        except Exception:
-            logger.warning("[PRORES] could not leave the prewarm queue", exc_info=True)
+    mark_portal_demand(getattr(live, "id", "") or "")
     try:
         portal_queue.enqueue_job(live, at_front=True)
     except Exception:

@@ -229,9 +229,10 @@ class WarmOnlyWorker(_RQWorker):
         Stock RQ would pop a prewarm job and the job would then block on a
         lock. That occupied the worker and hid portal jobs still queued in
         Redis. Here the process sleeps *without* a job until a portal export
-        can run, or until prewarm is allowed. The encode flock is taken
-        inside the job, around ffmpeg only, so a probe that finds a free
-        slot does not keep that slot through the R2 upload.
+        can run, or until prewarm is allowed. An encode-ready job keeps the
+        flock from the moment it is dequeued until the horse exits, so a
+        second worker cannot steal it and defer in a loop. The download
+        still runs without the flock.
         """
         from prores_capacity import gate_enabled_for
 
@@ -241,9 +242,9 @@ class WarmOnlyWorker(_RQWorker):
 
     def _dequeue_prores_gated(self):
         from prores_capacity import (
-            decide_admission, host_portal_waiting, max_concurrency,
-            portal_queue_name, prewarm_queue_name, refresh_portal_markers,
-            rq_job_inputs_ready, try_acquire_slot,
+            clear_portal_demand, decide_admission, host_portal_waiting,
+            max_concurrency, portal_queue_name, prewarm_queue_name,
+            refresh_portal_markers, rq_job_inputs_ready, try_acquire_slot,
         )
         from rq.job import Job
 
@@ -289,15 +290,19 @@ class WarmOnlyWorker(_RQWorker):
                     _sleep_until_shutdown(self, poll)
                     continue
                 if decision.takes_slot:
-                    # Probe only. Holding the fd across execute_job would
-                    # keep the CPU permit through the upload that follows
-                    # ffmpeg. A race that loses the slot raises ProResDefer
-                    # and the job returns to the front of its queue.
+                    # Hold the permit across the horse. Releasing it here let
+                    # every other worker pop the same ready job, fail to
+                    # re-acquire, and requeue with an error traceback.
+                    # The fd stays in this process (CLOEXEC); the horse sees
+                    # PRORES_SLOT_HELD and does not take a second lock.
+                    # execute_job releases it, which is after ffmpeg and the
+                    # upload that follows in the same horse.
                     slot = try_acquire_slot()
                     if slot is None:
                         _sleep_until_shutdown(self, poll)
                         continue
-                    slot.release()
+                    self._prores_slot = slot
+                    os.environ["PRORES_SLOT_HELD"] = "1"
                 result = self.queue_class.dequeue_any(
                     [by_name[target_name]],
                     None,
@@ -307,9 +312,19 @@ class WarmOnlyWorker(_RQWorker):
                     death_penalty_class=self.death_penalty_class,
                 )
                 if result is None:
+                    self._release_prores_slot()
                     _sleep_until_shutdown(self, poll)
                     continue
                 job, queue = result
+                ready = rq_job_inputs_ready(job)
+                if self._prores_slot is not None and not ready:
+                    # The head we probed was encode-ready, but the job we
+                    # actually popped still needs its source.
+                    self._release_prores_slot()
+                if queue.name == portal_name and not ready:
+                    # A download is not waiting for the CPU. Leave the slot
+                    # free for the other deployment's prewarm.
+                    clear_portal_demand(getattr(job, "id", "") or "")
                 try:
                     self.reorder_queues(reference_queue=queue)
                 except Exception:
@@ -343,12 +358,24 @@ class WarmOnlyWorker(_RQWorker):
             job, queue, started_job_registry=started_job_registry, exc_string=exc_string,
         )
 
+    def handle_exception(self, job, *exc_info):  # type: ignore[override]
+        """A defer is a requeue, not a failed job. Skip RQ's error traceback."""
+        exc = exc_info[1] if len(exc_info) > 1 else None
+        if exc is not None and exc.__class__.__name__ == "ProResDefer":
+            logger.info(
+                "[PRORES] %s deferred until an encode slot is free",
+                getattr(job, "id", "?"),
+            )
+            return None
+        return super().handle_exception(job, *exc_info)
+
     def _requeue_deferred_prores(self, job, queue, started_job_registry) -> None:
         """Put an encode-ready job back at the head without a failure."""
         logger.info(
             "[PRORES] encode slot busy; requeueing %s at the front of %s",
             getattr(job, "id", "?"), getattr(queue, "name", "?"),
         )
+        self._drop_intermediate_job(queue, job)
         try:
             if started_job_registry is None:
                 started_job_registry = queue.started_job_registry
@@ -364,14 +391,46 @@ class WarmOnlyWorker(_RQWorker):
             job.exc_info = None
         except Exception:
             pass
+        try:
+            from prores_capacity import mark_portal_demand, portal_queue_name
+            if getattr(queue, "name", None) == portal_queue_name():
+                mark_portal_demand(getattr(job, "id", "") or "")
+        except Exception:
+            logger.warning("[PRORES] could not republish portal demand", exc_info=True)
         queue.enqueue_job(job, at_front=True)
+
+    def _drop_intermediate_job(self, queue, job) -> None:
+        """RQ 1.16 LMOVEs a single-queue pop into an intermediate list.
+
+        ``prepare_job_execution`` only LREMs that list when the worker
+        listens to exactly one queue. This worker listens to portal and
+        prewarm, so a successful job stayed in the intermediate list and
+        the registry cleanup later marked it failed.
+        """
+        job_id = getattr(job, "id", None)
+        key = getattr(queue, "intermediate_queue_key", None)
+        connection = getattr(self, "connection", None)
+        if not job_id or not key or connection is None:
+            return
+        try:
+            connection.lrem(key, 1, job_id)
+        except Exception:
+            logger.warning("[PRORES] could not leave the intermediate queue", exc_info=True)
 
     def prepare_job_execution(  # type: ignore[override]
         self, job, remove_from_intermediate_queue=False,
     ):
-        """Reject incompatible payloads inside RQ's failure boundary."""
+        """Reject incompatible payloads inside RQ's failure boundary.
+
+        Gated ProRes workers dequeue one queue at a time, which is the
+        LMOVE path. Always drop the intermediate entry, even though this
+        process listens to two queues.
+        """
+        from prores_capacity import gate_enabled_for
         from queue_jobs import validate_rq_payload_metadata
 
+        if gate_enabled_for(self.queue_names()):
+            remove_from_intermediate_queue = True
         validate_rq_payload_metadata(getattr(job, "meta", None))
         return super().prepare_job_execution(job, remove_from_intermediate_queue)
 

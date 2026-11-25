@@ -170,7 +170,7 @@ def test_customer_click_promotes_a_queued_background_prewarm(monkeypatch, tmp_pa
     portal.enqueue = Mock()
     portal.enqueue_job = Mock()
     prewarm = type("Q", (), {"name": "prores_prewarm", "count": 0})()
-    prewarm.remove = Mock()
+    prewarm.remove = Mock(return_value=1)
 
     monkeypatch.setattr(
         queue_jobs, "prores_rq_queue",
@@ -200,6 +200,156 @@ def test_customer_click_promotes_a_queued_background_prewarm(monkeypatch, tmp_pa
     assert again == live.id
     prewarm.remove.assert_not_called()
     portal.enqueue_job.assert_not_called()
+
+
+def test_promotion_does_not_enqueue_when_the_worker_already_took_the_job(monkeypatch, tmp_path):
+    import queue_jobs
+    from unittest.mock import Mock
+
+    _dedicated(monkeypatch, tmp_path)
+    live = type("Live", (), {})()
+    live.id = "prewarm:job1:umg_master"
+    live.origin = "prores_prewarm"
+    live.meta = {}
+    live.get_status = lambda refresh=True: "queued"
+    live.save_meta = Mock()
+    portal = type("Q", (), {"name": "prores_portal", "count": 0})()
+    portal.enqueue = Mock()
+    portal.enqueue_job = Mock()
+    prewarm = type("Q", (), {"name": "prores_prewarm", "count": 0})()
+    prewarm.remove = Mock(return_value=0)
+    monkeypatch.setattr(
+        queue_jobs, "prores_rq_queue",
+        lambda kind: portal if kind == "portal" else prewarm,
+    )
+    monkeypatch.setattr(queue_jobs, "_live_prewarm_job", lambda *_a, **_k: live)
+    monkeypatch.setattr(queue_jobs, "_require_submissions_open", lambda: None)
+
+    job_id = queue_jobs.enqueue_prores_prewarm(
+        "job1", "umg_master", force=True, dedupe_live=True,
+    )
+    assert job_id == live.id
+    prewarm.remove.assert_called_once_with(live.id)
+    portal.enqueue_job.assert_not_called()
+    live.save_meta.assert_not_called()
+    assert cap.host_portal_waiting() == 0
+
+
+def test_download_cap_does_not_leave_rq_retries(monkeypatch, tmp_path):
+    import storage
+
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+
+    def stalled(key, dest):
+        raise cap.DownloadTimeout("total")
+
+    monkeypatch.setattr(cap, "_download_r2", stalled)
+    job = type("Job", (), {"id": "portal-1", "retries_left": 2})()
+    job.save = lambda: setattr(job, "saved", True)
+    monkeypatch.setattr(cap, "_current_rq_job", lambda: job)
+    assert cap.download_prores_source("k", str(tmp_path / "source.bin")) is False
+    assert job.retries_left == 0
+    assert job.saved is True
+
+
+def test_download_drops_the_portal_marker(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    cap.mark_portal_demand("portal-prores-abc")
+    assert cap.host_portal_waiting() == 1
+
+    class Job:
+        id = "portal-prores-abc"
+
+    monkeypatch.setattr(cap, "_current_rq_job", lambda: Job())
+    cap.clear_current_portal_demand()
+    assert cap.host_portal_waiting() == 0
+    portal = (BACKEND / "portal_prores.py").read_text()
+    ensure = (BACKEND / "prores.py").read_text().split("def ensure_prores_exists", 1)[1]
+    assert portal.index("clear_current_portal_demand()") < portal.index(
+        "download_prores_source(source_key, source_path)"
+    )
+    assert ensure.index("clear_current_portal_demand()") < ensure.index(
+        "download_prores_source(source_key, source_path)"
+    )
+
+
+def test_gated_worker_drops_the_intermediate_queue(monkeypatch):
+    import worker
+
+    monkeypatch.setenv("PRORES_PORTAL_QUEUE", "prores_portal")
+    monkeypatch.setenv("PRORES_PREWARM_QUEUE", "prores_prewarm")
+    seen = {}
+
+    def fake_prepare(self, job, remove_from_intermediate_queue=False):
+        seen["flag"] = remove_from_intermediate_queue
+
+    monkeypatch.setattr(worker._RQWorker, "prepare_job_execution", fake_prepare)
+    host = worker.WarmOnlyWorker.__new__(worker.WarmOnlyWorker)
+    host.queue_names = lambda: ["prores_portal", "prores_prewarm"]
+    worker.WarmOnlyWorker.prepare_job_execution(
+        host, type("Job", (), {"meta": {}})(), False,
+    )
+    assert seen["flag"] is True
+
+    host.queue_names = lambda: ["enterprise", "default"]
+    worker.WarmOnlyWorker.prepare_job_execution(
+        host, type("Job", (), {"meta": {}})(), False,
+    )
+    assert seen["flag"] is False
+
+
+def test_requeue_drops_the_intermediate_entry_and_restores_demand(monkeypatch, tmp_path):
+    import worker
+
+    _dedicated(monkeypatch, tmp_path)
+    removed = []
+
+    class Queue:
+        name = "prores_portal"
+        intermediate_queue_key = "rq:queue:prores_portal:intermediate"
+
+        def __init__(self):
+            self.started_job_registry = type("R", (), {"remove": lambda self, job: None})()
+
+        def enqueue_job(self, job, at_front=False):
+            removed.append(("enqueue", at_front, job.id))
+
+    class Job:
+        id = "portal-prores-1"
+        ended_at = "set"
+        exc_info = "set"
+
+    host = worker.WarmOnlyWorker.__new__(worker.WarmOnlyWorker)
+    host.connection = type("C", (), {"lrem": lambda self, key, n, job_id: removed.append(("lrem", key, job_id))})()
+    worker.WarmOnlyWorker._requeue_deferred_prores(
+        host, Job(), Queue(), Queue().started_job_registry,
+    )
+    assert ("lrem", "rq:queue:prores_portal:intermediate", "portal-prores-1") in removed
+    assert ("enqueue", True, "portal-prores-1") in removed
+    assert cap.host_portal_waiting() == 1
+
+
+def test_defer_is_not_logged_as_a_job_failure():
+    import worker
+
+    host = worker.WarmOnlyWorker.__new__(worker.WarmOnlyWorker)
+    called = {}
+
+    def boom(self, job, *exc_info):
+        called["super"] = True
+
+    host_cls = worker.WarmOnlyWorker
+    # super() looks up the real base. Spy by replacing the RQ method.
+    original = worker._RQWorker.handle_exception
+    worker._RQWorker.handle_exception = boom
+    try:
+        exc = cap.ProResDefer("busy")
+        host_cls.handle_exception(
+            host, type("J", (), {"id": "j"})(), type(exc), exc, None,
+        )
+    finally:
+        worker._RQWorker.handle_exception = original
+    assert "super" not in called
 
 
 def test_host_marker_is_visible_to_the_other_stack(monkeypatch, tmp_path):

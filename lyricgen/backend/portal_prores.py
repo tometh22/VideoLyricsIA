@@ -206,6 +206,9 @@ def _materialize_body(
                 os.makedirs(os.path.dirname(source_path), exist_ok=True)
             output_path = os.path.join(directory, "master.mov")
             already = os.path.exists(source_path) and os.path.getsize(source_path) > 0
+            if not already:
+                from prores_capacity import clear_current_portal_demand
+                clear_current_portal_demand()
             if not already and not download_prores_source(source_key, source_path):
                 raise RuntimeError("No se pudo leer el video publicado.")
             remember_inputs(source_path)

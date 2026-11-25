@@ -42,9 +42,11 @@ de delivery) entran en `prores_portal`. El prewarm de fondo entra en
 El tope es un flock en disco, no un lock de Redis: staging y producción no
 comparten Redis. Las dos stacks usan el mismo `PRORES_SEMAPHORE_NAME` y el
 mismo directorio montado en el host (`/var/lock/genly-prores`). Un marcador
-en ese directorio dice que hay un portal esperando en cualquiera de las
-dos colas; el prewarm de la otra stack no arranca mientras el marcador
-exista.
+en ese directorio dice que hay un portal listo para ffmpeg, o encolado
+esperando el slot, en cualquiera de las dos colas. El prewarm de la otra
+stack no arranca mientras el marcador exista. La descarga lo suelta: bajar
+la fuente no ocupa la CPU, y un portal bajando no tiene que frenar al
+prewarm.
 
 Si `PRORES_MAX_CONCURRENCY` no está, el tope no aplica. En la cola
 `enterprise` el tope tampoco aplica: un defer ahí haría girar workers que
@@ -52,8 +54,11 @@ no conocen la compuerta.
 
 La descarga de R2 ocurre antes de tomar el slot. Un socket mudo corta por
 inactividad. Un stream lento pero constante (el caso de ~65 KB/s) corta
-por el tope total. Solo se reintenta ese timeout, `PRORES_DOWNLOAD_MAX_ATTEMPTS`
-veces. `inactividad × intentos + encode` tiene que entrar en
+por el tope total. Esos intentos (`PRORES_DOWNLOAD_MAX_ATTEMPTS`, default
+2) son el presupuesto completo: un corte por tope no dispara el `Retry`
+de RQ. Cuando el job ya tiene la fuente, el worker se queda con el flock
+hasta que el proceso hijo termina, así dos workers no se lo arrebatan y
+reencolan en loop. `inactividad × intentos + encode` tiene que entrar en
 `PRORES_PREWARM_TIMEOUT_SECONDS` (900).
 
 ## Variables
