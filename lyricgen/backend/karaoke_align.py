@@ -159,7 +159,7 @@ def enrich_segments_with_word_timings(segments, audio_path):
         retimed = 0
         for seg in segments:
             txt = str(seg.get("text", "")).strip()
-            if not txt or _has_valid_words(seg):
+            if not txt:
                 merged.append(seg)
                 continue
             key = _norm(txt)
@@ -172,6 +172,13 @@ def enrich_segments_with_word_timings(segments, audio_path):
                     cursor = j + 1
                     break
                 j += 1
+            if _has_valid_words(seg):
+                # Keep its words, but the search above still advanced the
+                # cursor: FA aligns EVERY line, so skipping the timed ones
+                # without consuming their aligned line left the 6-line window
+                # stuck near the top and no later wordless line could match.
+                merged.append(seg)
+                continue
             if (
                 found
                 and _retime_enabled()
