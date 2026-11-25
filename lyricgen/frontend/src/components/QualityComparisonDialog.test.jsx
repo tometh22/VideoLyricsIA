@@ -121,3 +121,31 @@ it("reintenta el mismo voto tras un fallo y cierra al cambiar la revisión", asy
   act(() => rerender(<QualityProposalPanel {...props} currentRevision={5} />));
   expect(screen.queryByRole("dialog")).toBeNull();
 });
+
+it("permite corregir de inmediato sin exigir reproducción, voto ni aplicación", () => {
+  const onEdit = vi.fn();
+  const { dialog, props } = openComparison({ onEdit });
+  fireEvent.click(dialog.getByRole("button", { name: "Corregir en el editor" }));
+  expect(onEdit).toHaveBeenCalledWith(windowProposal);
+  expect(props.comparisonSource.onDecision).not.toHaveBeenCalled();
+  expect(props.onApplySelected).not.toHaveBeenCalled();
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+it("prioriza tres comparaciones y deja los cambios pequeños en la revisión manual", () => {
+  const segments = Array.from({ length: 5 }, (_, i) => ({ text: `Frase ${i}`, start: 5 * i, end: 5 * i + 2 }));
+  const windows = segments.map((line, i) => ({
+    id: `w${i}`, start: line.start, end: line.end + 1, suggestion_type: "timing",
+    current_segments: [line], proposed_segments: [{ ...line, end: line.end + (i === 4 ? 0.15 : 0.5) }],
+  }));
+  render(<QualityProposalPanel currentRevision={4}
+    proposal={{ id: "ranked", base_revision: 4, windows }}
+    comparisonSource={{ segments, duration: 30 }} />);
+  fireEvent.click(screen.getByText(/Ver propuestas/));
+  const more = screen.getByText("Ver más sugerencias (2)");
+  expect(more.parentElement).not.toHaveAttribute("open");
+  expect(within(more.parentElement).getAllByText("Comparar A/B")).toHaveLength(1);
+  fireEvent.click(more);
+  expect(screen.getAllByRole("button", { name: "Comparar A/B" })).toHaveLength(4);
+  expect(within(screen.getByTestId("quality-proposal-window-w4")).queryByRole("button", { name: "Comparar A/B" })).toBeNull();
+});

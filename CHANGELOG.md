@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.218] - 2026-11-25
+
+### Fixed
+- Prioritize three visibly distinct comparisons, show their audio range, and let reviewers jump straight to the editable lyric when either version needs work.
+
 ## [1.1.217] - 2026-11-24
 
 ### Added

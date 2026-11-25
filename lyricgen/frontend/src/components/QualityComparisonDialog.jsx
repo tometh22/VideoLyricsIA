@@ -5,7 +5,7 @@ const button = "rounded-lg border border-white/20 px-3 py-2 text-sm font-medium 
 
 export default function QualityComparisonDialog({
   comparison, jobId, audioUrl, backgroundUrl, settings, request,
-  onClose, onDecision, onApply, applying,
+  onClose, onDecision, onEdit, onApply, applying,
 }) {
   const title = useId();
   const dialog = useRef(null);
@@ -144,6 +144,7 @@ export default function QualityComparisonDialog({
       <NativeLyricPreview key={variant} segments={comparison[identity(variant)]} settings={settings}
         jobId={jobId} request={request} backgroundUrl={backgroundUrl} currentTime={currentTime}
         isPlaying={playing} onStateChange={changePreviewState} />
+      {onEdit && <button type="button" className={`mt-4 ${button}`} onClick={onEdit}>Corregir en el editor</button>}
       {audioError && <p role="alert" className="mt-3 text-sm text-amber-200">No se pudo reproducir el tramo del audio original.</p>}
       {vote ? (
         <div className="mt-4 space-y-3">
@@ -161,7 +162,7 @@ export default function QualityComparisonDialog({
         </div>
       ) : (
         <div className="mt-4 space-y-2">
-          <p className="text-sm text-gray-300">Escuchá completo el mismo tramo en A y B. Elegí la que mejor acompaña la voz.</p>
+          <p className="text-sm text-gray-300">Reproducí A y B para elegir. Si encontrás errores de letra o tiempos en ambas, podés ir directo al editor.</p>
           <div className="flex flex-wrap gap-2">
             {[["A", "Prefiero A"], ["B", "Prefiero B"], ["neither", "Ambas necesitan edición"]].map(([selection, label]) => (
               <button key={selection} type="button" className={button}

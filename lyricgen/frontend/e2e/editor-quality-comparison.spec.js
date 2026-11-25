@@ -8,7 +8,7 @@ test("compara dos renders con audio, guarda un voto y mantiene el borrador", asy
   const candidate = { ...line, end: 3.2 };
   const proposal = {
     id: "pilot", base_revision: 0, status: "pending", windows: [{
-      id: "tail", start: 0.5, end: 3.5, current_segments: [line], proposed_segments: [candidate],
+      id: "tail", start: 0.5, end: 3.5, suggestion_type: "timing", current_segments: [line], proposed_segments: [candidate],
     }],
   };
   const api = await installEditorHarness(page, { jobId, role: "admin", editorV2: true, segments });
@@ -52,4 +52,10 @@ test("compara dos renders con audio, guarda un voto y mantiene el borrador", asy
   expect(api.saves).toHaveLength(0);
   await page.keyboard.press("Escape");
   await expect(comparison).toHaveCount(0);
+  await page.getByRole("button", { name: "Comparar A/B" }).click();
+  await comparison.getByRole("button", { name: "Corregir en el editor" }).click();
+  await expect(comparison).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: /Ajustar tiempos/ })).toHaveAttribute("aria-selected", "true");
+  expect(decisions).toHaveLength(1);
+  expect(api.saves).toHaveLength(0);
 });
