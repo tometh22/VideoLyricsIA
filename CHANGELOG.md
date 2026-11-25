@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.221] - 2026-11-25
+
+### Fixed
+- Word-by-word looks and karaoke take word timing from the original transcription when an edited line has none and forced alignment cannot provide it. Words are matched to the line by text, and edited words are interpolated between their neighbours.
+
 ## [1.1.220] - 2026-11-25
 
 ### Fixed

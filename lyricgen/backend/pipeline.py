@@ -2457,6 +2457,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     or _looks.needs_word_timings(lyric_look)):
                 import karaoke_align
                 _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+                _enriched = _recover_words_from_editor_original(job_id, _enriched)
                 if _enriched is not segments:
                     segments = _enriched
                     update_job(job_id, segments_json=segments)
@@ -18946,6 +18947,30 @@ def _look_beats(look, audio_path: str, offset: float = 0.0) -> list[float]:
     return [b - offset for b in found[1] if b - offset >= 0]
 
 
+def _recover_words_from_editor_original(job_id: str, segments: list[dict]) -> list[dict]:
+    """Second source of word timing for word-timed renders: lines that are
+    still wordless after forced alignment (edited in the editor, or the hosted
+    aligner failed) take the words of the editor's ORIGINAL transcription.
+    Returns `segments` unchanged on any problem."""
+    if not job_id or not segments:
+        return segments
+    try:
+        from database import SessionLocal, EditorDocument
+        _db = SessionLocal()
+        try:
+            _doc = (_db.query(EditorDocument)
+                    .filter(EditorDocument.job_id == job_id).first())
+            reference = list(_doc.original_segments or []) if _doc is not None else []
+        finally:
+            _db.close()
+    except Exception as exc:  # noqa: BLE001 — accessory, never fatal
+        logger.warning("[KARAOKE] job=%s original transcription unavailable (%s)",
+                       job_id, exc)
+        return segments
+    import karaoke_align
+    return karaoke_align.recover_words_from_reference(segments, reference)
+
+
 def _render_lyrics_ass(
     bg_video_path: str,
     mp3_path: str,
@@ -22320,6 +22345,7 @@ def run_edit_pipeline(
                 or _looks.needs_word_timings(lyric_look)):
             import karaoke_align
             _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
+            _enriched = _recover_words_from_editor_original(job_id, _enriched)
             if _enriched is not segments:
                 segments = _enriched
                 update_job(job_id, segments_json=segments)
