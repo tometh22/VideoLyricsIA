@@ -218,3 +218,34 @@ def test_fa_span_trustworthy_guards():
     # no scores present → coherence alone gates (trusted)
     assert karaoke_align._fa_span_trustworthy(
         [{"word": "x", "start": 1.0, "end": 2.0}]) is True
+
+
+def test_wordless_lines_after_many_timed_lines_still_get_words(monkeypatch):
+    # "Acaba De Nacer" (GIT, 25-nov): the first 23 lines kept their words and
+    # every edited line after 2:22 had none. Lines that already carry words
+    # were skipped WITHOUT advancing the cursor, so the 6-line search window
+    # never reached the later lines and the look spread their words over the
+    # whole window (up to 1.3 s late on held notes).
+    timed = [{"start": float(i * 2), "end": float(i * 2 + 1.5), "text": f"linea {i}",
+              "words": [{"word": "linea", "start": i * 2.0, "end": i * 2.0 + 0.5},
+                        {"word": str(i), "start": i * 2.0 + 0.6, "end": i * 2.0 + 1.0}]}
+             for i in range(8)]
+    wordless = [{"start": 16.0, "end": 20.0, "text": "hoy quiero ver la luz"},
+                {"start": 20.5, "end": 24.0, "text": "una nueva vida"}]
+    fa = [{"start": s["start"], "end": s["end"], "text": s["text"], "words": s["words"]} for s in timed]
+    fa += [
+        {"start": 16.1, "end": 18.4, "text": "hoy quiero ver la luz",
+         "words": [{"word": w, "start": 16.1 + k * 0.4, "end": 16.4 + k * 0.4, "score": 0.9}
+                   for k, w in enumerate("hoy quiero ver la luz".split())]},
+        {"start": 20.6, "end": 22.0, "text": "una nueva vida",
+         "words": [{"word": w, "start": 20.6 + k * 0.4, "end": 20.9 + k * 0.4, "score": 0.9}
+                   for k, w in enumerate("una nueva vida".split())]},
+    ]
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: fa)
+    out = karaoke_align.enrich_segments_with_word_timings(timed + wordless, "/tmp/a.mp3")
+    assert [w["word"] for w in out[8]["words"]] == "hoy quiero ver la luz".split()
+    assert [w["word"] for w in out[9]["words"]] == "una nueva vida".split()
+    # Lines that already had words keep them untouched, operator timing kept.
+    assert out[3]["words"] == timed[3]["words"]
+    assert out[8]["start"] == 16.0 and out[8]["end"] == 20.0

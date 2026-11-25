@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.220] - 2026-11-25
+
+### Fixed
+- Word-by-word looks and karaoke recover forced-alignment timing for edited lines further down the song. Lines that already had word timing no longer stall the matching, so later lines stop falling back to an even split that showed words up to 1.3 s after they were sung.
+
 ## [1.1.219] - 2026-11-25
 
 ### Added
