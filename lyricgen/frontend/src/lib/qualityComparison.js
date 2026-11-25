@@ -26,7 +26,8 @@ export function buildQualityComparison(segments, window, duration) {
   }
   const oldLines = before.slice(first, left);
   const newLines = after.slice(first, right);
-  const changedTimes = oldLines.length === newLines.length && oldLines.every((line, i) => line.text === newLines[i].text)
+  const timingOnly = oldLines.length === newLines.length && oldLines.every((line, i) => line.text === newLines[i].text);
+  const changedTimes = timingOnly
     ? oldLines.flatMap((line, i) => ["start", "end"].flatMap(key =>
       line[key] === newLines[i][key] ? [] : [line[key], newLines[i][key]]))
     : [...oldLines, ...newLines].flatMap(line => [line.start, line.end]);
@@ -40,5 +41,8 @@ export function buildQualityComparison(segments, window, duration) {
   const clipEnd = Math.min(duration, clipStart + length);
   const proposed = [...segments.filter(line => !overlaps(line)), ...after]
     .sort((a, b) => a.start - b.start || a.end - b.end);
-  return { start: clipStart, end: clipEnd, current: segments, proposed };
+  const timingDelta = timingOnly ? Math.max(...oldLines.map((line, i) => Math.max(
+    Math.abs(line.start - newLines[i].start), Math.abs(line.end - newLines[i].end),
+  ))) : null;
+  return { start: clipStart, end: clipEnd, current: segments, proposed, timingDelta };
 }

@@ -4433,28 +4433,33 @@ export default function LyricsEditor({
     font_scale: fontScale, lyrics_animation: selectedAnimation, line_transition: selectedLineTransition,
   };
   const comparisonSource = durableEditor.document?.quality_proposal && editorRequest && transcribeJobId
-    && !isDirty && audioUrl && audioMetadataReady && !audioError
+    && !isDirty && audioUrl
     && new URLSearchParams(window.location.search).get("timing_ab") === "1"
     ? {
       segments: durableEditor.document.segments, duration, jobId: transcribeJobId, audioUrl,
       backgroundUrl: previewBgUrl, settings: nativePreviewSettings, request: editorRequest,
+      canStart: audioMetadataReady && !audioError,
       onOpen: stopGuidedPlayback,
       onDecision: (properties) => trackEditorEvent("editor_timing_ab_decided", properties, { keepalive: true }),
     }
     : undefined;
 
-  const jumpToUnsafeWindow = useCallback((qualityWindow) => {
+  const jumpToUnsafeWindow = useCallback((qualityWindow, { openEditor = false } = {}) => {
     if (!qualityWindow) return;
     setTimingWorkspaceMode("timeline");
     seekTo(qualityWindow.start, false);
     const overlapping = sanitizedEdited.find(
-      (segment) => segment.end >= qualityWindow.start && segment.start <= qualityWindow.end,
+      (segment) => segment.end > qualityWindow.start && segment.start < qualityWindow.end,
     );
     const nearest = overlapping || sanitizedEdited.reduce((best, segment) => (
       !best || Math.abs(segment.start - qualityWindow.start) < Math.abs(best.start - qualityWindow.start)
         ? segment : best
     ), null);
     if (nearest) {
+      if (openEditor) {
+        setSyncMode(false);
+        setViewMode(qualityWindow.suggestion_type === "timing" ? "advanced" : "basic");
+      }
       setFocusedSegId(nearest._id);
       setFlashReviewId(nearest._id);
       window.setTimeout(
@@ -4462,7 +4467,11 @@ export default function LyricsEditor({
         1200,
       );
       window.setTimeout(
-        () => rowRefs.current[nearest._id]?.scrollIntoView?.({ behavior: "smooth", block: "center" }),
+        () => {
+          const row = rowRefs.current[nearest._id];
+          row?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+          if (openEditor) row?.querySelector('input[type="text"], textarea')?.focus({ preventScroll: true });
+        },
         0,
       );
     }
@@ -5700,7 +5709,9 @@ export default function LyricsEditor({
             onObserve={observeQualityProposal}
             onRejectWindow={rejectQualityProposalWindow}
             onReviewTelemetry={(properties) => trackEditorEvent("editor_reviewer_candidate", properties)}
-            comparisonSource={comparisonSource}
+            comparisonSource={comparisonSource && {
+              ...comparisonSource, onEdit: (window) => jumpToUnsafeWindow(window, { openEditor: true }),
+            }}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}

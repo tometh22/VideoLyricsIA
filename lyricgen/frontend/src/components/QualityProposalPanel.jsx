@@ -165,8 +165,16 @@ export default function QualityProposalPanel({
     if (!comparisonSegments || unavailable) return new Map();
     return new Map(windows.filter(window => window?.id != null).map(window => [
       window.id, buildQualityComparison(comparisonSegments, window, comparisonDuration),
-    ]).filter(([, comparison]) => comparison));
+    ]).filter(([, comparison]) => comparison && (comparison.timingDelta == null || comparison.timingDelta >= 0.35)));
   }, [comparisonDuration, comparisonSegments, unavailable, windows]);
+  const priorityKeys = useMemo(() => {
+    const ranked = windowEntries.filter(({ window }) => comparisons.has(window.id))
+      .sort(({ window: a }, { window: b }) =>
+        Number(b.selector_policy === "timing-ab-pilot-v1") - Number(a.selector_policy === "timing-ab-pilot-v1")
+        || Number(b.suggestion_type !== "timing") - Number(a.suggestion_type !== "timing")
+        || (comparisons.get(b.id).timingDelta ?? 0) - (comparisons.get(a.id).timingDelta ?? 0));
+    return new Set(ranked.slice(0, 3).map(({ key }) => key));
+  }, [comparisons, windowEntries]);
 
   useEffect(() => {
     setSelectedKeys(new Set());
@@ -202,6 +210,15 @@ export default function QualityProposalPanel({
   const busy = applying || dismissing || observing || rejecting;
   const applyDisabled = unavailable || busy || selectedEntries.length === 0;
   const dismissDisabled = unavailable || busy;
+  const primaryWindows = comparisonSource
+    ? windowEntries.filter(({ key }) => priorityKeys.has(key))
+    : windowEntries;
+  const extraWindows = comparisonSource
+    ? windowEntries.filter(({ key }) => !priorityKeys.has(key))
+    : [];
+  const editWindow = comparisonSource?.onEdit
+    ? (window) => { setComparisonId(null); comparisonSource.onEdit(window); }
+    : null;
 
   const toggleWindow = (key) => {
     if (unavailable || busy) return;
@@ -316,7 +333,9 @@ export default function QualityProposalPanel({
           <p className="rounded-xl border border-white/10 bg-white/[0.025] p-4 text-sm text-gray-400">
             No hay ventanas sugeridas para revisar.
           </p>
-        ) : windowEntries.map(({ window: proposalWindow, index, key }) => {
+        ) : [primaryWindows, extraWindows].map((group, groupIndex) => {
+          if (!group.length) return null;
+          const cards = group.map(({ window: proposalWindow, index, key }) => {
           const label = `Zona ${index + 1}`;
           const range = `${formatTime(proposalWindow?.start)} a ${formatTime(proposalWindow?.end)}`;
           const reasons = Array.isArray(proposalWindow?.reasons) ? proposalWindow.reasons : [];
@@ -347,6 +366,8 @@ export default function QualityProposalPanel({
                     </span>
                   </span>
                 </label>
+                {!comparison && editWindow && <button type="button" onClick={() => editWindow(proposalWindow)}
+                  className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold text-white">Corregir en el editor</button>}
                 <button
                   type="button"
                   className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-200 hover:border-cyan-300/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -477,13 +498,20 @@ export default function QualityProposalPanel({
               {comparison ? (
                 <>
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <span className="text-sm font-semibold text-white">{label}</span>
-                    <button type="button" disabled={busy}
-                      className="rounded-lg border border-cyan-300/40 px-3 py-1.5 text-xs font-semibold text-cyan-100 disabled:opacity-50"
-                      onClick={() => {
-                        comparisonSource.onOpen();
-                        setComparisonId(proposalWindow.id);
-                      }}>Comparar A/B</button>
+                    <div>
+                      <p className="text-sm font-semibold text-white">{formatTime(comparison.start)} – {formatTime(comparison.end)}</p>
+                      {reasons.length > 0 && <p className="text-xs text-gray-300">{reasonLabel(reasons[0])}</p>}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {editWindow && <button type="button" onClick={() => editWindow(proposalWindow)}
+                        className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold text-white">Corregir en el editor</button>}
+                      <button type="button" disabled={busy || comparisonSource.canStart === false}
+                        className="rounded-lg border border-cyan-300/40 px-3 py-1.5 text-xs font-semibold text-cyan-100 disabled:opacity-50"
+                        onClick={() => {
+                          comparisonSource.onOpen();
+                          setComparisonId(proposalWindow.id);
+                        }}>Comparar A/B</button>
+                    </div>
                   </div>
                   <details className="mt-2">
                     <summary className="cursor-pointer text-xs text-gray-300">Ver valores de la propuesta</summary>
@@ -492,6 +520,13 @@ export default function QualityProposalPanel({
                 </>
               ) : details}
             </article>
+          );
+          });
+          return groupIndex === 0 ? <div key="primary" className="space-y-4">{cards}</div> : (
+            <details key="more">
+              <summary className="cursor-pointer text-sm text-cyan-200">Ver más sugerencias ({group.length})</summary>
+              <div className="mt-3 space-y-4">{cards}</div>
+            </details>
           );
         })}
       </fieldset>
@@ -533,6 +568,7 @@ export default function QualityProposalPanel({
           settings={comparisonSource.settings}
           request={comparisonSource.request}
           onClose={() => setComparisonId(null)}
+          onEdit={editWindow ? () => editWindow(windows.find(window => window.id === comparisonId)) : undefined}
           onDecision={properties => comparisonSource.onDecision({
             ...properties, proposal_id: proposal.id, window_id: comparisonId, revision: proposal.base_revision,
           })}
