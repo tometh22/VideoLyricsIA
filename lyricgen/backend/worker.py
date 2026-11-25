@@ -429,9 +429,15 @@ class WarmOnlyWorker(_RQWorker):
         from prores_capacity import gate_enabled_for
         from queue_jobs import validate_rq_payload_metadata
 
-        if gate_enabled_for(self.queue_names()):
-            remove_from_intermediate_queue = True
+        # Reject a bad payload before any other bookkeeping. A worker built
+        # without queues (the protocol test) must still reach this check.
         validate_rq_payload_metadata(getattr(job, "meta", None))
+        names = [
+            getattr(queue, "name", str(queue))
+            for queue in (getattr(self, "queues", None) or ())
+        ]
+        if names and gate_enabled_for(names):
+            remove_from_intermediate_queue = True
         return super().prepare_job_execution(job, remove_from_intermediate_queue)
 
     @property

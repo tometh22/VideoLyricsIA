@@ -285,13 +285,13 @@ def test_gated_worker_drops_the_intermediate_queue(monkeypatch):
 
     monkeypatch.setattr(worker._RQWorker, "prepare_job_execution", fake_prepare)
     host = worker.WarmOnlyWorker.__new__(worker.WarmOnlyWorker)
-    host.queue_names = lambda: ["prores_portal", "prores_prewarm"]
+    host.queues = [type("Q", (), {"name": "prores_portal"})(), type("Q", (), {"name": "prores_prewarm"})()]
     worker.WarmOnlyWorker.prepare_job_execution(
         host, type("Job", (), {"meta": {}})(), False,
     )
     assert seen["flag"] is True
 
-    host.queue_names = lambda: ["enterprise", "default"]
+    host.queues = [type("Q", (), {"name": "enterprise"})(), type("Q", (), {"name": "default"})()]
     worker.WarmOnlyWorker.prepare_job_execution(
         host, type("Job", (), {"meta": {}})(), False,
     )
