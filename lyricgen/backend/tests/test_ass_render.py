@@ -963,3 +963,21 @@ def test_title_card_lines_defaults_unchanged_no_regression():
     artist, song = lines
     assert artist.fontsize == 100 and song.fontsize == 62
     assert artist.alignment == 5 and artist.pos[0] == 0.5
+
+
+def test_poster_title_card_leads_with_the_song_and_spaces_the_artist():
+    # Videos without a look (Tomás, 26-nov): song first in caps at the large
+    # size, artist under it smaller in spaced caps, both in the video font.
+    from ass_render import title_card_lines, build_ass
+    kw = dict(width=1920, height=1080, text_scale=1.0,
+              lyric_font_family="Poppins", artist_font_family="Poppins")
+    for first in (12.0, 0.4):                       # centred hero and badge
+        lines = title_card_lines("Charly García", "Happy And Real", first, poster=True, **kw)
+        song, artist = lines
+        assert song.text == "HAPPY AND REAL" and artist.text == "CHARLY GARCÍA"
+        assert song.fontsize > artist.fontsize and artist.spacing > 0 and song.spacing == 0
+        assert song.pos[1] < artist.pos[1]
+        doc = build_ass(width=1920, height=1080, font_name="Poppins", base_fontsize=85, outline=2, shadow=2, lines=lines)
+        assert "\\fsp" in doc
+    classic = title_card_lines("Charly García", "Happy And Real", 12.0, **kw)
+    assert classic[0].text == "CHARLY GARCÍA" and all(not l.spacing for l in classic)

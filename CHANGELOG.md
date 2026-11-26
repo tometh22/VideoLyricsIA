@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.223] - 2026-11-26
+
+### Changed
+- Videos without a lyric look no longer get the generic cover. The thumbnail is set as a poster in the video's own font, and the opening title card leads with the song title in capitals and the artist below it in spaced capitals, in the video's font instead of Montserrat ExtraBold. The wizard's title preview mirrors it.
+
 ## [1.1.221] - 2026-11-25
 
 ### Fixed

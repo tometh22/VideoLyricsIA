@@ -46,6 +46,17 @@ function songNodes(container) {
 }
 
 describe("TitleCardPreview — font fidelity / backend connection", () => {
+  it("without a look shows the poster: song first in the video font, artist spaced under it", () => {
+    render(<TitleCardPreview artist="Charly García" song="Happy And Real" font="poppins-bold" poster />);
+    const divs = [...document.querySelectorAll("div")].filter((d) => d.textContent === "HAPPY AND REAL" || d.textContent === "CHARLY GARCÍA");
+    const song = divs.find((d) => d.textContent === "HAPPY AND REAL");
+    const artist = divs.find((d) => d.textContent === "CHARLY GARCÍA");
+    expect(song.style.fontFamily).toContain("Poppins");
+    expect(artist.style.fontFamily).toContain("Poppins");
+    expect(artist.style.letterSpacing).toBe("0.14em");
+    expect(song.compareDocumentPosition(artist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("uses the look fonts and respects an explicit song override", () => {
     const props = {
       artist: "Los Enanitos Verdes", song: "Amigos", textCase: "original", font: "montserrat-bold",

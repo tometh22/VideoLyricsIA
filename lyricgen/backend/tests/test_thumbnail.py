@@ -84,6 +84,9 @@ def test_thumbnail_uses_selected_fonts_colors_and_compositor(tmp_path, monkeypat
 
     monkeypatch.setattr(pipeline, "run_checked", render)
     monkeypatch.setattr(fx_compositor, "build_video_filter", capture_filter)
+    # The libass title card is the fallback; videos without a look now get
+    # the poster first (see test_no_look_thumbnail_is_a_poster_in_the_video_font).
+    monkeypatch.setenv("THUMBNAIL_LOOK_POSTER", "0")
     result = pipeline.generate_thumbnail(
         "Viejas Locas", "Me Gustas Mucho_Viejas Locas.mp3", str(tmp_path),
         bg_source=str(bg), font=FONT, style="oscuro", custom_colors="#123456",
@@ -250,3 +253,58 @@ def test_chat_title_stays_visible_on_dark_background(tmp_path, monkeypatch):
     with Image.open(result) as img:
         pixels = img.crop((0, 250, 1280, 480)).convert('RGB').getdata()
         assert sum(min(rgb) > 160 for rgb in pixels) > 1000
+
+
+def test_no_look_thumbnail_is_a_poster_in_the_video_font(tmp_path, monkeypatch):
+    # Tomás, 26-nov: a video without a look must not get the generic
+    # Montserrat card — the poster composition, in the video's own font.
+    import os as _os
+    bg = tmp_path / "bg.png"
+    Image.new("RGB", (320, 180), (20, 30, 40)).save(bg)
+    seen = {}
+
+    def render(cmd, **kwargs):
+        seen.setdefault("labels", []).append(kwargs["label"])
+        Image.new("RGB", (1280, 720), (20, 30, 40)).save(kwargs["output_path"])
+
+    import fx_compositor
+    real_filter = fx_compositor.build_video_filter
+
+    def capture_filter(**kwargs):
+        seen["grade_override"] = kwargs.get("grade_override", "missing")
+        return real_filter(**kwargs)
+
+    import thumbnail_poster as tp
+    real_compose = tp.compose
+
+    def capture_compose(bg_img, look, **kwargs):
+        seen["look"] = look
+        seen["kwargs"] = kwargs
+        return real_compose(bg_img, look, **kwargs)
+
+    monkeypatch.setattr(pipeline, "run_checked", render)
+    monkeypatch.setattr(fx_compositor, "build_video_filter", capture_filter)
+    monkeypatch.setattr(tp, "compose", capture_compose)
+    poppins = pipeline._resolve_font("poppins-bold")
+    result = pipeline.generate_thumbnail(
+        "Charly García", "Happy And Real.mp3", str(tmp_path), bg_source=str(bg),
+        song_title="Happy And Real", font=poppins, style="oscuro",
+    )
+    assert "thumbnail-poster-background" in seen["labels"]
+    assert "thumbnail-title-card" not in seen["labels"]
+    assert seen["look"].id == pipeline.CLASSIC_TITLE_LOOK_ID
+    assert seen["look"].font_file == _os.path.basename(poppins)
+    assert seen["grade_override"] is None          # the video's own style grade
+    style = tp.style_for(seen["look"])
+    assert _os.path.basename(style.title_font) == _os.path.basename(poppins)
+    assert _os.path.basename(style.artist_font) == _os.path.basename(poppins)
+    assert Image.open(result).size == (1280, 720)
+
+
+def test_classic_title_look_only_for_bundled_fonts(tmp_path):
+    assert pipeline._classic_title_look(None) is None
+    stray = tmp_path / "Poppins-Bold.ttf"
+    stray.write_bytes(b"x")
+    assert pipeline._classic_title_look(str(stray)) is None
+    look = pipeline._classic_title_look(pipeline._resolve_font("poppins-bold"))
+    assert look is not None and look.font_file == "Poppins-Bold.ttf"
