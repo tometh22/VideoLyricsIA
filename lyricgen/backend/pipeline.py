@@ -19097,6 +19097,10 @@ def _render_lyrics_ass(
         _look_artist_font = ""
         if look is not None and not (lyric_look_opts or {}).get("legacy"):
             _look_artist_font = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
+        elif look is None:
+            # No look: the artist speaks the video's own font too, never the
+            # generic Montserrat card (Tomás, 26-nov).
+            _look_artist_font = font_path or ""
         title_artist_path = (_resolve_font(title_artist_font)
                              or _look_artist_font or extrabold_font)
         title_song_path = _resolve_font(title_song_font) or font_path
@@ -19134,6 +19138,9 @@ def _render_lyrics_ass(
             # title_card_lines uses those lines as-is, fitting each one
             # individually.
             song_lines=(title_song_break.split("\n") if title_song_break else None),
+            # No look: the poster hierarchy (song leads, artist in spaced
+            # caps), like the thumbnail — never the generic card.
+            poster=look is None,
         )
         from lyric_overlay import compose_lyric_overlay
         ass_doc = compose_lyric_overlay(
@@ -20966,6 +20973,26 @@ def _thumbnail_poster_enabled() -> bool:
         "0", "false", "no", "off")
 
 
+CLASSIC_TITLE_LOOK_ID = "clasico"
+
+
+def _classic_title_look(font_path: str | None):
+    """A neutral look built from a no-look video's own font, so its cover is
+    set like the look covers (poster thumbnail, artist in the same face)
+    instead of the generic Montserrat card. None when the font isn't one of
+    the bundled files the poster can load."""
+    import lyric_looks as _looks
+    if not font_path or not os.path.isfile(font_path):
+        return None
+    if os.path.dirname(os.path.abspath(font_path)) != os.path.abspath(_FONTS_DIR):
+        return None
+    return _looks.Look(
+        id=CLASSIC_TITLE_LOOK_ID, font_file=os.path.basename(font_path),
+        layout="line", motion="fade", primary="#FFFFFF",
+        outline=2.5, shadow=3.0,
+    )
+
+
 def _render_look_poster_thumbnail(
     look, *, artist: str, song: str, song_lines: list[str] | None,
     song_font_path: str | None, artist_font_path: str | None,
@@ -21002,7 +21029,8 @@ def _render_look_poster_thumbnail(
                 ass_basename="thumbnail.ass", font_dir=font_dir,
                 width=width, height=height, effect=effect, style=style,
                 custom_colors=custom_colors, fx_input_index=1,
-                grade_override=look.grade,
+                # The classic (no-look) poster keeps the video's own style grade.
+                grade_override=(None if look.id == CLASSIC_TITLE_LOOK_ID else look.grade),
                 rhythm=_fx.detect_effect_rhythm(effect, mp3_path),
             )
             filters = (["-filter_complex", vf, "-map", "[out]"] if complex_filter
@@ -21082,6 +21110,8 @@ def generate_thumbnail(
     look_artist_path = ""
     if look is not None and not (lyric_look_opts or {}).get("legacy"):
         look_artist_path = os.path.join(_FONTS_DIR, look.key_font or look.font_file)
+    elif look is None:
+        look_artist_path = font_path
     artist_path = _resolve_font(title_artist_font) or look_artist_path or extrabold
     song_path = _resolve_font(title_song_font) or font_path
     if look is not None and _thumbnail_poster_enabled():
@@ -21104,6 +21134,27 @@ def generate_thumbnail(
         except Exception as poster_err:
             logger.warning("[THUMB] poster thumbnail failed (look=%s), using the "
                            "title card: %s", lyric_look, poster_err)
+    classic = (_classic_title_look(song_path)
+               if look is None and _thumbnail_poster_enabled() else None)
+    if classic is not None:
+        # No look: the same poster composition, in the video's own font
+        # (Tomás, 26-nov: the cover never uses the generic typography).
+        try:
+            return _render_look_poster_thumbnail(
+                classic, artist=artist,
+                song=_resolve_title_song(song_title, mp3_path, artist),
+                song_lines=(title_song_break.split("\n") if title_song_break else None),
+                song_font_path=_resolve_font(title_song_font),
+                artist_font_path=_resolve_font(title_artist_font),
+                primary_override=lyric_color or "",
+                bg_source=bg_source, mp3_path=mp3_path, job_dir=job_dir,
+                effect=effect, style=style, custom_colors=custom_colors,
+            )
+        except FileNotFoundError:
+            raise
+        except Exception as poster_err:
+            logger.warning("[THUMB] classic poster thumbnail failed, using the "
+                           "title card: %s", poster_err)
     artist_family, _ = _ass.font_family(artist_path)
     song_family, bold = _ass.font_family(song_path)
     lines = _ass.thumbnail_title_card_lines(

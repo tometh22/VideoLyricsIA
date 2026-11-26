@@ -46,7 +46,7 @@ function nfc(s) {
  * span gives the natural single-line width at the base size; everything else
  * is derived from that one measurement (width scales ~linearly with size).
  */
-function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity }) {
+function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity, letterSpacing = "-0.01em" }) {
   const measureRef = useRef(null);
   const [{ size, wrap }, setFit] = useState({ size: baseSize, wrap: false });
 
@@ -64,7 +64,7 @@ function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity 
       const fit = (maxWidth * baseSize) / natural;
       setFit(fit >= minSize ? { size: fit, wrap: false } : { size: minSize, wrap: true });
     }
-  }, [text, baseSize, maxWidth, fontFamily, weight]);
+  }, [text, baseSize, maxWidth, fontFamily, weight, letterSpacing]);
 
   if (!text) return null;
 
@@ -72,7 +72,7 @@ function FitLine({ text, baseSize, maxWidth, fontFamily, weight, color, opacity 
     fontFamily,
     fontWeight: weight,
     lineHeight: 1.05,
-    letterSpacing: "-0.01em",
+    letterSpacing,
     color,
     opacity,
     // Mirror the libass black outline so legibility reads like the render.
@@ -139,6 +139,10 @@ export default function TitleCardPreview({
   // null/undefined = intro length not known yet (transcription still running);
   // we assume the centered hero and the preview auto-corrects once it arrives.
   firstLyricStart = null,
+  // Video without a lyric look (ass_render.title_card_lines poster=True):
+  // the song leads in capitals and the artist sits under it in spaced caps,
+  // both in the video's own font — never the generic Montserrat card.
+  poster = false,
   label,
 }) {
   const boxRef = useRef(null);
@@ -172,7 +176,8 @@ export default function TitleCardPreview({
     : null;
   const useManualSplit = !!(manualSongLines && manualSongLines.length >= 2);
 
-  const artistResolved = (artistFont && FONT_BY_CODE[artistFont]) || lookArtistFont;
+  const artistResolved = (artistFont && FONT_BY_CODE[artistFont]) || lookArtistFont
+    || (poster ? ((songFont && FONT_BY_CODE[songFont]) || FONT_BY_CODE[font]) : null);
   const artistFamily = artistResolved?.css || ARTIST_FONT;
   const artistWeight = artistResolved?.weight || 800;
   // FONT_BY_CODE[""] is a real (truthy) entry with css:undefined, so guard on
@@ -235,7 +240,33 @@ export default function TitleCardPreview({
             paddingBottom: L.padB || 0,
           }}
         >
-          {boxW > 0 && (
+          {boxW > 0 && poster && (
+            <>
+              {(useManualSplit ? manualSongLines.slice(0, 2) : [songD]).map((line, i) => (
+                <FitLine
+                  key={i}
+                  text={line.toUpperCase()}
+                  baseSize={boxW * (L.artist / 1920) * sizeN}
+                  maxWidth={maxWidth}
+                  fontFamily={songFamily}
+                  weight={songWeight}
+                  color="#FFFFFF"
+                  opacity={0.97}
+                />
+              ))}
+              <FitLine
+                text={artistU}
+                baseSize={boxW * ((L.song * 0.72) / 1920) * sizeN}
+                maxWidth={maxWidth * 0.72}
+                fontFamily={artistFamily}
+                weight={artistWeight}
+                color="#FFFFFF"
+                opacity={0.85}
+                letterSpacing="0.14em"
+              />
+            </>
+          )}
+          {boxW > 0 && !poster && (
             <>
               <FitLine
                 text={artistU}

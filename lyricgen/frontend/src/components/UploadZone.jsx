@@ -4298,6 +4298,7 @@ export default function UploadZone({
                   : null
               }
               firstLyricStart={_firstLyricStart}
+              poster={!activeLook}
             />
           ) : artTrack ? (
             /* Art track: preview del layout real (cover blureada con scrim +

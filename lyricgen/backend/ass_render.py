@@ -97,6 +97,9 @@ class AssLine:
     # Per-line fill colour (#RRGGBB, "" = style colour). Used by lyric looks
     # to paint the title card's artist in the look's accent.
     color: str = ""
+    # Letter spacing in px (\\fsp). Used by the poster title card, whose
+    # artist line is set in spaced capitals under the song title.
+    spacing: float = 0.0
 
 
 # --- Style tiers (single source of truth, mirrored by pipeline) ---------
@@ -455,6 +458,11 @@ def title_card_lines(
     # historical behaviour preserved exactly. Threaded from the wizard's
     # "Partir en 2 líneas" control via render_params.title_song_break.
     song_lines: list[str] | None = None,
+    # Poster composition (videos without a look, Tomás 26-nov): the song
+    # title leads in capitals at the large size and the artist sits under it,
+    # smaller, in spaced capitals — the same hierarchy as the poster
+    # thumbnail (thumbnail_poster). False keeps the artist-over-song card.
+    poster: bool = False,
 ) -> list[AssLine]:
     """Build the artist/song title-card overlay as ASS lines, mirroring the
     moviepy title card (pipeline.generate_lyric_video) so the look matches
@@ -570,6 +578,37 @@ def title_card_lines(
     if not stack:
         return []
 
+    spacings = [0.0] * len(stack)
+    if poster:
+        stack, spacings = [], []
+        if song_d:
+            manual = [unicodedata.normalize("NFC", (x or "").strip()).upper()
+                      for x in (song_lines or [])]
+            manual = [x for x in manual if x]
+            if len(manual) >= 2:
+                fitted, size_min = [], artist_size
+                for part in manual:
+                    part_lines, part_size = _fit(part, artist_size, lyric_font_path)
+                    fitted.extend(part_lines)
+                    size_min = min(size_min, part_size)
+                stack.append(("\n".join(fitted), size_min, lyric_font_family,
+                              True, op_artist, len(fitted)))
+            else:
+                s_lines, s_size = _fit(song_d.upper(), artist_size, lyric_font_path)
+                stack.append(("\n".join(s_lines), s_size, lyric_font_family,
+                              True, op_artist, len(s_lines)))
+            spacings.append(0.0)
+        if artist_u:
+            a_base = max(L["floor_title"], int(round(title_size * 0.72)))
+            # Leave room for the letter spacing the measurement doesn't see.
+            a_lines, a_size = fit_title_text(
+                artist_u, artist_font_path, a_base, max_w * 0.72,
+                max(14, int(round(a_base * 0.62))),
+            )
+            stack.append(("\n".join(a_lines), a_size, artist_font_family,
+                          True, op_song, len(a_lines)))
+            spacings.append(round(a_size * 0.14, 1))
+
     line_hs = [1.2 * size * nlines for _, size, _, _, _, nlines in stack]
     gap = 8.0
     total_h = sum(line_hs) + gap * (len(stack) - 1)
@@ -590,7 +629,7 @@ def title_card_lines(
     cursor = top
     fade_in_ms = int(round(fade_in * 1000))
     fade_out_ms = int(round(fade_out * 1000))
-    for (txt, size, fam, bold, opacity, _nlines), lh in zip(stack, line_hs):
+    for (txt, size, fam, bold, opacity, _nlines), lh, spacing in zip(stack, line_hs, spacings):
         center_y = cursor + lh / 2.0
         lines.append(AssLine(
             text=txt,
@@ -604,6 +643,7 @@ def title_card_lines(
             bold=bold,
             alignment=alignment,
             primary_alpha=_opacity_to_alpha(opacity),
+            spacing=spacing,
         ))
         cursor += lh + gap
     return lines
@@ -1060,6 +1100,8 @@ def build_ass(
             overrides += f"\\an{int(ln.alignment)}"
         if ln.primary_alpha:
             overrides += f"\\1a&H{int(ln.primary_alpha):02X}&"
+        if ln.spacing:
+            overrides += f"\\fsp{_fmt_num(ln.spacing)}"
         if ln.rot:
             # CSS clockwise → ASS \frz is counter-clockwise-positive.
             overrides += f"\\frz{_fmt_num(-ln.rot)}"

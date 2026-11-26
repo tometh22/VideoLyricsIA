@@ -173,15 +173,26 @@ def test_generate_thumbnail_uses_the_poster_for_looks(tmp_path, monkeypatch):
     assert sorted(os.listdir(tmp_path)) == ['bg.png', 'thumbnail.jpg']
 
 
-def test_no_look_keeps_the_title_card(tmp_path, monkeypatch):
+def test_no_look_gets_the_poster_in_the_video_font(tmp_path, monkeypatch):
+    # Tomás, 26-nov: never the generic card — a video without a look gets the
+    # same poster composition, set in its own font. The kill switch still
+    # falls back to the libass title card.
     bg = tmp_path / 'bg.png'
     Image.new('RGB', (320, 180)).save(bg)
-    calls = []
+    calls, looks = [], []
+    real_compose = tp.compose
     monkeypatch.setattr(pipeline, 'run_checked', _fake_render(calls))
-    monkeypatch.setattr(tp, 'compose', lambda *a, **k: pytest.fail('poster without a look'))
+    monkeypatch.setattr(tp, 'compose', lambda bg_img, look, **k: (looks.append(look), real_compose(bg_img, look, **k))[1])
+    oswald = os.path.join(pipeline._FONTS_DIR, 'Oswald-Bold.ttf')
     pipeline.generate_thumbnail('Artista', 'track.mp3', str(tmp_path), bg_source=str(bg),
-                                song_title='Canción',
-                                font=os.path.join(pipeline._FONTS_DIR, 'Oswald-Bold.ttf'))
+                                song_title='Canción', font=oswald)
+    assert calls == ['thumbnail-background', 'thumbnail-poster-background']
+    assert looks[0].id == pipeline.CLASSIC_TITLE_LOOK_ID and looks[0].font_file == 'Oswald-Bold.ttf'
+
+    calls.clear()
+    monkeypatch.setenv('THUMBNAIL_LOOK_POSTER', '0')
+    pipeline.generate_thumbnail('Artista', 'track.mp3', str(tmp_path), bg_source=str(bg),
+                                song_title='Canción', font=oswald)
     assert calls == ['thumbnail-background', 'thumbnail-title-card']
 
 
