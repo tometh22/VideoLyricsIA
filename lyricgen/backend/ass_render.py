@@ -697,8 +697,12 @@ def _word_timings(
     karaoke / word_reveal working on every song with a smooth, believable
     sweep instead of falling back to a different template.
 
-    Returns [] for empty lines or aligned words wholly outside the line's
-    window: known late/early audio must not be invented at the line start."""
+    Returns [] for empty lines, or when EVERY aligned word sits wholly
+    outside the line window: that clock belongs somewhere else (the line
+    was moved) and must not be invented at the line start. A mix — some
+    words inside, some outside or zero-length — is a broken alignment,
+    not a foreign clock, so it falls through to synthesis and the lyric
+    still paints across its own window."""
     tokens = [t for t in (display or "").split() if t]
     if not tokens:
         return []
@@ -709,6 +713,7 @@ def _word_timings(
     if isinstance(raw_words, list) and len(raw_words) == len(tokens):
         cand = []
         ok = True
+        any_outside = False
         for tok, rw in zip(tokens, raw_words):
             if not isinstance(rw, dict) or "start" not in rw or "end" not in rw:
                 ok = False
@@ -731,12 +736,10 @@ def _word_timings(
             ws = max(seg_start, raw_start)
             we = min(seg_end, raw_end)
             if we <= ws:
-                # Valid absolute alignment outside this window is different
-                # from missing/malformed metadata. Keep the established
-                # conservative behavior instead of synthesizing early words.
-                return []
+                any_outside = True
+                continue
             cand.append({"word": tok, "start": ws, "end": we})
-        if ok:
+        if ok and cand and not any_outside:
             # enforce monotonic non-overlap
             for i in range(1, len(cand)):
                 if cand[i]["start"] < cand[i - 1]["end"]:
@@ -746,6 +749,9 @@ def _word_timings(
                     break
             if ok:
                 return cand
+        if ok and not cand:
+            # Every aligned word sits wholly outside this window.
+            return []
 
     # --- Synthesize: split the window proportional to token length ---------
     weights = [len(t) + 1 for t in tokens]  # +1 so 1-char words still get time
