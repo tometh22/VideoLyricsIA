@@ -4,6 +4,11 @@
 
 ### Changed
 - Videos without a lyric look no longer get the generic cover. The thumbnail is set as a poster in the video's own font, and the opening title card leads with the song title in capitals and the artist below it in spaced capitals, in the video's font instead of Montserrat ExtraBold. The wizard's title preview mirrors it.
+## [1.1.222] - 2026-11-26
+
+### Fixed
+- The editor's lyric preview uses the same recovered word timing as the render for word-by-word looks and karaoke, so edited lines no longer preview words late that the final video shows on time.
+- Lines whose word timing no longer spells their text (a word was changed in the editor) take their timing from the original transcription instead of an even split.
 
 ## [1.1.221] - 2026-11-25
 

@@ -141,3 +141,31 @@ def test_preview_keeps_document_limit_bounded():
     from editor import MAX_SEGMENTS
     with pytest.raises(ValidationError):
         TextPreviewRequest(segments=[{}] * (MAX_SEGMENTS + 1))
+
+
+def test_word_timed_look_preview_uses_the_words_the_render_recovers(monkeypatch):
+    # "Acaba De Nacer": edited lines have no `words`; the render takes them
+    # from the original transcription, so the editor preview must too —
+    # otherwise it shows "LUZ" >1 s late that the video shows on time.
+    import pipeline
+    recovered = [{"start": 158.25, "end": 162.28, "text": "hoy la luz",
+                  "words": [{"word": "hoy", "start": 158.25, "end": 158.4},
+                            {"word": "la", "start": 160.48, "end": 160.66},
+                            {"word": "luz", "start": 160.68, "end": 161.95}]}]
+    calls = []
+
+    def _fake(job_id, segments):
+        calls.append(job_id)
+        return recovered
+
+    monkeypatch.setattr(pipeline, "_recover_words_from_editor_original", _fake)
+    rows = [{"start": 158.25, "end": 162.28, "text": "hoy la luz"}]
+    result = build_text_preview(rows, {"lyric_look": "pincel", "lyric_variant": 0}, job_id="3087ebfab4b0")
+    assert calls == ["3087ebfab4b0"]
+    luz = [d for d in result["ass"].splitlines() if d.startswith("Dialogue:") and d.endswith("}LUZ")][0]
+    assert luz.split(",")[1] < "0:02:41.00"
+
+    calls.clear()
+    build_text_preview(rows, {"font": "montserrat-bold"}, job_id="3087ebfab4b0")
+    build_text_preview(rows, {"lyric_look": "pincel", "lyric_variant": 0})
+    assert calls == []       # line-level styles and anonymous previews skip the lookup
