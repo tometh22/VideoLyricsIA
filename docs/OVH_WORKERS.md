@@ -52,6 +52,18 @@ Si `PRORES_MAX_CONCURRENCY` no está, el tope no aplica. En la cola
 `enterprise` el tope tampoco aplica: un defer ahí haría girar workers que
 no conocen la compuerta.
 
+Con tope 2 o más, el prewarm puede ocupar como máximo un slot menos
+(`PRORES_PREWARM_MAX_SLOTS`, default `MAXC - 1`). El slot que sobra queda
+para un portal que llegue cuando los prewarm ya están encodeando: no hay
+preempción, así que sin esa reserva el portal espera a que termine un
+ffmpeg de fondo. El portal puede usar cualquier slot libre y prefiere el
+reservado, para no sentarse en el que el prewarm sí puede tomar. Con tope
+1, o sin tope, el prewarm sigue pudiendo usar todos los slots.
+
+`PRORES_PREWARM_BORROW=1` deja que el prewarm tome también el reservado
+cuando no hay marcador de portal. Lo devuelve al terminar ese encode. El
+default es no prestarlo.
+
 La descarga de R2 ocurre antes de tomar el slot. Un socket mudo corta por
 inactividad. Un stream lento pero constante (el caso de ~65 KB/s) corta
 por el tope total. Esos intentos (`PRORES_DOWNLOAD_MAX_ATTEMPTS`, default
@@ -71,6 +83,8 @@ Vacío significa el comportamiento de Railway de hoy, salvo
 | `PRORES_PORTAL_QUEUE` | `enterprise` | `prores_portal` |
 | `PRORES_PREWARM_QUEUE` | `enterprise` | `prores_prewarm` |
 | `PRORES_MAX_CONCURRENCY` | sin tope | número de ffmpeg simultáneos en el host |
+| `PRORES_PREWARM_MAX_SLOTS` | `MAXC-1` si `MAXC>1`, si no sin tope | cuántos de esos slots puede ocupar el prewarm |
+| `PRORES_PREWARM_BORROW` | off | `1` presta el slot reservado si no hay portal esperando |
 | `PRORES_SEMAPHORE_NAME` | `prores` | el mismo valor en staging y producción |
 | `PRORES_SEMAPHORE_DIR` | `/var/lock/genly-prores` | bind del host, compartido |
 | `PRORES_DOWNLOAD_INACTIVITY_SECONDS` | `45` | |

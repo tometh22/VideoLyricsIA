@@ -415,6 +415,228 @@ def test_flock_excludes_another_process(monkeypatch, tmp_path):
     assert freed.stdout.strip() == "free"
 
 
+def test_prewarm_keeps_one_slot_for_portal_when_the_cap_is_above_one(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "2")
+    monkeypatch.delenv("PRORES_PREWARM_MAX_SLOTS", raising=False)
+    monkeypatch.delenv("PRORES_PREWARM_BORROW", raising=False)
+    assert cap.prewarm_max_slots() == 1
+    assert cap.prewarm_may_borrow() is False
+
+    first = cap.try_acquire_slot(for_prewarm=True)
+    second = cap.try_acquire_slot(for_prewarm=True)
+    assert first is not None
+    assert second is None
+    # Portal prefers the reserved index, so the shared slot stays usable.
+    portal = cap.try_acquire_slot()
+    assert portal is not None
+    shared = cap.try_acquire_slot(for_prewarm=True)
+    assert shared is None
+    first.release()
+    shared = cap.try_acquire_slot(for_prewarm=True)
+    assert shared is not None
+    portal.release()
+    shared.release()
+
+
+def test_prewarm_reservation_is_the_same_directory_for_both_stacks(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "2")
+    held = cap.try_acquire_slot(for_prewarm=True)
+    script = textwrap.dedent(
+        """
+        import os, sys
+        sys.path.insert(0, os.environ["BACKEND"])
+        from prores_capacity import try_acquire_slot
+        slot = try_acquire_slot(for_prewarm=os.environ.get("SLOT_FOR") == "prewarm")
+        print("busy" if slot is None else "free")
+        if slot is not None:
+            slot.release()
+        """
+    )
+    env = os.environ.copy()
+    env["BACKEND"] = str(BACKEND)
+    env["PRORES_MAX_CONCURRENCY"] = "2"
+    env["PRORES_SEMAPHORE_DIR"] = str(tmp_path)
+    env["PRORES_SEMAPHORE_NAME"] = "prores"
+    env["PRORES_PORTAL_QUEUE"] = "prores_portal"
+    env["PRORES_PREWARM_QUEUE"] = "prores_prewarm"
+    env["SLOT_FOR"] = "prewarm"
+    blocked = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False,
+    )
+    assert blocked.returncode == 0, blocked.stderr
+    assert blocked.stdout.strip() == "busy"
+    env["SLOT_FOR"] = "portal"
+    allowed = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert allowed.stdout.strip() == "free"
+    held.release()
+
+
+def test_prewarm_cap_follows_the_documented_default(monkeypatch):
+    monkeypatch.delenv("PRORES_PREWARM_MAX_SLOTS", raising=False)
+    monkeypatch.delenv("PRORES_MAX_CONCURRENCY", raising=False)
+    assert cap.prewarm_max_slots() is None
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "1")
+    assert cap.prewarm_max_slots() is None
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "4")
+    assert cap.prewarm_max_slots() == 3
+    monkeypatch.setenv("PRORES_PREWARM_MAX_SLOTS", "0")
+    assert cap.prewarm_max_slots() == 0
+    monkeypatch.setenv("PRORES_PREWARM_MAX_SLOTS", "nope")
+    assert cap.prewarm_max_slots() == 3
+
+
+def test_prewarm_borrows_the_reserved_slot_only_when_asked_and_idle(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("PRORES_PREWARM_BORROW", "1")
+    first = cap.try_acquire_slot(for_prewarm=True)
+    second = cap.try_acquire_slot(for_prewarm=True)
+    assert first is not None and second is not None
+    first.release()
+    second.release()
+    cap.mark_portal_demand("portal-waiting")
+    only = cap.try_acquire_slot(for_prewarm=True)
+    reserved = cap.try_acquire_slot(for_prewarm=True)
+    assert only is not None
+    assert reserved is None
+    portal = cap.try_acquire_slot()
+    assert portal is not None
+    only.release()
+    portal.release()
+
+
+def test_prewarm_transcode_does_not_take_the_reserved_slot(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "2")
+    monkeypatch.delenv("PRORES_SLOT_HELD", raising=False)
+    held = cap.try_acquire_slot(for_prewarm=True)
+
+    class Job:
+        id = "prewarm-1"
+        origin = "prores_prewarm"
+
+    monkeypatch.setattr(cap, "_current_rq_job", lambda: Job())
+    with pytest.raises(cap.ProResDefer):
+        with cap.transcode_slot():
+            pass
+    portal = cap.try_acquire_slot()
+    assert portal is not None
+    held.release()
+    portal.release()
+
+
+def _gated_worker(monkeypatch, dequeue, *, head_ready, portal_n=1):
+    import worker as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod, "_queue_length",
+        lambda conn, name: portal_n if name == "prores_portal" else 0,
+    )
+    monkeypatch.setattr(worker_mod, "_head_inputs_ready", lambda *a, **k: head_ready)
+    steps = {"n": 0}
+
+    def shutdown(self):
+        steps["n"] += 1
+        return steps["n"] > 4
+
+    monkeypatch.setattr(worker_mod, "_worker_shutdown_requested", shutdown)
+    monkeypatch.setattr(worker_mod, "_sleep_until_shutdown", lambda *a, **k: None)
+
+    class Portal:
+        name = "prores_portal"
+        job_ids = []
+        connection = None
+        intermediate_queue_key = "rq:queue:prores_portal:intermediate"
+
+        def __init__(self):
+            self.events = []
+
+        def enqueue_job(self, job, at_front=False):
+            self.events.append(("enqueue", job.id, at_front))
+
+    portal = Portal()
+    prewarm = type("Q", (), {"name": "prores_prewarm", "job_ids": [], "connection": None})()
+
+    class QC:
+        @staticmethod
+        def dequeue_any(queues, timeout, connection=None, **kwargs):
+            return dequeue(queues[0])
+
+    host = worker_mod.WarmOnlyWorker.__new__(worker_mod.WarmOnlyWorker)
+    host.__dict__.pop("_prores_slot", None)
+    host.queues = [portal, prewarm]
+    host.connection = type("C", (), {
+        "lrem": lambda self, key, n, job_id: portal.events.append(("lrem", key, job_id)),
+    })()
+    host.queue_class = QC
+    host.job_class = object
+    host.serializer = None
+    host.death_penalty_class = None
+    host.heartbeat = lambda *a, **k: None
+    host.reorder_queues = lambda **k: None
+    return host, portal
+
+
+def test_gated_download_reads_a_slot_that_was_never_acquired(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.delenv("PRORES_SLOT_HELD", raising=False)
+    job = type("Job", (), {"id": "portal-download", "meta": {}})()
+    host, portal = _gated_worker(
+        monkeypatch, lambda queue: (job, queue), head_ready=False,
+    )
+    assert "_prores_slot" not in host.__dict__
+    got_job, got_queue = host.dequeue_job_and_maintain_ttl(1)
+    assert got_job is job
+    assert got_queue.name == "prores_portal"
+    assert host._prores_slot is None
+    assert os.environ.get("PRORES_SLOT_HELD") != "1"
+    assert portal.events == []
+
+
+def test_gated_worker_puts_the_job_back_if_it_fails_after_the_pop(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    job = type("Job", (), {"id": "portal-stuck", "meta": {}})()
+
+    def boom(ready_job):
+        raise RuntimeError("after lmove")
+
+    monkeypatch.setattr(cap, "rq_job_inputs_ready", boom)
+    host, portal = _gated_worker(
+        monkeypatch, lambda queue: (job, queue), head_ready=False,
+    )
+    assert host.dequeue_job_and_maintain_ttl(1) is None
+    assert ("lrem", "rq:queue:prores_portal:intermediate", "portal-stuck") in portal.events
+    assert ("enqueue", "portal-stuck", True) in portal.events
+
+
+def test_gated_encode_holds_the_slot_until_the_horse_exits(monkeypatch, tmp_path):
+    _dedicated(monkeypatch, tmp_path)
+    monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "1")
+    monkeypatch.delenv("PRORES_SLOT_HELD", raising=False)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"mp4")
+    job = type("Job", (), {
+        "id": "portal-ready",
+        "meta": {"prores_inputs_ready": True, "prores_input_path": str(source)},
+    })()
+    host, _portal = _gated_worker(
+        monkeypatch, lambda queue: (job, queue), head_ready=True,
+    )
+    got_job, _queue = host.dequeue_job_and_maintain_ttl(1)
+    assert got_job is job
+    assert host._prores_slot is not None
+    assert os.environ.get("PRORES_SLOT_HELD") == "1"
+    assert cap.try_acquire_slot() is None
+    host._release_prores_slot()
+    assert os.environ.get("PRORES_SLOT_HELD") != "1"
+    assert cap.try_acquire_slot() is not None
+
+
 def test_transcode_slot_defers_instead_of_blocking(monkeypatch, tmp_path):
     _dedicated(monkeypatch, tmp_path)
     monkeypatch.setenv("PRORES_MAX_CONCURRENCY", "1")

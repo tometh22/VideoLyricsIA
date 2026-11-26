@@ -211,6 +211,11 @@ class WarmOnlyWorker(_RQWorker):
     burst-deploy protection lives.)
     """
 
+    # Set on the class so a download (which never acquires a slot) can
+    # read it after RQ has already LMOVEd the job. An AttributeError
+    # there left the id in the intermediate queue.
+    _prores_slot = None
+
     def request_force_stop(self, signum, frame):  # type: ignore[override]
         logger.warning(
             "[WORKER] extra shutdown signal (%s) ignored — staying in WARM "
@@ -252,6 +257,7 @@ class WarmOnlyWorker(_RQWorker):
         while True:
             if _worker_shutdown_requested(self):
                 return None
+            popped = None
             try:
                 self.heartbeat()
                 by_name = {queue.name: queue for queue in self.queues}
@@ -297,7 +303,7 @@ class WarmOnlyWorker(_RQWorker):
                     # PRORES_SLOT_HELD and does not take a second lock.
                     # execute_job releases it, which is after ffmpeg and the
                     # upload that follows in the same horse.
-                    slot = try_acquire_slot()
+                    slot = try_acquire_slot(for_prewarm=decision.queue == "prewarm")
                     if slot is None:
                         _sleep_until_shutdown(self, poll)
                         continue
@@ -316,8 +322,9 @@ class WarmOnlyWorker(_RQWorker):
                     _sleep_until_shutdown(self, poll)
                     continue
                 job, queue = result
+                popped = result
                 ready = rq_job_inputs_ready(job)
-                if self._prores_slot is not None and not ready:
+                if getattr(self, "_prores_slot", None) is not None and not ready:
                     # The head we probed was encode-ready, but the job we
                     # actually popped still needs its source.
                     self._release_prores_slot()
@@ -333,6 +340,19 @@ class WarmOnlyWorker(_RQWorker):
             except Exception:
                 logger.exception("[PRORES] admission loop failed; retrying")
                 self._release_prores_slot()
+                # The pop already happened. Leaving the id in the
+                # intermediate queue makes registry cleanup fail a job
+                # that never started.
+                if popped is not None:
+                    job, queue = popped
+                    self._drop_intermediate_job(queue, job)
+                    try:
+                        queue.enqueue_job(job, at_front=True)
+                    except Exception:
+                        logger.exception(
+                            "[PRORES] could not return %s to %s",
+                            getattr(job, "id", "?"), getattr(queue, "name", "?"),
+                        )
                 _sleep_until_shutdown(self, poll)
 
     def _release_prores_slot(self) -> None:

@@ -23,6 +23,9 @@ The fix is three separate mechanisms:
 Unset ``PRORES_PORTAL_QUEUE`` / ``PRORES_PREWARM_QUEUE`` keep the legacy
 ``enterprise`` queue, so a Railway deploy that does not set them behaves
 as before. ``PRORES_MAX_CONCURRENCY`` unset means unlimited encodes.
+When that cap is 2 or more, prewarm may hold at most one less slot
+(``PRORES_PREWARM_MAX_SLOTS``) so a portal job is not stuck behind a
+full host of background encodes.
 
 The semaphore is a directory of ``flock`` files. Staging and production
 have separate Redis instances; the lock directory is the shared host
@@ -150,6 +153,55 @@ def max_concurrency() -> int | None:
     return value
 
 
+def prewarm_max_slots() -> int | None:
+    """How many encode slots background prewarm may hold at once.
+
+    ``None`` means every slot, which is today's behaviour. That stays the
+    default when the cap is unset or 1: ``MAXC - 1`` would be 0 and
+    prewarm would never run. With a cap of 2 or more the default is one
+    slot reserved for portal. ``PRORES_PREWARM_MAX_SLOTS`` overrides it,
+    including an explicit 0.
+    """
+    raw = os.environ.get("PRORES_PREWARM_MAX_SLOTS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(
+                "[PRORES] ignoring invalid PRORES_PREWARM_MAX_SLOTS=%r", raw,
+            )
+    limit = max_concurrency()
+    if limit is None or limit <= 1:
+        return None
+    return limit - 1
+
+
+def prewarm_may_borrow() -> bool:
+    """Prewarm may take a reserved slot only while no portal is waiting.
+
+    Off unless ``PRORES_PREWARM_BORROW`` is set. The borrowed slot comes
+    back when that encode finishes. It is not preempted.
+    """
+    return os.environ.get("PRORES_PREWARM_BORROW", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _slot_indexes(limit: int, *, for_prewarm: bool) -> list[int]:
+    """Portal tries the reserved high indexes first.
+
+    Prewarm never opens those indexes unless borrowing is on and no
+    portal marker is published. Both stacks share the same files.
+    """
+    cap = prewarm_max_slots()
+    borrow = for_prewarm and prewarm_may_borrow() and host_portal_waiting() == 0
+    if for_prewarm and cap is not None and not borrow:
+        return list(range(min(limit, max(0, cap))))
+    if not for_prewarm and cap is not None and cap < limit:
+        return list(range(cap, limit)) + list(range(max(0, cap)))
+    return list(range(limit))
+
+
 def download_inactivity_seconds() -> float:
     return _positive_float(
         "PRORES_DOWNLOAD_INACTIVITY_SECONDS", _DEFAULT_INACTIVITY_SECONDS,
@@ -268,21 +320,25 @@ class HeldSlot:
             pass
 
 
-def try_acquire_slot() -> HeldSlot | None:
-    """Non-blocking. None means every slot is taken or the directory is unusable.
+def try_acquire_slot(*, for_prewarm: bool = False) -> HeldSlot | None:
+    """Non-blocking. None means every allowed slot is taken or the directory is unusable.
 
-    Callers must not sleep on this. A waiting job belongs back in RQ.
+    ``for_prewarm`` skips the indexes reserved for portal. Callers must
+    not sleep on this. A waiting job belongs back in RQ.
     """
     limit = max_concurrency()
     if limit is None:
         return HeldSlot(None)
+    indexes = _slot_indexes(limit, for_prewarm=for_prewarm)
+    if not indexes:
+        return None
     root = os.path.join(semaphore_root(), "slots")
     try:
         _mkdir_shared(root)
     except OSError as exc:
         logger.error("[PRORES] cannot create semaphore dir %s: %s", root, exc)
         return None
-    for index in range(limit):
+    for index in indexes:
         path = os.path.join(root, f"slot-{index}")
         try:
             fd = open(path, "a+")
@@ -509,7 +565,10 @@ def transcode_slot():
         clear_current_portal_demand()
         yield
         return
-    slot = try_acquire_slot()
+    job = _current_rq_job()
+    origin = str(getattr(job, "origin", "") or "")
+    for_prewarm = bool(origin) and origin == prewarm_queue_name() and origin != portal_queue_name()
+    slot = try_acquire_slot(for_prewarm=for_prewarm)
     if slot is None:
         raise ProResDefer("ProRes encode slot busy")
     clear_current_portal_demand()
