@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { campaignRequest } from "../../lib/campaignApi";
 import { CHANGE_SLA_HOURS, businessHoursSince, changeSlaTone, portalLabel, relativeDate } from "../../lib/campaignPipeline";
 import { STEP_STATE_LABELS, correctionStepList } from "../admin/sections/operacion/changeRequestWorkflow";
+import RequestVerification from "../admin/sections/operacion/RequestVerification";
 import { Banner, Button, Chip, EmptyState, Skeleton, inputClass } from "./ui";
 
 const FILTERS = [["open", "Abiertos"], ["resolved", "Resueltos"], ["all", "Todos"]];
@@ -35,6 +36,12 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
   const controller = useRef(null);
   const [closing, setClosing] = useState(null);
   const [notice, setNotice] = useState("");
+  // Mismo control que Admin > Cambios: cada punto ✘ necesita justificación.
+  const [closingGate, setClosingGate] = useState({ ready: false, overrides: {} });
+  const closingId = closing?.id;
+  const loadVerification = useCallback(() => request(
+    `/batch/campaigns/${encodeURIComponent(campaignId)}/change-requests/${encodeURIComponent(closingId)}/verification`,
+  ), [campaignId, closingId, request]);
 
   const load = useCallback(async (cursor = null) => {
     controller.current?.abort();
@@ -61,9 +68,12 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
     if (!closing || closing.busy) return;
     const note = closing.note.trim();
     if (!note) { setClosing({ ...closing, error: "Escribí por qué el pedido está atendido: el cliente lo ve." }); return; }
+    if (!closingGate.ready) { setClosing({ ...closing, error: "Hay puntos ✘: corregilos o justificá cada uno antes de cerrar." }); return; }
     setClosing({ ...closing, busy: true, error: "" });
     try {
-      await request(`/batch/campaigns/${encodeURIComponent(campaignId)}/change-requests/${encodeURIComponent(closing.id)}/resolve`, { method: "POST", json: { resolution_note: note } });
+      const overrides = closingGate.overrides || {};
+      await request(`/batch/campaigns/${encodeURIComponent(campaignId)}/change-requests/${encodeURIComponent(closing.id)}/resolve`, { method: "POST",
+        json: { resolution_note: note, ...(Object.keys(overrides).length ? { point_overrides: overrides } : {}) } });
       setClosing(null);
       setNotice("Pedido cerrado. El cliente ve tu nota en el portal.");
       onChanged?.();
@@ -113,6 +123,7 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
                 <Chip tone={STEP_TONE[item.step?.tone] || "neutral"}>{item.step?.label}</Chip>
                 {open && <Chip tone={changeSlaTone(hours)} title={`${Math.floor(hours)} horas hábiles sin resolver (objetivo ${CHANGE_SLA_HOURS})`}>{relativeDate(item.submitted_at)}</Chip>}
                 {!open && <Chip>{relativeDate(item.resolved_at)}</Chip>}
+                {item.recurrences?.length > 0 && <Chip tone="danger" title={`Repite puntos del pedido #${item.recurrences[0].request_id}, ya cerrado`}>Reincidencia</Chip>}
                 {item.client_approval && <Chip tone={item.client_approval === "approved" ? "success" : "neutral"} title={APPROVAL[item.client_approval]}>
                   {item.client_approval === "approved" ? "Cliente aprobó" : "Cliente sin aprobar"} · v{item.published_revision}</Chip>}
               </div>
@@ -129,6 +140,7 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
           <p className="mt-3 whitespace-pre-wrap text-sm text-ink-primary/90">{item.comment}</p>
           {closing?.id === item.id && <div className="mt-3 space-y-2 rounded-xl bg-white/[0.04] p-3 ring-1 ring-white/10">
             <p className="text-xs text-ink-secondary">Cerrar no genera ni publica otro video. La nota queda visible para el cliente en el portal.</p>
+            <RequestVerification load={loadVerification} refreshKey={item.updated_at} onChange={setClosingGate} />
             <div className="flex flex-wrap gap-1.5">{NOTE_TEMPLATES.map((text) => <button key={text} type="button" className="rounded-full bg-white/[0.05] px-2.5 py-1 text-xs text-ink-secondary ring-1 ring-white/10 hover:text-white"
               onClick={() => setClosing({ ...closing, note: text })}>{text}</button>)}</div>
             <textarea aria-label="Nota para el cliente" className={`${inputClass} min-h-[72px]`} maxLength={2000} value={closing.note} disabled={closing.busy}
@@ -136,7 +148,7 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
             {closing.error && <p role="alert" className="text-xs text-red-300">{closing.error}</p>}
             <div className="flex justify-end gap-2">
               <Button size="sm" variant="ghost" disabled={closing.busy} onClick={() => setClosing(null)}>Cancelar</Button>
-              <Button size="sm" variant="primary" disabled={closing.busy} onClick={closeRequest}>{closing.busy ? "Cerrando…" : "Confirmar cierre"}</Button>
+              <Button size="sm" variant="primary" disabled={closing.busy || !closingGate.ready} onClick={closeRequest}>{closing.busy ? "Cerrando…" : "Confirmar cierre"}</Button>
             </div>
           </div>}
           {!open && item.resolution_note && <p className="mt-2 text-xs text-ink-secondary">Respuesta: {item.resolution_note}</p>}

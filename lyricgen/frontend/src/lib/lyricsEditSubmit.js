@@ -70,6 +70,12 @@ export function layoutChanged(baseline, payloadSegments) {
 export function translateBackendError(raw, t) {
   if (raw == null) return null;
   const tr = typeof t === "function" ? t : () => null;
+  if (["review_line_identity_missing", "review_lines_incomplete_or_stale"].includes(
+    typeof raw === "string" ? raw : raw?.code,
+  )) {
+    return tr("editor.review_identity_retry") ||
+      "No pudimos confirmar todas las líneas de esta versión. Guardá tus cambios y volvé a abrir el editor antes de aprobar.";
+  }
   if (raw && typeof raw === "object" && raw.code === "batch_render_window_full") {
     return "La cola de generación de tu equipo está completa. Esperá a que terminen algunos videos para enviar los siguientes.";
   }

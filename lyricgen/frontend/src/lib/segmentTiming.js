@@ -41,7 +41,11 @@ export function clampBlockShiftDelta(segments, requestedDelta, duration) {
   const upperBound = duration && Number.isFinite(Number(duration))
     ? Math.max(lowerBound, Number(duration) - maxEnd)
     : Infinity;
-  return Math.max(lowerBound, Math.min(delta, upperBound));
+  const bounded = Math.max(lowerBound, Math.min(delta, upperBound));
+  // Imported outliers may already violate a bound. A clamp may limit an
+  // intentional inward repair, but must never reverse the requested shift
+  // (or turn a zero-offset anchor into an unsolicited repair).
+  return Math.sign(bounded) === Math.sign(delta) ? bounded : 0;
 }
 
 /**
@@ -447,7 +451,11 @@ export function canonicalizeEditorSegments(segments) {
     if (!segment || typeof segment !== "object") return;
     const start = Number(segment.start);
     const duplicate = cleaned.find((previous) => (
-      (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
+      // Distinct durable identities are distinct editor lines, even when an
+      // intentional copy initially shares the original's text and timing.
+      (previous.segment_id == null || segment.segment_id == null
+        || String(previous.segment_id) === String(segment.segment_id))
+      && (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
       && Math.abs(Number(previous.start) - start) < 0.35
     ));
     if (duplicate) {

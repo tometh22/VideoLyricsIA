@@ -145,6 +145,26 @@ describe("publicationStatus", () => {
     expect(screen.getByRole("status", { name: "Resultado del pedido" })).toHaveTextContent("podría haberse publicado");
   });
 
+  it("checks publication from the selected request footer without throwing", () => {
+    const reconcile = vi.fn();
+    renderPanel({}, {
+      crPublishNotice: { requestId: REQUEST.id, tone: "wait", outcomeUnknown: true,
+        text: "Se perdió la respuesta del envío." },
+      reconcilePublication: reconcile,
+    });
+    const footer = screen.getByRole("status", { name: "Estado de la acción" });
+    fireEvent.click(within(footer).getByRole("button", { name: "Consultar estado" }));
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(REQUEST.id);
+  });
+
+  it("distinguishes a published correction from its still-open request", () => {
+    const resolve = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, revision: 2, render_matches_editor: true } },
+      { resolveChangeRequest: resolve });
+    expect(screen.getByText("Publicado · pedido abierto")).toBeInTheDocument();
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("warns that the broadcast master is still the previous cut", () => {
     // El caso de producción del 2026-09-15: el MP4 ya está corregido y el
     // .mov PRE-EDIT sigue descargable en la misma key.
@@ -1034,5 +1054,69 @@ describe("cerrar un pedido ya publicado", () => {
     fireEvent.click(button);
     expect(confirm).toHaveBeenCalledWith(7, published, 2, undefined);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("verificación punto por punto antes de cerrar", () => {
+  it("un punto ✘ bloquea el cierre manual hasta justificarlo y la justificación viaja aparte de la nota", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url) => ({
+      ok: true,
+      json: async () => (String(url).includes("/verification") ? {
+        enabled: true, recurrences: [],
+        verification: { revision: 3, counts: { ok: 0, fail: 1, manual: 0 }, points: [
+          { id: "p-9", kind: "punctuation", status: "fail", reason: "question_marks_remain",
+            excerpt: "0:13 sin signos de interrogación", line: { start: 13, end: 15, text: "¿Quién sos?" } },
+        ] },
+      } : { segments: [] }),
+    })));
+    const resolve = vi.fn();
+    renderPanel({}, { resolveChangeRequest: resolve });
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    fireEvent.change(screen.getByLabelText("Motivo del cierre sin publicar"), { target: { value: "Corregido" } });
+    const close = screen.getByRole("button", { name: "Confirmar cierre" });
+    await screen.findByLabelText(/No verificado: 0:13/);
+    await waitFor(() => expect(close).toBeDisabled());
+    fireEvent.change(screen.getByLabelText(/Justificación interna/), { target: { value: "La pregunta es real" } });
+    await waitFor(() => expect(close).toBeEnabled());
+    fireEvent.click(close);
+    expect(resolve).toHaveBeenCalledWith(7, "Corregido", { "p-9": "La pregunta es real" });
+    vi.unstubAllGlobals();
+  });
+
+  it("marca la reincidencia en la cola", () => {
+    renderPanel({ recurrences: [{ point_id: "p-1", request_id: 3, excerpt: "0:13" }] });
+    expect(screen.getAllByText("Reincidencia").length).toBeGreaterThan(0);
+  });
+});
+
+describe("resumen antes de publicar", () => {
+  const summary = { job_id: "f7752c6feed4", title: "Yo vengo de San Rosendo", listening_status: "measured",
+    lines_total: 30, lines_unheard: 2, warnings_count: 0, needs_attention: true, token: "d".repeat(64),
+    unheard: [{ line_index: 3, start: 42, end: 45, text: "Una línea sin escuchar" }], warnings: [] };
+  const publication = { ...BASE_PUBLICATION, needs_publish: true, render_fingerprint: "cut", editor_revision: 9 };
+
+  it.each([
+    ["publish", "Publicar igual"],
+    ["confirm", "Dar por resuelto igual"],
+  ])("muestra el resumen (%s) en el pedido y reenvía la misma acción con su token", (action, label) => {
+    const publish = vi.fn();
+    const confirm = vi.fn();
+    const args = action === "publish" ? ["f7752c6feed4", "chile", 7, publication] : [7, publication, 2];
+    renderPanel({ publication }, {
+      publishDeliveryUpdate: publish,
+      confirmChangeRequestPublication: confirm,
+      crPublishNotice: { requestId: 7, tone: "wait", text: "Antes de publicar, mirá qué quedó sin escuchar y sin revisar.",
+        publishReview: { action, args, summaries: [summary],
+          totals: { songs: 1, songs_needing_attention: 1, lines_unheard: 2, lines_total: 30, warnings: 0 } } },
+    });
+    const section = screen.getByRole("region", { name: "Resumen antes de publicar" });
+    expect(within(section).getByText("2 líneas sin escuchar.")).toBeInTheDocument();
+    expect(within(section).getByText("Una línea sin escuchar")).toBeInTheDocument();
+    fireEvent.click(within(section).getByRole("button", { name: label }));
+    const called = action === "publish" ? publish : confirm;
+    const padded = [...args];
+    while (padded.length < 5) padded.push(undefined);
+    expect(called).toHaveBeenCalledExactlyOnceWith(...padded, summary.token);
+    expect(action === "publish" ? confirm : publish).not.toHaveBeenCalled();
   });
 });

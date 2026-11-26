@@ -1,4 +1,22 @@
 import { expect } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { applyCase } from "../src/components/fontCatalog.js";
+
+// The transport is mocked; rendering still uses the real WASM worker and
+// bundled font. Composer parity is gated separately by the backend fixture
+// freshness test and the native-preview pixel test.
+const previewFixture = JSON.parse(readFileSync(new URL("./fixtures/native-preview.json", import.meta.url), "utf8"));
+const previewFont = readFileSync(new URL("../../backend/fonts/Montserrat-Bold.ttf", import.meta.url));
+function previewTrack(body) {
+  const time = value => {
+    const cs = Math.round(Number(value) * 100);
+    return `${Math.floor(cs / 360000)}:${String(Math.floor(cs / 6000) % 60).padStart(2, "0")}:${String(Math.floor(cs / 100) % 60).padStart(2, "0")}.${String(cs % 100).padStart(2, "0")}`;
+  };
+  const escape = text => text.replace(/\\/g, "\\\\").replace(/\{/g, "(").replace(/\}/g, ")").replace(/\n/g, "\\N");
+  const header = previewFixture.ass.split("[Events]")[0];
+  const events = body.segments.map(line => `Dialogue: 0,${time(line.start)},${time(line.end)},Lyric,,0,0,0,,{\\fs85}${escape(applyCase(line.text || "", body.settings?.text_case || "upper"))}`);
+  return { ...previewFixture, ass: `${header}[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${events.join("\n")}\n` };
+}
 
 export const EDITOR_JOB_ID = "e2e-lyrics-editor";
 
@@ -65,6 +83,7 @@ export async function installEditorHarness(page, options = {}) {
   const transcriptionQuality = options.transcriptionQuality || null;
   const saves = [];
   const approvals = [];
+  const creativeSaves = [];
   let durableRevision = options.initialRevision || 0;
   let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
   const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
@@ -91,6 +110,15 @@ export async function installEditorHarness(page, options = {}) {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
+
+    if (request.method() === "POST" && path === `/editor/${jobId}/text-preview`) {
+      await route.fulfill(jsonResponse(previewTrack(request.postDataJSON())));
+      return;
+    }
+    if (request.method() === "GET" && path === "/editor/preview/fonts/Montserrat-Bold.ttf") {
+      await route.fulfill({ status: 200, contentType: "font/ttf", body: previewFont });
+      return;
+    }
 
     if (path === "/e2e/audio.wav") {
       await route.fulfill({
@@ -126,6 +154,7 @@ export async function installEditorHarness(page, options = {}) {
         revision: durableRevision,
         segments: durableSegments,
         original_segments: durableOriginal,
+        ...(options.qualityProposal ? { quality_proposal: options.qualityProposal } : {}),
         latest_approved_version: options.latestApprovedVersion || null,
         ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
         updated_by: null,
@@ -240,6 +269,13 @@ export async function installEditorHarness(page, options = {}) {
       return;
     }
 
+    if (request.method() === "POST" && /^\/batch\/campaigns\/[^/]+\/creative\/items\/[^/]+$/.test(path)) {
+      const body = request.postDataJSON();
+      creativeSaves.push(body);
+      await route.fulfill(jsonResponse({ revision: Number(body.revision || 0) + 1, settings: body.settings }));
+      return;
+    }
+
     if (request.method() === "POST" && path === `/edit/${jobId}`) {
       approvals.push(request.postDataJSON());
       await route.fulfill(jsonResponse({
@@ -263,6 +299,7 @@ export async function installEditorHarness(page, options = {}) {
     jobId,
     saves,
     approvals,
+    creativeSaves,
     heartbeats,
     get sourceAudioRequests() { return sourceAudioRequests; },
     async open() {
@@ -297,6 +334,9 @@ export async function installEditorHarness(page, options = {}) {
 export async function openAdvanced(page, { expectTimeline = true } = {}) {
   await page.getByRole("tab", { name: "Ajustar tiempos" }).click();
   await expect(page.getByRole("tab", { name: "Ajustar tiempos" })).toHaveAttribute("aria-selected", "true");
+  if (!expectTimeline && await page.getByRole("tab", { name: /Revisión guiada/ }).isVisible()) {
+    await page.getByRole("tab", { name: /Revisión guiada/ }).click();
+  }
   if (expectTimeline) {
     await page.getByRole("tab", { name: "Timeline avanzada" }).click();
     await expect(page.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");

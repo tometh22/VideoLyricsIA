@@ -3,7 +3,8 @@
 - Letra oficial: la que pegó el operador para esta canción, la de la
   planilla de la campaña o, fuera de las campañas batch, la de lrclib. Las
   campañas batch son "sólo audio" (``reference_hypothesis.audio_only_batch_mode``):
-  para ellas nunca se busca ni se usa letra externa.
+  para ellas no se busca ni se usa letra externa, salvo con
+  ``LYRIC_REVIEW_OFFICIAL_IN_BATCH=1`` (ver ``_external_lyrics_allowed``).
 - Memoria de correcciones: lo que los revisores del MISMO tenant ya
   corrigieron en otras canciones del mismo artista (máquina → aprobado).
 
@@ -81,9 +82,29 @@ def _fetched_key(artist: str, title: str) -> str:
     return f"{_FETCHED_PREFIX}{digest[:16]}"
 
 
+def _official_in_batch_enabled() -> bool:
+    return os.environ.get("LYRIC_REVIEW_OFFICIAL_IN_BATCH", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _external_lyrics_allowed(job) -> bool:
-    """Las campañas batch se referencian sólo con el audio."""
-    return str(getattr(job, "workload_class", "") or "").lower() != "batch"
+    """Las campañas batch se referencian sólo con el audio.
+
+    ``LYRIC_REVIEW_OFFICIAL_IN_BATCH=1`` (apagado por defecto) deja que la
+    Revisión rápida de las campañas batch use también la letra de lrclib como
+    "oído": en el backtest de UMG (#112-#131) lrclib tenía la corrección del
+    cliente en 74 de 97 ítems. Sólo alimenta los puntos a revisar del editor;
+    la transcripción del lote sigue siendo sólo audio
+    (``reference_hypothesis.audio_only_batch_mode`` no cambia). Los mismos
+    resguardos de siempre: similitud mínima o ventana del fragmento, letra
+    corrupta descartada; las coincidencias entre fuentes ordenan las
+    sugerencias sin bloquear la aprobación. La búsqueda en lrclib es
+    gratuita, en segundo plano y se apaga con
+    ``LYRIC_REVIEW_FETCH_OFFICIAL=0``.
+    """
+    if str(getattr(job, "workload_class", "") or "").lower() != "batch":
+        return True
+    return _official_in_batch_enabled()
 
 
 def official_text(db, job) -> tuple[str, str]:
@@ -276,36 +297,60 @@ def memory_pairs(db, job) -> dict[str, str]:
 
 
 def effective_mode(job) -> str:
-    """``enforce`` sólo donde corresponde. Con ``LYRIC_REVIEW_ENFORCE_TENANTS``
-    (lista separada por comas) se bloquea en esos tenants; sin esa variable,
-    en las campañas batch (UMG). En el resto el panel se muestra sin
-    bloquear."""
-    base = mode()
-    if base != "enforce" or job is None:
-        return base
-    tenants = {t.strip() for t in os.environ.get("LYRIC_REVIEW_ENFORCE_TENANTS", "").split(",") if t.strip()}
-    if tenants:
-        return "enforce" if str(getattr(job, "tenant_id", "")) in tenants else "observe"
-    return "enforce" if str(getattr(job, "workload_class", "") or "").lower() == "batch" else "observe"
+    """Misma política orientativa para campañas y trabajos individuales.
+
+    LYRIC_REVIEW_ENFORCE_TENANTS queda obsoleta: el tenant no cambia el
+    derecho del revisor a conservar su letra.
+    """
+    return mode()
 
 
-def _content_key(document, job, official: str, pairs: dict) -> str:
+def review_portal(db, job) -> str | None:
+    """Perfil de estilo de la Revisión rápida: el portal de UMG al que va la
+    campaña (``argentina``/``chile``); ``umg`` si es una entrega UMG sin
+    portal fijo; ``None`` fuera de UMG (sin reglas de perfil)."""
+    if job is None:
+        return None
+    campaign_id = getattr(job, "campaign_id", None)
+    if campaign_id:
+        try:
+            from database import BatchCampaign
+
+            row = db.query(BatchCampaign.destination_portal).filter(
+                BatchCampaign.id == campaign_id).first()
+        except Exception:  # pragma: no cover - sin portal, perfil genérico
+            row = None
+        portal = str((row[0] if row else "") or "").strip().lower()
+        return portal if portal in {"argentina", "chile"} else "umg"
+    if str(getattr(job, "workload_class", "") or "").lower() == "batch" or str(
+            getattr(job, "delivery_profile", "") or "").lower() in {"umg", "both"}:
+        return "umg"
+    return None
+
+
+def _content_key(document, job, official: str, pairs: dict, portal: str | None = None,
+                 official_origin: str = "") -> str:
     payload = json.dumps({
         "s": [(s.get("text"), s.get("start"), s.get("end"), s.get("segment_id"), s.get("qa_dismissed"))
               for s in (document.current_segments or []) if isinstance(s, dict)],
         "e": (document.machine_evidence or {}).get("evidence_sha256")
         if isinstance(document.machine_evidence, dict) else None,
         "o": hashlib.sha1((official or "").encode()).hexdigest(),
+        "official_origin": official_origin,
         "m": sorted(pairs.items()),
         "t": str(getattr(job, "song_title", "") or ""),
         "n": len(document.original_segments or []),
+        "p": portal,
     }, sort_keys=True, default=str)
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
-def review_for_document(db, document, job=None) -> dict:
+def review_for_document(db, document, job=None, *, fetch_official: bool = True) -> dict:
     """Revisión rápida de la letra actual del documento. Nunca rompe la
-    transacción del request: las lecturas van en un savepoint."""
+    transacción del request: las lecturas van en un savepoint.
+
+    ``fetch_official=False`` no agenda la búsqueda en lrclib (la usa el
+    resumen al publicar, que sólo lee lo que ya hay)."""
     job_mode = effective_mode(job)
     if job_mode == "off":
         return {"schema": "lyric-review-v1", "mode": "off", "items": [],
@@ -319,15 +364,16 @@ def review_for_document(db, document, job=None) -> dict:
         try:
             text, origin = official_text(db, job) if job is not None else ("", "")
             pairs = memory_pairs(db, job) if job is not None else {}
+            portal = review_portal(db, job)
         except Exception:
             if nested is not None and nested.is_active:
                 nested.rollback()
             raise
         if nested is not None and nested.is_active:
             nested.commit()
-        if job is not None and not text:
+        if job is not None and not text and fetch_official:
             schedule_official_fetch(job)
-        key = _content_key(document, job, text, pairs)
+        key = _content_key(document, job, text, pairs, portal, origin)
         cached = _review_cache.get_fresh(key)
         if cached is None:
             cached = build_review(
@@ -336,7 +382,9 @@ def review_for_document(db, document, job=None) -> dict:
                 machine_evidence=document.machine_evidence,
                 title=str(getattr(job, "song_title", "") or ""),
                 official_text=text,
+                official_origin=origin,
                 memory_pairs=pairs,
+                portal=portal,
             )
             cached["sources"]["official_origin"] = origin
             _review_cache.put(key, cached)
@@ -357,7 +405,9 @@ def review_for_document(db, document, job=None) -> dict:
 
 
 def pending_for(db, document, job=None, *, scope: str = "full") -> LyricReviewPending | None:
-    """El error a levantar si la aprobación debe esperar; ``None`` si no."""
+    """Compatibilidad con los callers de aprobación: en modo orientativo
+    devuelve ``None`` sin calcular propuestas ni modificar la letra.
+    """
     if scope == "none" or effective_mode(job) != "enforce":
         return None
     review = review_for_document(db, document, job)

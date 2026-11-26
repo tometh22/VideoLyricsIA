@@ -1,3 +1,5 @@
+import BulkPrompts from "./BulkPrompts";
+import { campaignOrder } from "../../lib/campaignOverview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource, { invalidateCampaignResources, mutateCampaignResource } from "../../hooks/useCampaignResource";
@@ -91,8 +93,8 @@ function SongToolbar({ view, params, setParam, songs, lyricSongs, searchRef, onH
         <select aria-label="Versión" value={params.get("version") || ""} onChange={(event) => setParam("version", event.target.value)} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
           <option value="">Estudio y vivo</option><option value="studio">Estudio</option><option value="live">Vivo</option>
         </select>
-        <select aria-label="Orden" value={params.get("order") === "learning" ? "learning" : "effort"} onChange={(event) => setParam("order", event.target.value === "learning" ? "learning" : "")} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
-          <option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20 %)</option>
+        <select aria-label="Orden" value={campaignOrder(params.get("order"))} onChange={(event) => setParam("order", event.target.value)} className={`${inputClass} !h-8 !w-auto !py-0 text-xs`}>
+          <option value="calendar">Orden del calendario</option><option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20 %)</option>
         </select>
         <InfoTip label="Cómo leer las alertas">Las alertas orientan dónde escuchar primero; no son un porcentaje de acierto ni una confianza calibrada. Toda canción requiere escuchar y confirmar letra y tiempos. La falta de referencia externa no significa por sí sola que la letra esté mal.</InfoTip>
       </>}
@@ -123,7 +125,7 @@ export default function CampaignDetailPage({ id }) {
   const base = `/batch/campaigns/${encodeURIComponent(id)}`;
   const prefix = `campaign:${id}:`;
 
-  const head = useCampaignResource(`${prefix}head`, ({ signal }) => campaignRequest(base, { signal }));
+  const head = useCampaignResource(`${prefix}head`, ({ signal }) => campaignRequest(base, { signal }), { staleMs: 60000, pollMs: 60000 });
   const pipe = useCampaignResource(`${prefix}pipeline`, ({ signal }) => campaignRequest(`${base}/pipeline`, { signal }));
   const campaign = head.data;
   const kind = campaign?.kind || pipe.data?.kind || "lyric_video";
@@ -136,14 +138,20 @@ export default function CampaignDetailPage({ id }) {
   const view = requestedView === "priority" && id !== RICARDO_PRIORITY_CAMPAIGN ? "all" : requestedView;
   // `?view=contract` predates the settings tab; it still lands on the report.
   const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
-  const order = params.get("order") === "learning" ? "learning" : "effort";
+  const order = campaignOrder(params.get("order"));
   const [styleTargets, setStyleTargets] = useState(null);
+  const [promptTargets, setPromptTargets] = useState(null);
+  const [promptBusy, setPromptBusy] = useState(false);
   const [styleBusy, setStyleBusy] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
   const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
-  const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
-  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) });
-  const report = useCampaignResource(`${prefix}report`, ({ signal }) => campaignRequest(`${base}/creative/report`, { signal }), { enabled: needs(["all", "qc", "approved", "delivered"], ["contract"]) });
+  const drawerItem = pipe.data?.items?.find(item => item.item_id === params.get("song"));
+  const drawerNeedsLyrics = drawerItem && ["lyrics", "discarded", "attention"].includes(drawerItem.stage);
+  const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["lyrics", "discarded"], ["activity"]) || Boolean(drawerNeedsLyrics) || Boolean(params.get("discard")), staleMs: 30000, pollMs: 60000 });
+  const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["ready"], ["style", "contract"]) || Boolean(styleTargets) || Boolean(promptTargets), staleMs: 60000, pollMs: 0 });
+  const fullReport = needs([], ["contract"]);
+  const reportJob = drawerItem?.has_video ? drawerItem.current_job_id : null;
+  const report = useCampaignResource(`${prefix}report:${fullReport ? "full" : reportJob}`, ({ signal }) => campaignRequest(`${base}/creative/report${fullReport ? "?history_limit=50" : `?job_id=${encodeURIComponent(reportJob)}&history_limit=0`}`, { signal }), { enabled: fullReport || Boolean(reportJob), staleMs: 30000, pollMs: 0 });
 
   const canManage = Boolean(pipe.data?.can_manage);
   // Art-track campaigns delivered as files have no portal to send to.
@@ -244,6 +252,24 @@ export default function CampaignDetailPage({ id }) {
   }, [navigate, returnPath]);
 
   const videosFor = (list) => list.map((song) => ({ item_id: song.id, job_id: song.current_job_id, title: song.title, artist: song.artist }));
+  const prepareGeneration = useCallback(async (list) => {
+    setBusyIds(new Set(list.map(song => song.id)));
+    try {
+      // The overview intentionally has no creative payload. Read the current
+      // settings when the operator asks to generate, then recheck eligibility.
+      const fresh = await campaignRequest(`${base}/creative`);
+      const targets = new Set(list.map(song => song.id));
+      const eligible = fresh.items.filter(item => targets.has(item.id) && canGenerate({
+        stage: "ready", creative: { ...item, requires_background_assignment: fresh.requires_background_assignment },
+      }));
+      if (!eligible.length) throw new Error("Estas canciones ya no están listas para generar o les falta asignar un fondo.");
+      setDialog({ type: "generate", items: eligible });
+    } catch (error) {
+      setFlash({ tone: "warning", text: error.message });
+    } finally {
+      setBusyIds(new Set());
+    }
+  }, [base]);
   const runRetry = async (list) => {
     setBusyIds(new Set(list.map((song) => song.id)));
     const failed = [];
@@ -265,9 +291,7 @@ export default function CampaignDetailPage({ id }) {
         break;
       }
       case "generate":
-        if (!song.creative) { setFlash({ tone: "warning", text: "Cargando el estilo de la canción; probá de nuevo en un instante." }); break; }
-        if (!canGenerate(song)) { setFlash({ tone: "warning", text: "Esta canción ya no está lista para generar." }); break; }
-        setDialog({ type: "generate", items: [song.creative] });
+        void prepareGeneration([song]);
         break;
       case "send": setDialog({ type: "send", songs: [song] }); break;
       case "record-delivery": setDialog({ type: "record", song }); break;
@@ -278,7 +302,7 @@ export default function CampaignDetailPage({ id }) {
       case "detail": updateParams({ song: song.id }, { push: true }); break;
       default: break;
     }
-  }, [openEditLyrics, openReview, updateParams, visible]);
+  }, [openEditLyrics, openReview, prepareGeneration, updateParams, visible]);
 
   const next = campaignNextStep(counts, kind, { portalSends });
   const runNextStep = useCallback(() => {
@@ -295,8 +319,8 @@ export default function CampaignDetailPage({ id }) {
       return;
     }
     if (next.stage === "ready") {
-      const items = songs.filter(canGenerate).map((song) => song.creative);
-      if (items.length) setDialog({ type: "generate", items }); else setView("ready");
+      const candidates = songs.filter(song => song.stage === "ready");
+      if (candidates.length) void prepareGeneration(candidates); else setView("ready");
       return;
     }
     if (next.stage === "approved" && canManage && portalSends) {
@@ -305,7 +329,7 @@ export default function CampaignDetailPage({ id }) {
       return;
     }
     setView(next.stage);
-  }, [canManage, lyricSongs, next, openReview, setView, songs, view, visible]);
+  }, [canManage, lyricSongs, next, openReview, prepareGeneration, setView, songs, view, visible]);
 
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
@@ -346,11 +370,12 @@ export default function CampaignDetailPage({ id }) {
   const selectedVisible = visible.filter((song) => selected.has(song.id));
   const hiddenSelected = selected.size - selectedVisible.length;
   const onBulk = (action, list) => {
-    if (action === "generate") setDialog({ type: "generate", items: list.map((song) => song.creative) });
+    if (action === "generate") void prepareGeneration(list);
     else if (action === "approve") setDialog({ type: "approve", songs: list });
     else if (action === "send") setDialog({ type: "send", songs: list });
     else if (action === "discard" || action === "restore") setDialog({ type: "discard", songs: list, mode: action });
     else if (action === "retry") void runRetry(list);
+    else if (action === "prompts") setPromptTargets(list.map((song) => song.id));
     else if (action === "style") setStyleTargets(list.map((song) => song.id));
   };
 
@@ -465,7 +490,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && view !== "priority" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} canEditPrompts={Boolean(pipe.data?.features?.bulk_prompts || creative.data?.features?.bulk_prompts)} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}
@@ -531,6 +556,10 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: result.failed.length ? "warning" : "success", text: `${result.done} ${result.done === 1 ? "canción" : "canciones"} ${dialog.mode === "restore" ? "recuperada" : "descartada"}${result.done === 1 ? "" : "s"}.` });
       void refresh();
     }} />}
+    {promptTargets && <Modal label="Editar prompts en lote" busy={promptBusy} onClose={() => setPromptTargets(null)} width="max-w-4xl">
+      <div className="mb-5 flex items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Editar prompts · {promptTargets.length} canciones</h2><p className="mt-1 text-sm text-ink-secondary">Un mismo criterio visual, un fondo distinto por canción.</p></div><Button size="sm" variant="ghost" disabled={promptBusy} onClick={() => setPromptTargets(null)} aria-label="Cerrar">✕</Button></div>
+      {creative.data?.can_manage ? <BulkPrompts campaignId={id} creative={creative.data} itemIds={promptTargets} onBusyChange={setPromptBusy} onSaved={refresh} /> : <p className="text-sm text-ink-secondary">Sólo quien creó la campaña o un administrador puede cambiar los prompts.</p>}
+    </Modal>}
     {styleTargets && <Modal label="Preparar lote" busy={styleBusy} onClose={() => setStyleTargets(null)} width="max-w-4xl">
       <div className="mb-5 flex items-start justify-between gap-3">
         <div><p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Producción por lote</p>

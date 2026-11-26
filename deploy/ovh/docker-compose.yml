@@ -1,0 +1,89 @@
+# One Genly deployment on the OVH host. Bring up a second project
+# (staging vs production) with its own env file, DB and Redis, and the
+# same host bind for /var/lock/genly-prores plus the same
+# PRORES_SEMAPHORE_NAME. Do not point both projects at one Redis.
+#
+# Image: lyricgen/Dockerfile.worker (context lyricgen/). The API image is
+# deployed separately; it must receive the same PRORES_PORTAL_QUEUE,
+# PRORES_PREWARM_QUEUE, PRORES_SEMAPHORE_NAME and PRORES_SEMAPHORE_DIR.
+
+x-prores-env: &prores-env
+  PRORES_PORTAL_QUEUE: ${PRORES_PORTAL_QUEUE:-prores_portal}
+  PRORES_PREWARM_QUEUE: ${PRORES_PREWARM_QUEUE:-prores_prewarm}
+  PRORES_MAX_CONCURRENCY: ${PRORES_MAX_CONCURRENCY:-}
+  PRORES_SEMAPHORE_NAME: ${PRORES_SEMAPHORE_NAME:-prores}
+  PRORES_SEMAPHORE_DIR: /var/lock/genly-prores
+  PRORES_DOWNLOAD_INACTIVITY_SECONDS: ${PRORES_DOWNLOAD_INACTIVITY_SECONDS:-45}
+  PRORES_DOWNLOAD_TOTAL_SECONDS: ${PRORES_DOWNLOAD_TOTAL_SECONDS:-420}
+  PRORES_DOWNLOAD_MAX_ATTEMPTS: ${PRORES_DOWNLOAD_MAX_ATTEMPTS:-2}
+
+services:
+  worker-render:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      <<: *prores-env
+      QUEUES: enterprise,canary
+      REDIS_URL: ${REDIS_URL}
+    volumes:
+      - /var/lock/genly-prores:/var/lock/genly-prores
+
+  worker-default:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      QUEUES: default
+      REDIS_URL: ${REDIS_URL}
+
+  worker-prores:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      <<: *prores-env
+      QUEUES: prores_portal,prores_prewarm
+      REDIS_URL: ${REDIS_URL}
+    volumes:
+      - /var/lock/genly-prores:/var/lock/genly-prores
+
+  worker-interactive:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      WHISPER_PRELOAD: "1"
+      QUEUES: transcription,bg_preview,audio_preview
+      REDIS_URL: ${REDIS_URL}
+
+  worker-batch-short:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      WHISPER_PRELOAD: "1"
+      WORKLOAD_CLASS: batch
+      QUEUES: campaign_control,transcription_batch
+      REDIS_URL: ${REDIS_URL}
+
+  worker-batch-render:
+    build:
+      context: ../../lyricgen
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    command: ["python", "backend/worker.py"]
+    environment:
+      WORKLOAD_CLASS: batch
+      QUEUES: batch_render
+      REDIS_URL: ${REDIS_URL}

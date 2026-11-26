@@ -5,7 +5,7 @@ import LyricsEditor, { isServerQualityAcknowledgementCurrent } from "./LyricsEdi
 import { segmentsStore } from "../state/segmentsStore";
 
 vi.mock("../i18n", () => ({
-  useI18n: () => ({ t: () => undefined }),
+  useI18n: () => ({ t: (key) => key.startsWith("editor.lyric_observation_") ? key : undefined }),
 }));
 vi.mock("./OnboardingTour", () => ({ EditorTour: () => null }));
 
@@ -61,6 +61,24 @@ afterEach(() => {
 });
 
 describe("LyricsEditor — revisión focalizada transcription quality v5", () => {
+  it.each([7, 6])("muestra observaciones sólo para la revisión analizada %i", (revision) => {
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: {
+        ...V5_QUALITY,
+        mode: "observe",
+        decision: "pass",
+        evaluated_revision: revision,
+        lyric_observation: { findings: [{
+          code: "reused_word_clock", start: 43, end: 44, segment_indices: [0, 1],
+        }] },
+      },
+    })} />);
+    const observation = screen.queryByText(/editor\.lyric_observation_title/);
+    if (revision === 7) expect(observation).toBeInTheDocument();
+    else expect(observation).toBeNull();
+    expect(screen.queryByTestId("quality-review-panel")).toBeNull();
+  });
+
   it.each(["success", "recovered"])("refresca quality tras reanchor %s sin reemplazar nuevas ediciones", async (mode) => {
     let resolveQuality;
     const editorRequest = vi.fn().mockImplementation((path) => path.startsWith("/editor/")

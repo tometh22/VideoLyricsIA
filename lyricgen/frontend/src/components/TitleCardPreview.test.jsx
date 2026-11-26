@@ -46,6 +46,25 @@ function songNodes(container) {
 }
 
 describe("TitleCardPreview — font fidelity / backend connection", () => {
+  it("uses the look fonts and respects an explicit song override", () => {
+    const props = {
+      artist: "Los Enanitos Verdes", song: "Amigos", textCase: "original", font: "montserrat-bold",
+      lookArtistFont: { css: "'Knewave', cursive", weight: 400 },
+      lookSongFont: { css: "'Oswald', sans-serif", weight: 700 },
+    };
+    const { rerender } = render(<TitleCardPreview {...props} />);
+    const artist = screen.getByText("LOS ENANITOS VERDES", { selector: "div" });
+    const song = screen.getByText("Amigos", { selector: "div" });
+    expect(artist.style.fontFamily).toContain("Knewave");
+    expect(artist.style.fontWeight).toBe("400");
+    expect(song.style.fontFamily).toContain("Oswald");
+    expect(song.style.fontWeight).toBe("700");
+
+    rerender(<TitleCardPreview {...props} songFont="anton" />);
+    expect(artist.style.fontFamily).toContain("Knewave");
+    expect(song.style.fontFamily).toContain("Anton");
+  });
+
   it("renders the artist UPPERCASE in Montserrat (ExtraBold)", () => {
     const { container } = render(
       <TitleCardPreview artist="Soda Stereo" song="De Música Ligera" font="oswald-bold" />,

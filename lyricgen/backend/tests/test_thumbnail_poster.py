@@ -82,6 +82,21 @@ def test_recipe_variant_font_and_palette_reach_the_poster():
     assert greens < greens_b
 
 
+@pytest.mark.parametrize("look_id", ["perspectiva", "escalera"])
+def test_stacked_poster_uses_both_look_faces_for_single_word_titles(look_id):
+    custom = {"font_main": "oswald", "font_key": "knewave", "accent": "#77ED59"}
+    look = runtime.resolve_for_render(look_id, {**OPTS, **(custom if look_id == "perspectiva" else {})})
+    layer, style, layout = tp.text_layer(look, artist="Los Enanitos Verdes", title="Amigos")
+    assert layout == "stack"
+    assert os.path.basename(style.artist_font) == "Knewave-Regular.ttf"
+    assert os.path.basename(style.title_font) == "Oswald-Bold.ttf"
+    assert style.artist_color == (119, 237, 89)
+    assert any(90 < r < 150 and g > 200 and 65 < b < 115 and a > 180 for r, g, b, a in layer.getdata())
+    override = tp.style_for(look, artist_font_path=looks.font_path(look))
+    assert override.artist_font == looks.font_path(look)
+    assert override.artist_color == override.ink
+
+
 @pytest.mark.parametrize('look_id', looks.LOOKS)
 @pytest.mark.parametrize('artist,title,lines', [
     (LONG_ARTIST, LONG_TITLE, None),

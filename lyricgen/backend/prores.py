@@ -194,38 +194,77 @@ def ensure_prores_exists(
         os.path.exists(file_path) and _mov_is_fresh(file_path, source_path)
     )
     if cached_file_ready and not require_r2_upload:
+        from prores_capacity import clear_current_portal_demand
+        clear_current_portal_demand()
         return file_path
 
     umg_spec = job.get("umg_spec")
     if not umg_spec:
+        from prores_capacity import clear_current_portal_demand
+        clear_current_portal_demand()
         raise ProResMisconfigured(
             "This job did not request UMG delivery; ProRes not available."
         )
 
-    lock = _prores_lock_for(job_id, file_type)
-    with lock:
-        # Double-check inside the lock: a sibling caller may have
-        # finished a FRESH transcode while we were waiting.
-        cached_file_ready = (
-            os.path.exists(file_path) and _mov_is_fresh(file_path, source_path)
-        )
-        if cached_file_ready and not require_r2_upload:
-            return file_path
-
-        if not cached_file_ready and not os.path.exists(source_path):
-            source_key = (job.get("s3_keys") or {}).get(source_key_name)
-            if source_key and storage.is_enabled():
-                os.makedirs(os.path.dirname(source_path), exist_ok=True)
-                if not storage.download_object(source_key, source_path):
-                    raise ProResSourceMissing(
-                        f"Source {source_filename} not available locally or in R2."
-                    )
-            else:
+    # Download before the per-job lock and before the host encode slot.
+    # A stalled R2 GET must not sit on the CPU permit until JobTimeout.
+    from prores_capacity import (
+        download_prores_source, remember_inputs,
+        release_portal_demand_on_terminal, clear_current_portal_demand,
+    )
+    if not os.path.exists(source_path):
+        # Downloading is not waiting for the encode slot. Drop the marker
+        # so the other deployment's prewarm can use a free CPU.
+        clear_current_portal_demand()
+        source_key = (job.get("s3_keys") or {}).get(source_key_name)
+        if source_key and storage.is_enabled():
+            os.makedirs(os.path.dirname(source_path), exist_ok=True)
+            if not download_prores_source(source_key, source_path):
+                clear_current_portal_demand()
                 raise ProResSourceMissing(
-                    f"Source {source_filename} not found; cannot generate ProRes."
+                    f"Source {source_filename} not available locally or in R2."
                 )
+        elif not os.path.exists(source_path):
+            # The lock below still reports a missing source when the file
+            # never arrives. Leave that path to preserve the 404 contract
+            # for callers that race a local write.
+            pass
+    if os.path.exists(source_path):
+        remember_inputs(source_path)
 
-        # Freshness fence (audit 2026-06-09): the source lyric_video.mp4 is
+    lock = _prores_lock_for(job_id, file_type)
+    with release_portal_demand_on_terminal():
+        with lock:
+            return _publish_prores_locked(
+                job_id, file_type, tenant_id, file_path, source_path,
+                source_filename, umg_spec, require_r2_upload,
+            )
+
+
+def _publish_prores_locked(
+    job_id, file_type, tenant_id, file_path, source_path,
+    source_filename, umg_spec, require_r2_upload,
+):
+    """Transcode and publish. Caller holds the per-(job, type) lock.
+
+    ffmpeg runs inside the host encode slot. The R2 upload does not.
+    """
+    import storage
+    from pipeline import _transcode_to_prores, _short_prores_spec
+    from render_spec import RenderSpec
+    from prores_capacity import transcode_slot
+
+    cached_file_ready = (
+        os.path.exists(file_path) and _mov_is_fresh(file_path, source_path)
+    )
+    if cached_file_ready and not require_r2_upload:
+        return file_path
+    if not cached_file_ready and not os.path.exists(source_path):
+        raise ProResSourceMissing(
+            f"Source {source_filename} not found; cannot generate ProRes."
+        )
+
+    # Freshness fence (audit 2026-06-09): the source lyric_video.mp4 is
         # MUTABLE — run_edit_pipeline overwrites it in place on an edit. This
         # transcode runs 60-300 s in a SEPARATE process (the per-(job,type)
         # lock above is a threading.Lock, in-process only — it does NOT
@@ -238,108 +277,110 @@ def ensure_prores_exists(
         # publishing; if it moved, we discard the .mov and raise
         # ProResSuperseded — the edit's own re-enqueued prewarm regenerates
         # from the new cut.
-        fingerprint = _render_fingerprint(job_id, source_path)
+    fingerprint = _render_fingerprint(job_id, source_path)
 
-        if not cached_file_ready:
-            spec = (
-                RenderSpec.umg(**umg_spec) if file_type == "umg_master"
-                else _short_prores_spec(umg_spec)
-            )
-            # ffmpeg writes to .tmp; we rename atomically once the post-
-            # transcode validator is happy. Two processes may race on the
-            # same source but only one's os.replace lands. The loser's .tmp
-            # is overwritten or unlinked below.
-            tmp_path = f"{file_path}.tmp"
-            try:
+    if not cached_file_ready:
+        spec = (
+            RenderSpec.umg(**umg_spec) if file_type == "umg_master"
+            else _short_prores_spec(umg_spec)
+        )
+        # ffmpeg writes to .tmp; we rename atomically once the post-
+        # transcode validator is happy. Two processes may race on the
+        # same source but only one's os.replace lands. The loser's .tmp
+        # is overwritten or unlinked below.
+        tmp_path = f"{file_path}.tmp"
+        try:
+            # Slot covers ffmpeg only. Upload below stays outside it.
+            with transcode_slot():
                 _transcode_to_prores(source_path, tmp_path, spec)
+            if _is_superseded(job_id, source_path, fingerprint):
+                raise ProResSuperseded(
+                    f"Job {job_id} re-rendered during {file_type} transcode; "
+                    "discarding stale .mov (fingerprint changed)."
+                )
+            os.replace(tmp_path, file_path)
+        finally:
+            # If transcode raised mid-way (or we discarded a superseded
+            # build), drop the partial.
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # Background prewarms may keep the local result when R2 has a
+    # transient issue. Portal-triggered work runs on a separate worker
+    # from the API, so it must confirm the R2 object before reporting
+    # success to the customer.
+    # (Unreachable when superseded at os.replace — the raise above skips
+    # this.)
+    try:
+        if not storage.is_enabled():
+            if require_r2_upload:
+                raise RuntimeError("R2 storage is unavailable for portal ProRes.")
+        else:
+            from delivery_snapshots import pin_legacy_deliveries
+            pin_legacy_deliveries(job_id)
+            key = storage.upload_master(
+                file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
+            )
+            if not key:
+                if require_r2_upload:
+                    raise RuntimeError("R2 did not return a ProRes object key.")
+            else:
+                if require_r2_upload and storage.object_status(key) != "exists":
+                    raise RuntimeError("ProRes upload was not confirmed in R2.")
+                # SECOND freshness fence (audit 2026-06-09): the upload
+                # above takes seconds (a 4K master is GBs). An edit/retry
+                # can land in that window — os.replace published a then-
+                # fresh .mov, but it is stale NOW. Re-check before merging
+                # the key: otherwise merge_s3_keys would re-add a key
+                # pointing at the pre-edit bytes AFTER run_edit_pipeline's
+                # remove_s3_keys already dropped it (last-writer-wins
+                # across separate FOR-UPDATE txns). On supersede we drop our
+                # now-stale LOCAL .mov and bail WITHOUT merging the key.
+                #
+                # We deliberately do NOT storage.delete_object(key): the R2
+                # key is fully deterministic ({tenant}/{job}/umg_master.mov),
+                # so the edit's re-enqueued prewarm — running on another
+                # replica — uploads the FRESH master to the SAME key. A
+                # blind delete here can race-clobber that fresh object,
+                # leaving s3_keys pointing at a deleted key → permanent 404
+                # (worse than a stale cut; audit re-review 2026-06-09). A
+                # stale object briefly left at the key is harmless: it is
+                # overwritten by the fresh upload (last-writer), and we
+                # never merged a key pointing at it.
                 if _is_superseded(job_id, source_path, fingerprint):
-                    raise ProResSuperseded(
-                        f"Job {job_id} re-rendered during {file_type} transcode; "
-                        "discarding stale .mov (fingerprint changed)."
+                    logger.warning(
+                        "[PRORES] %s/%s superseded during R2 upload; "
+                        "dropping stale local .mov, not merging key",
+                        job_id, file_type,
                     )
-                os.replace(tmp_path, file_path)
-            finally:
-                # If transcode raised mid-way (or we discarded a superseded
-                # build), drop the partial.
-                if os.path.exists(tmp_path):
                     try:
-                        os.unlink(tmp_path)
+                        os.unlink(file_path)
                     except OSError:
                         pass
-
-        # Background prewarms may keep the local result when R2 has a
-        # transient issue. Portal-triggered work runs on a separate worker
-        # from the API, so it must confirm the R2 object before reporting
-        # success to the customer.
-        # (Unreachable when superseded at os.replace — the raise above skips
-        # this.)
-        try:
-            if not storage.is_enabled():
-                if require_r2_upload:
-                    raise RuntimeError("R2 storage is unavailable for portal ProRes.")
-            else:
-                from delivery_snapshots import pin_legacy_deliveries
-                pin_legacy_deliveries(job_id)
-                key = storage.upload_master(
-                    file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
-                )
-                if not key:
-                    if require_r2_upload:
-                        raise RuntimeError("R2 did not return a ProRes object key.")
-                else:
-                    if require_r2_upload and storage.object_status(key) != "exists":
-                        raise RuntimeError("ProRes upload was not confirmed in R2.")
-                    # SECOND freshness fence (audit 2026-06-09): the upload
-                    # above takes seconds (a 4K master is GBs). An edit/retry
-                    # can land in that window — os.replace published a then-
-                    # fresh .mov, but it is stale NOW. Re-check before merging
-                    # the key: otherwise merge_s3_keys would re-add a key
-                    # pointing at the pre-edit bytes AFTER run_edit_pipeline's
-                    # remove_s3_keys already dropped it (last-writer-wins
-                    # across separate FOR-UPDATE txns). On supersede we drop our
-                    # now-stale LOCAL .mov and bail WITHOUT merging the key.
-                    #
-                    # We deliberately do NOT storage.delete_object(key): the R2
-                    # key is fully deterministic ({tenant}/{job}/umg_master.mov),
-                    # so the edit's re-enqueued prewarm — running on another
-                    # replica — uploads the FRESH master to the SAME key. A
-                    # blind delete here can race-clobber that fresh object,
-                    # leaving s3_keys pointing at a deleted key → permanent 404
-                    # (worse than a stale cut; audit re-review 2026-06-09). A
-                    # stale object briefly left at the key is harmless: it is
-                    # overwritten by the fresh upload (last-writer), and we
-                    # never merged a key pointing at it.
-                    if _is_superseded(job_id, source_path, fingerprint):
-                        logger.warning(
-                            "[PRORES] %s/%s superseded during R2 upload; "
-                            "dropping stale local .mov, not merging key",
-                            job_id, file_type,
-                        )
-                        try:
-                            os.unlink(file_path)
-                        except OSError:
-                            pass
-                        raise ProResSuperseded(
-                            f"Job {job_id} re-rendered during {file_type} R2 upload."
-                        )
-                    # U1 fix (audit 2026-05-25): merge atómico vía
-                    # `jobs.merge_s3_keys` — SELECT FOR UPDATE + read +
-                    # write en una sola tx. El path anterior (read en tx
-                    # A, write en tx B) tenía una race window entre los
-                    # dos prewarm workers (umg_master + umg_short) que
-                    # corrieron en paralelo: ambos snapshotean s3_keys={}
-                    # antes del transcode de 60-300s, y al final el
-                    # segundo en escribir pisa la key del primero. Prod
-                    # 2026-05-12: 8/18 jobs UMG perdieron una key,
-                    # reconciliado a mano por SQL.
-                    from jobs import merge_s3_keys
-                    merge_s3_keys(job_id, file_type, key)
-        except ProResSuperseded:
+                    raise ProResSuperseded(
+                        f"Job {job_id} re-rendered during {file_type} R2 upload."
+                    )
+                # U1 fix (audit 2026-05-25): merge atómico vía
+                # `jobs.merge_s3_keys` — SELECT FOR UPDATE + read +
+                # write en una sola tx. El path anterior (read en tx
+                # A, write en tx B) tenía una race window entre los
+                # dos prewarm workers (umg_master + umg_short) que
+                # corrieron en paralelo: ambos snapshotean s3_keys={}
+                # antes del transcode de 60-300s, y al final el
+                # segundo en escribir pisa la key del primero. Prod
+                # 2026-05-12: 8/18 jobs UMG perdieron una key,
+                # reconciliado a mano por SQL.
+                from jobs import merge_s3_keys
+                merge_s3_keys(job_id, file_type, key)
+    except ProResSuperseded:
+        raise
+    except Exception as e:  # pragma: no cover
+        if require_r2_upload:
             raise
-        except Exception as e:  # pragma: no cover
-            if require_r2_upload:
-                raise
-            logger.warning("[PRORES] R2 upload skipped: %s", e)
+        logger.warning("[PRORES] R2 upload skipped: %s", e)
 
     return file_path
 

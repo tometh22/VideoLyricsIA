@@ -1474,7 +1474,7 @@ def test_historical_revision_is_used_for_lazy_document(client):
     assert response.json()["segments"] == segments
 
 
-def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
+def test_equal_revision_legacy_order_is_migrated_without_deleting_or_retiming_rows():
     first, _, job_id = _users_and_job("editor_timing_repair")
     malformed = [
         {"_id": 9, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
@@ -1493,9 +1493,9 @@ def test_equal_revision_legacy_timing_anomaly_is_migrated_once():
         db.commit()
         repaired = get_or_create_document(db, job_id, job.tenant_id, malformed)
         db.commit()
-        assert [row["_id"] for row in repaired.current_segments] == [9, 10, 11, 22]
-        assert repaired.current_segments[2]["start"] == 46.5773
+        assert repaired.current_segments == sorted(malformed, key=lambda row: row["start"])
         assert job.segments_revision == repaired.revision == 2
+        assert get_or_create_document(db, job_id, job.tenant_id, malformed).revision == 2
     finally:
         db.close()
 
@@ -1636,7 +1636,12 @@ def test_analytics_events_store_client_time_or_fall_back_to_arrival(client):
             )
         }
     assert all(row.occurred_at is not None for row in rows.values())
-    assert abs((rows[1_000].occurred_at - client_time).total_seconds()) < 0.01
+    stored_client_time = rows[1_000].occurred_at
+    # SQLite returns timezone-aware DateTime values as naive; compare them in
+    # UTC, matching PostgreSQL's timestamptz behavior in production.
+    if stored_client_time.tzinfo is None:
+        stored_client_time = stored_client_time.replace(tzinfo=timezone.utc)
+    assert abs((stored_client_time - client_time).total_seconds()) < 0.01
     for position in (2_000, 3_000):
         lag = abs((rows[position].occurred_at - rows[position].created_at).total_seconds())
         assert lag < 60, position
@@ -1696,6 +1701,32 @@ def test_transaction_rollback_never_leaves_partial_editor_state():
         assert verify.query(EditorVersion).filter(EditorVersion.job_id == job_id).count() == 1
     finally:
         verify.close()
+
+
+def test_approval_keeps_lyrics_with_pending_suggestions_under_legacy_enforce(monkeypatch):
+    from copy import deepcopy
+    from lyric_review_sources import review_for_document
+
+    monkeypatch.setenv("LYRIC_REVIEW_MODE", "enforce")
+    first, _, job_id = _users_and_job("approval_optional_suggestions")
+    rows = [{"start": 0.4, "end": 1.8, "text": "¿Cuando vuelvas?", "locked": True}]
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        job.workload_class = "batch"
+        monkeypatch.setenv("LYRIC_REVIEW_ENFORCE_TENANTS", job.tenant_id)
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, rows, "manual")
+        db.commit()
+        before = deepcopy(document.current_segments)
+        review = review_for_document(db, document, job)
+        assert review["required_count"] > 0
+        assert review["mode"] == "observe"
+        approved, frozen = approve_document(
+            db, job, first.id, editor_revision=version.revision, editor_version_id=version.id,
+        )
+        db.commit()
+        assert approved.current_segments == frozen.segments == job.segments_json == before
+        assert not any(line.get("qa_dismissed") for line in frozen.segments)
 
 
 def test_approval_preserves_historical_forty_ms_edges_including_locked():
@@ -2016,3 +2047,42 @@ def test_campaign_review_needs_activity_for_same_actor_revision_and_save_time(db
     assert saved_review_history(db, [job_id]) == {}
     _review_activity(db, doc, human.id)
     assert saved_review_history(db, [job_id])[job_id]["user_id"] == human.id
+
+
+def test_explicit_duplicate_survives_autosave_database_and_reload(client):
+    """A deliberately duplicated final line must survive server canonicalization."""
+    actor, _, job_id = _users_and_job("ux_duplicate_roundtrip")
+    headers = auth(_token_for(actor))
+    loaded = client.get(f"/editor/{job_id}", headers=headers).json()
+    rows = [
+        {"segment_id": "original", "start": 0, "end": 1, "text": "con espacios"},
+        {"segment_id": "copy", "start": 0, "end": 1, "text": "con espacios", "review": True},
+    ]
+    saved = client.patch(f"/editor/{job_id}", headers=headers, json={
+        "base_revision": loaded["revision"], "segments": rows, "checkpoint": "autosave",
+    })
+    assert saved.status_code == 200, saved.text
+    with SessionLocal() as db:
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        assert len(document.current_segments) == 2
+        assert [r["segment_id"] for r in document.current_segments] == ["original", "copy"]
+        assert document.current_segments[1]["review"] is True
+        assert document.revision == saved.json()["revision"]
+        assert db.query(Job).filter_by(job_id=job_id).one().segments_json == document.current_segments
+    reloaded = client.get(f"/editor/{job_id}", headers=headers)
+    assert reloaded.status_code == 200
+    assert [r["segment_id"] for r in reloaded.json()["segments"]] == ["original", "copy"]
+    # Editing the copy and navigating away must retain both the text and timing.
+    rows = reloaded.json()["segments"]
+    rows[1].update(text="copia corregida con espacios", start=1.2, end=2.4)
+    changed = client.patch(f"/editor/{job_id}", headers=headers, json={
+        "base_revision": reloaded.json()["revision"], "segments": rows, "checkpoint": "manual",
+    })
+    assert changed.status_code == 200, changed.text
+    final = client.get(f"/editor/{job_id}", headers=headers).json()
+    assert final["segments"][1]["text"] == "copia corregida con espacios"
+    assert final["segments"][1]["start"] == 1.2
+    assert final["segments"][1]["end"] == 2.4
+    with SessionLocal() as db:
+        version = db.query(EditorVersion).filter_by(job_id=job_id, revision=final["revision"]).one()
+        assert version.segments == final["segments"]

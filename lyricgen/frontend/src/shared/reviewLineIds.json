@@ -1,0 +1,233 @@
+[
+  {
+    "name": "unique",
+    "segments": [
+      {
+        "segment_id": "a"
+      },
+      {
+        "id": "b"
+      }
+    ],
+    "expected": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "name": "missing",
+    "segments": [
+      {},
+      {}
+    ],
+    "expected": [
+      "index:0",
+      "index:1"
+    ]
+  },
+  {
+    "name": "duplicate stable",
+    "segments": [
+      {
+        "segment_id": "same"
+      },
+      {
+        "segment_id": "same"
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1"
+    ]
+  },
+  {
+    "name": "duplicate legacy",
+    "segments": [
+      {
+        "id": "16"
+      },
+      {
+        "id": "16"
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1"
+    ]
+  },
+  {
+    "name": "fallback collision",
+    "segments": [
+      {},
+      {
+        "segment_id": "index:0"
+      }
+    ],
+    "expected": [
+      "index:0#1",
+      "index:1"
+    ]
+  },
+  {
+    "name": "reserved suffixes",
+    "segments": [
+      {
+        "id": "same"
+      },
+      {
+        "id": "same"
+      },
+      {
+        "id": "index:0"
+      },
+      {
+        "id": "index:0#1"
+      },
+      {
+        "id": "index:0#2"
+      }
+    ],
+    "expected": [
+      "index:0#3",
+      "index:1",
+      "index:0",
+      "index:0#1",
+      "index:0#2"
+    ]
+  },
+  {
+    "name": "whitespace",
+    "segments": [
+      {
+        "segment_id": " a "
+      },
+      {
+        "id": "a"
+      },
+      {
+        "segment_id": " ",
+        "id": "b"
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1",
+      "b"
+    ]
+  },
+  {
+    "name": "numeric ids",
+    "segments": [
+      {
+        "id": 16
+      },
+      {
+        "id": 16.0
+      },
+      {
+        "id": 0
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1",
+      "0"
+    ]
+  },
+  {
+    "name": "split legacy",
+    "segments": [
+      {
+        "id": "parent",
+        "segment_id": "new-a"
+      },
+      {
+        "id": "parent",
+        "segment_id": "new-b"
+      }
+    ],
+    "expected": [
+      "new-a",
+      "new-b"
+    ]
+  },
+  {
+    "name": "malformed metadata",
+    "segments": [
+      {
+        "id": true
+      },
+      {
+        "id": {}
+      },
+      {
+        "id": 16.5
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1",
+      "index:2"
+    ]
+  },
+  {
+    "name": "BOM is trimmed",
+    "segments": [
+      {
+        "segment_id": "\ufeffa\ufeff"
+      },
+      {
+        "id": "a"
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1"
+    ]
+  },
+  {
+    "name": "NEL is retained",
+    "segments": [
+      {
+        "segment_id": "\u0085a\u0085"
+      },
+      {
+        "id": "a"
+      }
+    ],
+    "expected": [
+      "\u0085a\u0085",
+      "a"
+    ]
+  },
+  {
+    "name": "file separator is retained",
+    "segments": [
+      {
+        "segment_id": "\u001ca\u001c"
+      },
+      {
+        "id": "a"
+      }
+    ],
+    "expected": [
+      "\u001ca\u001c",
+      "a"
+    ]
+  },
+  {
+    "name": "Unicode space and BOM collision",
+    "segments": [
+      {
+        "segment_id": "\u2000\ufeffa\u3000"
+      },
+      {
+        "id": "a"
+      }
+    ],
+    "expected": [
+      "index:0",
+      "index:1"
+    ]
+  }
+]

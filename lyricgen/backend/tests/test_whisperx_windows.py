@@ -117,6 +117,31 @@ def test_partial_provider_failure_is_not_published_as_complete(provider, monkeyp
         windows.transcribe_windows('audio.wav', 'provider:hash', {}, 480)
 
 
+def test_decoder_loop_retries_preserve_timed_refrain(provider, monkeypatch):
+    _, results = provider
+    results[0]["_language_detection_probability"] = .25
+    results[0]["segments"] = [{
+        "start": 2, "end": 10, "text": "Vuela, vuela, vuela, vuela, vuela, vuela",
+        "words": [{"word": "vuela", "start": 2 + i, "end": 2.5 + i} for i in range(6)],
+    }]
+    monkeypatch.setattr(windows, "_independent_retry", lambda *_: (
+        [{"start": 0, "end": 12, "text": "vuela, " * 111}], "spanish",
+    ))
+    result = windows.transcribe_windows("audio.wav", "provider:hash", {}, 480)
+    assert result["segments"][0]["text"].casefold().count("vuela") == 6
+    assert result["segments"][0]["words"][0]["start"] == 62
+
+
+def test_decoder_loop_without_timed_fallback_refuses_partial_result(provider, monkeypatch):
+    _, results = provider
+    results[0]["_language_detection_probability"] = .25
+    monkeypatch.setattr(windows, "_independent_retry", lambda *_: (
+        [{"start": 0, "end": 3, "text": "A" * 120}], "french",
+    ))
+    with pytest.raises(RuntimeError, match="repetition loop"):
+        windows.transcribe_windows("audio.wav", "provider:hash", {}, 480)
+
+
 def test_deadline_shared_across_windows(provider, monkeypatch):
     calls, _ = provider
     ticks = iter([0, 1, 2, 481])

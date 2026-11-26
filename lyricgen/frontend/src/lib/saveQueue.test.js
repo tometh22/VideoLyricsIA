@@ -252,14 +252,16 @@ describe("saveQueue", () => {
     expect(seen.at(-1)).toBe("saved");
   });
 
-  it("no dispara si no hay segmentos (o lista vacía)", async () => {
+  it("persists an intentional empty snapshot but rejects absent data", async () => {
     const persist = vi.fn().mockResolvedValue({ ok: true });
     const q = createSaveQueue(persist);
-    q.flush("job", { provider: () => [] });
-    q.flush("job", { provider: () => null });
+    await q.flush("job", { provider: () => [] });
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(await q.flush("job", { provider: () => null })).toEqual({ ok: false, reason: "no-data" });
+    expect(persist).toHaveBeenCalledTimes(1);
     q.schedule("job", () => []);
     await vi.advanceTimersByTimeAsync(3000);
-    expect(persist).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledWith("job", [], expect.objectContaining({ baseRevision: 0 }));
   });
 
   it("evict cancela el debounce pendiente y limpia el estado", async () => {

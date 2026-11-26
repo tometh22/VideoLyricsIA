@@ -85,8 +85,107 @@ dashboards.
 - **No burst deploys** — kills in-flight renders. One at a time, wait for healthy.
 - **Build ~20–30 min** — plan around it; not instant.
 - **`RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`** on Worker — leave it; it's what lets a render finish across a deploy. Verify it's still set after any service recreation.
-- **`watchPatterns`** keep the Worker from redeploying on frontend-only changes — don't remove.
+- **One runtime deployment cohort** — API and all five worker services share watch patterns. Frontend-only releases must deploy the workers too; the quality CAS token includes the Git SHA.
 - **No native canary / percentage rollout** — staging soak is the substitute. For true canary/blue-green/SLO-driven auto-rollback you'd need a traffic proxy or a flag service (LaunchDarkly/Flagsmith); that's a separate investment, relevant around the ~50-user scale inflection.
+
+### SHA-bound runtime and watch-pattern contract
+
+`queue_jobs._transcription_quality_runtime_token()` binds quality work to the
+release SHA, policy, pipeline configuration and calibration. A worker with a
+different token discards the work before taking its snapshot. Equal backend code
+fingerprints alone therefore do not make different release SHAs compatible.
+
+The API, Worker, ShortWorker, BatchWorker, BatchShortWorker and quality-worker
+share the same watch paths. They cover root `/VERSION`, frontend, backend,
+assets, both Dockerfiles and the six runtime-service TOML files. This makes a
+frontend-only release select the complete cohort. Frontend tests or package
+changes without a version bump also select everyone: they used to deploy only
+the API. A version-only release or a change to one cohort config also selects all
+six. Normal application releases still update VERSION/package/changelog together.
+
+Paths are relative to the repository root even though the build root is
+`/lyricgen`; see [Railway watch-path semantics](https://docs.railway.com/builds/build-configuration#configure-watch-paths).
+Docs, CI-only files, and independent cost-collector/R2 service configs remain
+outside these triggers. Do not replace this list with `railway/**` or a global
+wildcard that restarts the runtime fleet for unrelated maintenance.
+
+The contract runs in the existing fast CI check:
+
+```sh
+python3.11 -m unittest discover -s ci/tests -p test_release_watch_contract.py -v
+```
+
+Tests parse the real TOML and use Git's gitignore matcher against changed-path
+scenarios; no deployment, database, provider or queue access is involved. The
+six lists must remain identical, so adding a new API trigger cannot silently
+leave workers behind.
+
+Staging activation has two sources. API, Worker, ShortWorker and quality-worker
+read their existing `/railway/<service>.toml` files. BatchWorker and
+BatchShortWorker have `railwayConfigFile=null` and use persisted service watch
+settings. A new TOML binding was rejected by Railway with `BAD_USER_INPUT`
+(Config as Code deprecated); do not retry the legacy mutation or claim those
+services read the TOML. [Railway's documented restriction](https://docs.railway.com/config-as-code)
+was checked on 2026-11-20.
+
+On 2026-11-20 the release owner authorized a staging-only watch-pattern change.
+An `environmentPatchCommit` with `skipDeploys=true` set only the two batch
+`build.watchPatterns` arrays to the same 12 entries as this repository. Direct
+`ServiceInstance.watchPatterns` reads confirmed persistence. The complete staging
+configuration differed only in those arrays; production configuration, all six
+active/latest deployment IDs and SHAs (`979b2c44`), regional capacity (6/8 batch
+replicas) and health/runtime identity were unchanged. Before/after, the exact
+request and guarded rollback are retained in the release workspace receipt
+`release-watch-patterns979/after.json` (patch
+`38ad8e50-896a-4ce1-b802-52a6da4b1563`). This is an effective trigger-setting
+change, not a new deployment or server-side file binding.
+
+Before every publication that changes cohort patterns, synchronize the two batch
+settings from the reviewed TOML arrays using a separately reviewed staging patch.
+Use only those two `build.watchPatterns` keys, explicit staging environment ID,
+and `skipDeploys=true`; capture old arrays for rollback and verify the complete
+before/after config has no other delta. Do not change `configFile`, environment
+variables, source, capacity, queues, or production. Pattern drift must fail the
+read-only gate, even when the last deployment's manifest looks correct:
+
+```sh
+python3.11 ci/verify_staging_runtime_watches.py --phase before
+# After the authorized automatic staging rollout (substitute its exact merge SHA):
+python3.11 ci/verify_staging_runtime_watches.py --phase after --release-sha "$MERGE_SHA"
+```
+
+The pre-merge gate checks persisted batch triggers and the other four bindings.
+The post-rollout gate additionally checks all six successful deployments, exact
+release SHA and effective watch lists. Neither replaces the full health/runtime,
+queue coverage and authenticated smoke checks below. CLI credentials stay outside
+source; CI tests use synthetic provider records and make no live calls. No new
+live credential or privileged workflow is introduced.
+
+This explicit synchronization is transitional. The supported permanent successor
+is one staging IaC authoring file: import the environment with variables preserved,
+translate the six cohort filters/build/deploy settings, and preview a reviewed
+plan before cutover. Pin project/environment to staging, preserve every imported
+resource and current regional capacity, and reject any delete or unrelated delta.
+Four existing file bindings require coordinated staging-only cutover; the two
+unbound batch services do not. Use the installed CLI's supported import/plan
+commands and the [official migration procedure](https://docs.railway.com/infrastructure-as-code#migrating-from-config-as-code).
+Do not run a whole-project apply containing only six services: omitted resources
+can be deleted. This PR does not perform IaC adoption or production changes.
+
+This intentionally increases worker rollouts for frontend-only changes. Preserve
+all existing queues, replicas and 1200-second draining settings, schedule one
+publication at a time, and let in-flight work finish. Watch-pattern selection is
+not proof of a completed rollout: before releasing the turn, verify every
+service's actual commit, healthy queue/service coverage, config/protocol parity
+and `quality_gates.fleet_runtime_token_match=true`. Do not accept a partial
+`SKIPPED` rollout on backend fingerprint equality alone. Stop and coordinate
+recovery if source identity or runtime tokens disagree; never hide the guard,
+change flags to equalize tokens, or publish a feature checkout manually.
+
+Railway's [Config-as-Code reference](https://docs.railway.com/config-as-code/reference)
+(checked 2026-11-20) announces legacy TOML support through 2026-12-01. This patch repairs the existing
+files; migrating the same contract to Infrastructure as Code is separate,
+coordinated work before that deadline, not an infrastructure action in this PR.
 
 ### Veo cost-control rollout (schema + locking protocol)
 

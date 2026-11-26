@@ -16,6 +16,19 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
     expect(login.ok()).toBeTruthy();
     const token = (await login.json()).token;
     const headers = { Authorization: `Bearer ${token}` };
+    const campaignStatus = async () => {
+      const response = await request.get(`${API}/status/${JOB}`, { headers });
+      expect(response.ok()).toBeTruthy();
+      const status = await response.json();
+      // The disposable song must have the same batch identity as a real
+      // campaign job. Otherwise reload drops its design revision and every
+      // subsequent creative save correctly fails CAS at revision zero.
+      expect(status.workload_class).toBe("batch");
+      expect(status.campaign?.campaign_id).toBe(CAMPAIGN);
+      expect(status.campaign?.campaign_item_id).toBe("e2erevieweritem");
+      return status;
+    };
+    await campaignStatus();
     const document = async () => {
       const response = await request.get(`${API}/editor/${JOB}`, { headers });
       expect(response.ok()).toBeTruthy();
@@ -48,13 +61,13 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
     await page.route(`**/jobs/${JOB}/background-url`, route => route.fulfill({ json: { url: null } }));
     try {
       await page.goto(`/review/${JOB}`);
-      // A campaign opens directly at lyrics (six-step wizard), unlike the
-      // four-step post-render editor. Wait for the actual editor, not a tab's
-      // incidental step number; keep every candidate/adoption assertion below.
+      // A campaign opens directly in its dedicated review workspace.
       await expect(page.getByTestId("lyrics-editor")).toBeVisible();
       const announcement = page.getByRole("dialog");
       if (await announcement.isVisible()) await announcement.getByRole("button", { name: "Cancelar", exact: true }).click();
       await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+      await expect(page.getByTestId("native-lyric-preview").getByRole("img")).toHaveAttribute("aria-busy", "false");
+      await expect.poll(async () => (await campaignStatus()).campaign.render_overrides?.creative_assignment?.revision || 0).toBeGreaterThan(0);
       const companion = page.getByRole("region", { name: "Revisión acústica completa" });
       await expect(companion).toBeVisible();
       await companion.getByText(/Ver letra y timing de toda la candidata/).click();
@@ -65,11 +78,14 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       await companion.getByText(/Dudas y límites/).click();
       await expect(companion.getByText("Se conserva tu edición humana")).toBeVisible();
 
+      const proposals = page.getByTestId("quality-proposal-disclosure");
+      await expect(proposals).not.toHaveAttribute("open");
+      await proposals.locator(":scope > summary").click();
       const applyResponse = page.waitForResponse(response => response.url().includes(`/editor/${JOB}/quality-proposals/`)
         && response.url().endsWith("/apply") && response.request().method() === "POST");
       await page.getByRole("button", { name: "Usar candidata completa para revisar", exact: true }).click();
       expect((await applyResponse).ok()).toBeTruthy();
-      await expect(page.getByRole("textbox", { name: "Letra de la línea 1" })).toHaveValue("Canto aquí");
+      await expect(page.getByRole("textbox", { name: "Letra de esta línea", exact: true })).toHaveValue("Canto aquí");
       const adopted = await document();
       expect(adopted.segments[0].text).toBe("Canto aquí");
       expect(adopted.segments[1]).toEqual(protectedLine);
@@ -77,6 +93,17 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       const itemsBefore = await request.get(`${API}/batch/campaigns/${CAMPAIGN}/items`, { headers });
       expect(itemsBefore.ok()).toBeTruthy();
       expect((await itemsBefore.json()).items.find(item => item.job_id === JOB).phase).toBe("lyrics_ready");
+
+      // The new campaign panel must persist ordinary typing before blur and
+      // recover it from PostgreSQL after a complete page reload.
+      const lyric = page.getByRole("textbox", { name: "Letra de esta línea", exact: true });
+      await lyric.fill("Canto aquí con espacios");
+      await expect.poll(async () => (await document()).segments[0].text).toBe("Canto aquí con espacios");
+      await expect(lyric).toBeFocused();
+      await page.reload();
+      await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+      await expect(page.getByRole("textbox", { name: "Letra de esta línea", exact: true })).toHaveValue("Canto aquí con espacios");
+      expect((await campaignStatus()).campaign.render_overrides.creative_assignment.revision).toBeGreaterThan(0);
 
       const approveResponse = page.waitForResponse(response => response.url().endsWith(`/batch/campaigns/${CAMPAIGN}/jobs/${JOB}/approve-lyrics`)
         && response.request().method() === "POST");
@@ -88,7 +115,7 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
       // forwards to the campaign's lyric stage keeping the approval marker.
       await expect(page).toHaveURL(new RegExp(`/campaigns/${CAMPAIGN}\\?view=lyrics&approved=${JOB}`));
       const after = await document();
-      expect(after.segments[0].text).toBe("Canto aquí");
+      expect(after.segments[0].text).toBe("Canto aquí con espacios");
       expect(after.segments[1]).toEqual(protectedLine);
       const itemsAfter = await request.get(`${API}/batch/campaigns/${CAMPAIGN}/items`, { headers });
       expect(itemsAfter.ok()).toBeTruthy();

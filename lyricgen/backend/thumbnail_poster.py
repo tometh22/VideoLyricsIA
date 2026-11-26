@@ -294,6 +294,9 @@ def style_for(look: L.Look, *, song_font_path: str | None = None,
     else:
         case = "upper"
 
+    # On a stacked poster the artist can carry the look's display face
+    # and accent, including when the song title is a single word.
+    display_face = _path(look.key_font) if layout == "stack" and look.key_font else None
     if artist_font_path:
         artist_font = artist_font_path
     elif layout == "script" or neon:
@@ -301,8 +304,8 @@ def style_for(look: L.Look, *, song_font_path: str | None = None,
     elif layout == "block":
         artist_font = light_font
     else:
-        artist_font = title_font
-    artist_color = ink
+        artist_font = display_face or title_font
+    artist_color = accent if accent is not None and artist_font == display_face else ink
 
     glow = None
     if neon:

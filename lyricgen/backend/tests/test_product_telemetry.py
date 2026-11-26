@@ -14,6 +14,22 @@ def test_numeric_metrics_cannot_store_lyrics_or_poison_percentiles():
     assert not valid_property("status", 600)
 
 
+def test_timing_ab_accepts_decisions_and_rejects_free_text():
+    import main
+
+    event = "editor_timing_ab_decided"
+    sample = {
+        "proposal_id": "proposal-1", "window_id": "window-1", "revision": 4,
+        "choice": "neither", "variant_a": "current", "first_heard": "proposed",
+        "position_ms": 13300, "duration_ms": 6000, "event_id": "ab-1234",
+    }
+    assert event in main._PRODUCT_EVENT_NAMES
+    assert set(sample) == main._PRODUCT_EVENT_PROPERTIES[event]
+    assert all(valid_property(key, value) for key, value in sample.items())
+    assert not valid_property("choice", "borrador de letra")
+    assert not valid_property("first_heard", "neither")
+
+
 def test_session_and_boolean_types_are_strict():
     assert valid_property("session_id", "019abcde-1234-4567-8901-abcdefabcdef")
     assert not valid_property("session_id", "lyric text with spaces")

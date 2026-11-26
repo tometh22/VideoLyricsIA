@@ -317,6 +317,157 @@ class CreateUserRequest(BaseModel):
     # "universal_music" consumen del mismo plan mensual aunque no se vean
     # los videos entre sí. Vacío = sin grupo (cuota por tenant).
     billing_group: str = ""
+    # Additional lyric campaigns this user can review outside their workspace.
+    campaign_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
+@router.get("/user-assignment-options")
+async def user_assignment_options(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Workspace and campaign choices for the admin user-creation flow."""
+    from database import BatchCampaign
+
+    workspace_ids = {
+        value for (value,) in db.query(User.tenant_id).distinct().all() if value
+    }
+    workspace_ids.update(
+        value for (value,) in db.query(Job.tenant_id).distinct().all() if value
+    )
+    workspace_ids.update(
+        value for (value,) in db.query(BatchCampaign.tenant_id).distinct().all() if value
+    )
+    workspaces = []
+    for workspace_id in sorted(workspace_ids, key=str.casefold):
+        workspaces.append({
+            "id": workspace_id,
+            "users": db.query(User.id).filter(User.tenant_id == workspace_id, User.is_active.is_(True)).count(),
+            "campaigns": db.query(BatchCampaign.id).filter(BatchCampaign.tenant_id == workspace_id).count(),
+        })
+    campaigns = db.query(BatchCampaign).filter(
+        BatchCampaign.kind == "lyric_video",
+        BatchCampaign.status == "active",
+    ).order_by(BatchCampaign.name.asc()).limit(500).all()
+    return {
+        "workspaces": workspaces,
+        "campaigns": [{
+            "id": campaign.id,
+            "name": campaign.name,
+            "tenant_id": campaign.tenant_id,
+            "expected_count": campaign.expected_count,
+        } for campaign in campaigns],
+    }
+
+
+class CampaignAccessChange(BaseModel):
+    enabled: bool
+    expected_granted: bool
+
+
+def _campaign_access_row(campaign, grant, user):
+    explicit = grant is not None and grant.revoked_at is None
+    inherited = "admin" if user.role == "admin" else (
+        "team" if user.tenant_id == campaign.tenant_id else None
+    )
+    return {
+        "id": campaign.id, "name": campaign.name, "tenant_id": campaign.tenant_id,
+        "status": campaign.status, "kind": campaign.kind,
+        "granted": explicit, "inherited": inherited,
+        "has_access": bool(explicit or inherited),
+    }
+
+
+@router.get("/users/{user_id}/campaign-access")
+def user_campaign_access(
+    user_id: int,
+    search: str = Query(default="", max_length=200),
+    granted_only: bool = False,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=30, ge=1, le=100),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import and_, or_
+    from database import BatchCampaign, BatchCampaignReviewer
+    from batch_campaigns import _scope_enabled
+
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "Usuario no encontrado")
+    grant = BatchCampaignReviewer
+    active_grant = and_(grant.user_id.isnot(None), grant.revoked_at.is_(None))
+    query = db.query(BatchCampaign, grant).outerjoin(grant, and_(
+        grant.campaign_id == BatchCampaign.id, grant.user_id == user.id,
+    )).filter(or_(
+        and_(BatchCampaign.kind == "lyric_video", BatchCampaign.status == "active"),
+        active_grant,
+    ))
+    if search.strip():
+        query = query.filter(or_(
+            BatchCampaign.name.icontains(search.strip(), autoescape=True),
+            BatchCampaign.tenant_id.icontains(search.strip(), autoescape=True),
+        ))
+    if granted_only:
+        query = query.filter(active_grant)
+    total = query.count()
+    rows = query.order_by(case((active_grant, 0), else_=1), BatchCampaign.name, BatchCampaign.id).offset(offset).limit(limit).all()
+    return {
+        "items": [_campaign_access_row(c, g, user) for c, g in rows],
+        "total": total, "offset": offset, "limit": limit,
+        "user_active": user.is_active,
+        "campaigns_enabled": _scope_enabled({
+            "id": user.id, "role": user.role, "tenant_id": user.tenant_id,
+            "billing_group": user.billing_group,
+        }),
+    }
+
+
+@router.put("/users/{user_id}/campaign-access/{campaign_id}")
+def change_user_campaign_access(
+    user_id: int, campaign_id: str, body: CampaignAccessChange,
+    admin: dict = Depends(require_admin), db: Session = Depends(get_db),
+):
+    from database import BatchCampaign, BatchCampaignReviewer
+    from batch_campaigns import _scope_enabled
+
+    # Serialize changes for the same recipient, including a first grant.
+    user = db.query(User).filter_by(id=user_id).with_for_update().first()
+    if user is None:
+        raise HTTPException(404, "Usuario no encontrado")
+    campaign = db.query(BatchCampaign).filter_by(id=campaign_id).with_for_update().first()
+    if campaign is None:
+        raise HTTPException(404, "Campaña no encontrada")
+    grant = db.get(BatchCampaignReviewer, (campaign_id, user_id))
+    granted = grant is not None and grant.revoked_at is None
+    if granted != body.expected_granted:
+        raise HTTPException(409, "El permiso cambió. Actualizá la lista antes de volver a intentarlo.")
+    if body.enabled:
+        if not user.is_active:
+            raise HTTPException(422, "Reactivá la cuenta antes de darle acceso")
+        if user.role == "admin" or user.tenant_id == campaign.tenant_id:
+            raise HTTPException(422, "Este usuario ya tiene acceso por su rol o equipo")
+        if campaign.kind != "lyric_video" or campaign.status != "active":
+            raise HTTPException(422, "Solo se puede dar acceso a campañas de letras activas")
+        if not _scope_enabled({"id": user.id, "role": user.role,
+                               "tenant_id": user.tenant_id, "billing_group": user.billing_group}):
+            raise HTTPException(422, "Las campañas no están habilitadas para el equipo de este usuario")
+    if body.enabled != granted:
+        now = datetime.now(timezone.utc)
+        if body.enabled:
+            if grant is None:
+                grant = BatchCampaignReviewer(campaign_id=campaign_id, user_id=user_id)
+                db.add(grant)
+            grant.granted_by = admin["id"]
+            grant.granted_at = now
+            grant.revoked_at = None
+        else:
+            grant.revoked_at = now
+        db.add(AuditLog(user_id=admin["id"], action="admin.user_campaign_access_changed", detail={
+            "target_user": user_id, "campaign_id": campaign_id, "enabled": body.enabled,
+        }))
+        db.commit()
+    return _campaign_access_row(campaign, grant, user)
 
 
 @router.post("/users")
@@ -348,6 +499,20 @@ async def create_user_admin(
         # Without this, admin-managed teams can only ever have one user
         # (whoever was created first claims the tenant; later users in
         # the same team get rejected with "Tenant 'X' already exists").
+        campaign_ids = list(dict.fromkeys(body.campaign_ids))
+        if campaign_ids:
+            from database import BatchCampaign
+
+            campaigns = db.query(BatchCampaign).filter(
+                BatchCampaign.id.in_(campaign_ids),
+                BatchCampaign.kind == "lyric_video",
+                BatchCampaign.status == "active",
+            ).all()
+            if len(campaigns) != len(campaign_ids):
+                raise HTTPException(status_code=422, detail="Una o más campañas ya no están disponibles")
+        else:
+            campaigns = []
+
         user = create_user(
             db,
             username=body.username,
@@ -358,25 +523,46 @@ async def create_user_admin(
             tenant_id=body.tenant_id.strip() or None,
             ai_authorized=body.ai_authorized,
             enforce_reserved=False,
+            commit=False,
         )
-        _post_create_dirty = False
         if body.allow_overage:
             user.allow_overage = True
-            _post_create_dirty = True
         if body.ai_authorized:
             # Stamp audit fields so the authorization is attributable to
             # the admin that created the user, mirroring authorize-ai.
             user.ai_authorized_at = datetime.now(timezone.utc)
             user.ai_authorized_by = admin["id"]
-            _post_create_dirty = True
         if body.billing_group.strip():
             user.billing_group = body.billing_group.strip().lower()
-            _post_create_dirty = True
-        if _post_create_dirty:
-            db.commit()
-            db.refresh(user)
+        if campaigns:
+            from database import BatchCampaignReviewer, AuditLog
+            from batch_campaigns import _scope_enabled
+            cross_workspace = [campaign for campaign in campaigns if campaign.tenant_id != user.tenant_id]
+            if cross_workspace and not _scope_enabled({
+                "id": user.id, "role": user.role, "tenant_id": user.tenant_id,
+                "billing_group": user.billing_group,
+            }):
+                raise HTTPException(status_code=422, detail="El workspace elegido todavía no tiene acceso a campañas")
+            for campaign in campaigns:
+                if campaign.tenant_id == user.tenant_id:
+                    continue
+                db.add(BatchCampaignReviewer(
+                    campaign_id=campaign.id,
+                    user_id=user.id,
+                    granted_by=admin["id"],
+                ))
+            db.add(AuditLog(
+                user_id=admin["id"], action="admin.user_campaign_access_granted",
+                detail={"target_user": user.id, "campaign_ids": [c.id for c in cross_workspace]},
+            ))
+        db.commit()
+        db.refresh(user)
         return user.to_dict()
+    except HTTPException:
+        db.rollback()
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -1981,7 +2167,8 @@ def admin_change_requests(
     desde los dos entornos.
     """
     import change_request_stats as crs
-    from database import Delivery, DeliveryChangeRequest, scoped_deliveries_db
+    from database import (AuditLog, Delivery, DeliveryChangeRequest,
+                          SessionLocal, scoped_deliveries_db)
 
     with scoped_deliveries_db() as ddb:
         q = ddb.query(DeliveryChangeRequest)
@@ -1999,6 +2186,70 @@ def admin_change_requests(
         rows = q.order_by(DeliveryChangeRequest.submitted_at).all()
         result = crs.summarize(rows, deliveries_total=int(dq.scalar() or 0))
         result["period"] = period.strip() or None
+        # A monthly count of requests divided by monthly deliveries mixes two
+        # different cohorts. Use the append-only first-publication AuditLog
+        # event and a complete fixed follow-up window for the client defect rate.
+        work_db = SessionLocal()
+        try:
+            from sqlalchemy import or_
+            lyric_products = ("hits_lyrics", "rock_lyrics")
+            lyric_product_filter = or_(
+                Delivery.product_category.is_(None),
+                Delivery.product_category.in_(lyric_products),
+            )
+            # El portal es de Universal: lo que define la cohorte es en qué
+            # portal se publicó, no qué cuenta lo publicó. Filtrar por
+            # `tenant_snapshot ILIKE '%universal%'` dejaba afuera las campañas
+            # que el equipo publica con su propia cuenta (221 entregas de
+            # noviembre de 2026 y sus pedidos).
+            from delivery_plan import PORTALS
+            client_portal_filter = or_(
+                Delivery.portal_id.in_(tuple(PORTALS.keys())),
+                Delivery.portal_id.is_(None),
+            )
+            not_art_track = or_(Delivery.label.is_(None), Delivery.label != "Art Track")
+            all_deliveries = ddb.query(Delivery).filter(
+                client_portal_filter,
+                lyric_product_filter,
+                not_art_track,
+            ).all()
+            request_rows = (
+                ddb.query(Delivery.job_id, Delivery.portal_id,
+                          DeliveryChangeRequest.submitted_at,
+                          DeliveryChangeRequest.comment)
+                .join(Delivery, Delivery.id == DeliveryChangeRequest.delivery_id)
+                .filter(client_portal_filter, lyric_product_filter, not_art_track)
+                .all()
+            )
+            publication_events = work_db.query(
+                AuditLog.created_at, AuditLog.action, AuditLog.detail
+            ).filter(AuditLog.action.in_(("delivery.create", "delivery.update"))).all()
+            if period.strip():
+                start, end = _month_bounds(period.strip())
+                publication_events = [
+                    event for event in publication_events
+                    if event[0] and start <= event[0] < end
+                ]
+            events = [(None, None, created_at, action, detail)
+                      for created_at, action, detail in publication_events]
+            cohorts = [(str(d.job_id), str(d.portal_id or "argentina"))
+                       for d in all_deliveries]
+            request_facts = [(str(job_id), str(portal or "argentina"), submitted_at, comment)
+                             for job_id, portal, submitted_at, comment in request_rows]
+            import change_request_stats as crs
+            result["delivery_cohort"] = crs.summarize_delivery_cohort(
+                cohorts, request_facts, events, followup_days=30,
+            )
+            result["delivery_cohort"]["period"] = period.strip() or None
+            result["delivery_cohort"]["status"] = "ready"
+        except Exception as exc:
+            logger.warning("[CHANGE-REQUEST-STATS] cohort history unavailable: %s", exc)
+            result["delivery_cohort"] = {
+                "status": "unavailable",
+                "note": "No se pudo reconstruir el historial de primera publicación.",
+            }
+        finally:
+            work_db.close()
         if include_raw:
             result["raw"] = [
                 {"id": r.id, "comment": r.comment,

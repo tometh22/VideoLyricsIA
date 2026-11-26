@@ -39,6 +39,14 @@ def bind_job_attempt(kind: str, attempt_id: str):
         _CURRENT_JOB_ATTEMPT.reset(token)
 
 
+def current_job_attempt_id(kind: str) -> str | None:
+    """Outbox attempt id bound by ``bind_job_attempt`` for ``kind``, if any."""
+    attempt = _CURRENT_JOB_ATTEMPT.get()
+    if attempt is None or attempt[0] != kind:
+        return None
+    return attempt[1]
+
+
 def _report_shared_input_delete_attempt(job: Job, caller: str) -> None:
     """Record a guarded input-delete attempt without alerting on normal deletes."""
     _logger.warning(

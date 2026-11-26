@@ -22,10 +22,13 @@ revisor.
 
 | Regla | Ejemplo real | Control automático |
 |---|---|---|
-| Sin punto final en las líneas | #11, #12, #22, #25, #32, #33 | Sí (preflight de entrega) |
+| Sin punto final en las líneas | #11, #12, #22, #25, #32, #33; "Para no volver." (oct), "Lejos de vos." (nov) | Sí: "Punto final", obligatorio en los dos portales, también en el re-render por pedido de cambio (las siglas "V.S.D." y los "..." quedan) |
 | ¿? sólo si de verdad es una pregunta | "Cuando vuelvas" sin signos (#121), "Cuando miro en tus ojos" (#117) | Sí: "¿Cuando…" sin tilde, "¿A ver si…" |
-| Exclamaciones con ¡! | "¡Qué lindo añorar la zamba!" (#124), "¡Cuánto me hiciste llorar!" (#100) | Sí: "¿Qué lindo…?" pasa a ¡! |
+| Un signo de pregunta siempre con su par | "Si ya no tengo las caricias de mi madre?", "¿Por qué soy wacho amor" (oct) | Sí, obligatorio: con interrogativo con tilde se completa ("Pero, ¿qué hago yo acá?"), si no se quitan; la otra opción a un número |
+| Exclamaciones: Argentina sin signos, Chile con ¡! | "¿Qué lindo añorar la zamba?" → sin signos (AR, #124); "¡Cuánto me hiciste llorar!" (CL, #100) | Sí: "¿Qué lindo…?" según el portal |
+| Argentina: coros y ecos sin paréntesis | "(cargada del amor)", "(AY, AY, AY)" de más (oct-nov) | Sugerencia: UMG aceptó otros 22 con paréntesis |
 | La misma palabra lleva siempre la misma tilde | "MÍO MIO" (#114) | Sí: "Tildes distintas" |
+| Tildes que faltan sin dudas | "ARDÍAN", "Descubriéndose", "ESTÁ de más" (CL), "DARÁN" (AR) | Sí, obligatorio: "Falta una tilde" (sólo palabras que sin tilde no existen, gerundio + pronombre, -ción/-sión, "está" antes de "de/en/bien…") |
 | Tildes que cambian el sentido se deciden escuchando | "llegue / llegué" (#115), "cuando / cuándo" (#108) | No: sólo avisa si la palabra aparece distinta en la canción |
 | Palabras separadas, con espacio después de la coma | "logro entender", "si esto" (#125), "vuelvo, vuelvo" | Sí: "Palabras pegadas" / "Falta un espacio" |
 
@@ -38,18 +41,53 @@ revisor.
 | Líneas de largo parecido; repeticiones cortas por separado | "MANOS / COSAS / MANOS / COSAS" (#131), Mataz (#125) | No |
 | La línea aparece cuando se canta y dura lo que dura | "alargar brasero" (#115), "aparecer antes" (#119) | Parcial (preflight: línea que termina antes de la palabra) |
 
+## Perfil por portal
+
+La Revisión rápida sabe a qué portal va la canción (el destino de la
+campaña; "umg" si es una entrega UMG sin portal fijo) y aplica sus reglas.
+Lo que no se puede decidir sin escuchar queda afuera: preguntas de sí/no sin
+signo de duda ("¿Llegas a la ciudad?"), "¿Cuánto…?" que exclama o pregunta,
+las comas.
+
+**Voseo (sólo Argentina).** La máquina pasa el voseo a tuteo ("querés" →
+"quieres", "vení" → "ven", "anotate" → "anótate", "No te quedés" → "No te
+quedes", "Te llevás" → "Te llevas"). La Revisión rápida propone la forma de
+vos con un clic sólo con evidencia: es prioritaria (`required`, se lista
+primero) si la oyeron dos oídos (testigo, Gemini, letra oficial), o uno y la
+canción ya vosea en otra línea; es sugerencia si la oyó un solo oído o si
+sólo vosea la canción. Como toda la Revisión rápida, nunca bloquea la
+aprobación. Sin
+evidencia no toca nada: baladas, folklore y artistas extranjeros tutean de
+verdad. Si la letra oficial dice la forma de tú, gana la letra oficial.
+"Ven", "mira" o "ganas" (que también son otras palabras) sólo se corrigen si
+un oído oyó "vení", "mirá", "ganás". En Chile no corre nunca: allá se canta
+"querís", "sabís", "estái" y también hay tuteo legítimo.
+
+## Artista y título
+
+Se escriben como los pide UMG desde que se registra la campaña:
+`lyricgen/backend/data/umg_metadata_catalog.json` fija el artista
+("Charly García", "Serú Girán", "Los Enanitos Verdes") y las correcciones
+de canciones puntuales ("Tuyu", "¿Dónde Estarás?", "Coti Ft. Enrique
+Iglesias" en "¿Dónde Están Corazón?"). Cada corrección de artista/título que
+se aplica a un video de UMG (pedido de cambio o Editar → artista/título) se
+recuerda para las canciones siguientes. Un video renderizado con un nombre
+distinto no se publica: hay que corregirlo y volver a renderizar
+(`UMG_METADATA_GATE=observe` lo deja pasar con un aviso en el log).
+
 ## Cómo se usa en el editor
 
-1. Abrí la canción: arriba de la letra está **Revisión rápida**, con una
-   tarjeta a la vez. La línea de la letra correspondiente queda marcada.
+1. Abrí **Sugerencias de letra** con **Ver sugerencias** si querés consultar
+   las propuestas. Son opcionales y pueden equivocarse, aunque coincidan
+   varias fuentes. La línea de la tarjeta activa queda marcada.
 2. Cada tarjeta muestra la línea como va a quedar: en verde lo que entra,
    tachado lo que sale (en un cambio de signos, sólo el signo).
-3. Teclado (el panel toma el teclado al abrir la canción):
+3. Teclado (sólo cuando abrís el panel y le das foco):
 
    | Tecla | Qué hace |
    |---|---|
    | **Enter** | aplica el arreglo y pasa al siguiente |
-   | **⌫** | "está bien así" / "no se canta" |
+   | **⌫** | "conservar mi letra" |
    | **1–3** | elige otra opción cuando los oídos no coinciden |
    | **E** | escucha el tramo (con "Reproducir al avanzar" suena solo al pasar de punto) |
    | **J / K** | siguiente / anterior |
@@ -57,8 +95,9 @@ revisor.
    | **Z** | deshace la última decisión |
    | **?** | muestra los atajos, las fuentes comparadas y esta guía |
 
-4. "Aprobar" dice **Faltan N · Revisar** mientras quede algo obligatorio;
-   al tocarlo te lleva al panel. Las sugerencias no bloquean.
+4. **Aprobar** conserva la letra actual aunque queden sugerencias sin revisar.
+   **Conservar mi letra** descarta una sugerencia y guarda esa decisión;
+   **Aplicar sugerencia** cambia el texto y permite deshacer.
 5. Si tenés la letra oficial (Google, planilla de UMG), pegala **apenas abrís
    la canción**, antes de pasar las tarjetas: **Comparar con letra oficial**
    (abajo del panel) o **Pegar letra oficial** (barra de la letra) abren la
@@ -69,11 +108,15 @@ revisor.
    oídos automáticos no coinciden), escuchala entera o pedí una segunda
    revisión.
 
-## Qué bloquea y dónde
+## Política de aprobación
 
-- Bloquea la aprobación en las campañas batch (UMG) o en los tenants de
-  `LYRIC_REVIEW_ENFORCE_TENANTS`; en el resto el panel se muestra sin frenar.
-- Un re-render por pedido de cambio sólo frena si se perdió letra cantada.
-- Un cambio de fondo o tipografía nunca frena por la letra.
+- Las sugerencias de letra no bloquean campañas, trabajos individuales ni
+  re-renders. Siguen vigentes las validaciones de letra vacía, conflictos
+  de edición y errores de guardado.
+- `LYRIC_REVIEW_MODE` usa `observe` por defecto; `off` desactiva el análisis.
+  El valor legado `enforce` equivale a `observe` y
+  `LYRIC_REVIEW_ENFORCE_TENANTS` ya no activa bloqueos.
+- `required` en la respuesta es metadata legada de prioridad, no una
+  obligación de aplicar o descartar. No se modifican las decisiones previas.
 - Las campañas batch son "sólo audio": nunca se busca letra en lrclib para
   ellas; la letra oficial entra por la planilla o pegada por el operador.

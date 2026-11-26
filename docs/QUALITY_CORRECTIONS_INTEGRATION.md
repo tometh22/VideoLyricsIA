@@ -201,10 +201,21 @@ revisión manual. Esto clasifica pedidos, no confirma errores del reconocimiento
 para eso hay que contrastarlos con el audio. Las cuatro flags nuevas consultadas
 en el servicio API están sin configurar y siguen apagadas por defecto.
 
-El esquema de staging sigue en `f4a6c8e0b2d4`: no tiene la columna de revisión
-acústica. La migración de esta implementación aún no se aplicó. El informe
-privado `.context/umg-staging-audit.json` contiene la evidencia técnica sin
-texto de letras ni comentarios; la consulta no escribió datos en staging.
+La implementación base se publicó en staging como versión `1.1.168` (commit
+`86574004`) y la migración `c0e2f4a6b8d0` quedó aplicada. Las flags de
+autoaplicación, escucha completa y revisión obligatoria siguen apagadas. El
+informe privado `.context/umg-staging-audit.json` contiene la evidencia técnica
+sin texto de letras ni comentarios.
+
+La medición de reclamos se calcula ahora desde la primera publicación real
+(`delivery.create`) enlazada por trabajo y portal. Cada video entra una sola vez
+en el denominador; las republicaciones no reinician la ventana. La tasa principal
+cuenta pedidos de letra y sincronización recibidos dentro de 30 días, solo para
+cohortes cuya ventana ya maduró. Estructura y repeticiones aparecen separadas.
+Las entregas cuyo primer evento no se puede reconstruir se informan aparte, no
+se mezclan silenciosamente en el denominador. El selector mensual corresponde
+al mes de primera publicación. No usar `requests_per_delivery` como tasa de
+calidad: ese indicador mezcla pedidos y entregas, y no controla la ventana.
 
 Se probaron aplicación/reversión, identidad del sistema, idempotencia, colisiones,
 protecciones, cobertura parcial, fallos de proveedor, caché incompatible,
@@ -212,9 +223,10 @@ comparación de audio con MP4 sintético y controles de aprobación/publicación
 También se ejecutaron pruebas de interfaz, recorridos de navegador con servicios
 simulados, build del portal y upgrade/downgrade de la migración en SQLite.
 
-Pendiente de la puesta en marcha: completar el paquete de los 17 casos y la
-medición inicial, aplicar/verificar la migración en PostgreSQL de staging,
-ejecutar CI desde checkout limpio, coordinar versiones de API/worker/portal y
-congelar el manifiesto de 30 masters nuevos antes de habilitar las flags. No se
-ejecutaron llamadas pagas de reconocimiento ni publicaciones de clientes como
-prueba de esta implementación.
+Pendiente para evaluar el impacto: terminar el paquete comparable de los 17
+casos y congelar el manifiesto de 30 masters nuevos antes de habilitar las
+flags. La suite de regresión y CI de la extensión de medición deben pasar desde
+checkout limpio antes de desplegarla. No se ejecutaron llamadas pagas de
+reconocimiento ni publicaciones de clientes como prueba. La reducción de
+reclamos, minutos activos y renders no se puede declarar lograda sin el piloto
+de 30 masters y su seguimiento completo de 30 días.

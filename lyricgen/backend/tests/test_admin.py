@@ -33,6 +33,66 @@ def test_admin_create_user(client, admin_token):
     assert res.json()["plan"] == "250"
 
 
+def test_user_assignment_options_lists_workspaces_and_active_lyric_campaigns(client, admin_token):
+    import uuid
+    from database import BatchCampaign, SessionLocal, User
+
+    suffix = uuid.uuid4().hex[:8]
+    campaign_id = uuid.uuid4().hex[:12]
+    workspace = f"campaign-workspace-{suffix}"
+    with SessionLocal() as db:
+        admin_user = db.query(User).filter_by(role="admin").first()
+        campaign = BatchCampaign(
+            id=campaign_id, tenant_id=workspace, created_by=admin_user.id,
+            name="Campaign options", kind="lyric_video", status="active", expected_count=3,
+        )
+        db.add(campaign)
+        db.commit()
+
+    response = client.get("/admin/user-assignment-options", headers=auth(admin_token))
+    assert response.status_code == 200
+    data = response.json()
+    assert {"id": workspace, "users": 0, "campaigns": 1} in data["workspaces"]
+    assert {
+        "id": campaign_id, "name": "Campaign options",
+        "tenant_id": workspace, "expected_count": 3,
+    } in data["campaigns"]
+
+
+def test_admin_create_user_grants_selected_campaigns(client, admin_token, monkeypatch):
+    import uuid
+    from database import BatchCampaign, BatchCampaignReviewer, SessionLocal, User
+
+    suffix = uuid.uuid4().hex[:8]
+    campaign_id = uuid.uuid4().hex[:12]
+    reviewer_workspace = f"new-review-workspace-{suffix}"
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", reviewer_workspace)
+    with SessionLocal() as db:
+        admin_user = db.query(User).filter_by(role="admin").first()
+        db.add(BatchCampaign(
+            id=campaign_id, tenant_id=f"owner-workspace-{suffix}", created_by=admin_user.id,
+            name="Review campaign", kind="lyric_video", status="active", expected_count=1,
+        ))
+        db.commit()
+
+    response = client.post("/admin/users", headers=auth(admin_token), json={
+        "username": f"campaign_reviewer_{suffix}",
+        "password": "password123",
+        "email": f"campaign.reviewer.{suffix}@example.com",
+        "tenant_id": reviewer_workspace,
+        "campaign_ids": [campaign_id],
+    })
+    assert response.status_code == 200, response.text
+    user_id = response.json()["id"]
+    with SessionLocal() as db:
+        grant = db.query(BatchCampaignReviewer).filter_by(
+            campaign_id=campaign_id, user_id=user_id,
+        ).one()
+        assert grant.revoked_at is None
+        assert grant.granted_by is not None
+
+
 def test_admin_create_user_in_reserved_tenant(client, admin_token):
     """POST /admin/users must bypass the reserved-tenant guard.
 

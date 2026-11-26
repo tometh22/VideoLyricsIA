@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import useCampaignResource, { clearCampaignResourceCache, invalidateCampaignResources, mutateCampaignResource } from "./useCampaignResource";
 
 function Probe({ resourceKey, fetcher, label = "probe" }) {
-  const { data, loading, error } = useCampaignResource(resourceKey, fetcher, { pollMs: 0 });
-  return <p data-testid={label}>{loading ? "loading" : error ? `error:${error.message}` : data}</p>;
+  const { data, loading, error, reload } = useCampaignResource(resourceKey, fetcher, { pollMs: 0 });
+  return <><p data-testid={label}>{loading ? "loading" : error ? `error:${error.message}` : data}</p><button onClick={reload}>refresh</button></>;
 }
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
@@ -21,15 +21,39 @@ describe("useCampaignResource", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("never lets a slower, older response overwrite a newer one", async () => {
+  it("coalesces mutation invalidations and waits for a snapshot requested after the mutation", async () => {
     const slow = deferred();
     let calls = 0;
     const fetcher = vi.fn(() => { calls += 1; return calls === 1 ? slow.promise : Promise.resolve("nuevo"); });
     render(<Probe resourceKey="k2" fetcher={fetcher} />);
-    await act(async () => { await invalidateCampaignResources("k2"); });
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    let refreshes;
+    act(() => { refreshes = Promise.all([invalidateCampaignResources("k2"), invalidateCampaignResources("k2")]); });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await act(async () => { slow.resolve("viejo"); await refreshes; });
     expect(screen.getByTestId("probe")).toHaveTextContent("nuevo");
-    await act(async () => { slow.resolve("viejo"); });
-    expect(screen.getByTestId("probe")).toHaveTextContent("nuevo");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares concurrent refreshes without aborting the server request", async () => {
+    const pending = deferred();
+    let signal;
+    const fetcher = vi.fn(options => { signal = options.signal; return pending.promise; });
+    render(<Probe resourceKey="shared" fetcher={fetcher} />);
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    act(() => { screen.getByRole("button", { name: "refresh" }).click(); screen.getByRole("button", { name: "refresh" }).click(); });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(false);
+    await act(async () => pending.resolve("done"));
+    expect(screen.getByTestId("probe")).toHaveTextContent("done");
+  });
+
+  it("does not revalidate a fresh snapshot when the page regains visibility", async () => {
+    const fetcher = vi.fn(async () => "fresh");
+    render(<Probe resourceKey="visible" fetcher={fetcher} />);
+    await screen.findByText("fresh");
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the last data on a failed refresh and supports optimistic updates", async () => {

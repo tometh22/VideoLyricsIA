@@ -101,10 +101,15 @@ describe("persistSegments — contrato real (sin eco a currentReview)", () => {
 
   it("input inválido → { ok: false, reason: 'no-data' } sin tocar la red", async () => {
     expect(await persist("", SEGMENTS)).toEqual({ ok: false, reason: "no-data" });
-    expect(await persist("abc", [])).toEqual({ ok: false, reason: "no-data" });
     expect(await persist("abc", null)).toEqual({ ok: false, reason: "no-data" });
     expect(await persist(null, SEGMENTS)).toEqual({ ok: false, reason: "no-data" });
     expect(authFetch).not.toHaveBeenCalled();
+  });
+
+  it("persists deletion of all rows with the exact CAS base", async () => {
+    authFetch.mockResolvedValue({ ok: true, clone: () => ({ json: async () => ({ revision: 8 }) }) });
+    expect(await persist("abc", [], { baseRevision: 7 })).toMatchObject({ ok: true, revision: 8 });
+    expect(JSON.parse(authFetch.mock.calls[0][1].body)).toEqual({ segments: [], base_revision: 7 });
   });
 
   it("sanitiza al contrato ANTES del POST: un segmento fuera de rango degrada, no rechaza", async () => {

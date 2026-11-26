@@ -1,6 +1,8 @@
+import { reviewLineIds } from "./lib/reviewLineIds";
 import { reviewCreativeSettings } from "./lib/campaignCreative";
 import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
+import { fetchLanguageRetranscription, startLanguageRetranscription } from "./lib/languageRetranscription";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { pollReanchorTask } from "./lib/reanchorTask";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
@@ -49,6 +51,7 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const TeamPage = lazy(() => import("./components/TeamPage"));
 const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
 const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
@@ -588,10 +591,13 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const activeView =
+    pathname.startsWith("/review/") ? "review_queue" :
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
     pathname === "/admin/cola" ? "review_queue" :
     pathname.startsWith("/campaigns") ? "campaigns" :
+    pathname === "/team" ? "team" :
+    pathname === "/my-tasks" ? "my_tasks" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
@@ -650,6 +656,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
     else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "team") navigate("/team");
+    else if (id === "my_tasks") navigate("/my-tasks");
     else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
@@ -667,7 +675,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   }
 
   return (
-    <div className="min-h-screen overflow-x-hidden bg-surface flex">
+    <div className={`min-h-screen ${pathname.startsWith("/review/") ? "overflow-x-clip" : "overflow-x-hidden"} bg-surface flex`}>
       <Sidebar
         activeView={activeView}
         onNav={handleNav}
@@ -1838,6 +1846,14 @@ export default function App() {
 
   const [reviewQueue, setReviewQueue] = useState([]);
   const [currentReview, setCurrentReview] = useState(null);
+  const [campaignDesignJobId, setCampaignDesignJobId] = useState(null);
+  // Rendered campaign jobs use the existing edit wizard and have no
+  // transcribeJobId. Only an explicit first-pass review owns this workspace.
+  const dedicatedCampaignReview = Boolean(currentReview?.campaignId && currentReview?.transcribeJobId
+    && !currentReview?.editingJobId && !currentReview?.editMode && !currentReview?.variantMode);
+  const campaignDesignOpen = Boolean(dedicatedCampaignReview
+    && campaignDesignJobId === currentReview?.transcribeJobId);
+  useEffect(() => { setCampaignDesignJobId(null); }, [currentReview?.transcribeJobId]);
   const currentReviewWaveformJobId = currentReview?.transcribeJobId || null;
   // First-pass reviews, resumed sessions and back-navigation all have a
   // transcription job but previously never requested its peak envelope.
@@ -2163,6 +2179,12 @@ export default function App() {
   const [backgroundMode, setBackgroundMode] = useState("as_is");
   const creativeReviewRef = useRef(currentReview);
   creativeReviewRef.current = currentReview;
+  const campaignRouteKeyRef = useRef(location.key);
+  campaignRouteKeyRef.current = location.key;
+  const campaignReviewStillCurrent = useCallback((review, routeKey) => (
+    campaignRouteKeyRef.current === routeKey
+    && creativeReviewRef.current?.transcribeJobId === review?.transcribeJobId
+  ), []);
   const campaignCreativeSave = useCampaignCreativeSave({
     identity: currentReview?.campaignCreativeRevision != null && currentReview?.campaignId
       ? `${currentReview.campaignId}/${currentReview.campaignItemId}` : null,
@@ -2465,7 +2487,10 @@ export default function App() {
           referenceLyrics: job.reference_lyrics || "",
           referenceLinks: job.campaign?.review_reference_links || [],
           sourceReference: job.campaign?.source_reference || null,
-          campaignCreativeRevision: campaignPreset.creative_assignment?.revision ?? null,
+          // Individual creative edits can bootstrap an unassigned campaign
+          // item at revision 0; null disables its save hook entirely.
+          campaignCreativeRevision: campaignPreset.creative_assignment?.revision
+            ?? (job.campaign_id && job.campaign_item_id ? 0 : null),
           bgVerbatim: preset("bg_verbatim", "bgVerbatim", resumedCreativeFields.bgVerbatim),
           matchLyrics: preset("match_lyrics", "matchLyrics", true),
           titleTemplate: preset("title_template", "titleTemplate", "auto"),
@@ -3882,9 +3907,39 @@ export default function App() {
     return result;
   };
 
+  // Re-hear the song with a reviewer-chosen language. The editor reloads the
+  // canonical server version once the new transcription is installed.
+  const handleRetranscribeLanguage = ({ language, baseRevision } = {}) => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    return startLanguageRetranscription(
+      (path, options) => authFetch(`${API}${path}`, options), jobId, language, baseRevision,
+    );
+  };
+  const handlePollRetranscription = () => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    return fetchLanguageRetranscription(
+      (path, options) => authFetch(`${API}${path}`, options), jobId,
+    );
+  };
+
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
+    const submissionRouteKey = campaignRouteKeyRef.current;
+    const submissionIsCurrent = () => {
+      const active = creativeReviewRef.current;
+      return isMountedRef.current && campaignRouteKeyRef.current === submissionRouteKey
+        && active != null && active.editingJobId === r.editingJobId
+        && active.transcribeJobId === r.transcribeJobId
+        && active.parentJobId === r.parentJobId
+        && !!active.variantMode === !!r.variantMode;
+    };
+    // The server may finish an accepted request after navigation. Preserve
+    // that result, but never clear a newer review, prompt or submit a retry.
+    const abandonedSubmission = (res, data) => ({
+      ok: res?.ok === true, abandoned: true, reason: "abandoned",
+      approvedEditorVersionId: data?.approved_editor_version_id || null,
+    });
 
     // Variant-wizard mode (2026-07-24): "Crear variante" abre el mismo
     // wizard, pero el submit crea un JOB NUEVO en vez de parchear el
@@ -3946,6 +4001,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // Cap de versiones por canción: el plan incluye N renders del
         // mismo tema; a partir del siguiente se factura extra. El backend
@@ -3969,10 +4025,12 @@ export default function App() {
             + (t("variant.overage_confirm_question") || "¿Crear la variante igual?");
           track("variant.overage_prompted", { job_id: parentJobId });
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({
             ...payload,
             acknowledge_variant_overage: true,
           }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -3995,6 +4053,9 @@ export default function App() {
         // el modal viejo navegaba a /job/:id, que no existe).
         navigate(newJobId ? `/videos/${newJobId}` : `/videos/${parentJobId}`, { replace: true });
         return;
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
         setVariantSubmitting(false);
@@ -4146,6 +4207,7 @@ export default function App() {
             });
             let _upData = {};
             try { _upData = await _up.json(); } catch { /* empty body */ }
+            if (!submissionIsCurrent()) return abandonedSubmission();
             if (!_up.ok || !_upData?.bg_r2_key) {
               const _friendly = translateBackendError(_upData?.detail, t) || `Error ${_up.status}`;
               alert({
@@ -4158,6 +4220,7 @@ export default function App() {
             }
             payload.custom_background_r2_key = _upData.bg_r2_key;
           } catch (e) {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.custom_bg_upload_failed_title") || "No pudimos subir el fondo",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4207,6 +4270,7 @@ export default function App() {
               },
             );
           } catch {
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
@@ -4214,8 +4278,10 @@ export default function App() {
             });
             return { ok: false, reason: "campaign-approval-network" };
           }
+          if (!submissionIsCurrent()) return abandonedSubmission();
           if (!approvalResponse.ok) {
             const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!submissionIsCurrent()) return abandonedSubmission();
             alert({
               title: t("edit.error_title") || "No pudimos aplicar el edit",
               description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
@@ -4253,6 +4319,7 @@ export default function App() {
         };
 
         let { res, data } = await doPost(payload);
+        if (!submissionIsCurrent()) return abandonedSubmission(res, data);
 
         // YouTube already-published 409 retry.
         if (res.status === 409 && data?.detail?.code === "youtube_already_published") {
@@ -4261,7 +4328,9 @@ export default function App() {
             "Este video ya está publicado en YouTube. La re-sincronización actualizará el archivo en la plataforma pero NO reemplazará el video en YouTube (la API de YouTube no permite reemplazar archivos, solo metadata).\n\n¿Continuar igual?")
             + (url ? `\n\nYouTube: ${url}` : "");
           if (!window.confirm(msg)) return;
+          if (!submissionIsCurrent()) return abandonedSubmission();
           ({ res, data } = await doPost({ ...payload, allow_youtube_drift: true }));
+          if (!submissionIsCurrent()) return abandonedSubmission(res, data);
         }
 
         if (!res.ok) {
@@ -4315,6 +4384,9 @@ export default function App() {
           { replace: true },
         );
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
+      } catch (error) {
+        if (!submissionIsCurrent()) return abandonedSubmission();
+        throw error;
       } finally {
         editSubmitLockRef.current = false;
       }
@@ -4324,6 +4396,7 @@ export default function App() {
     // the generic wizard's approve→generate transition: backgrounds and
     // renders are a separate, later stage triggered outside this screen.
     if (r.campaignId && r.transcribeJobId) {
+      const approvalRouteKey = campaignRouteKeyRef.current;
       // Never infer review from mere presence in the submitted document.
       // LyricsEditor supplies only the identities explicitly confirmed (or
       // deliberately edited) by the operator; the backend then compares this
@@ -4333,6 +4406,7 @@ export default function App() {
         : [];
       try {
         if (r.campaignCreativeRevision != null) await campaignCreativeSave.save();
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) return { ok: false, reason: "abandoned" };
         const response = await authFetch(
           `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
           {
@@ -4354,6 +4428,9 @@ export default function App() {
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           return campaignApprovalFailure(response, body, t);
+        }
+        if (!campaignReviewStillCurrent(r, approvalRouteKey)) {
+          return { ok: true, abandoned: true, approvedEditorVersionId: body?.approved_version_id || null };
         }
         wizardPersistence.clear();
         segmentsStore.evict(reviewStoreKey(r));
@@ -4669,9 +4746,7 @@ export default function App() {
         let res = null;
         try {
           if (campaignId) {
-            const confirmedLineIds = generationSegments.map((segment) =>
-              String(segment?.segment_id || segment?.id || "")
-            );
+            const confirmedLineIds = reviewLineIds(generationSegments);
             const approvalResponse = await authFetch(
               `${API}/batch/campaigns/${campaignId}/jobs/${jobList[i].transcribeJobId}/approve-lyrics`,
               {
@@ -5882,6 +5957,7 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
+        initialStep={campaignDesignOpen ? 4 : null}
         editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
@@ -5989,8 +6065,10 @@ export default function App() {
 
   const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     if (review?.transcribeJobId) {
       try {
         await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
@@ -5999,20 +6077,23 @@ export default function App() {
         });
       } catch { /* the lock expires safely even if release is unavailable */ }
     }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
     navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
-  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   const handleCampaignReviewNext = useCallback(async () => {
     const review = currentReview;
+    const routeKey = campaignRouteKeyRef.current;
     if (!review?.campaignId || !review?.transcribeJobId) {
       await handleCampaignReviewExit();
       return;
     }
     try { await campaignCreativeSave.save(); }
     catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     let nextPath = campaignReturnPath || "/admin/cola";
     const returnParams = campaignReturnPath
       ? new URL(campaignReturnPath, window.location.origin).searchParams
@@ -6033,17 +6114,19 @@ export default function App() {
         nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
       }
     } catch { /* leave through the queue; the current draft is already saved */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     try {
       await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
         method: "DELETE",
         headers: editorSessionHeaders(),
       });
     } catch { /* the lock expires safely even if release is unavailable */ }
+    if (!campaignReviewStillCurrent(review, routeKey)) return;
     setCurrentReview(null);
     wizardPersistence.clear();
     segmentsStore.evict(reviewStoreKey(review));
     navigate(nextPath);
-  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert]);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert, campaignReviewStillCurrent]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -6155,7 +6238,7 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
-          <div className="w-full max-w-[980px]">
+          <div className={`w-full ${dedicatedCampaignReview ? "max-w-[1600px]" : "max-w-[980px]"}`}>
           {currentReview.transcribeJobId && (
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
               <div className="min-w-0">
@@ -6164,9 +6247,16 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 {currentReview.campaignId && (
                   <>
+                    {!campaignDesignOpen && <button type="button" className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                      onClick={() => {
+                        const open = () => setCampaignDesignJobId(currentReview.transcribeJobId);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(open); else open();
+                      }}>{t("review_workspace.design")}</button>}
+
                     <button
                       type="button"
                       onClick={() => {
@@ -6196,7 +6286,7 @@ export default function App() {
                         if (safeExit) void safeExit(handleCampaignReviewNext);
                         else void handleCampaignReviewNext();
                       }}
-                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
                     >
                       Siguiente
                     </button>
@@ -6247,7 +6337,7 @@ export default function App() {
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
             // player bar se portalea ahí; null (modal/inline) → inline.
-            playerSlot={playerSlotEl}
+            playerSlot={dedicatedCampaignReview ? null : playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
@@ -6288,7 +6378,7 @@ export default function App() {
             // que es justo abajo del banner stack del wizard. Sin cambio
             // visual perceptible para el operador, pero conceptualmente
             // correcto en el nuevo layout.
-            stickyHeaderTop={0}
+            stickyHeaderTop={dedicatedCampaignReview ? 72 : 0}
             segments={currentReview.segments}
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
@@ -6311,6 +6401,7 @@ export default function App() {
             sourceReference={currentReview.sourceReference || null}
             referenceUnavailable={!!currentReview.referenceUnavailable}
             requireLineReview={!!currentReview.campaignId}
+            previewBgUrl={currentReview.bgUrl || null}
             preferApprovedVersion={!!currentReview.editingJobId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
@@ -6323,8 +6414,13 @@ export default function App() {
             needsLanguageReview={!!currentReview.needsLanguageReview}
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
+            // Campaign lyrics review only: wizard uploads still pick the
+            // language before uploading, and post-render edits are not in review.
+            onRetranscribeLanguage={currentReview.campaignId && !currentReview.editMode ? handleRetranscribeLanguage : null}
+            onPollRetranscription={currentReview.campaignId && !currentReview.editMode ? handlePollRetranscription : null}
+            languageProbe={currentReview.languageProbe || currentReview.transcriptionQuality?.language_probe || null}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
+            submitLabel={(currentReview.editMode || currentReview.editingJobId || currentReview.changeRequestContext) ? "Aprobar cambios y generar video" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
               ? registerCampaignReviewSafeExit
               : null}
@@ -6417,6 +6513,7 @@ export default function App() {
             // animation/contrast. Layout colapsa a 1 columna (timeline +
             // lista a ancho completo).
             hideTypographyControls={true}
+            startAtWorkspace={dedicatedCampaignReview}
             // Phase C 2026-05-25: callback que sincroniza el preview central
             // con la línea que está sonando ahora. Actualiza un ref para no
             // disparar re-renders a 60fps.
@@ -6491,19 +6588,29 @@ export default function App() {
     );
   })();
 
-  // Capa B 2026-05-24 + Phase 2 2026-05-25 — wizardScreen siempre es
-  // newBatchScreen (UploadZone). El layout de 3 columnas del wizard
-  // (stepper + WizardLivePreview + contenido) abarca ahora también la
-  // review (paso 6): el contenido de reviewScreen se inyecta como render
-  // prop en UploadZone y aparece en la columna derecha del wizard. El
-  // operador NUNCA cambia de layout durante el flow — el preview central
-  // y el stepper persisten desde el drop del audio hasta "Crear videos".
-  // wizardStage queda como flag de back-compat (sessionStorage, /review
-  // como ruta legacy) pero NO controla qué pantalla se renderiza.
+  // Campaigns open in the dedicated review workspace. Visual design remains
+  // an explicit entry into the existing wizard, with saves flushed on exit.
+  // Creation and post-render editing retain their existing wizard flow.
   const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
   const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
     ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
-    : newBatchScreen;
+    : dedicatedCampaignReview ? (campaignDesignOpen ? <>
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <button type="button" className="btn-secondary" onClick={async () => {
+          const review = currentReview;
+          const routeKey = campaignRouteKeyRef.current;
+          try {
+            await campaignCreativeSave.save();
+            if (!campaignReviewStillCurrent(review, routeKey)) return;
+            const close = () => setCampaignDesignJobId(null);
+            const safeExit = campaignReviewSafeExitRef.current;
+            if (safeExit) await safeExit(close); else close();
+          } catch { /* The save hook exposes the error below and retains edits. */ }
+        }}>{t("review_workspace.back_to_lyrics")}</button>
+        {campaignCreativeSave.error && <p role="alert" className="text-red-300">{campaignCreativeSave.error}</p>}
+      </div>
+      {newBatchScreen}
+    </> : reviewScreen) : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
@@ -6618,6 +6725,8 @@ export default function App() {
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
           <Route path="/review/:jobId" element={wizardScreen} />
+          <Route path="/team" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
+          <Route path="/my-tasks" element={<Suspense fallback={<RouteSuspenseFallback />}><TeamPage user={user} /></Suspense>} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
