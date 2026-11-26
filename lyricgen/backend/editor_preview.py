@@ -75,6 +75,13 @@ def build_text_preview(segments, settings, *, render_params=None, job_id="", spe
         job_id=job_id, lyric_look=look_id, render_params=rp, detect_genre=False,
     ) if look_id else ({}, {})
     look = lyric_look_runtime.resolve_for_render(look_id, opts) if look_id else None
+    if job_id and (lyric_looks.needs_word_timings(look_id)
+                   or rp.get("lyrics_animation") in ("karaoke", "word_reveal")):
+        # Same word timing the render uses: edited lines lose their `words`,
+        # and without them the preview spread each line evenly and showed
+        # words late that the final video shows on time. Read-only — the
+        # editor's segments are not changed.
+        segments = pipeline._recover_words_from_editor_original(job_id, segments)
     # Resolve Auto to a concrete choice which the editor publishes back to
     # its parent's render settings. Preview and export then use that choice.
     font_id = rp.get("font") or "montserrat-bold"

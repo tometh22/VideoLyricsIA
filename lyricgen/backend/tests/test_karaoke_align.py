@@ -340,3 +340,20 @@ def test_pipeline_takes_words_from_the_editor_original(monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", _boom)
     assert pipeline._recover_words_from_editor_original("3087ebfab4b0", segs) is segs
     assert pipeline._recover_words_from_editor_original("", segs) is segs
+
+
+def test_stale_words_that_no_longer_spell_the_line_are_recovered():
+    # "El Anda Diciendo": "amor" -> "vos" kept the old words array; the render
+    # rejected it and spread the line evenly. It now counts as missing.
+    seg = {"start": 166.82, "end": 170.66, "text": "Él anda diciendo que vos",
+           "words": [{"word": w, "start": s, "end": s + 0.2} for w, s in
+                     (("él", 166.9), ("anda", 167.1), ("diciendo", 167.7), ("que", 169.28), ("amor", 169.46))]}
+    ref = [{"start": 166.82, "end": 170.66, "text": "Él anda diciendo que amor",
+            "words": seg["words"]}]
+    out = karaoke_align.recover_words_from_reference([seg], ref)
+    words = out[0]["words"]
+    assert [w["word"] for w in words] == ["Él", "anda", "diciendo", "que", "vos"]
+    assert words[3]["start"] == 169.28 and words[4]["start"] >= words[3]["end"]
+    # Words that still match their text are left exactly as they were.
+    ok = dict(seg, text="Él anda diciendo que amor")
+    assert karaoke_align.recover_words_from_reference([ok], ref)[0] is ok

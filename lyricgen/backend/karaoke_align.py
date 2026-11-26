@@ -223,6 +223,15 @@ def enrich_segments_with_word_timings(segments, audio_path):
         return segments
 
 
+def _words_match_text(seg: dict) -> bool:
+    """True when the line's `words` still spell its text. An edit that changes
+    a word ("amor" -> "vos") can keep the old array; the renderer then rejects
+    it and spreads the line evenly, so such words count as missing here."""
+    tokens = [_norm(t) for t in str(seg.get("text", "")).split()]
+    words = [_norm(str(w.get("word", ""))) for w in seg.get("words") or []]
+    return [t for t in tokens if t] == [w for w in words if w]
+
+
 def recover_words_from_reference(segments, reference_segments, *,
                                  pad_s: float = 0.35, min_match: float = 0.5):
     """Give wordless lines the word timing of the ORIGINAL transcription.
@@ -262,7 +271,7 @@ def recover_words_from_reference(segments, reference_segments, *,
         out, changed = [], 0
         for seg in segments:
             txt = str(seg.get("text", "")).strip()
-            if not txt or _has_valid_words(seg):
+            if not txt or (_has_valid_words(seg) and _words_match_text(seg)):
                 out.append(seg)
                 continue
             try:
