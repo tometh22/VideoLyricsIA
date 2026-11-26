@@ -32,7 +32,14 @@ export function isReusableEditSnapshot({ snapshot, jobId, serverRevision }) {
 //     through the backend revision check, so this can never be a raw
 //     overwrite.
 export function resolveLegacyDraft({ draft, currentSegments, currentRevision }) {
-  if (!Array.isArray(draft?.segments) || draft.segments.length === 0) {
+  if (!Array.isArray(draft?.segments)) {
+    return { action: "none", segments: null };
+  }
+  // An empty snapshot is an intentional deletion only when it has a save
+  // base. Keep ignoring unversioned legacy placeholders such as {segments:[]}.
+  if (draft.segments.length === 0
+    && !(Number.isInteger(draft.base_revision) && draft.base_revision >= 0)
+    && !(Array.isArray(draft.base_segments) && draft.base_segments.length > 0)) {
     return { action: "none", segments: null };
   }
   if (segmentsEquivalent(draft.segments, currentSegments)) {
@@ -48,5 +55,9 @@ export function resolveLegacyDraft({ draft, currentSegments, currentRevision }) 
     );
     return { action: "restore", segments: merged.merged, rebased: true };
   }
+  // A stale empty draft without its base cannot distinguish deletion of the
+  // old rows from deletion of NEW remote rows. Keep its bytes for recovery,
+  // but never turn it into an automatic full-document overwrite.
+  if (draft.segments.length === 0) return { action: "none", segments: null };
   return { action: "restore", segments: draft.segments, rebased: true };
 }

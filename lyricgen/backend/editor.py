@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import AuditLog, EditorDocument, EditorVersion, Job, User
-from segment_timing import canonicalize_editor_segments
+from segment_timing import sort_segments_chronologically
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
@@ -52,10 +52,24 @@ def operator_suggestions_enabled() -> bool:
 
 
 def reviewer_candidate_enabled(proposal: dict) -> bool:
+    if isinstance(proposal, dict) and proposal.get("local_genly_model"):
+        from genly_model_candidate_api import enabled
+        metadata = proposal["local_genly_model"]
+        return (enabled()
+                and (not metadata.get("changes_text") or text_operator_suggestions_enabled())
+                and (not metadata.get("changes_timing") or timing_operator_suggestions_enabled()))
     if not isinstance(proposal, dict) or not proposal.get("reviewer_assist"):
         return True
     from reviewer_assist_scope import display_enabled
     return display_enabled(proposal["reviewer_assist"].get("campaign_id"))
+
+
+def _pending_local_model_proposal(document: EditorDocument) -> bool:
+    proposal = document.quality_proposal or {}
+    if not proposal.get("local_genly_model") or not reviewer_candidate_enabled(proposal):
+        return False
+    current = _proposal_for_response(document) or {}
+    return current.get("status") == "pending"
 
 
 def text_operator_suggestions_enabled() -> bool:
@@ -155,11 +169,10 @@ def normalize_segments(value: Any) -> list[dict]:
             "end": round(end, 4),
             "text": text,
         })
-    # Canonicalize appended rows by timestamp, but preserve semantic source
-    # order inside an anomalous overlap region and repair only that region.
-    # This prevents a post-alignment regression from making playback jump to
-    # a later lyric and then back to an earlier one.
-    normalized = canonicalize_editor_segments(normalized)
+    # Editor rows are an operator-owned snapshot. A rebase/insert can append
+    # a row whose time precedes its neighbours: sort it, never reinterpret
+    # that array order as an alignment defect or silently delete occurrences.
+    normalized = sort_segments_chronologically(normalized)
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise ValueError(f"segments payload cannot exceed {MAX_PAYLOAD_BYTES} bytes")
     return normalized
@@ -589,8 +602,24 @@ def get_or_create_document(
     return document
 
 
-def attach_machine_provenance(db: Session, job_id: str, provenance: dict) -> bool:
-    """Complete the initial checkpoint lineage before its transaction commits."""
+def attach_machine_provenance(
+    db: Session, job_id: str, provenance: dict, *, revision: int | None = None,
+) -> bool:
+    """Complete the initial checkpoint lineage before its transaction commits.
+
+    ``revision`` targets the machine checkpoint installed by a reviewer
+    requested re-transcription; its request metadata is preserved.
+    """
+    if revision is not None:
+        version = db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.revision == int(revision),
+        ).with_for_update().first()
+        if version is None:
+            return False
+        version.provenance = {**dict(provenance), **dict(version.provenance or {})}
+        db.flush()
+        return True
     version = db.query(EditorVersion).filter(
         EditorVersion.job_id == job_id,
         EditorVersion.reason == "transcription",
@@ -750,6 +779,7 @@ def serialize_document(
         "original_segments": document.original_segments,
         **({"display_segmentation": display_report,
             "display_segmentation_current": display_current} if isinstance(display_report, dict) else {}),
+        **_display_segmentation_suggestions(document),
         "auto_repair_undo_available": bool(
             job is not None and auto_repair_undo_segments(job, document) is not None
         ),
@@ -763,6 +793,34 @@ def serialize_document(
             "active": lock_active,
             "user": _user_summary(db, document.lock_user_id) if lock_active else None,
             "expires_at": lock_expires.isoformat() if lock_active else None,
+        },
+    }
+
+
+def _display_segmentation_suggestions(document: EditorDocument) -> dict:
+    """Reviewer split/merge hints, only with DISPLAY_SEGMENTATION_MODE=suggest.
+
+    Recomputed on the document's CURRENT lines on every read (pure, no audio,
+    no network), so they never point at a line the reviewer already changed.
+    Lines with quality evidence issues are excluded, exactly as in shadow.
+    """
+    from display_segmentation import SUGGESTION_SCHEMA, mode, suggestions
+    if mode() != "suggest":
+        return {}
+    segments = document.current_segments if isinstance(document.current_segments, list) else []
+    try:
+        from line_evidence import evidence_issues
+        protected = {issue["segment_index"] for issue in evidence_issues(segments)}
+    except Exception:  # noqa: BLE001 - advisory metadata must not break the editor
+        protected = set()
+    try:
+        items = suggestions(segments, protected_indices=protected)
+    except Exception:  # noqa: BLE001
+        items = []
+    return {
+        "display_segmentation_mode": "suggest",
+        "display_segmentation_suggestions": {
+            "schema": SUGGESTION_SCHEMA, "revision": document.revision, "items": items,
         },
     }
 
@@ -1019,6 +1077,8 @@ def persist_quality_proposal_if_current(
     ).with_for_update().first()
     if job is None or document is None:
         return False
+    if _pending_local_model_proposal(document):
+        return False
     if not quality_v6_proposals_enabled():
         revoke_quality_proposal_if_disabled(document)
         db.flush()
@@ -1104,6 +1164,8 @@ def persist_quality_observation_if_current(
     ).with_for_update().first()
     if job is None or document is None:
         return False
+    if _pending_local_model_proposal(document):
+        return False
     if (
         int(document.revision or 0) != int(expected_revision)
         or segments_hash(document.current_segments or []) != expected_segments_hash
@@ -1167,6 +1229,8 @@ def persist_operator_review_proposal_if_current(
         EditorDocument.job_id == job_id,
     ).with_for_update().first()
     if job is None or document is None:
+        return False
+    if _pending_local_model_proposal(document):
         return False
     if proposal.get("reviewer_assist"):
         from reviewer_assist_scope import publication_enabled
@@ -1408,7 +1472,7 @@ def apply_quality_proposal(
         EditorDocument.job_id == document.job_id,
     ).populate_existing().with_for_update().one()
     proposal = dict(document.quality_proposal or {})
-    if proposal.get("reviewer_assist") and (
+    if (proposal.get("reviewer_assist") or proposal.get("local_genly_model")) and (
         getattr(document, "approved_at", None) or getattr(job, "approved_at", None)
         or getattr(job, "status", None) in {"lyrics_approved", "done"}
     ):
@@ -1503,7 +1567,7 @@ def apply_quality_proposal(
         raise ValueError("text proposal changed the existing timeline")
     document, version, applied = save_document(
         db, job, document, user_id, base_revision, segments,
-        "reviewer_candidate" if proposal.get("reviewer_assist") else "quality_proposal",
+        "reviewer_candidate" if (proposal.get("reviewer_assist") or proposal.get("local_genly_model")) else "quality_proposal",
     )
     history = [
         dict(item) for item in (proposal.get("decision_history") or [])
@@ -2204,9 +2268,8 @@ def approve_document(
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
 
-    ``review_scope`` decides which Revisión rápida points block: ``full``
-    (editor and campaign approval), ``missing_only`` (change-request renders:
-    only sung words that were lost) or ``none``.
+    ``review_scope`` is retained for caller compatibility. Lyric suggestions
+    are advisory; snapshot identity and structural validation still apply.
     """
     if getattr(job, "pilot_id", None):
         raise ValueError("pilot_copy_cannot_be_approved")

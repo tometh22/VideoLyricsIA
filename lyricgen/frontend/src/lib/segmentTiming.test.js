@@ -435,3 +435,13 @@ describe("chronological playback selection", () => {
     expect(canonical[1].end + 0.05).toBeLessThanOrEqual(canonical[2].start);
   });
 });
+
+
+it("preserves intentional copies with distinct durable identities at the same time", () => {
+  const rows = [
+    { segment_id: "original", start: 3, end: 4, text: "última frase" },
+    { segment_id: "copy", start: 3, end: 4, text: "última frase", review: true },
+  ];
+  expect(canonicalizeEditorSegments(rows)).toEqual(rows);
+  expect(canonicalizeEditorSegments([rows[0], { ...rows[0] }])).toHaveLength(1);
+});

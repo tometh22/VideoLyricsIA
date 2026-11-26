@@ -111,6 +111,8 @@ def test_concurrent_apply_is_one_revision_postgresql(client, admin_token, propos
 
 
 def test_analyze_apply_contention_keeps_one_saved_revision(client, admin_token, proposal_case, db):
+    if db.bind.dialect.name != 'postgresql':
+        pytest.skip('Concurrent row-lock guarantee requires PostgreSQL')
     path, proposal, job_id = proposal_case
     barrier = Barrier(8, timeout=10)
     headers, body = auth(admin_token), _body(proposal)

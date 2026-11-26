@@ -17,7 +17,7 @@ import { sanitizeSegmentsForSave, findSanitizedDiffs } from "./sanitizeSegments"
 // El motivo alimenta el copy honesto del banner (network / session(401) /
 // job-gone(404) / server). Ver LyricsEditor `_SAVE_ERROR_COPY`.
 export async function persistSegments(authFetch, API, jobId, segments, opts = {}) {
-  if (!jobId || !Array.isArray(segments) || segments.length === 0) {
+  if (!jobId || !Array.isArray(segments)) {
     return { ok: false, reason: "no-data" };
   }
   // Sanitizar al contrato del backend ANTES del POST. Un solo segmento fuera

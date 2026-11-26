@@ -1,5 +1,241 @@
 # Changelog
 
+## [1.1.221] - 2026-11-25
+
+### Fixed
+- Word-by-word looks and karaoke take word timing from the original transcription when an edited line has none and forced alignment cannot provide it. Words are matched to the line by text, and edited words are interpolated between their neighbours.
+
+## [1.1.220] - 2026-11-25
+
+### Fixed
+- Word-by-word looks and karaoke recover forced-alignment timing for edited lines further down the song. Lines that already had word timing no longer stall the matching, so later lines stop falling back to an even split that showed words up to 1.3 s after they were sung.
+
+## [1.1.219] - 2026-11-25
+
+### Added
+- Three word-synced lyric looks in Oswald with the key word in green Knewave: Escalera (each word typed letter by letter down a staircase, then the letters burst apart), Una por una (only the sung word, huge and centered) and Ventana (the last two sung words, the older one dimming).
+
+### Fixed
+- Look posters and the title-card preview use the look's display face and accent for the artist and its main face for the song, matching the render.
+
+## [1.1.218] - 2026-11-25
+
+### Fixed
+- Prioritize three visibly distinct comparisons, show their audio range, and let reviewers jump straight to the editable lyric when either version needs work.
+
+## [1.1.217] - 2026-11-24
+
+### Added
+- Opt-in blind A/B review for bounded, revision-matched lyric proposals. Compare both versions on the same audio and native subtitle preview, record the reviewer's choice, then apply a selected proposal explicitly.
+
+## [1.1.216] - 2026-11-24
+
+### Fixed
+- Preserve timed vocal evidence when an independent language retry returns an extreme decoder loop.
+- Prioritize caption boundaries that cross verified consecutive lines of an operator or workbook lyric reference, including partial references.
+
+## [1.1.215] - 2026-11-23
+
+### Fixed
+- In new transcriptions with `VOICE_END_TIMING_MODE` set to `observe` or `apply`, request the vocal stem once (same R2 cache key, no second Demucs run) before the rule runs, so line ends follow the voice instead of the fixed hold. If separation fails the transcription continues with the hold and the report says `stem_unavailable_after_attempt`. Costs one Demucs run (about 1-3 minutes, a few cents) only when the stem was not already cached.
+
+## [1.1.214] - 2026-11-23
+
+### Fixed
+- Keep structural lyric observations in the stored final-render review.
+- Recompute final-render QC once when background analysis updates only transcription quality during inspection. A different render, revision or operator decision still invalidates the report.
+
+## [1.1.213] - 2026-11-23
+
+### Added
+- Report reused word timestamps, duplicate lyric captions and possible unrelated text during transcription and delivery review. The editor links each observation to the corresponding audio in the analyzed revision.
+- Add a read-only replay against verified UMG cuts and campaign snapshots.
+
+## [1.1.212] - 2026-11-22
+
+### Fixed
+- Release document locks before composing a text preview and on unchanged or rejected campaign design saves so simultaneous editor saves/proposal adoption cannot deadlock the API; preserve conservative handling of aligned words outside their line window across every animated look.
+- Preserve lyric occurrences and independent text/timing corrections during concurrent editor saves: collision-free internal keys, base-aware matching for duplicated or missing legacy IDs, atomic timing intervals and conservative handling of ambiguous identities. Reconciliation retains typing made while a quality proposal is pending, including after a failed or lost response, and matches a uniquely identified inserted line after a committed save response is lost.
+- Persist intentional deletion of the final legacy line and recover versioned empty drafts without treating an evicted editor store as a deletion. Never replay a stale empty draft without its base over newly saved remote rows. Keep Space playback working from campaign navigation rows.
+- Keep editor snapshots in chronological order without deleting rows or repairing operator timings. Bound manual start edits inside the audio; move absolute word clocks with a line and invalidate incompatible word timing after trims while retaining optional repeat-timing suggestions.
+- Restore native text preview with Auto variant settings, share the editor's 5,000-line limit, and synthesize safe word timings for malformed metadata without moving known out-of-window alignment to the line start. Existing authentication, exact approval snapshots, immutable history, CAS and quota guards remain enforced.
+
+## [1.1.210] - 2026-11-21
+
+### Added
+- Warn in Revisión rápida when a song's timing as a whole is not reliable ("El timing de esta canción no es confiable: revisala completa") (the review payload carries the most suspicious lines first; the editor does not highlight them yet). It combines five signals already stored (median word score, singing without a line on screen, stretched words, whisper-1 witness words outside every line, agreement with the Gemini control transcript); cross-validated on 220 approved UMG songs: AUC 0.75, 16 % of songs flagged, precision 0.34, recall 0.39 (32 bad songs). Priority only: it never blocks approval.
+- `SONG_TIMING_TRUST_MODE=observe|shadow|apply|off` (default `observe`): the transcription worker stores the verdict in `transcription_quality.song_timing_trust`; `shadow` also re-aligns an unreliable song against attested official lyrics and records what would move; `apply` copies that timing (text untouched). Measured with audio on 30 songs, re-alignment did not fix the badly placed lines of the bad songs (1 of 8 measurable applied, 0 lines fixed), so `apply` is not recommended. Details in `docs/SONG_TIMING_TRUST_2026-11-20.md`.
+
+## [1.1.209] - 2026-11-20
+
+### Added
+- `VOICE_END_TIMING_MODE=off|observe|apply` (default `off`): end each line where the voice ends, measured on the cached `mdx_extra` vocal stem (energy 250-4000 Hz, 10 ms step; anchor = p75 of the last 0.3 s of the last word; release when energy stays under 0.35 x anchor for more than 0.10 s; end = release + 0.20 s; floor = last word, cap = next line start - 0.05 s and last word + 4 s; no stem or inaudible anchor keeps the current 0.5 s hold). The ~25 ms late stem clock is corrected. Offline on 71 approved Argentina songs (40-song holdout, frozen parameters): lines within 0.3 s of the operator's end 63% -> ~79%, lines the operator lengthened 43% -> 70%, early cuts 10% -> 5%; `STABLE_PITCH_TAIL_ENABLED=1` reaches 65% and `VOCAL_CONTINUITY_MODE=apply` 64%. Only moves `end`, never text, words or locked lines. `observe` records per-line evidence (`transcription_quality.voice_end_timing`, `/reanchor` response and audit `voice_end`) without changing times. Runs at upload (after display segmentation) and in "Re-sincronizar" (after `REANCHOR_HOLD_MODE`, only on lines that re-anchor re-timed).
+- With `apply`, this rule is the single owner of the line end: `VOCAL_CONTINUITY_MODE` and `STABLE_PITCH_TAIL_ENABLED` are skipped (reported as `superseded_by_voice_end_timing`). Part of `runtime_timing_config` fleet parity: it must be loaded as a SHARED variable in all 6 Railway services before deploy.
+- `scripts/backtest_voice_end_timing.py`: read-only backtest of the rule against approved versions over a list of jobs.
+
+## [1.1.208] - 2026-11-20
+
+### Added
+- Let a campaign reviewer re-transcribe a song from its audio in a chosen language (Spanish, English, Portuguese, French, Italian, German) from the editor's language alerts or the Tools menu. The current text stays in the version history ("Antes de volver a transcribir"), the previous pre-human machine snapshot, evidence and quality verdict are archived in the new append-only `editor_retranscriptions` table, and the new lyrics arrive as a new revision for review. No editor version or correction observation is deleted. The forced language reaches WhisperX and every post-pass, a mixed audio reference no longer demotes it to auto-detection, and a previous language attestation does not carry over to the new text.
+- Refuse the request with "Genly se está actualizando, probá en unos minutos" while any worker serving the target queue runs different backend code, and return any attempt that ends without a result (failure, reaper timeout, a worker on older code discarding it) to review with the previous text intact.
+
+## [1.1.207] - 2026-11-20
+
+### Fixed
+- Flag lyrics written in a language that is not sung. When WhisperX guesses the wrong language from an intro it translates verses instead of transcribing them ("Gran Ídolo De Asia", Gilda "Rompo Las Cadenas": Spanish verses delivered in English or Japanese), and the output passed as a bilingual song with no alert. Every transcription now asks Gemini, in parallel and without requesting lyrics, which languages are sung (`transcription_quality.language_probe`, ~US$0.01 per song, retried on Vertex 429). Two or more delivered lines confidently written in a language the probe did not hear, or in a non-Latin script, raise the existing language-conflict review with those lines highlighted. Bilingual songs, unavailable probes and unclassifiable languages abstain; nothing is forced or rewritten. The probe survives edits and quality replays, and the gate recomputes it from persisted data. A truncated probe answer (unparseable JSON or a non-STOP finish such as MAX_TOKENS) is kept as `status=incomplete` and never gates: a language missing from a cut-off list is not evidence of absence. `SUNG_LANGUAGE_PROBE_ENABLED=0` turns it off.
+
+## [1.1.206] - 2026-11-20
+
+### Added
+- Warn in Revisión rápida when a line is out of sync with the voice: it appears before the singing starts, stays on screen without voice, enters late, or leaves before the last word ends. Times come from the stored forced-alignment words and the whole-song WhisperX words; the whisper-1 witness only confirms. Each warning moves the line start or end to the measured time with one click, never past the neighbouring line, never touching text or line breaks, and is skipped if the line was moved by hand after the server saw it. Nothing changes timing on its own. `LYRIC_REVIEW_TIMING_MODE=observe` (default) shows them as suggestions; `enforce` marks the witness-confirmed ones as `required` (priority, listed first; like the rest of Revisión rápida they never block approval); `off` disables them. Measured on 201 UMG songs: 20 % of client timing points flagged near the cited time (3 % by chance), 0.21 warnings per accepted song. Replaces the disconnected whisper-1 `_rule_timing`. Details in `docs/LYRIC_TIMING_REVIEW_2026-11-18.md`; offline measurement in `scripts/measure_lyric_timing_review.py`.
+- Check AI backgrounds for what UMG rejected in its September–November change requests: guns and knives, blood or raw meat, human body parts without a face, burned-in overlays such as a "16:9" label, and black letterbox bars. Weapons, gore, body parts and overlays use a separate, capped Vision call (at most 8 frames per background) that leaves the existing people/brand/anatomy request untouched; letterbox bars are measured without AI from the effective aspect ratio of the picture. Any error, timeout or quota response from the new call counts as "not evaluated" and never fails a job. `BACKGROUND_EXTENDED_QC_MODE` defaults to `observe` (findings are recorded, nothing is rejected); `enforce` sends the categories in `BACKGROUND_EXTENDED_QC_ENFORCE` (default `weapon,gore,overlay,letterbox`) through the existing regenerate-once → safe-gradient recovery before the final render, with letterbox rejected before any Vision call is paid; `off` disables it.
+- Show background findings in the delivery review before publishing: what the validator observed on the current background and its scene clips (weapon, gore, body parts, people, malformed anatomy, brand, overlay, letterbox) plus a letterbox scan of the encoded video, as "review" items with a "Revisado" action and two new checks. `DELIVERY_QC_BACKGROUND_MODE` defaults to `observe` (never blocks); `enforce` requires a reviewer to acknowledge them before an UMG publication; `off` hides them.
+- Summarize, before a lyric video reaches the UMG portal, the lines nobody played in the editor (from the existing `editor_audio_played` telemetry: a line counts as heard when at least half of it played, by anyone, before publishing; lines are only listed when that telemetry is complete for the song: when the server heartbeat says someone listened but their played ranges never arrived, or nothing played, the summary says listening data is unavailable instead of claiming nobody listened) and the Quick Review points still pending from high-precision sources: the official lyrics, two ears agreeing, and the portal style rules (final period, unpaired ¿?, missing accents including voseo). Every publication path computes it: single publish from the video page and from Cambios, "confirm publication", and campaign sends (one confirmation for the whole send, with the count per song). No schema change.
+- `PUBLISH_REVIEW_SUMMARY=observe` (default) computes the summary and records it in the local audit log (`delivery.publish_review`: who, unheard lines, pending warnings) without showing anything. `prompt` shows it and requires one click on "Publicar igual", which resends the token of the summary seen and is recorded the same way. `off` skips it. It never blocks hard: a failure to compute it publishes and records `unavailable`. Art Tracks are excluded.
+- `scripts/report_listening_coverage.py` now shares its coverage math with the publication summary (`listening_coverage.py`).
+- `REANCHOR_HOLD_MODE=off|observe|apply` (default `off`): editor re-anchoring ("Re-sincronizar", pasted official lyrics) can apply the same reading hold as upload (`lead_in.apply_hold`, i.e. the fleet's `LYRIC_HOLD_S`/`LYRIC_MIN_GAP_MS`); re-anchored lines currently vanish on the last phoneme. Only extends, only lines this re-anchor re-timed that end on their last word, never locked lines. `observe` reports the would-be changes in the response and the audit log without touching segments. Offline bank (201 UMG songs): extend-the-end requests within 0.5 s of the accepted end go from 8 to 17 of 112, 32 move closer, 1 of 41 shorten requests is lengthened; 12.3% of accepted Argentina lines (+0.39 s mean, max +0.5) and 1.3% of Chile lines change.
+- `docs/UMG_AR_CRITERIO_FORMA_TIMING_2026-11-19.md`: Argentina's form/timing criterion measured on its change requests, what the pipeline contradicts, and a draft question for the client.
+
+### Fixed
+- Keep Argentine voseo in Revisión rápida (Argentina portal only): when the machine normalised "querés", "vení", "anotate", "No te quedés" or "Te llevás" to tú, propose the vos form with one click. Marked as priority (`required`, listed first; like the rest of Revisión rápida it never blocks approval) when two independent ears (witness, Gemini, official lyrics) wrote the vos form, or one did and the song already uses voseo in another line; a suggestion with a single ear or with only the song's own voseo. Ears are now compared with accents, so "llevas"/"llevás" is no longer invisible. Songs that really use tú (ballads, folklore, foreign artists) are left alone without evidence, official lyrics in tú win, forms that are also other words ("ven", "mira", "ganas") need an ear, and an ear that matches the voseo point is merged into it instead of showing a second card. Chile and portal-less UMG deliveries are never touched.
+- Add `scripts/measure_umg_voseo_bank.py`, an offline measurement of the voseo rule over exported UMG requests, delivered and final lyrics.
+
+## [1.1.205] - 2026-11-20
+
+### Fixed
+- Make the campaign lyric highlight follow audio playback instead of staying on the manually selected line. Keep the text edit target and caret stable; restore the selected-line highlight when playback pauses or ends. Preserve the existing audio follow, playing indicator, reordering and deletion controls.
+
+## [1.1.195] - 2026-11-20
+
+### CI / automation
+- Report unverified smoke-session revocation on authentication or cleanup errors; never revoke another session. Require the exact staging release and fleet runtime parity before authenticated reads. This automation correction retains application version 1.1.195.
+
+### Fixed
+- Keep the authenticated staging campaign-access smoke read-only: inspect only the dedicated administrator’s own permission panel and close its login session. Never create reviewers in customer workspaces or grant access to real campaigns; exercise permission writes only in isolated tests.
+
+## [1.1.194] - 2026-11-20
+
+### Added
+- Administrators can grant and revoke lyric campaign review access for existing users from Gestión de usuarios, with searchable campaigns, inherited-access explanations, revocation confirmation, audit records and stale-change protection. Existing campaign feature scopes remain enforced.
+- Authenticated staging smoke verifies grants, reviewer visibility, revocation and CORS using a disposable account.
+
+## [1.1.193] - 2026-11-20
+
+### Fixed
+- Insert campaign lyric lines immediately below the selected occurrence, including adjacent or overlapping phrases. Add row deletion and mouse, touch and keyboard reordering with immediate persistence and Undo; preserve neighbouring timings and flag the placed line for timing review.
+- Render the campaign editor's text preview with browser libass, the final video's shared ASS composer, bundled font files and output dimensions. Keep line breaks stable when the panel resizes, discard stale preview responses and expose retry on failure.
+
+## [1.1.192] - 2026-11-19
+
+### Fixed
+- Show complete lyric text in the timeline sidebar with matching row heights. Allow stable inline edits from sidebar and timeline; Enter flushes autosave and returns keyboard focus, while Space toggles playback outside text fields and preserves Sync mode. Keep editing stationary and preserve reconciled remote corrections. Cover long songs during playback: anchor the input outside scrollports, reserve the undo toolbar before typing, and keep playing-row text metrics stable; preserve interaction blocking for approval/restoration and keyboard focus when closing the field.
+- Expose single-line deletion on both surfaces and add exact-time insertion through the sidebar or timeline context menu, preserving existing rows and minting new identities. Reject occupied intervals instead of silently moving existing lyrics.
+
+### Added
+- Resize the lyric sidebar by dragging its divider or using the keyboard, with responsive bounds and double-click reset.
+- Offer optional text and duration corrections for later matching phrases. Keep each occurrence onset, require explicit timing selection, and revalidate source/target snapshots, audio bounds and collisions before applying. Text similarity proposes candidates; it does not assert acoustic equivalence.
+
+## [1.1.181] - 2026-11-18
+
+### Fixed
+- Keep the UMG artist/title catalog to the spellings the client asked for. Remove the accents and articles added as "official spelling" that UMG had been accepting without them (Babasonicos, Tan Bionica, Fito Paez, Leon Gieco, Andres Calamaro, Myriam Hernandez, Victor Jara, Cacho Castaña and others, "Abuelos De La Nada", "Cancion Para Mi Muerte"). They renamed artists the client never asked to change and blocked republishing videos already rendered with the accepted spelling. Client-requested corrections (Charly García, Serú Girán, Los Enanitos Verdes and the song-specific fixes) and corrections learned from new client requests are unchanged.
+## [1.1.180] - 2026-11-18
+
+### Fixed
+- Unblock campaign approval for legacy documents with duplicate or missing line identities by attesting collision-safe occurrences from the exact persisted snapshot. Keep stored IDs, lyrics, timings and approved versions intact; preserve stale-revision and full ordered-list checks.
+- Align Unicode identity normalization across Python and JavaScript and explain identity-related approval errors without exposing raw JSON.
+
+## [1.1.178] - 2026-11-18
+
+### Fixed
+- Restore a single live lyric preview beside campaign editing, selecting paused lines by identity, preserving unconfirmed-text masking and following existing audio playback. Keep read-only touch scrolling, bounded detail scrolling and native disclosure keyboard actions.
+- Start quality proposals collapsed; keep stale/expired warnings and a local hide action accessible outside the disclosure. Prevent applying outdated proposals and announce in-flight decisions once.
+- Make lyric-review suggestions advisory across campaigns, individual jobs and re-renders, including missing-text and portal-style suggestions. Preserve snapshot, revision, language and structural approval controls. Legacy `LYRIC_REVIEW_MODE=enforce` now behaves as `observe`; `LYRIC_REVIEW_ENFORCE_TENANTS` no longer enables blocking. Deploy compatible API and frontend before verifying approval.
+
+## [1.1.176] - 2026-11-18
+
+### Fixed
+- Measure the client change-request cohort by the Universal portal (Argentina/Chile) where a lyric video was published, not by the publishing account. Lyric campaigns published by internal accounts (221 November deliveries and their requests) were excluded, so the panel under-reported the request rate. Art Tracks stay out of the lyric rate.
+- Write UMG artist and song titles the way the client asked before anything is drawn or published: a versioned catalog (accents, "Los Enanitos Verdes", song corrections such as "Tuyu", "¿Dónde Estarás?" or "Coti Ft. Enrique Iglesias") plus every artist/title correction applied to a UMG video, reused for the artist's following songs. Names are normalized when campaigns are registered and before every render; a video rendered with a different name is held back from the portal (single and campaign sends) with the expected name, until it is corrected and re-rendered. `UMG_METADATA_GATE=observe|off` relaxes the hold.
+- Apply a per-portal UMG style profile in Revisión rápida: a final period, a question mark without its pair and unambiguous missing accents are required points with a one-click fix; exclamations follow the portal (Argentina without marks, Chile with ¡!); Argentina parentheses are suggested. Required style points now also block a change-request re-render, where already-reported periods and marks used to come back. Jobs outside UMG are unaffected.
+- Verify every point of a client change request against the approved lyrics before closing it, on every close path (manual close and confirm-publication in Cambios, publishing the reviewed cut, manual close and bulk send in Campaigns). Text must be present at the cited time (a phrase fixed in another repetition of the chorus no longer counts), "says X" must be gone, explicit "Desde X hasta Y" intervals and prose timing must have moved the line towards what was asked, artist/title must match with accents, and requested punctuation must be removed. Each failing point blocks the close unless the operator writes an internal justification for that point; justifications are stored in the local audit log and never shown to the client. Publications keep going and leave a request with unjustified failing points open. Background and free-prose points stay as manual checks. `CHANGE_REQUEST_CLOSE_VERIFICATION=0` restores the previous behaviour.
+- Flag a request that repeats a point (same cited time or text) of an already closed request on the same delivery as a recurrence in Cambios and Campaigns.
+- Propose the same correction on the other repetitions of a corrected line when a change request is analysed: each identical repetition becomes its own operation, never auto-applied, and can be unticked. Operator adjustments of the requested line follow to its repetitions.
+- List each repetition with its time in the editor's "apply to all repetitions" prompt so one can be left out.
+- Add `scripts/backtest_change_request_verification.py`, an offline backtest of the verification over exported requests and editor versions.
+
+## [1.1.175] - 2026-11-18
+
+### Added
+- Add a staging full-song Genly model pilot: authenticated editor requests, leased local Mac inference, private source-bound candidate storage and manual adoption through existing editor suggestions. Preserve approved songs, human edits and stale revisions.
+- Add reproducible historical-correction corpus preparation, CPU edit-risk training, measured local LoRA experiments and serial MLX recognition/CTC alignment. Use corroborated word edits and verified vocal continuity; keep uncertain hypotheses for review instead of replacing line timing wholesale. No paid inference or external GPU is required.
+
+## [1.1.174] - 2026-11-18
+
+### Fixed
+- Speed up campaign navigation with grouped summary counts, bounded job projections, shared review activity reads, and on-demand review and delivery details. Keep publication freshness, reviewer provenance and tenant permissions intact.
+- Coalesce campaign refresh requests and avoid polling unchanged reports while navigating between campaign stages.
+
+## [1.1.173] - 2026-11-17
+
+### Fixed
+- Restore click-to-play in lyric review and follow the playing line without changing the editing selection or text focus. Keep playback controls visible below the app header.
+- Show compact horizontal time ranges, separate playback from selection, respect the marked filter during previous/next navigation and expose stale/failed phrase analysis in a compact disclosure.
+- Correct timestamp rounding at minute boundaries and the active navigation item during lyric review.
+
+## [1.1.172] - 2026-11-17
+
+### Added
+- Add tenant-scoped team coordination with persistent bulk song/campaign assignments, operator task lists, priorities, due dates, notes, blockers and progress derived from the existing review pipeline. Administrators can grant coordination without granting platform administration. Concurrent assignment conflicts roll back the entire batch.
+
+## [1.1.171] - 2026-11-17
+
+### Fixed
+- Reject clearly malformed human anatomy in generated backgrounds even in observation mode, while retaining normal people and ambiguous or naturally occluded anatomy. Validate before encoding and scan every scene so observation shortcuts cannot publish a detected defect. Retry or replace rejected generated backgrounds using the existing recovery path.
+
+### Added
+### Added
+- Streamline admin user creation with searchable workspaces and selectable lyric campaigns, granting cross-workspace review access in the same transaction.
+
+## [1.1.170] - 2026-11-17
+
+### Fixed
+- Parse explicit metadata corrections phrased as “Corregir título a: …” or “Corregir artista a: …” as applicable change-request operations instead of sending them to manual review.
+
+## [1.1.169] - 2026-11-15
+
+### Added
+- Measure Universal lyric and timing correction rate by first publication with a complete 30-day follow-up cohort. Show the numerator, denominator, separate structure/repetition categories and deliveries whose publication date cannot be reconstructed.
+
+## [1.1.168] - 2026-11-13
+
+### Added
+- Integrate Universal change-request automation, full-audio review, render-bound Delivery QC and recorded reviewer decisions. New behaviors remain flag-gated for staged rollout.
+
+## [1.1.167] - 2026-11-11
+
+### Changed
+- Compose YouTube thumbnails of lyric-look jobs as a poster in the video's effective look typography (font, palette and accent from the resolved variant): keyword layout for Cine, stacked equal-width rows for Bloque, title on a ring for Arco, glowing script for Romántico/handwritten looks, and a big title with an accented key word and tracked artist for the rest. Long titles wrap and shrink, qualifiers such as "(En Vivo)" become a subtitle, and the text block always stays inside the frame. Jobs without a look keep the current title card; text no poster font can draw (e.g. CJK) and any poster failure fall back to it too. `THUMBNAIL_LOOK_POSTER=0` restores the previous thumbnail for every job.
+
+## [1.1.166] - 2026-11-10
+
+### Fixed
+- Stop editor cleanup after approval or navigation from creating empty local drafts. Preserve genuine unsaved edits and intentional deletions.
+- Make draft recovery compact and readable, keep actions visible, archive the local copy before opening the saved version, and require explicit confirmation before restoring an empty draft.
+- Show line start/end times in review and give lyric editing more space alongside the preview.
+
+## [1.1.165] - 2026-11-06
+
+### Fixed
+- Recover the selected UMG request’s publication status without a client-side reference error. Confirm an already-published corrected video even when its change request stays open, keep manual review available, and label publication separately from request closure.
+
+## [1.1.164] - 2026-11-06
+
+### Fixed
+- Allow corrections to existing campaign videos when the final-review backlog is full, while retaining human approval, campaign status, and simultaneous-render limits. New video generation keeps the review backlog limit.
+- Show all campaigns by default and distinguish product and status filters. Add a client change-request view with song names, request text, and direct resolution links, including delivered campaigns.
+- Label post-render approval as “Aprobar cambios y generar video” to explain the next step.
+
 ## [1.1.163] - 2026-11-06
 
 ### Added
@@ -13,6 +249,50 @@
 ### Fixed
 - Add “Clásico — letra simple” to the campaign batch look selector and review summary. Treat the classic renderer as an explicit selection so operators can review and generate a classic-only batch while keeping balanced photo/video and effect quotas.
 - Clear previous pack look variants when applying a classic batch, and preserve the existing reviewed-confirmation and ready-song generation checks.
+
+## [1.1.161] - 2026-11-04
+
+### Fixed
+
+- Empty lyric drafts now explain how to recover text, expose version history
+  directly and disable approval until text exists. The quick-review panel no
+  longer presents missing text as ready to approve; a clear issue queue only
+  means there are no pending observations, not that the transcript is correct.
+
+## [1.1.160] - 2026-11-04
+
+### Added
+
+- Staging-only vocal endpoint correction for fresh transcriptions. Follow the
+  clock-verified vocal stem, require periodic evidence inside each extension,
+  preserve locked/approved lines and provider word clocks, and persist the
+  adjustment before the final quality verdict and immutable editor snapshot.
+  `VOCAL_CONTINUITY_MODE=apply` enables the pilot in staging; production and
+  unknown environments decline application. Default remains `off`.
+
+
+## [1.1.159] - 2026-11-03
+
+### Added
+
+- Edit background prompts for selected campaign songs with a shared direction,
+  individual backgrounds and calendar-order distribution. Review the complete prompts
+  before saving; preserve typography, motion, effects, source assignments and
+  pinned designs. Reuse revision checks, audit history and undo without starting
+  generation or enabling multi-scene mode. Fixed-photo songs keep their assigned
+  overlay effects. Detect repeated prompts and reject mismatched description counts.
+
+## [1.1.158] - 2026-11-03
+
+### Changed
+
+- Simplify the campaign home to one list with confirmed deliveries, pending
+  work and direct next actions. Separate ongoing, attention and finished
+  campaigns; retain product filters, account plans and the creation wizard.
+  Approved videos are no longer counted as delivered, and unavailable portal
+  status is shown explicitly. File-only campaigns label ready files separately.
+- Default campaign lyric review to calendar order while retaining effort and
+  learning modes and preserving the order of recently saved drafts.
 
 ## [1.1.157] - 2026-11-03
 

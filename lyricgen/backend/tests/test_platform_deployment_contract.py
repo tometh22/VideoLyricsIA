@@ -116,9 +116,14 @@ def test_worker_deployment_contracts_share_image_without_http_healthcheck():
         cfg = _config(name)
         assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
         workload = "WORKLOAD_CLASS=batch " if name.startswith("batch-") else ""
+        whisper = (
+            "WHISPER_PRELOAD=1 " if name in {"short-worker.toml", "batch-short-worker.toml"}
+            else ""
+        )
         expected_start = (
             "sh -c 'python backend/scripts/require_worker_schema.py "
-            f"&& exec env {workload}QUEUES={expected_queues[name]} python backend/worker.py'"
+            f"&& exec env {whisper}{workload}QUEUES={expected_queues[name]} "
+            "python backend/worker.py'"
         )
         assert cfg["deploy"]["startCommand"] == expected_start
         assert cfg["deploy"]["numReplicas"] == replicas

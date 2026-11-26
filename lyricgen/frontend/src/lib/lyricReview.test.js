@@ -102,6 +102,52 @@ describe("lyric review fixes", () => {
     expect(timing.segments[0].locked).toBe(true);
   });
 
+  it("moves a line to the measured voice only if it is still where the server saw it", () => {
+    const segments = [
+      { _id: 1, segment_id: "a", start: 80, end: 82, text: "Antes" },
+      { _id: 2, segment_id: "b", start: 82.3, end: 87.08, text: "El tiempo corría" },
+      { _id: 3, segment_id: "c", start: 87.22, end: 91.9, text: "Ella me dio un beso" },
+    ];
+    const fix = { type: "timing", start: 83.2, expect_start: 82.3 };
+    const moved = applyReviewItem(segments, { occurrences: [occ("b", fix, 82.3)] });
+    expect(moved.applied).toBe(1);
+    expect(moved.segments[1]).toMatchObject({ start: 83.2, end: 87.08, text: "El tiempo corría", locked: true });
+    expect(moved.segments[0]).toEqual(segments[0]);
+    expect(moved.segments[2]).toEqual(segments[2]);
+    // La revisora ya la movió a mano: el tiempo medido era para otra posición.
+    const touched = segments.map((s) => (s.segment_id === "b" ? { ...s, start: 82.9 } : s));
+    expect(applyReviewItem(touched, { occurrences: [occ("b", fix, 82.9)] }).applied).toBe(0);
+    // Alargar nunca pisa a la línea siguiente.
+    const longer = applyReviewItem(segments, {
+      occurrences: [occ("b", { type: "timing", end: 89, expect_end: 87.08 }, 82.3)] });
+    expect(longer.segments[1].end).toBeCloseTo(87.17);
+  });
+
+  it("re-cutting moves word clocks with their words and the inner boundary to them", () => {
+    // GBA Stage demo: "Senhor" belongs to the previous line.
+    const w = (word, start, end) => ({ word, start, end });
+    const segments = [
+      { _id: 1, segment_id: "a", start: 10, end: 12.1, text: "Eis-me aqui",
+        words: [w("Eis-me", 10.2, 10.9), w("aqui", 11.0, 12.0)] },
+      { _id: 2, segment_id: "b", start: 12.2, end: 16, text: "Senhor dai-me um coração",
+        words: [w("Senhor", 12.3, 14.1), w("dai-me", 14.4, 14.9), w("um", 15.0, 15.1), w("coração", 15.2, 15.9)] },
+    ];
+    const relayout = { type: "relayout", lines: [
+      { segment_id: "a", text: "Eis-me aqui, Senhor", expect: "eisme aqui" },
+      { segment_id: "b", text: "Dai-me um coração", expect: "senhor daime um coracao" },
+    ] };
+    const { segments: next } = applyReviewItem(segments, { occurrences: [occ("a", relayout)] });
+    expect(next[0].words.map((x) => x.word)).toEqual(["Eis-me", "aqui", "Senhor"]);
+    expect(next[1].words.map((x) => x.word)).toEqual(["dai-me", "um", "coração"]);
+    expect(next[0]).toMatchObject({ start: 10, end: 14.1 });
+    expect(next[1]).toMatchObject({ start: 14.4, end: 16 });
+    // A changed word means no clocks for the new text (previous behaviour).
+    const changed = { ...relayout, lines: [relayout.lines[0], { ...relayout.lines[1], text: "Dá-me um coração" }] };
+    const { segments: plain } = applyReviewItem(segments, { occurrences: [occ("a", changed)] });
+    expect(plain.map((s) => s.words)).toEqual([undefined, undefined]);
+    expect(plain[0].end).toBe(12.1);
+  });
+
   it("adds a missing chorus pass as a new line", () => {
     const segments = [{ _id: 4, segment_id: "z", start: 75.9, end: 78.7, text: "Te está poniendo nervioso" }];
     const { segments: next } = applyReviewItem(segments, {

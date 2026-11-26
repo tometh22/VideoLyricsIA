@@ -122,7 +122,7 @@ describe("WizardLivePreview — looks de letra", () => {
   });
 });
 
-const NEW_LOOKS = ["cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "duotono", "romantico", "degrade", "y2k"];
+const NEW_LOOKS = ["cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "escalera", "una_por_una", "ventana", "duotono", "romantico", "degrade", "y2k"];
 
 async function playLine(refOut, tick) {
   await act(async () => {
@@ -140,6 +140,52 @@ const LIVE_TICK = {
 };
 
 describe("WizardLivePreview — looks nuevos", () => {
+  it("Una por una shows only the word being sung, the key word in green Knewave", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="una_por_una" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    expect(lyric.style.fontFamily).toContain("Oswald");
+    const shown = [...lyric.querySelectorAll("[data-look-word]")];
+    expect(shown.map((w) => w.dataset.lookWord)).toEqual(["3"]);
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.7 });
+    const key = lyric.querySelector('[data-look-key="true"]');
+    expect(key).not.toBeNull();
+    expect(key.style.fontFamily).toContain("Knewave");
+    expect(key.style.color).toBe("rgb(119, 237, 89)");
+  });
+
+  it("Ventana keeps the last two sung words and dims the older one", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="ventana" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    const shown = [...lyric.querySelectorAll("[data-look-word]")];
+    expect(shown.map((w) => w.dataset.lookWord)).toEqual(["2", "3"]);
+    expect(shown[0].dataset.lookDim).toBe("true");
+    expect(shown[1].dataset.lookDim).toBeUndefined();
+  });
+
+  it("Escalera types the sung words letter by letter and bursts them at the end", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="escalera" />);
+    await playLine(refOut, LIVE_TICK);
+    const lyric = container.querySelector('[data-testid="look-lyric"]');
+    const rows = [...lyric.querySelectorAll("[data-look-row]")];
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows[0].style.transform).not.toBe(rows[1].style.transform);
+    const word = (i) => lyric.querySelector(`[data-look-word="${i}"]`);
+    expect(word(3).dataset.lookVisible).toBe("true");
+    expect(word(4).dataset.lookVisible).toBe("false");
+    const letters = (i) => [...word(i).querySelectorAll("[data-look-letter]")];
+    expect(letters(3).every((l) => l.style.animation.includes("wlp-type-in"))).toBe(true);
+    expect(letters(4).every((l) => l.style.visibility === "hidden")).toBe(true);
+    const keyRow = lyric.querySelector('[data-look-row][data-look-key="true"]');
+    expect(keyRow.style.fontFamily).toContain("Knewave");
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.95 });
+    expect(letters(8).every((l) => l.style.animation.includes("wlp-burst"))).toBe(true);
+  });
+
   it.each(NEW_LOOKS)("%s renderiza en el loop de muestra y nombra el look", (code) => {
     const { container } = renderLook({ lyricLook: code });
     expect(container.querySelector(`[data-lyric-look="${code}"]`)).not.toBeNull();
@@ -359,10 +405,9 @@ describe("lookLineMotionStyle (modo en vivo)", () => {
     expect(parseFloat(end.transform.slice(6))).toBeGreaterThan(8);
   });
 
-  it("Cine: entra desenfocado y con letras abiertas que se cierran", () => {
+  it("Cine: entra transparente y con letras abiertas que se cierran", () => {
     const start = lookLineMotionStyle("cine", 0, 3);
     expect(start.opacity).toBe(0);
-    expect(start.filter).toBe("blur(10.00px)");
     expect(start.letterSpacing).toBe("0.220em");
     expect(lookLineMotionStyle("cine", 1.5, 3)).toMatchObject({ opacity: 1, letterSpacing: "0.03em" });
   });
@@ -599,5 +644,82 @@ describe("WizardLivePreview — composiciones aprobadas", () => {
       const texts = [...container.querySelectorAll("[data-editorial-look] text")].map(n => n.textContent).join(" ");
       expect(texts).toBe(texts.toLowerCase());
     }
+  });
+});
+
+// Reporte dd104256a7f1 (16-nov): con el audio corriendo la línea entera
+// titilaba y aparecía un recuadro detrás de la letra (el MP4 salía limpio).
+// Dos causas en el preview en vivo, ninguna en el render.
+describe("WizardLivePreview en vivo — sin titileo ni recuadro", () => {
+  const MOTIONS = ["zoom_through", "cine", "fade", "smear", "boil", "write_on"];
+
+  it.each(MOTIONS)("%s: el estilo por tick nunca anima `filter`", (motion) => {
+    for (let t = 0; t <= 3; t += 0.05) {
+      expect(lookLineMotionStyle(motion, t, 3, { textLen: 16 })).not.toHaveProperty("filter");
+    }
+  });
+
+  it.each(["duotono", "cosmico", "cine", "cinetico", "pelicula"])(
+    "%s: el bloque de letra en vivo no lleva filter ni lo transiciona, ni a mitad de línea ni en la salida",
+    async (code) => {
+      const refOut = { current: null };
+      const { container } = render(<LiveHarness refOut={refOut} lyricLook={code} textCase="upper" />);
+      for (const currentTime of [10.05, 12, 13.95]) {
+        await playLine(refOut, { ...LIVE_TICK, currentTime });
+        await waitFor(() => expect(container.querySelector('[data-testid="look-lyric"]')).not.toBeNull());
+        const blocks = [container.querySelector('[data-testid="look-lyric"]'),
+          ...container.querySelectorAll('[data-testid="look-lyric"] *')];
+        for (const el of blocks) {
+          expect(el.style.filter || "").not.toMatch(/blur/);
+          expect(el.style.transition || "").not.toMatch(/filter/);
+        }
+      }
+    },
+  );
+
+  it.each(["", "cosmico", "duotono"])(
+    "look '%s': un hueco entre líneas con el audio corriendo no muestra la frase de muestra",
+    async (code) => {
+      const refOut = { current: null };
+      const { container } = render(<LiveHarness refOut={refOut} lyricLook={code} textCase="original" />);
+      await playLine(refOut, { ...LIVE_TICK, activeLine: "y te tengo guardada en el pecho", currentTime: 11.5 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).toContain("pecho"));
+      // LyricsEditor publica activeLine "" con el reloj real entre dos líneas.
+      await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 14.1 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).not.toContain("pecho"));
+      expect(container.textContent.toLowerCase()).not.toContain("esta es tu letra");
+      expect(container.querySelector('[data-testid="look-lyric"]')).toBeNull();
+      // Vuelve la línea siguiente.
+      await playLine(refOut, { ...LIVE_TICK, activeLine: "según quién", activeStart: 14.3, activeEnd: 16, currentTime: 14.6 });
+      await waitFor(() => expect(container.textContent.toLowerCase()).toContain("según quién"));
+      expect(container.textContent.toLowerCase()).not.toContain("esta es tu letra");
+    },
+  );
+
+  it("canción nueva (App resetea el tick a currentTime 0) vuelve al loop de muestra", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="cosmico" textCase="original" />);
+    await playLine(refOut, { ...LIVE_TICK, activeLine: "una línea", currentTime: 11.5 });
+    await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 12.5 });
+    await waitFor(() => expect(container.textContent).not.toContain("una línea"));
+    await playLine(refOut, { activeLine: "", activeStart: 0, activeEnd: 0, currentTime: 0 });
+    await waitFor(() => expect(container.textContent.toLowerCase()).toContain("esta es tu letra"));
+  });
+
+  it("los clips no usan el atributo autoplay (Safari dibuja su botón de play encima de la letra)", () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play");
+    const { container } = render(
+      <WizardLivePreview style="oscuro" movementStyle="estandar" effect="snow" lyricLook="cosmico"
+        clipSrc="/movement_samples/estandar.mp4" />,
+    );
+    const videos = [...container.querySelectorAll("video")];
+    expect(videos.length).toBeGreaterThanOrEqual(2);
+    for (const v of videos) {
+      expect(v.hasAttribute("autoplay")).toBe(false);
+      expect(v.muted).toBe(true);
+      expect(v.loop).toBe(true);
+    }
+    expect(play).toHaveBeenCalled();
+    play.mockRestore();
   });
 });

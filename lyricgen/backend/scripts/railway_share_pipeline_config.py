@@ -35,7 +35,8 @@ DEFAULT_SERVICES = {
     "staging": ("api", "Worker", "ShortWorker", "quality-worker", "BatchWorker", "BatchShortWorker"),
 }
 TIMING_KEYS = ("LYRIC_LEAD_IN_S", "LYRIC_HOLD_S", "LYRIC_LEAD_IN_MS", "STABLE_PITCH_TAIL_ENABLED",
-               "LYRIC_MIN_GAP_MS", "LYRIC_MIN_GAP_AB_ENABLED", "LYRIC_MIN_GAP_AB_ARM_B_MS")
+               "LYRIC_MIN_GAP_MS", "LYRIC_MIN_GAP_AB_ENABLED", "LYRIC_MIN_GAP_AB_ARM_B_MS",
+               "VOICE_END_TIMING_MODE")
 _REF = "${{shared.%s}}"
 
 

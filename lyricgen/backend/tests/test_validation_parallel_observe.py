@@ -21,10 +21,10 @@ class TestGate:
         monkeypatch.delenv("BACKGROUND_VALIDATION_PARALLEL", raising=False)
         assert pipeline._validation_parallel_enabled() is False
 
-    def test_on_solo_con_observe(self, monkeypatch):
+    def test_observe_still_waits_for_anatomy_before_encoding(self, monkeypatch):
         monkeypatch.setenv("BACKGROUND_VALIDATION_ENFORCEMENT", "observe")
         monkeypatch.setenv("BACKGROUND_VALIDATION_PARALLEL", "1")
-        assert pipeline._validation_parallel_enabled() is True
+        assert pipeline._validation_parallel_enabled() is False
 
     def test_block_ignora_el_flag(self, monkeypatch):
         """Prod (block) jamás paraleliza, aunque el flag esté prendido:

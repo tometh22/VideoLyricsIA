@@ -22,6 +22,22 @@ SCHEMA = "display-segmentation-proposal-v1"
 # End/start fragments that almost always strand a function word. Conservative
 # across ES/EN/PT; unknown languages can still use punctuation + word clocks.
 _DANGLING = frozenset("a al de del el la los las un una unos unas y o que por para con sin en mi tu su te me se le les lo pero ni the an and or of to with for e os as um uma do da dos das em com".split())
+# Words that never close a sung phrase in ES/PT (articles, prepositions,
+# contractions, prenominal possessives, relatives). Post-positive PT
+# possessives ("amor meu") and ES "no" (negation) are deliberately absent.
+_OPEN_ENDED = _DANGLING | frozenset(
+    "quem quien cuyo cuya cujo cuja pelo pela pelos pelas num numa ao aos à às pro pra mis tus sus nuestro nuestra".split()
+)
+# Lowercase prepositions/articles that, opening the next card without any
+# punctuation before them, continue the phrase ("passe | a enxergar").
+# Conjunctions and relatives ("que", "y", "e", "mas") legitimately open a
+# phrase and are absent; so are ES "no"/"nos" and the ambiguous "o".
+_CONTINUES_PHRASE = frozenset(
+    "a al de del el la los las un una unos unas en por para con sin os as um uma do da dos das em com ao aos à às pra pro pelo pela pelos pelas num numa na nas".split()
+)
+# Lowercase infinitive opening a card right after a verb ("quiero | ver").
+_INFINITIVE = re.compile(r"^[^\W\d_]{2,}(?:ar|er|ir|ôr)$")
+_TRAILING_PUNCTUATION = re.compile(r"[,;:.!?…][\)\]\"’”]*$")
 _PRESENTATION = frozenset({
     "scale", "pos", "rot", "font", "font_size", "color", "event_type",
     "speaker", "layer", "style", "alignment", "voice", "language",
@@ -46,9 +62,15 @@ def digest(value) -> str:
     ).encode()).hexdigest()
 
 
+# off: nothing. shadow: plan + report only. suggest: shadow + the editor shows
+# each proposal as a one-click reviewer suggestion (never applied by the
+# pipeline). enforce: signed, fresh-job automatic application.
+MODES = frozenset({"off", "shadow", "suggest", "enforce"})
+
+
 def mode() -> str:
     value = os.environ.get("DISPLAY_SEGMENTATION_MODE", "shadow").strip().lower()
-    return value if value in {"off", "shadow", "enforce"} else "off"
+    return value if value in MODES else "off"
 
 
 def _number(value) -> float:
@@ -123,8 +145,28 @@ def _balanced(tokens: list[str]) -> bool:
     return all(text.count(a) == text.count(b) for a, b in (("(", ")"), ("[", "]")))
 
 
-def _boundary(tokens, words, k, config) -> str | None:
+def _phrase_continues(tokens, k) -> bool:
+    """Reviewer-suggestion guard: the cut would strand a phrase.
+
+    Never after a word that cannot close a phrase, and never before a
+    lowercase preposition/article or infinitive that continues it, unless
+    punctuation already closes the left side ("…gaveta, | pelo gambé").
+    """
+    left, right = tokens[k - 1], tokens[k]
+    if _TRAILING_PUNCTUATION.search(left):
+        return False
+    if _token(left) in _OPEN_ENDED:
+        return True
+    first = right.lstrip("¿¡\"'“‘([")
+    if not first or not first[0].islower():
+        return False
+    return _token(first) in _CONTINUES_PHRASE or bool(_INFINITIVE.match(_token(first)))
+
+
+def _boundary(tokens, words, k, config, phrase_guard: bool = False) -> str | None:
     if _token(tokens[k - 1]) in _DANGLING:
+        return None
+    if phrase_guard and _phrase_continues(tokens, k):
         return None
     if not _balanced(tokens[:k]) or not _balanced(tokens[k:]):
         return None
@@ -141,10 +183,10 @@ def _boundary(tokens, words, k, config) -> str | None:
     return None
 
 
-def _partition(row, config: Config):
+def _partition(row, config: Config, phrase_guard: bool = False):
     tokens, words = _parent(row)
     n = len(tokens)
-    allowed = {k: _boundary(tokens, words, k, config) for k in range(1, n)}
+    allowed = {k: _boundary(tokens, words, k, config, phrase_guard) for k in range(1, n)}
     # Endpoints stay EXACTLY as provided. Interior switches use the onset of
     # the next word, after the previous word has finished; no count-based time.
     clocks = {0: row["start"], n: row["end"], **{
@@ -172,7 +214,10 @@ def _partition(row, config: Config):
                     for _start, end in ranges[:-1]]
 
 
-def plan(segments: list[dict], *, source: dict, config: Config = Config()) -> dict:
+def plan(segments: list[dict], *, source: dict, config: Config = Config(),
+         phrase_guard: bool = False) -> dict:
+    """`phrase_guard` is only for reviewer suggestions; shadow/enforce keep
+    the validated display-phrases-v1 boundaries byte for byte."""
     if not (2 <= config.min_words <= config.target_words <= config.max_words <= 32
             and 16 <= config.max_chars <= 160
             and all(math.isfinite(v) and v > 0 for v in (
@@ -194,7 +239,7 @@ def plan(segments: list[dict], *, source: dict, config: Config = Config()) -> di
         try:
             if index in source.get("protected_quality_indices", []):
                 raise ValueError("parent_quality_review_required")
-            ranges, boundaries = _partition(row, config)
+            ranges, boundaries = _partition(row, config, phrase_guard)
             proposal["changes"].append({**base, "ranges": ranges, "boundaries": boundaries})
         except ValueError as exc:
             proposal["review"].append({**base, "reason": str(exc)})
@@ -270,6 +315,100 @@ def apply(segments: list[dict], proposal: dict, *, source: dict) -> list[dict]:
     return output
 
 
+# ── Reviewer suggestions (DISPLAY_SEGMENTATION_MODE=suggest) ─────────────────
+# Read-only. The editor shows each item as "Cortar acá" / "Unir con la
+# siguiente"; only the reviewer's click changes the document, through the
+# same editor split/merge that keeps per-word clocks. Nothing here mutates.
+SUGGESTION_SCHEMA = "display-segmentation-suggestions-v1"
+MERGE_MAX_GAP_S = 1.5
+_CLOSING_PUNCTUATION = re.compile(r"[,;:.!?…][\)\]\"’”]*$")
+
+
+def _row_identity(row: dict):
+    value = row.get("segment_id", row.get("_id"))
+    return None if value is None else str(value)
+
+
+def _merge_suggestions(segments, config, skip: set[int]) -> list[dict]:
+    """A line that strands an open-ended word ("…feliz quem" / "Sabe", or an
+    orphan "En") is joined with the next one when both fit one card."""
+    out = []
+    for i in range(len(segments) - 1):
+        a, b = segments[i], segments[i + 1]
+        if i in skip or i + 1 in skip or not isinstance(a, dict) or not isinstance(b, dict):
+            continue
+        if _protected(a) or _protected(b):
+            continue
+        ta, tb = str(a.get("text") or "").split(), str(b.get("text") or "").split()
+        if not ta or not tb or _CLOSING_PUNCTUATION.search(ta[-1]) or _token(ta[-1]) not in _OPEN_ENDED:
+            continue
+        try:
+            a_start, a_end = _number(a.get("start")), _number(a.get("end"))
+            b_start, b_end = _number(b.get("start")), _number(b.get("end"))
+        except ValueError:
+            continue
+        # Simultaneous voices or a nested echo are not one phrase.
+        if b_start < a_start or b_end <= a_end or b_start - a_end > MERGE_MAX_GAP_S:
+            continue
+        merged = ta + tb
+        if len(merged) > config.max_words or len(" ".join(merged)) > config.max_chars:
+            continue
+        out.append({
+            "kind": "merge", "index": i,
+            "segment_id": _row_identity(a), "next_segment_id": _row_identity(b),
+            "text": a["text"], "next_text": b["text"], "merged_text": " ".join(merged),
+            "start": a_start, "end": b_end, "reason": "open_ended_line",
+        })
+    return out
+
+
+def suggestions(segments, *, protected_indices=(), config: Config = Config()) -> list[dict]:
+    """Split/merge proposals for the reviewer, computed on the CURRENT lines.
+
+    Splits are the planner's partitions (same word-clock contract as
+    shadow/enforce) with an extra phrase guard: never cut after a word that
+    cannot close a phrase, nor before a lowercase preposition/article or
+    infinitive that continues it. Merges are conservative phrase-boundary hints: a line
+    ending in an open-ended word, sung within MERGE_MAX_GAP_S of the next line,
+    whose union still fits one card.
+    Every item carries the exact text it was computed on so the client can
+    refuse to apply it to a line that changed since.
+    """
+    if not isinstance(segments, list) or not segments:
+        return []
+    try:
+        proposal = plan(segments, source={"protected_quality_indices": sorted(set(protected_indices))},
+                        config=config, phrase_guard=True)
+    except (ValueError, TypeError, KeyError):
+        return []
+    items = []
+    split_indices = set()
+    for change in proposal["changes"]:
+        row = segments[change["index"]]
+        tokens = row["text"].split()
+        split_indices.add(change["index"])
+        items.append({
+            "kind": "split", "index": change["index"], "segment_id": _row_identity(row),
+            "text": row["text"], "start": row["start"], "end": row["end"],
+            "cuts": [boundary["token"] for boundary in change["boundaries"]],
+            "basis": [boundary["basis"] for boundary in change["boundaries"]],
+            "parts": [{"text": " ".join(tokens[a:b]), "token_range": [a, b]}
+                      for a, b in change["ranges"]],
+        })
+    try:
+        # A line whose timing/evidence the quality checks flagged gets no
+        # structural hint at all, on either side of the pair.
+        items.extend(_merge_suggestions(segments, config, split_indices | set(protected_indices)))
+    except (ValueError, TypeError, KeyError):
+        pass
+    for item in items:
+        # Identity = line + content, not position: an edit above must not turn
+        # a suggestion the reviewer dismissed into a "new" one.
+        item["id"] = digest([SUGGESTION_SCHEMA, item["kind"], item["segment_id"],
+                             item["text"], item.get("next_text"), item.get("cuts")])[:16]
+    return sorted(items, key=lambda item: (item["index"], item["kind"]))
+
+
 def run(segments, *, source, fresh: bool, authorization: dict) -> tuple[list, dict | None, dict | None]:
     """One finalizer stage; application requires an independently signed grant."""
     current_mode = mode()
@@ -279,7 +418,10 @@ def run(segments, *, source, fresh: bool, authorization: dict) -> tuple[list, di
     report = {k: deepcopy(proposal[k]) for k in (
         "schema", "policy_version", "source", "source_hash", "proposal_hash", "config", "review",
     )}
-    report.update(mode=current_mode, status="shadow", before=len(segments),
+    # `suggest` is shadow for the pipeline: the proposal is only surfaced to
+    # the reviewer by the editor API, which recomputes it on current lines.
+    report.update(mode=current_mode, status="suggest" if current_mode == "suggest" else "shadow",
+                  before=len(segments),
                   after=len(segments), proposed_count=len(proposal["changes"]), applied_count=0,
                   authorization_status=authorization.get("status", "missing"),
                   candidates=[{k: deepcopy(c[k]) for k in ("index", "parent_id", "start", "end")}

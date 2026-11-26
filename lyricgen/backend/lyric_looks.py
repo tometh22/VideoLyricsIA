@@ -38,7 +38,7 @@ class Look:
     # EDITORIAL_LAYOUTS delegate to lyric_editorial for the six approved designs.
     layout: str
     # Motion: "zoom_through" | "cine" | "word_pop" | "fade" | "neon" |
-    # "write_on" | "boil".
+    # "write_on" | "boil" | "one_word" | "stack" | "word_window".
     motion: str
     primary: str                    # #RRGGBB text fill
     accent: str = ""                # key-word fill ("" = same as primary)
@@ -232,6 +232,29 @@ LOOKS: dict[str, Look] = {
     ),
     # Shakira "Dai Dai": the background becomes a two-ink poster (blue on
     # cream) and the marker lettering "boils" like hand animation.
+    # Three takes on the "Amigos" references, all in the face the client
+    # approved (Oswald, key word in Knewave green).
+    "una_por_una": Look(
+        id="una_por_una", font_file="Oswald-Bold.ttf",
+        key_font="Knewave-Regular.ttf", bold=True,
+        layout="line", motion="one_word",
+        primary="#FFFFFF", accent="#77ED59", outline=4, shadow=3,
+        key_scale=1.0,
+    ),
+    "escalera": Look(
+        id="escalera", font_file="Oswald-Bold.ttf",
+        key_font="Knewave-Regular.ttf", bold=True,
+        layout="line", motion="stack",
+        primary="#FFFFFF", accent="#77ED59", outline=3, shadow=3,
+        key_scale=1.0,
+    ),
+    "ventana": Look(
+        id="ventana", font_file="Oswald-Bold.ttf",
+        key_font="Knewave-Regular.ttf", bold=True,
+        layout="line", motion="word_window",
+        primary="#FFFFFF", accent="#77ED59", outline=2.5, shadow=3,
+        key_scale=1.05,
+    ),
     "duotono": Look(
         id="duotono", font_file="PermanentMarker-Regular.ttf",
         layout="line", motion="boil",
@@ -639,6 +662,358 @@ class _Measure:
         if f is None:
             f = self._fonts[em] = ImageFont.truetype(self.path, em)
         return float(f.getlength(text))
+
+
+# --- Word-synced motions (one_word, stack, word_window) -----------------------
+# Built for the Los Enanitos Verdes "Amigos" brief from five reference lyric
+# videos: one huge word at a time (Airtist "Tas Bien"), each word typed letter
+# by letter down a staircase that then bursts apart (Alex Zurdo "Tengo
+# Victoria") and a two-word window that slides along the line (Omar Courtz,
+# "Para Siempre Contigo"). All three keep every word inside its line's
+# approved window.
+
+WORD_MOTIONS = ("one_word", "stack", "word_window")
+
+_ASC_CACHE: dict[str, float] = {}
+
+
+def _asc_ratio(path: str) -> float:
+    """Ascender share of the libass line box (usWinAscent / span)."""
+    v = _ASC_CACHE.get(path)
+    if v is None:
+        import struct
+        v = 0.8
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            num = struct.unpack(">H", data[4:6])[0]
+            tables = {}
+            for i in range(num):
+                tag, _cs, off, ln = struct.unpack(">4sIII", data[12 + 16 * i:28 + 16 * i])
+                tables[tag] = (off, ln)
+            if b"OS/2" in tables:
+                off = tables[b"OS/2"][0]
+                asc, desc = struct.unpack(">HH", data[off + 74:off + 78])
+            else:
+                off = tables[b"hhea"][0]
+                asc, neg = struct.unpack(">hh", data[off + 4:off + 8])
+                desc = -neg
+            if asc + desc > 0:
+                v = asc / float(asc + desc)
+        except Exception:
+            pass
+        _ASC_CACHE[path] = v
+    return v
+
+
+def _cap_center(path: str, fs: float, y: float) -> int:
+    """\\an5 y that puts the CAPITALS' centre at `y`. Faces centre their line
+    box differently (Knewave sits high, Oswald low); without this a stack of
+    mixed faces looks unevenly spaced."""
+    asc = _asc_ratio(path) * fs
+    desc = fs - asc
+    cap = cap_per_fs(path) * fs
+    return int(round(y + (cap + desc - asc) / 2.0))
+
+
+def _word_onsets(timings: list[dict], start: float, end: float) -> list[float]:
+    """Perceptual onset of each word (30 ms early), monotonic, in the line."""
+    out: list[float] = []
+    for t in timings:
+        on = max(start, min(end, float(t["start"]) - 0.03))
+        out.append(max(on, out[-1]) if out else on)
+    return out
+
+
+def _face(look: Look, is_key: bool, fs: int, key_fs: int, family: str,
+          key_family: str, key_bold: bool) -> str:
+    if is_key:
+        return (f"\\fn{key_family}\\b{int(key_bold)}\\fs{key_fs}"
+                f"\\1c{_c(look.accent or look.primary)}")
+    return f"\\fn{family}\\b{int(look.bold)}\\fs{fs}\\1c{_c(look.primary)}"
+
+
+def _one_word_events(look: Look, tokens: list[str], timings: list[dict],
+                     start: float, end: float, base_fs: int, width: int,
+                     height: int, sc: float, measure: _Measure, key_m: _Measure,
+                     family: str, key_family: str, key_bold: bool) -> list[str]:
+    """Only the word being sung, huge and centred; hard cut to the next one
+    with a short punch-in. Words sung too fast to read alone (< 0.18 s) ride
+    with the next one."""
+    key = pick_keyword(tokens)
+    onsets = _word_onsets(timings, start, end)
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    for i in range(len(tokens)):
+        cur.append(i)
+        nxt = onsets[i + 1] if i + 1 < len(tokens) else end
+        if nxt - onsets[cur[0]] >= 0.18 or len(cur) >= 3:
+            groups.append(cur)
+            cur = []
+    if cur:
+        if groups and end - onsets[cur[0]] < 0.18:
+            groups[-1].extend(cur)
+        else:
+            groups.append(cur)
+
+    # Sized by cap height (a share of the frame), not by the line's length:
+    # one word on screen can afford to be poster-sized.
+    user = base_fs / max(1.0, _ass.lyric_fontsize(len(" ".join(tokens)), sc))
+    big = min(width, height) * 0.19 / cap_per_fs(measure.path) * user
+    cx, cy = width // 2, height // 2
+    events: list[str] = []
+    for g_i, g in enumerate(groups):
+        g_start = onsets[g[0]]
+        g_end = onsets[groups[g_i + 1][0]] if g_i + 1 < len(groups) else end
+        if g_end - g_start < 0.02:
+            continue
+        has_key = key in g
+        fs = big
+        key_fs = big * look.key_scale
+
+        def group_width(f: float, kf: float) -> float:
+            return (sum(key_m.width(tokens[i], int(kf)) if i == key
+                        else measure.width(tokens[i], int(f)) for i in g)
+                    + measure.width(" ", int(f)) * (len(g) - 1))
+
+        fit = min(1.0, width * 0.84 / max(1.0, group_width(fs, key_fs)))
+        fs, key_fs = max(18, int(fs * fit)), max(18, int(key_fs * fit))
+        body = "".join(
+            ("{" + _face(look, i == key, fs, key_fs, family, key_family, key_bold) + "}"
+             + ("" if j == 0 else " ") + _ass._ass_escape(tokens[i]))
+            for j, i in enumerate(g))
+        path = key_m.path if (has_key and len(g) == 1) else measure.path
+        y = _cap_center(path, key_fs if (has_key and len(g) == 1) else fs, cy)
+        dur = max(1, int(round((g_end - g_start) * 1000)))
+        blur = _ass._fmt_num(7 * sc)
+        tags = (f"\\an5\\pos({cx},{y})\\q2\\fscx118\\fscy118\\blur{blur}"
+                "\\t(0,110,0.5,\\fscx100\\fscy100\\blur0)")
+        if g_i == len(groups) - 1:
+            ex = min(140, dur // 4)
+            tags += f"\\t({dur - ex},{dur},\\alpha&HFF&)"
+        events.append(_dialogue(2, g_start, g_end, "{" + tags + "}" + body))
+    return events
+
+
+def _jitter(i: int, salt: int) -> float:
+    """Deterministic pseudo-random value in [-1, 1] (re-renders match)."""
+    return ((i * 2654435761 + salt * 40503) % 2001) / 1000.0 - 1.0
+
+
+def _stair_rows(tokens: list[str], key: int | None) -> list[list[int]]:
+    """One word per row; a short connector (≤ 3 letters) rides with the next
+    word. More than four rows → two words per row."""
+    rows: list[list[int]] = []
+    cur: list[int] = []
+    for i, tok in enumerate(tokens):
+        cur.append(i)
+        short = len(tok) <= 3 and i != key and i + 1 < len(tokens)
+        if not short or len(cur) >= 3:
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    while len(rows) > 4:
+        merged, j = [], 0
+        while j < len(rows):
+            if (j + 1 < len(rows) and key not in rows[j] and key not in rows[j + 1]
+                    and len(merged) + (len(rows) - j) > 4):
+                merged.append(rows[j] + rows[j + 1])
+                j += 2
+            else:
+                merged.append(rows[j])
+                j += 1
+        if len(merged) == len(rows):
+            break
+        rows = merged
+    return rows
+
+
+def _stack_events(look: Look, n: int, tokens: list[str], timings: list[dict],
+                  start: float, end: float, base_fs: int, width: int,
+                  height: int, sc: float, measure: _Measure, key_m: _Measure,
+                  family: str, key_family: str, key_bold: bool) -> list[str]:
+    """Escalera: one word per row, the rows stepping down diagonally. Each
+    word is TYPED letter by letter while it is sung (every letter drops in
+    with a small pop); at the end of the line the letters burst apart and
+    scatter, left to right. The key word is set in the brush face."""
+    key = pick_keyword(tokens)
+    onsets = _word_onsets(timings, start, end)
+    rows = _stair_rows(tokens, key)
+    user = base_fs / max(1.0, _ass.lyric_fontsize(len(" ".join(tokens)), sc))
+    short = min(width, height)
+
+    def face_of(r):
+        return (key_m, look.key_scale * 1.15) if key in r else (measure, 1.0)
+
+    def layout(unit: float):
+        out = []
+        for r in rows:
+            m, k = face_of(r)
+            fs = unit * k
+            text = " ".join(tokens[i] for i in r)
+            out.append((m, fs, m.width(text, int(fs)), cap_per_fs(m.path) * fs))
+        return out
+
+    unit = short * 0.15 / cap_per_fs(measure.path)
+    step_k = 0.07
+    gap_k = 0.30
+    for _ in range(2):
+        lay = layout(unit)
+        step = width * step_k
+        span_w = max(w + step * j for j, (_m, _f, w, _c) in enumerate(lay))
+        total = sum(c for *_x, c in lay) + gap_k * unit * cap_per_fs(measure.path) * (len(lay) - 1)
+        fit = min(1.0, width * 0.80 / span_w, short * 0.66 / total)
+        unit *= fit
+    unit *= user
+    lay = layout(unit)
+    step = width * step_k * (1 if n % 2 == 0 else -1)
+    gap = gap_k * unit * cap_per_fs(measure.path)
+    total = sum(c for *_x, c in lay) + gap * (len(lay) - 1)
+    lefts = [step * j - w / 2.0 for j, (_m, _f, w, _c) in enumerate(lay)]
+    rights = [step * j + w / 2.0 for j, (_m, _f, w, _c) in enumerate(lay)]
+    shift = width / 2.0 - (min(lefts) + max(rights)) / 2.0
+
+    dur_line = end - start
+    ex_ms = min(420, max(120, int(dur_line * 1000 * 0.22)))
+    exit_at = end - ex_ms / 1000.0
+    rise = 0.35
+    blur = _ass._fmt_num(10 * sc)
+    events: list[str] = []
+    y = height / 2.0 - total / 2.0
+    letters_total = sum(len(tokens[i]) for i in range(len(tokens)))
+    g = 0
+    for j, (r, (m, fs, w, cap)) in enumerate(zip(rows, lay)):
+        mid = y + cap / 2.0
+        y += cap + gap
+        is_key = key in r
+        fs_i = int(round(fs))
+        py = _cap_center(m.path, fs_i, mid)
+        face = _face(look, is_key, fs_i, fs_i, family, key_family, key_bold)
+        left = shift + lefts[j]
+        text = " ".join(tokens[i] for i in r)
+        offset = 0
+        for i in r:
+            word = tokens[i]
+            ws = onsets[i]
+            we = max(ws + 0.12, min(end, float(timings[i]["end"])))
+            span = min(0.5, max(0.12, (we - ws) * 0.85))
+            for k, ch in enumerate(word):
+                pre = m.width(text[:offset + k], fs_i)
+                cw = m.width(ch, fs_i)
+                x = int(round(left + pre + cw / 2.0))
+                t0 = ws + span * k / max(1, len(word))
+                if t0 >= exit_at - 0.03:
+                    t0 = max(start, exit_at - 0.03)
+                drop = int(round(cap * rise))
+                enter = (f"\\an5\\move({x},{py - drop},{x},{py},0,110){face}"
+                         f"\\fscx55\\fscy55\\alpha&HFF&"
+                         f"\\t(0,110,0.6,\\fscx100\\fscy100\\alpha&H00&)")
+                char = _ass._ass_escape(ch)
+                # Staggered left → right so the burst reads as a sweep.
+                order = g / max(1, letters_total - 1)
+                # Centisecond grid (the ASS clock) so the flight never
+                # outlasts its event on very short lines.
+                t0 = round(t0, 2)
+                burst = round(min(end, max(t0 + 0.02, exit_at + order * ex_ms / 1000.0 * 0.45)), 2)
+                events.append(_dialogue(2, t0, burst, "{" + enter + "}" + char))
+                bx = x + int(round(_jitter(g, 1) * width * 0.10))
+                by = py + int(round(-abs(_jitter(g, 2)) * height * 0.16
+                                    + _jitter(g, 5) * height * 0.04))
+                spin = _ass._fmt_num(round(_jitter(g, 3) * 70, 1))
+                fly = max(1, int(round((round(end, 2) - burst) * 1000)))
+                out = (f"\\an5\\move({x},{py},{bx},{by},0,{fly}){face}"
+                       f"\\t(0,{fly},0.7,\\frz{spin}\\fscx40\\fscy40"
+                       f"\\blur{blur}\\alpha&HFF&)")
+                events.append(_dialogue(2, burst, end, "{" + out + "}" + char))
+                g += 1
+            offset += len(word) + 1
+    return events
+
+
+def _word_window_events(look: Look, tokens: list[str], timings: list[dict],
+                        start: float, end: float, base_fs: int, width: int,
+                        height: int, sc: float, measure: _Measure, key_m: _Measure,
+                        family: str, key_family: str, key_bold: bool,
+                        size: int = 2) -> list[str]:
+    """A window of the last `size` sung words. The new word blurs in, the
+    group re-centres, the older word dims and drops out as the next arrives."""
+    key = pick_keyword(tokens)
+    onsets = _word_onsets(timings, start, end)
+    count = len(tokens)
+    user = base_fs / max(1.0, _ass.lyric_fontsize(len(" ".join(tokens)), sc))
+    fs = min(width, height) * 0.075 / cap_per_fs(measure.path) * user
+    key_fs = fs * look.key_scale
+
+    def w_of(i: int, f: float, kf: float) -> float:
+        return key_m.width(tokens[i], int(kf)) if i == key else measure.width(tokens[i], int(f))
+
+    def window(s: int) -> list[int]:
+        return list(range(max(0, s - size + 1), s + 1))
+
+    widest = max(sum(w_of(i, fs, key_fs) for i in window(s))
+                 + measure.width(" ", int(fs)) * (len(window(s)) - 1)
+                 for s in range(count))
+    fit = min(1.0, width * 0.86 / max(1.0, widest))
+    fs, key_fs = max(18, int(fs * fit)), max(18, int(key_fs * fit))
+    space = measure.width(" ", fs)
+    cy = height / 2.0
+
+    def centres(s: int) -> dict[int, int]:
+        ids = window(s)
+        ws = [w_of(i, fs, key_fs) for i in ids]
+        x = width / 2.0 - (sum(ws) + space * (len(ids) - 1)) / 2.0
+        out = {}
+        for i, w in zip(ids, ws):
+            out[i] = int(round(x + w / 2.0))
+            x += w + space
+        return out
+
+    ys = {i: _cap_center(key_m.path if i == key else measure.path,
+                         key_fs if i == key else fs, cy) for i in range(count)}
+    pos = [centres(s) for s in range(count)]
+    state_end = [onsets[s + 1] if s + 1 < count else end for s in range(count)]
+    blur = _ass._fmt_num(10 * sc)
+    rise = int(round(14 * sc))
+    dim = "\\1c&H9A9A9A&" 
+    ex_line = 150
+    events: list[str] = []
+    for i in range(count):
+        face = _face(look, i == key, fs, key_fs, family, key_family, key_bold)
+        word = _ass._ass_escape(tokens[i])
+        y = ys[i]
+        for s in range(i, min(count, i + size)):
+            s_start, s_end = onsets[s], state_end[s]
+            dur = max(1, int(round((s_end - s_start) * 1000)))
+            x = pos[s][i]
+            if s == i:
+                # Enter in lockstep with the group's re-centring slide so the
+                # new word never overlaps the one before it.
+                shift = (pos[s - 1][i - 1] - pos[s][i - 1]) if i > 0 else 0
+                tags = (f"\\an5\\move({x + shift},{y + rise},{x},{y},0,200){face}"
+                        f"\\alpha&HFF&\\blur{blur}\\t(0,220,0.6,\\alpha&H00&\\blur0)")
+            else:
+                px = pos[s - 1][i]
+                tags = f"\\an5\\move({px},{y},{x},{y},0,200){face}"
+                if s == i + size - 1 and s + 1 < count and dur > 380:
+                    g = int(dur * 0.45)
+                    tags += (f"\\t({g},{g + 240},"
+                             + ("" if i == key else dim) + "\\alpha&H60&)")
+            if s == count - 1:
+                tags += f"\\t({dur - ex_line},{dur},\\alpha&HFF&)"
+            events.append(_dialogue(2, s_start, s_end, "{" + tags + "}" + word))
+        leave = i + size
+        if leave < count:
+            l_start = onsets[leave]
+            l_end = min(state_end[leave], l_start + 0.22)
+            x = pos[leave - 1][i]
+            slide = pos[leave][i + 1] - pos[leave - 1][i + 1]
+            drift = int(round(24 * sc))
+            tags = (f"\\an5\\move({x},{y},{x + slide - drift},{y},0,200){face}"
+                    + ("" if i == key else dim) + "\\alpha&H60&"
+                    f"\\t(0,200,\\alpha&HFF&\\blur{blur})")
+            events.append(_dialogue(2, l_start, l_end, "{" + tags + "}" + word))
+    return events
 
 
 def _deco_start(wanted: float, line_start: float, line_end: float,
@@ -1814,7 +2189,9 @@ def build_look_ass(
         case_fn = str.lower
     sc = min(width, height) / 1080.0
     path = font_path(look)
-    family, _bold = _ass.font_family(path)
+    family, font_bold = _ass.font_family(path)
+    if look.motion in WORD_MOTIONS:
+        look = dataclasses.replace(look, bold=font_bold)
     measure = _Measure(path)
     # The operator's size slider keeps its 0.6-1.5 clamp; the look's own
     # scale multiplies on top so display faces (script, neon) can go big.
@@ -1859,10 +2236,11 @@ def build_look_ass(
             second = _Measure(font_paths(look)[1])
             second_family = _ass.font_family(font_paths(look)[1])[0]
 
-    key_m, key_family = None, ""
+    key_m, key_family, key_bold = None, "", font_bold
     if look.key_font:
         _kp = os.path.join(_FONTS_DIR, look.key_font)
-        key_m, key_family = _Measure(_kp), _ass.font_family(_kp)[0]
+        key_m = _Measure(_kp)
+        key_family, key_bold = _ass.font_family(_kp)
 
     light, light_family = None, ""
     if look.layout == "block":
@@ -1895,13 +2273,31 @@ def build_look_ass(
         base_fs = fs_for(len(display))
         if look.layout == "kinetic":
             timings = _ass._word_timings(display, start, end, seg.get("words"))
+            if not timings:
+                continue
             events.extend(_kinetic_events(look, n, tokens, timings, start, end,
                                           base_fs, width, height, sc, measure,
                                           second or measure, second_family,
                                           beats or [], key_m, key_family))
             continue
+        if look.motion in WORD_MOTIONS:
+            timings = _ass._word_timings(display, start, end, seg.get("words"))
+            if not timings:
+                continue
+            args = (look, tokens, timings, start, end, base_fs, width, height,
+                    sc, measure, key_m or measure, family, key_family or family,
+                    key_bold)
+            if look.motion == "one_word":
+                events.extend(_one_word_events(*args))
+            elif look.motion == "stack":
+                events.extend(_stack_events(look, n, *args[1:]))
+            else:
+                events.extend(_word_window_events(*args))
+            continue
         if look.layout in ("build", "block", "arc"):
             timings = _ass._word_timings(display, start, end, seg.get("words"))
+            if not timings:
+                continue
             if look.layout == "build":
                 events.extend(_build_events(look, n, tokens, timings, start, end,
                                             base_fs, width, height, measure))

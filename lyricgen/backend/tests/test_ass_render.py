@@ -541,6 +541,38 @@ def test_word_timings_rejects_stale_words_and_synthesizes():
     assert [x["word"] for x in w] == ["nuevo", "contenido"]
 
 
+def test_word_timings_keeps_the_line_when_only_some_words_hit_the_window():
+    # Forced-align on a non-speech tone (the golden-render sine) attached a
+    # first word inside the line and the rest seconds later. Dropping the
+    # whole line hid the karaoke lyric at t=11s. A clock that misses the
+    # window entirely still returns [] — that case is the moved-line guard.
+    raw = [
+        {"word": "Añoranza,", "start": 12.78, "end": 13.2},
+        {"word": "corazón", "start": 17.6, "end": 17.96},
+        {"word": "y", "start": 17.96, "end": 18.1},
+        {"word": "café", "start": 17.96, "end": 20.66},
+    ]
+    w = _word_timings("Añoranza, corazón y café", 9.5, 14.0, raw)
+    assert [x["word"] for x in w] == ["Añoranza,", "corazón", "y", "café"]
+    assert w[0]["start"] == pytest.approx(9.5)
+    assert w[-1]["end"] == pytest.approx(14.0)
+
+    # The first words can be the ones outside; later hits still count.
+    early = [
+        {"word": "La", "start": 3.36, "end": 3.5},
+        {"word": "tipografía", "start": 8.12, "end": 8.78},
+    ]
+    w = _word_timings("La tipografía", 4.5, 9.0, early)
+    assert w[0]["start"] == pytest.approx(4.5)
+    assert w[-1]["end"] == pytest.approx(9.0)
+
+    foreign = [
+        {"word": "hola", "start": 5.0, "end": 6.0},
+        {"word": "mundo", "start": 6.0, "end": 7.0},
+    ]
+    assert _word_timings("hola mundo", 0.0, 1.0, foreign) == []
+
+
 def test_build_ass_pop_emits_scale_overshoot():
     ln = AssLine(text="hola", start_s=1.0, end_s=3.0, fontsize=85,
                  animation="pop")

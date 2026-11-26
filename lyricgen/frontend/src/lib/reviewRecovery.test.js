@@ -102,3 +102,16 @@ describe("review recovery concurrency", () => {
     });
   });
 });
+
+it('does not replay a stale empty snapshot against unseen remote additions without its base', () => {
+  const remote=[{segment_id:'new',start:1,end:2,text:'New remote line'}];
+  expect(resolveLegacyDraft({draft:{segments:[],base_revision:4},currentSegments:remote,currentRevision:5}))
+    .toEqual({action:'none',segments:null});
+});
+
+it('rebases a deletion against its known base while preserving new remote lines', () => {
+  const original=[{segment_id:'old',start:1,end:2,text:'Old'}];
+  const added={segment_id:'new',start:3,end:4,text:'New remote line'};
+  expect(resolveLegacyDraft({draft:{segments:[],base_segments:original,base_revision:4},currentSegments:[...original,added],currentRevision:5}).segments)
+    .toEqual([expect.objectContaining(added)]);
+});

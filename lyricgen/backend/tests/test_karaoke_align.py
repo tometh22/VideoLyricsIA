@@ -218,3 +218,125 @@ def test_fa_span_trustworthy_guards():
     # no scores present → coherence alone gates (trusted)
     assert karaoke_align._fa_span_trustworthy(
         [{"word": "x", "start": 1.0, "end": 2.0}]) is True
+
+
+def test_wordless_lines_after_many_timed_lines_still_get_words(monkeypatch):
+    # "Acaba De Nacer" (GIT, 25-nov): the first 23 lines kept their words and
+    # every edited line after 2:22 had none. Lines that already carry words
+    # were skipped WITHOUT advancing the cursor, so the 6-line search window
+    # never reached the later lines and the look spread their words over the
+    # whole window (up to 1.3 s late on held notes).
+    timed = [{"start": float(i * 2), "end": float(i * 2 + 1.5), "text": f"linea {i}",
+              "words": [{"word": "linea", "start": i * 2.0, "end": i * 2.0 + 0.5},
+                        {"word": str(i), "start": i * 2.0 + 0.6, "end": i * 2.0 + 1.0}]}
+             for i in range(8)]
+    wordless = [{"start": 16.0, "end": 20.0, "text": "hoy quiero ver la luz"},
+                {"start": 20.5, "end": 24.0, "text": "una nueva vida"}]
+    fa = [{"start": s["start"], "end": s["end"], "text": s["text"], "words": s["words"]} for s in timed]
+    fa += [
+        {"start": 16.1, "end": 18.4, "text": "hoy quiero ver la luz",
+         "words": [{"word": w, "start": 16.1 + k * 0.4, "end": 16.4 + k * 0.4, "score": 0.9}
+                   for k, w in enumerate("hoy quiero ver la luz".split())]},
+        {"start": 20.6, "end": 22.0, "text": "una nueva vida",
+         "words": [{"word": w, "start": 20.6 + k * 0.4, "end": 20.9 + k * 0.4, "score": 0.9}
+                   for k, w in enumerate("una nueva vida".split())]},
+    ]
+    monkeypatch.setattr("forced_align.is_enabled", lambda: True)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda a, t: fa)
+    out = karaoke_align.enrich_segments_with_word_timings(timed + wordless, "/tmp/a.mp3")
+    assert [w["word"] for w in out[8]["words"]] == "hoy quiero ver la luz".split()
+    assert [w["word"] for w in out[9]["words"]] == "una nueva vida".split()
+    # Lines that already had words keep them untouched, operator timing kept.
+    assert out[3]["words"] == timed[3]["words"]
+    assert out[8]["start"] == 16.0 and out[8]["end"] == 20.0
+
+
+def _orig():
+    # Original transcription ("Acaba De Nacer", GIT): aligned words.
+    return [
+        {"start": 158.26, "end": 159.06, "text": "No quiero ver",
+         "words": [{"word": "No", "start": 158.34, "end": 158.4},
+                   {"word": "quiero", "start": 158.42, "end": 158.72},
+                   {"word": "ver", "start": 158.76, "end": 159.0}]},
+        {"start": 159.07, "end": 162.45, "text": "En tus ojos reflejar la luz",
+         "words": [{"word": "en", "start": 159.02, "end": 159.06},
+                   {"word": "tus", "start": 159.1, "end": 159.34},
+                   {"word": "ojos", "start": 159.4, "end": 159.84},
+                   {"word": "reflejar", "start": 159.88, "end": 160.46},
+                   {"word": "la", "start": 160.48, "end": 160.66},
+                   {"word": "luz", "start": 160.68, "end": 161.95}]},
+    ]
+
+
+def test_recovers_edited_line_words_from_the_original_transcription():
+    # The operator merged two lines and changed "No" -> "hoy": the line lost
+    # its words. Matched words keep their real time; "hoy" is interpolated.
+    segs = [{"start": 158.25, "end": 162.28, "text": "hoy quiero ver en tus ojos reflejar la luz"}]
+    out = karaoke_align.recover_words_from_reference(segs, _orig())
+    words = out[0]["words"]
+    assert [w["word"] for w in words] == segs[0]["text"].split()
+    assert words[-1]["start"] == 160.68            # "luz" when it is sung
+    assert words[0]["start"] == 158.25             # "hoy" fills the gap before "quiero"
+    assert all(158.25 <= w["start"] < w["end"] <= 162.28 for w in words)
+    assert all(a["end"] <= b["start"] for a, b in zip(words, words[1:]))
+    assert out[0]["start"] == 158.25 and out[0]["end"] == 162.28
+
+
+def test_recovery_leaves_timed_and_unmatched_lines_alone():
+    timed = {"start": 1.0, "end": 2.0, "text": "hola", "words": [{"word": "hola", "start": 1.0, "end": 1.5}]}
+    other = {"start": 158.25, "end": 162.28, "text": "algo completamente distinto acá"}
+    segs = [timed, other]
+    assert karaoke_align.recover_words_from_reference(segs, _orig()) is segs
+    assert karaoke_align.recover_words_from_reference(segs, []) is segs
+    assert karaoke_align.recover_words_from_reference(segs, None) is segs
+
+
+def test_recovered_words_drive_the_word_timed_look():
+    import lyric_looks as L
+
+    segs = [{"start": 158.25, "end": 162.28, "text": "hoy quiero ver en tus ojos reflejar la luz"}]
+    doc_synth = L.build_look_ass(segs, L.LOOKS["pincel"], width=1920, height=1080, duration=170)
+    doc_real = L.build_look_ass(karaoke_align.recover_words_from_reference(segs, _orig()),
+                                L.LOOKS["pincel"], width=1920, height=1080, duration=170)
+
+    def luz_start(doc):
+        line = [d for d in doc.splitlines() if d.startswith("Dialogue:") and d.endswith("}LUZ")][0]
+        h, m, s = line.split(",")[1].split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    assert luz_start(doc_real) < 160.8            # sung at 160.68
+    assert luz_start(doc_synth) > 161.5           # the even split showed it >1 s late
+
+
+def test_pipeline_takes_words_from_the_editor_original(monkeypatch):
+    import database
+    import pipeline
+
+    class _Doc:
+        original_segments = _orig()
+
+    class _Query:
+        def filter(self, *_a):
+            return self
+
+        def first(self):
+            return _Doc()
+
+    class _Session:
+        def query(self, *_a):
+            return _Query()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(database, "SessionLocal", lambda: _Session())
+    segs = [{"start": 158.25, "end": 162.28, "text": "hoy quiero ver en tus ojos reflejar la luz"}]
+    out = pipeline._recover_words_from_editor_original("3087ebfab4b0", segs)
+    assert out[0]["words"][-1]["start"] == 160.68
+
+    def _boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(database, "SessionLocal", _boom)
+    assert pipeline._recover_words_from_editor_original("3087ebfab4b0", segs) is segs
+    assert pipeline._recover_words_from_editor_original("", segs) is segs

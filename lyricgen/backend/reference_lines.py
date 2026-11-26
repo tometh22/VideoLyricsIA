@@ -32,6 +32,9 @@ Puro: sin I/O, sin red. Nunca levanta.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections import defaultdict
+from itertools import accumulate
 import logging
 import math
 import re
@@ -64,6 +67,40 @@ def line_key(text: str) -> str:
     Conserva los acentos (en portugués "e"/"é" son palabras distintas)."""
     folded = unicodedata.normalize("NFC", str(text or "")).casefold()
     return " ".join(re.findall(r"[^\W_]+", folded, re.UNICODE))
+
+
+def crossed_reference_boundaries(segments: list[dict], reference_text: str) -> list[int]:
+    """Locate cards crossing a unique pair of consecutive official lines.
+
+    Local exact matches permit a partial reference. Repeated or ambiguous pairs
+    are ignored. This is evidence for review and supplies no inferred timing.
+    """
+    def words(text: str) -> list[str]:
+        decomposed = unicodedata.normalize("NFD", text)
+        return line_key(decomposed.replace("\u0301", "")).split()
+
+    reference = [words(line) for line in split_reference_lines(reference_text)]
+    cards = [words(str(segment.get("text") or "")) for segment in segments]
+    ref_tokens = [token for line in reference for token in line]
+    card_tokens = [token for card in cards for token in card]
+    ref_starts, card_starts = defaultdict(list), defaultdict(list)
+    for i, token in enumerate(ref_tokens):
+        ref_starts[token].append(i)
+    for i, token in enumerate(card_tokens):
+        card_starts[token].append(i)
+    card_ends = list(accumulate(map(len, cards)))
+    boundaries = set(card_ends)
+    found = set()
+    for left, right in zip(reference, reference[1:]):
+        if len(left) < 3 or len(right) < 3:
+            continue
+        pair = left + right
+        if sum(ref_tokens[i:i+len(pair)] == pair for i in ref_starts[pair[0]]) != 1:
+            continue
+        hits = [i for i in card_starts[pair[0]] if card_tokens[i:i+len(pair)] == pair]
+        if len(hits) == 1 and (boundary := hits[0] + len(left)) not in boundaries:
+            found.add(bisect_right(card_ends, boundary))
+    return sorted(found)
 
 
 def _num(value):

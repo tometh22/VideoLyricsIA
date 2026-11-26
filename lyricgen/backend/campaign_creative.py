@@ -17,12 +17,12 @@ import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, File, Form, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, File, Form, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 import delivery_freshness
 from auth import get_current_user, has_scenes_access
@@ -209,6 +209,19 @@ class UndoRequest(Strict):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class SongPrompt(Strict):
+    item_id: str = Field(min_length=1, max_length=100)
+    scene: str = Field(default="", max_length=4000)
+
+
+class PromptRequest(Strict):
+    revision: int = Field(ge=0)
+    common: str = Field(default="", max_length=3000)
+    songs: list[SongPrompt] = Field(min_length=1, max_length=512)
+    source: Literal["prompt_improved", "prompt_literal"] = "prompt_improved"
+    replace_exceptions: bool = False
+
+
 def apportion(groups, count, mode):
     weights = [g.weight for g in groups]
     if mode == "count":
@@ -299,7 +312,9 @@ def validate_combination(db, campaign, settings, group, user):
 @router.get("/{campaign_id}/creative")
 def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     campaign = _campaign(db, campaign_id, current_user)
-    jobs = {j.campaign_item_id: j for j in db.query(Job).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
+    jobs = {j.campaign_item_id: j for j in db.query(
+        Job.campaign_item_id, Job.job_id, Job.status,
+    ).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
     plan = _plan(campaign)
     plan = {**plan, "groups": [
         {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
@@ -307,7 +322,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
     ]}
     from campaign_mix import catalog as mix_catalog
     return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
-            "mix_catalog": mix_catalog(), "portal_id": campaign.destination_portal,
+            "mix_catalog": mix_catalog(), "features": {"bulk_prompts": True}, "portal_id": campaign.destination_portal,
             "delivery_plan_period": (campaign.default_render_params or {}).get("delivery_plan_period", ""),
             "can_view_account_balance": current_user.get("role") == "admin",
             "requires_background_assignment": bool(campaign.destination_portal or (campaign.default_render_params or {}).get("delivery_plan_target")),
@@ -384,6 +399,41 @@ def preview(campaign_id: str, body: PlanRequest, current_user=Depends(get_curren
             "changes": [{**{k: c[k] for k in ("item_id", "artist", "title", "group")},
                          "before": effective_settings(campaign, c["before"]),
                          "after": effective_settings(campaign, c["after"])} for c in changes]}
+
+
+@router.post("/{campaign_id}/creative/prompts-preview")
+def preview_prompts(campaign_id: str, body: PromptRequest, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Assign explicit prompts to their songs through the existing frozen ledger.
+
+    One count=1 group per editable song, in the same seeded order used by
+    preview(). Keeping this mapping server-side avoids swapping scenes when
+    the UI selection order changes. Apply/undo retain the normal guards.
+    """
+    campaign = _campaign(db, campaign_id, current_user, True)
+    by_id = {song.item_id: song for song in body.songs}
+    if len(by_id) != len(body.songs):
+        fail("La selección contiene canciones repetidas")
+    selected = [item for item in _items(db, campaign) if item.id in by_id]
+    if len(selected) != len(by_id):
+        fail("Selección ajena a la campaña", 404)
+    available = [item for item in selected if body.replace_exceptions or not (item.render_overrides or {}).get(ASSIGNMENT, {}).get("pinned")]
+    if not available:
+        fail("Todos los diseños están fijados. Activá su reemplazo si querés cambiar los prompts.")
+    seed = "song-prompts-v1"
+    groups = []
+    for item in sorted(available, key=lambda item: digest([seed, item.id])):
+        prompt = "\n\n".join(part.strip() for part in (body.common, by_id[item.id].scene) if part.strip())
+        if not prompt or len(prompt) > 4000:
+            fail(f"{item.title or item.filename}: el prompt debe tener entre 1 y 4000 caracteres")
+        groups.append(Group(id="prompt-" + digest(item.id)[:20], name=("Prompt · " + (item.title or item.filename))[:100],
+            weight=1, requirement="creative", settings={"scene_source": body.source, "background_hint": prompt,
+                "background_id": None, "background_mode": "as_is"}))
+    result = preview(campaign_id, PlanRequest(revision=body.revision, item_ids=list(by_id), groups=groups,
+        mode="count", seed=seed, replace_exceptions=body.replace_exceptions, preserve_existing_pins=True,
+        reason="Edición de prompts de fondo en lote"), current_user, db)
+    positions = {item.id: (item.ordinal, item.id) for item in selected}
+    result["changes"].sort(key=lambda change: positions[change["item_id"]])
+    return result
 
 
 @router.post("/{campaign_id}/creative/apply")
@@ -527,48 +577,65 @@ class IndividualRequest(Strict):
 @router.post("/{campaign_id}/creative/items/{item_id}")
 def save_individual(campaign_id: str, item_id: str, body: IndividualRequest,
                     current_user=Depends(get_current_user), db: Session = Depends(get_db)):
-    campaign = _campaign(db, campaign_id, current_user)
-    campaign = db.query(BatchCampaign).filter_by(id=campaign.id).populate_existing().with_for_update().one()
-    item = db.query(BatchCampaignItem).filter_by(id=item_id, campaign_id=campaign.id).first()
-    job = db.query(Job).filter_by(campaign_item_id=item_id, campaign_id=campaign.id).with_for_update().first()
-    if not item or not job:
-        fail("Canción no encontrada", 404)
-    if job.status not in {"transcribed_pending", "transcribed", "lyrics_approved"}:
-        fail("La canción ya avanzó a generación", 409)
-    doc = db.query(EditorDocument).filter_by(job_id=job.job_id).first()
-    if doc and doc.lock_expires_at and _aware(doc.lock_expires_at) > datetime.now(timezone.utc) and doc.lock_user_id != current_user["id"]:
-        fail("Otra persona está revisando esta canción", 409)
-    before = copy.deepcopy(item.render_overrides or {})
-    assignment = before.get(ASSIGNMENT) or {}
-    if assignment.get("revision", 0) != body.revision:
-        fail("La configuración individual cambió; reabrí el editor", 409)
-    patch = normalize_settings(body.settings)
-    effective = effective_settings(campaign, {**before, **patch})
-    group = Group(id=assignment.get("group_id", "individual"), name=assignment.get("group_name", "Individual"),
-                  weight=100, requirement=assignment.get("requirement", "creative"), model=assignment.get("model", ""))
-    validate_combination(db, campaign, effective, group, current_user)
-    # Idempotent autosave/approval retry; an unchanged choice isn't an exception.
-    if all(effective.get(k) == effective_settings(campaign, before).get(k) for k in patch):
-        return {"revision": body.revision, "unchanged": True}
-    plan = _plan(campaign)
-    plan["revision"] += 1
-    assignment = {**assignment, "group_id": group.id, "group_name": group.name,
-                  "requirement": group.requirement, "model": group.model, "revision": plan["revision"], "pinned": True}
-    item.render_overrides = {**before, **patch, ASSIGNMENT: assignment}
-    campaign.default_render_params = {**(campaign.default_render_params or {}), KEY: plan}
-    _log(db, campaign, "individual", current_user["id"], {"item_id": item.id, "before": before,
-          "after": item.render_overrides, "revision": plan["revision"]})
-    db.commit()
-    return {"revision": plan["revision"]}
+    try:
+        campaign = _campaign(db, campaign_id, current_user)
+        campaign = db.query(BatchCampaign).filter_by(id=campaign.id).populate_existing().with_for_update().one()
+        item = db.query(BatchCampaignItem).filter_by(id=item_id, campaign_id=campaign.id).first()
+        job = db.query(Job).filter_by(campaign_item_id=item_id, campaign_id=campaign.id).with_for_update().first()
+        if not item or not job:
+            fail("Canción no encontrada", 404)
+        if job.status not in {"transcribed_pending", "transcribed", "lyrics_approved"}:
+            fail("La canción ya avanzó a generación", 409)
+        doc = db.query(EditorDocument).filter_by(job_id=job.job_id).first()
+        if doc and doc.lock_expires_at and _aware(doc.lock_expires_at) > datetime.now(timezone.utc) and doc.lock_user_id != current_user["id"]:
+            fail("Otra persona está revisando esta canción", 409)
+        before = copy.deepcopy(item.render_overrides or {})
+        assignment = before.get(ASSIGNMENT) or {}
+        if assignment.get("revision", 0) != body.revision:
+            fail("La configuración individual cambió; reabrí el editor", 409)
+        patch = normalize_settings(body.settings)
+        effective = effective_settings(campaign, {**before, **patch})
+        group = Group(id=assignment.get("group_id", "individual"), name=assignment.get("group_name", "Individual"),
+                      weight=100, requirement=assignment.get("requirement", "creative"), model=assignment.get("model", ""))
+        validate_combination(db, campaign, effective, group, current_user)
+        # Idempotent autosave/approval retry; an unchanged choice isn't an exception.
+        if all(effective.get(k) == effective_settings(campaign, before).get(k) for k in patch):
+            # No-op saves still hold the locked campaign/job rows. Release
+            # before ASGI dependency teardown can yield to another editor request.
+            db.commit()
+            return {"revision": body.revision, "unchanged": True}
+        plan = _plan(campaign)
+        plan["revision"] += 1
+        assignment = {**assignment, "group_id": group.id, "group_name": group.name,
+                      "requirement": group.requirement, "model": group.model, "revision": plan["revision"], "pinned": True}
+        item.render_overrides = {**before, **patch, ASSIGNMENT: assignment}
+        campaign.default_render_params = {**(campaign.default_render_params or {}), KEY: plan}
+        _log(db, campaign, "individual", current_user["id"], {"item_id": item.id, "before": before,
+              "after": item.render_overrides, "revision": plan["revision"]})
+        db.commit()
+        return {"revision": plan["revision"]}
+    except Exception:
+        db.rollback()
+        raise
 
 
-def campaign_jobs(db, campaign):
+def campaign_jobs(db, campaign, *, job_id=None):
     # Include pre-feature variants by ancestry, always intersecting tenant.
     from sqlalchemy import select, or_
     lineage = select(Job.job_id).where(Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id).cte(recursive=True)
     lineage = lineage.union(select(Job.job_id).join(lineage, Job.parent_job_id == lineage.c.job_id).where(
         Job.tenant_id == campaign.tenant_id, or_(Job.campaign_id.is_(None), Job.campaign_id == campaign.id)))
-    return db.query(Job).filter(Job.job_id.in_(select(lineage.c.job_id)), Job.tenant_id == campaign.tenant_id).all()
+    query = db.query(Job).options(load_only(
+        Job.job_id, Job.parent_job_id, Job.campaign_item_id,
+        Job.artist, Job.song_title, Job.filename, Job.status,
+        Job.created_at, Job.approved_at, Job.video_url, Job.render_params,
+        # Publication freshness must keep using the current render identity.
+        Job.previous_versions, Job.edit_count, Job.completed_at,
+        raiseload=True,
+    )).filter(Job.job_id.in_(select(lineage.c.job_id)), Job.tenant_id == campaign.tenant_id)
+    if job_id is not None:
+        query = query.filter(Job.job_id == job_id)
+    return query.all()
 
 
 def portal_history(job_ids, tenant_id):
@@ -670,11 +737,19 @@ def portal_history(job_ids, tenant_id):
     return result
 
 
-def history_rows(db, campaign):
+def history_rows(db, campaign, *, items=None, job_id=None):
     rows = []
     jobs_by_id = {}
-    codes = {item.id: item.technical_code for item in _items(db, campaign)}
-    for j in sorted(campaign_jobs(db, campaign), key=lambda j: (str(j.created_at), j.job_id), reverse=True):
+    jobs = campaign_jobs(db, campaign, job_id=job_id)
+    if items is None:
+        # The history only needs item codes, not private source manifests.
+        item_ids = {job.campaign_item_id for job in jobs if job.campaign_item_id}
+        items = db.query(BatchCampaignItem.id, BatchCampaignItem.technical_code).filter(
+            BatchCampaignItem.campaign_id == campaign.id,
+            BatchCampaignItem.id.in_(item_ids),
+        ).all() if item_ids else []
+    codes = {item.id: item.technical_code for item in items}
+    for j in sorted(jobs, key=lambda j: (str(j.created_at), j.job_id), reverse=True):
         jobs_by_id[j.job_id] = j
         rp = j.render_params or {}
         if not j.video_url and not rp.get("campaign_creative_receipt") and j.status not in {"queued", "processing", "rendering", "editing", "pending_review", "done"}:
@@ -738,12 +813,49 @@ def public_audit_detail(value):
 
 
 @router.get("/{campaign_id}/creative/report")
-def report(campaign_id: str, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+def report(
+    campaign_id: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+    *,
+    job_id: Annotated[str | None, Query(min_length=12, max_length=12)] = None,
+    history_limit: Annotated[int | None, Query(ge=0, le=200)] = None,
+    history_offset: Annotated[int, Query(ge=0)] = 0,
+):
     campaign = _campaign(db, campaign_id, current_user)
+    # Drawers need evidence for one song, not every video, assignment and
+    # audit JSON in the campaign. Keep the full export contract as the default.
+    if job_id is not None:
+        videos = history_rows(db, campaign, job_id=job_id)
+        if not videos:
+            fail("Video no disponible en esta campaña", 404)
+        return {"campaign_id": campaign.id, "name": campaign.name, "at": now(),
+                "contract": {}, "groups": [], "videos": videos,
+                "assignments": [], "history": []}
     contract = _plan(campaign).get("contract") or {}
-    videos = history_rows(db, campaign)
-    delivered = {(r.detail["job_id"], r.detail["video_sha256"]) for r in _logs(db, campaign, "delivered").all()}
     items = {i.id: i for i in _items(db, campaign)}
+    videos = history_rows(db, campaign, items=items.values())
+    history_query = db.query(
+        AuditLog.created_at, AuditLog.user_id, AuditLog.action, AuditLog.detail,
+    ).filter(AuditLog.action.in_([
+        "campaign.creative.applied", "campaign.creative.undone", "campaign.creative.individual",
+        "campaign.creative.rendered", "campaign.creative.delivered",
+    ]), AuditLog.detail["campaign_id"].as_string() == campaign.id).order_by(AuditLog.id)
+    if history_limit is None:
+        history = history_query.all()
+        delivered = {(r.detail["job_id"], r.detail["video_sha256"]) for r in history
+                     if r.action == "campaign.creative.delivered"}
+        history_has_more = False
+    else:
+        # Paginate in SQL, before reading/decoding the potentially large JSON.
+        fetched = history_query.offset(history_offset).limit(history_limit + 1).all() if history_limit else []
+        history = fetched[:history_limit]
+        history_has_more = len(fetched) > history_limit
+        delivered = {(r.job_id, r.video_sha256) for r in db.query(
+            AuditLog.detail["job_id"].as_string().label("job_id"),
+            AuditLog.detail["video_sha256"].as_string().label("video_sha256"),
+        ).filter(AuditLog.action == "campaign.creative.delivered",
+                 AuditLog.detail["campaign_id"].as_string() == campaign.id).all()}
     groups = []
     for index, g in enumerate(contract.get("groups", [])):
         ids = {i for i in contract.get("item_ids", []) if i in items and (items[i].render_overrides or {}).get(ASSIGNMENT, {}).get("group_id") == g["id"]}
@@ -754,14 +866,18 @@ def report(campaign_id: str, current_user=Depends(get_current_user), db: Session
                        "approved": sum(v["status"] == "done" and bool(v["approved_at"]) for v in principal),
                        "verified": sum(v["compliance"] == "verified" for v in principal),
                        "delivered": sum((v["job_id"], v["evidence"].get("video_sha256")) in delivered for v in principal)})
-    return {"campaign_id": campaign.id, "name": campaign.name, "at": now(), "contract": contract,
+    result = {"campaign_id": campaign.id, "name": campaign.name, "at": now(), "contract": contract,
             "groups": groups, "videos": videos, "delivery_note": "La generación no acredita entrega al cliente. Registrar la entrega del archivo aprobado.",
             "assignments": [{"item_id": i.id, "artist": i.artist, "title": i.title or i.filename,
                              "assignment": (i.render_overrides or {}).get(ASSIGNMENT) or {},
                              "settings": effective_settings(campaign, i.render_overrides)} for i in items.values()],
             "history": [{"at": str(r.created_at), "actor": r.user_id, "action": r.action, "detail": public_audit_detail(r.detail)}
-                        for r in db.query(AuditLog).filter(AuditLog.action.in_(["campaign.creative.applied", "campaign.creative.undone", "campaign.creative.individual", "campaign.creative.rendered", "campaign.creative.delivered"]),
-                        AuditLog.detail["campaign_id"].as_string() == campaign.id).order_by(AuditLog.id).all()]}
+                        for r in history]}
+    if history_limit is not None:
+        result["history_pagination"] = {"offset": history_offset, "limit": history_limit,
+                                        "has_more": history_has_more,
+                                        "next_offset": history_offset + len(history) if history_has_more else None}
+    return result
 
 
 @router.get("/{campaign_id}/creative/export.csv")

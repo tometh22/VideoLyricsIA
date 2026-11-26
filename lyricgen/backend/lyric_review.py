@@ -25,9 +25,9 @@ QUÉ DEVUELVE
 ------------
 Una lista de puntos a revisar, cada uno con un arreglo de un click:
 
-- ``required`` bloquea la aprobación hasta que el revisor aplica o descarta.
-  Sólo lo es lo que tiene dos fuentes que coinciden o una regla objetiva.
-- lo que oyó una sola fuente es una sugerencia: se muestra, no bloquea.
+- ``required`` es un campo legado de prioridad: ordena primero los puntos
+  con fuentes coincidentes o reglas de estilo, pero NO bloquea la aprobación.
+- todas las propuestas son opcionales: incluso varias fuentes pueden errar.
 - los arreglos idénticos se agrupan ("aplicar en las 8 repeticiones"), que
   es exactamente lo que UMG pide cuando dice "corregir en todos los coros".
 
@@ -56,12 +56,24 @@ from heard_words import (
     opcode_similarity,
     witness_words,
 )
+from lyric_timing_review import describe, find_timing_issues
+from lyric_timing_review import mode as timing_review_mode
+from reference_window import crop_reference
+from transcribe_postprocess import has_terminal_line_period
+from voseo_lexicon import TU_MARKERS, is_determiner, is_vos_marker, lookup as voseo_pair
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
 MAX_ITEMS = 60
 PHRASE_REVIEW_MAX_WORDS = 8
 PHRASE_REVIEW_MAX_CHARS = 42
+# Un oído que coincide menos que esto con la pantalla es otra versión o una
+# alucinación (el testigo, que oye la canción entera con tiempos, 0,35).
+EAR_MIN_SIMILARITY = 0.45
+WITNESS_MIN_SIMILARITY = 0.35
+# La letra oficial se recorta al tramo que suena sólo si la pantalla tiene
+# bastante menos palabras que la canción (el audio es un fragmento).
+OFFICIAL_FRAGMENT_MAX_RATIO = 0.7
 # Más palabras que esto no se comparan contra los oídos (se avisa como canción
 # difícil): protege al servidor de letras gigantes o pegadas a propósito.
 MAX_REVIEW_TOKENS = 2500
@@ -122,15 +134,55 @@ KIND_GROUP = {
     "chorus_propagate": "chorus", "question_marks": "style",
     "title_spelling": "style", "accent_inconsistent": "style",
     "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
-    "timing": "timing", "phrase_structure": "layout",
+    "timing": "timing", "phrase_structure": "layout", "reference_boundary": "layout",
+    "timing_early_start": "timing", "timing_late_start": "timing",
+    "timing_early_end": "timing", "timing_no_voice": "timing",
+    "terminal_period": "style", "parentheses": "style", "accent_missing": "style",
+    "voseo": "text",
 }
+
+# --------------------------------------------------------------------------
+# Perfiles de estilo por portal de UMG.
+#
+# Medido sobre 310 pedidos de sep-nov 2026: los dos portales piden quitar ¿?
+# de frases que no preguntan y nunca quieren punto final; Argentina prefiere
+# sin signos las exclamaciones ("¿Qué lindo añorar…?" → sin signos) y a veces
+# saca los paréntesis (sugerencia: en versiones finales aceptó otros 22);
+# Chile las quiere con ¡! ("¡Cuánto me hiciste llorar!"); los dos piden las
+# tildes que faltan. Con perfil, los puntos obligatorios de estilo frenan
+# también un re-render por pedido de cambio (ahí volvían a aparecer: "Para
+# no volver.", "Lejos de vos.").
+# --------------------------------------------------------------------------
+PORTAL_PROFILES: dict[str, dict[str, Any]] = {
+    "argentina": {"exclaim": "remove_question", "parentheses": True},
+    "chile": {"exclaim": "exclaim", "parentheses": False},
+    # Entrega UMG sin portal conocido: sólo lo que vale para los dos.
+    "umg": {"exclaim": None, "parentheses": False},
+}
+# Avisos de sincronización (lyric_timing_review) → tipo de punto.
+TIMING_KIND = {
+    "starts_before_voice": "timing_early_start", "starts_after_voice": "timing_late_start",
+    "ends_before_voice": "timing_early_end", "no_voice": "timing_no_voice",
+}
+# Puntos que dejan la letra como la pide el perfil sin tocar lo que se canta.
+STYLE_RULE_KINDS = {"terminal_period", "parentheses", "accent_missing", "question_marks"}
+# Un solo punto con todas las líneas: "Quitar el punto final (7 líneas)".
+_GROUP_ACROSS_LINES = {"terminal_period", "parentheses"}
+
+
+def style_profile(portal: str | None) -> dict[str, Any] | None:
+    key = str(portal or "").strip().lower()
+    return PORTAL_PROFILES.get(key)
 
 
 def mode() -> str:
-    """``enforce`` (default): aprobar exige decidir los puntos obligatorios.
-    ``observe``: se muestran sin bloquear. ``off``: no se calculan."""
-    value = os.environ.get("LYRIC_REVIEW_MODE", "enforce").strip().lower()
-    return value if value in {"enforce", "observe", "off"} else "enforce"
+    """La revisión es orientativa; ``off`` desactiva su cálculo.
+
+    ``enforce`` se acepta como valor legado de ``observe``. Una configuración
+    antigua no debe volver a bloquear decisiones editoriales humanas.
+    """
+    value = os.environ.get("LYRIC_REVIEW_MODE", "observe").strip().lower()
+    return "off" if value == "off" else "observe"
 
 
 def fold(text: str) -> str:
@@ -434,6 +486,119 @@ def _ear_blocks(segments: list[dict], screen: list[dict], ear: list[dict],
     return out, similarity, confirmed
 
 
+def _official_ear(screen: list[dict], official_clean: str) -> tuple[list[dict], dict | None]:
+    """Tokens de la letra oficial como oído y, si el audio es un fragmento,
+    el tramo de la letra al que se recortaron.
+
+    La letra describe la canción entera. Si la pantalla tiene bastante menos
+    palabras (demo de 30 s, Short) y la letra completa no pasa el filtro de
+    similitud o parece corrupta, se recorta al tramo de líneas consecutivas
+    que suena (``reference_window``), con una línea de cada lado por si el
+    audio corta una línea a la mitad. Si ningún tramo coincide lo suficiente
+    (otra canción, otra versión) se sigue como siempre: se descarta.
+    Evaluación sobre 15 demos (16-11-2026): recall de texto 58 %→71 %, los
+    puntos de letra oficial aciertan el 84 %; la letra equivocada (ventana
+    0,39) queda afuera. Con la canción entera no cambia nada.
+    """
+    tokens = _ear_tokens(official_clean)
+    if not tokens:
+        return [], None
+    corrupt = _looks_corrupt(tokens, screen)
+    fragment = bool(screen) and len(tokens) <= MAX_REVIEW_TOKENS and \
+        len(screen) <= OFFICIAL_FRAGMENT_MAX_RATIO * len(tokens)
+    if fragment and (corrupt or opcode_similarity(
+            aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens]),
+            len(screen), len(tokens)) < EAR_MIN_SIMILARITY):
+        found = crop_reference(official_clean, " ".join(s["raw"] for s in screen), pad_lines=1)
+        if found is not None:
+            text, window = found
+            cropped = _ear_tokens(text)
+            if len(cropped) < len(tokens) and not _looks_corrupt(cropped, screen):
+                return cropped, window
+    return ([] if corrupt else tokens), None
+
+
+def _fragment_edge_addition(block: dict, n_screen: int) -> bool:
+    """Bloque en el borde del fragmento que AGREGA palabras de la letra."""
+    i1, i2 = block["scr_range"]
+    if i1 > 0 and i2 < n_screen:
+        return False
+    return block["fix"]["type"] == "insert" or len(block["diff_heard"]) > len(block["diff_screen"])
+
+
+def _listen_item(kind: str, line: int, sources: set, fix: dict) -> dict:
+    heard = fix.get("replace") if fix["type"] == "replace" else fix.get("text")
+    return {
+        "kind": kind, "line": line, "required": False, "listen": True,
+        "title": "Escuchá este tramo", "why": _listen_hint(sources, heard or ""),
+        "sources": sources, "fix": fix, "alternatives": [],
+        "action": "Escuchar", "dismiss": "Está bien así",
+    }
+
+
+def _drops_neighbour_words(fix: dict) -> bool:
+    """Un reemplazo que en realidad corresponde a una PARTE de lo que borra:
+    «Dai-me um» → «Dá me» suena como «Dai-me» y se come el «um» que el oído
+    no oyó. Aplicarlo de un clic borraría una palabra cantada."""
+    if fix.get("type") != "replace":
+        return False
+    find = [norm_token(w) for w in str(fix.get("find") or "").split()]
+    find = [w for w in find if w]
+    heard = "".join(norm_token(w) for w in str(fix.get("replace") or "").split())
+    if len(find) < 2 or not heard:
+        return False
+
+    def ratio(words: list[str]) -> float:
+        return difflib.SequenceMatcher(None, "".join(words), heard, autojunk=False).ratio()
+
+    whole = ratio(find)
+    for k in range(1, len(find)):
+        for part in (find[:k], find[k:]):
+            score = ratio(part)
+            if score >= 0.8 and score > whole:
+                return True
+    return False
+
+
+def _one_click_guard(ear_items: list[tuple[dict, tuple[int, int]]],
+                     withheld: list[tuple[set, int, tuple[int, int]]]) -> list[dict]:
+    """Sólo se ofrece un arreglo de un clic si es una edición limpia y
+    completa de un tramo contiguo de palabras. Si no, el punto pasa a
+    "Escuchá este tramo" y su arreglo queda marcado ``one_click: False``.
+
+    - No borra palabras vecinas que el oído no oyó (``_drops_neighbour_words``).
+    - No es la mitad de una frase: si el mismo oído tenía otra diferencia en
+      la misma línea, pegada (a lo sumo una palabra en el medio), que no se
+      propone, aplicar sólo ésta deja la línea a medias («Mas tu não será»
+      con la letra «Mas tu não serás»; «Tudo menos e Salvador» con la letra
+      «Tudo Menos É Mais e Nattanzinho em Salvador»).
+    """
+    def near(a: tuple[int, int], b: tuple[int, int]) -> bool:
+        return a != b and b[0] <= a[1] + 1 and a[0] <= b[1] + 1
+
+    pending = list(ear_items)
+    out: list[dict] = []
+    changed = True
+    while changed:
+        changed = False
+        keep = []
+        for item, span in pending:
+            broken = item["fix"].get("one_click") is False or _drops_neighbour_words(item["fix"])
+            partial = any(
+                line == item["line"] and set(srcs) & set(item["sources"]) and near(span, other)
+                for srcs, line, other in withheld
+            )
+            if broken or partial:
+                fix = {**item["fix"], "one_click": False}
+                out.append(_listen_item(item["kind"], item["line"], item["sources"], fix))
+                withheld.append((item["sources"], item["line"], span))
+                changed = True
+            else:
+                keep.append((item, span))
+        pending = keep
+    return out + [item for item, _span in pending]
+
+
 def _only_style_difference(screen_raw: list[str], heard_raw: list[str]) -> bool:
     """Diferencias que no son errores: apócopes regionales que UMG quiere
     conservar ("na'", "pa'", "to'") y la h muda ("ay"/"hay", "a"/"ha")."""
@@ -526,13 +691,121 @@ def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
 # Reglas deterministas (medidas sobre los pedidos #112-#131).
 # --------------------------------------------------------------------------
 
-def _rule_question_marks(segments: list[dict]) -> list[dict]:
+def _question_balance_broken(text: str) -> bool:
+    """¿ sin su ?, ? sin su ¿, o un ¿ que se abre antes de cerrar el anterior."""
+    open_ = False
+    for ch in text:
+        if ch == "¿":
+            if open_:
+                return True
+            open_ = True
+        elif ch == "?":
+            if not open_:
+                return True
+            open_ = False
+    return open_
+
+
+def _strip_question_marks(text: str) -> str:
+    out = re.sub(r"\s*¿\s*", " ", text)
+    out = re.sub(r"\s*\?", "", out)
+    out = re.sub(r"\s+([,.;:!])", r"\1", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+_CLOSERS = "\"”»'"
+_INTERROGATIVE_RE = re.compile(
+    r"\b(?:a\s+d[oó]nde|por\s+qu[eé]|qu[eé]|c[oó]mo|cu[aá]ndo|d[oó]nde|ad[oó]nde|"
+    r"qui[eé]n(?:es)?|cu[aá]l(?:es)?|cu[aá]nt[oa]s?)\b", re.I)
+
+
+def _interrogative_at(clause: str) -> int | None:
+    """Posición del primer interrogativo CON tilde de la frase ("qué",
+    "a dónde", "por qué"); sin tilde no cuenta: "cuando vuelvas" no pregunta."""
+    for m in _INTERROGATIVE_RE.finditer(clause):
+        if fold(m.group(0)) != m.group(0).lower():
+            return m.start()
+    return None
+
+
+def _close_at_end(body: str) -> str:
+    m = re.search(r"[\s,;:" + _CLOSERS + r"]*$", body)
+    cut = m.start() if m else len(body)
+    tail = body[cut:].strip()
+    return f"{body[:cut]}?{tail}"
+
+
+def _complete_question(text: str) -> str:
+    """La línea con sus signos de pregunta completos. La pregunta abre en el
+    ¿ que había, en el interrogativo ("nena ¿qué vas a hacer?") o al
+    comienzo de la frase."""
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if "¿" in text and "?" not in text:
+        return _close_at_end(text)
+    if "?" in text and "¿" not in text:
+        out, rest = [], text
+        while "?" in rest:
+            at = rest.index("?")
+            clause, rest = rest[:at], rest[at + 1:]
+            starts = [m.end() for m in re.finditer(r"[.!:;" + _CLOSERS + r"“«]\s*", clause)]
+            begin = starts[-1] if starts else 0
+            lead = len(clause[begin:]) - len(clause[begin:].lstrip())
+            begin += lead
+            asked = _interrogative_at(clause[begin:])
+            if asked is not None:
+                begin += asked
+            out.append(f"{clause[:begin]}¿{clause[begin:].rstrip()}?")
+        return "".join(out) + rest
+    body = _strip_question_marks(text)
+    return _close_at_end("¿" + body)
+
+
+def _rule_question_balance(segments: list[dict], profile: dict) -> list[dict]:
+    """Un signo de pregunta sin su par es un error de escritura, sin importar
+    si la frase pregunta: "Si ya no tengo las caricias de mi madre?",
+    "¿Por qué soy wacho amor", "¿Cuántas" / "veces corro…?". Obligatorio con
+    las dos salidas a un clic: completar la pregunta (por defecto si hay un
+    interrogativo con tilde) o quitar los signos."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if ("?" not in text and "¿" not in text) or not _question_balance_broken(text):
+            continue
+        removed = _strip_question_marks(text)
+        if not _words(removed):
+            continue
+        completed = _complete_question(text)
+        asks = _interrogative_at(text) is not None and not _EXCLAMATIVE.search(
+            text.replace("¿", ""))
+        remove_fix = {"type": "set_text", "text": removed, "expect": _key_text(text)}
+        complete_fix = {"type": "set_text", "text": completed, "expect": _key_text(text)}
+        if asks:
+            fix, why = complete_fix, "La pregunta quedó sin uno de sus signos"
+            alternatives = [{"label": "No es pregunta", "why": "", "fix": remove_fix}]
+        else:
+            fix, why = remove_fix, "Signo de pregunta sin su par: si no pregunta, va sin signos"
+            alternatives = [{"label": "Es pregunta", "why": "", "fix": complete_fix}]
+        out.append({
+            "kind": "question_marks", "line": i, "required": True, "style_rule": True,
+            "title": "Signos de pregunta", "why": why, "fix": fix,
+            "alternatives": alternatives, "action": "Corregir",
+        })
+    return out
+
+
+def _rule_question_marks(segments: list[dict], profile: dict | None = None) -> list[dict]:
     """Sólo los casos que UMG devolvió; una pregunta de sí/no ("¿Me
-    querés?") es legítima y no se toca. El arreglo toca sólo esa frase."""
+    querés?") es legítima y no se toca. El arreglo toca sólo esa frase.
+
+    Con perfil de portal, la exclamación ("¿Qué lindo añorar…?") se corrige
+    como pide ese portal (Argentina: sin signos; Chile: con ¡!) y las líneas
+    con un signo sin par se resuelven en ``_rule_question_balance``."""
     out = []
     for i, seg in enumerate(segments):
         text = str(seg.get("text") or "")
         if "?" not in text and "¿" not in text:
+            continue
+        if profile is not None and _question_balance_broken(text):
             continue
         for m in re.finditer(r"¿[^?¿]*\??|^[^¿?]*\?", text):
             clause = m.group(0)
@@ -545,6 +818,17 @@ def _rule_question_marks(segments: list[dict]) -> list[dict]:
             required = True
             if _EXCLAMATIVE.search(body):
                 why, mode_ = "Es una exclamación: va con ¡ !", "exclaim"
+                if profile is not None and profile.get("exclaim") == "remove_question":
+                    why, mode_ = "Es una exclamación: en Argentina va sin signos", "remove_question"
+                    alternatives.append({
+                        "label": "Con ¡ !", "why": "",
+                        "fix": {"type": "punctuation", "mode": "exclaim", "clause": clause},
+                    })
+                elif profile is not None:
+                    alternatives.append({
+                        "label": "Sin signos", "why": "",
+                        "fix": {"type": "punctuation", "mode": "remove_question", "clause": clause},
+                    })
             elif {w.lower() for w in words} & _INTERROGATIVES:
                 continue  # ya pregunta con tilde ("¿que dónde llega…?")
             elif fold(first) in _ACCENTED_INTERROGATIVE and first.lower() not in _INTERROGATIVES:
@@ -568,6 +852,7 @@ def _rule_question_marks(segments: list[dict]) -> list[dict]:
                 continue
             out.append({
                 "kind": "question_marks", "line": i, "required": required,
+                "style_rule": profile is not None,
                 "title": "Signos de pregunta", "why": why,
                 "fix": {"type": "punctuation", "mode": mode_, "clause": clause},
                 "alternatives": alternatives, "action": "Corregir",
@@ -656,6 +941,172 @@ def _rule_accents(segments: list[dict]) -> list[dict]:
                                 "scope": "all"},
                         "action": "Unificar",
                     })
+    return out
+
+
+# --------------------------------------------------------------------------
+# Reglas de perfil UMG (punto final, paréntesis, tildes que faltan, preguntas
+# sin signos). Sólo corren con ``portal``; ninguna toca lo que se canta.
+# --------------------------------------------------------------------------
+
+_INITIALS_END = re.compile(r"(?:\b[^\W\d_]\.){2,}$", re.UNICODE)
+
+
+def _rule_terminal_period(segments: list[dict]) -> list[dict]:
+    """UMG nunca quiere punto al final de la línea ("Para no volver.",
+    "Lejos de vos."). Los puntos suspensivos y las siglas ("V.S.D.") quedan."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if not has_terminal_line_period(text) or _INITIALS_END.search(text.rstrip()):
+            continue
+        fixed = text.rstrip()[:-1].rstrip()
+        if not _words(fixed):
+            continue
+        out.append({
+            "kind": "terminal_period", "line": i, "required": True, "style_rule": True,
+            "title": "Punto final", "why": "Las líneas no llevan punto al final",
+            "fix": {"type": "set_text", "text": fixed, "expect": _key_text(text)},
+            "action": "Quitar", "dismiss": "Dejar el punto",
+        })
+    return out
+
+
+def _rule_parentheses(segments: list[dict]) -> list[dict]:
+    """UMG Argentina pidió sacar paréntesis 6 veces ("sacar paréntesis a la
+    frase", "(AY, AY, AY)" de más) pero aceptó otros 22 en versiones
+    finales: se sugiere, no bloquea. El texto queda, los signos no."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = str(seg.get("text") or "")
+        if "(" not in text and ")" not in text:
+            continue
+        fixed = re.sub(r"\s*[()]\s*", " ", text)
+        fixed = re.sub(r"\s+([,.;:!?])", r"\1", fixed)
+        fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+        if not _words(fixed) or fixed == text:
+            continue
+        out.append({
+            "kind": "parentheses", "line": i, "required": False, "style_rule": True,
+            "title": "Paréntesis", "why": "En Argentina los coros y ecos van sin paréntesis",
+            "fix": {"type": "set_text", "text": fixed, "expect": _key_text(text)},
+            "action": "Quitar", "dismiss": "Dejar los paréntesis",
+        })
+    return out
+
+
+# Palabras que sin tilde no existen (o son otra palabra rarísima en una
+# canción). Nada de pares que cambian el sentido (esta/está, mas/más,
+# sabia/sabía, hacia/hacía, seria/sería, venia/venía, vera/verá…).
+_ACCENT_LEXICON = {
+    w.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o")
+     .replace("ú", "u"): w
+    for w in (
+        # Imperfecto -ía de verbos -er/-ir (ARDÍAN, UMG Chile).
+        *(f"{stem}{end}" for stem in (
+            "había", "tenía", "podía", "quería", "decía", "sentía", "vivía", "creía",
+            "veía", "leía", "oía", "traía", "caía", "pedía", "perdía", "mentía",
+            "seguía", "conocía", "entendía", "existía", "latía", "partía", "dormía",
+            "moría", "salía", "volvía", "ardía", "dolía", "reía", "sonreía", "comía",
+            "bebía", "corría", "escribía", "sufría", "abría", "cubría", "ponía",
+            "temía", "debía", "parecía", "merecía", "crecía", "nacía",
+            "prefería", "elegía", "huía", "fingía", "subía",
+        ) for end in ("", "n", "s")),
+        # Futuro que no choca con el subjuntivo -ra (DARÁN, UMG Argentina).
+        *(f"{stem}{end}" for stem in (
+            "será", "estará", "tendrá", "podrá", "habrá", "hará", "dará", "vendrá",
+            "dirá", "sabrá", "querrá", "saldrá", "pondrá", "valdrá", "volverá",
+            "morirá", "vivirá", "sentirá", "dormirá", "verá",
+        ) for end in ("", "n", "s") if f"{stem}{end}" not in {"verá", "verás"}),
+        "irán",
+        # Voseo sin par sin tilde.
+        "querés", "tenés", "podés", "venís", "decís", "sentís", "pedís", "vivís",
+        "salís", "dormís",
+        # Sustantivos y adverbios de uso frecuente en las letras.
+        "día", "días", "mío", "mía", "míos", "mías", "todavía", "alegría", "melodía",
+        "poesía", "fantasía", "compañía", "policía", "energía", "armonía", "agonía",
+        "rebeldía", "cobardía", "valentía", "lejanía", "travesía", "también",
+        "después", "jamás", "además", "detrás", "atrás", "quizás", "aquí", "allí",
+        "ahí", "allá", "acá", "así", "ojalá", "corazón", "razón", "perdón", "adiós",
+        "ningún", "algún", "según", "común", "país", "raíz", "maíz", "baúl", "oído",
+        "reír", "sonreír", "oír", "fácil", "difícil", "ángel", "ángeles", "árbol",
+        "lágrima", "lágrimas", "música", "único", "única", "pájaro", "pájaros",
+        "café", "están", "frío", "demás", "compás", "sofá",
+        "mágico", "mágica", "teléfono", "pétalos", "lámpara", "brújula",
+    )
+}
+_GERUND_CLITIC = re.compile(
+    r"^(?P<stem>[a-zñ]+?)(?P<g>ando|iendo|yendo)"
+    r"(?P<cl>(?:me|te|se|nos|lo|la|le|los|las|les){1,2})$")
+_ESTA_NEXT = {
+    "de", "en", "bien", "mal", "aqui", "ahi", "alli", "aca", "alla", "lejos",
+    "cerca", "muy", "tan", "mas", "con", "sin", "para", "conmigo", "contigo",
+}
+_ENGLISH = {
+    "the", "you", "your", "and", "is", "are", "to", "of", "it", "my", "i", "i'm",
+    "im", "don't", "dont", "love", "baby", "with", "this", "that", "what", "all",
+    "need", "gonna", "get", "we", "just", "can", "never", "know", "yeah", "she",
+    "he", "they", "will", "was", "for", "like", "want",
+}
+
+
+def _looks_english(words: list[str]) -> bool:
+    return sum(1 for w in words if w.lower() in _ENGLISH) >= 2
+
+
+def _accented(word: str, next_word: str | None) -> str | None:
+    """La forma con tilde de ``word`` si la falta de tilde es un error sin
+    ambigüedad; ``None`` si no."""
+    lower = word.lower()
+    if any(c in "áéíóúü" for c in lower):  # ya tiene alguna tilde
+        return None
+    if lower in _ACCENT_LEXICON:
+        return _ACCENT_LEXICON[lower]
+    m = _GERUND_CLITIC.match(lower)
+    if m and len(m.group("stem")) >= 1:
+        accent = {"ando": "ándo", "iendo": "iéndo", "yendo": "yéndo"}[m.group("g")]
+        return m.group("stem") + accent + m.group("cl")
+    if len(lower) >= 5 and re.search(r"[^s][cs]ion$", lower):
+        return lower[:-3] + "ión"
+    if lower in {"esta", "estas"}:
+        follower = fold(next_word or "")
+        if next_word is None or follower in _ESTA_NEXT or re.search(r"(ando|iendo|yendo)$", follower):
+            return "está" if lower == "esta" else "estás"
+    return None
+
+
+def _rule_missing_accents(segments: list[dict], required: bool) -> list[dict]:
+    """Tildes que faltan sin dudas ("ARDIAN", "Descubriendose", "esta de
+    más", "daran"). Respeta mayúsculas; no mira líneas en inglés."""
+    out = []
+    for i, seg in enumerate(segments):
+        text = unicodedata.normalize("NFC", str(seg.get("text") or ""))
+        tokens = text.split()
+        words = _words(text)
+        if not words or _looks_english(words):
+            continue
+        for k, raw in enumerate(tokens):
+            body = _split_punct(raw)[1]
+            if not body or not _WORD_RE.fullmatch(body):
+                continue
+            trail = _split_punct(raw)[2]
+            next_word = None
+            if k + 1 < len(tokens) and not re.search(r"[.;:!?…]", trail):
+                # "Y esta, la más linda": después de una coma no se decide.
+                next_word = "," if "," in trail else _split_punct(tokens[k + 1])[1]
+            fixed = _accented(body, next_word)
+            if not fixed or fold(fixed) != fold(body):
+                continue
+            contextual = body.lower() in {"esta", "estas"}
+            out.append({
+                "kind": "accent_missing", "line": i, "required": required,
+                "style_rule": True, "title": "Falta una tilde",
+                "why": f"Se escribe «{fixed}»",
+                "fix": {"type": "replace", "find": body, "replace": _match_case(body, fixed),
+                        "scope": "one" if contextual else "all",
+                        **({"at_word": k} if contextual else {})},
+                "action": "Corregir",
+            })
     return out
 
 
@@ -833,6 +1284,173 @@ def _rule_memory(segments: list[dict], pairs: dict[str, str],
     return out
 
 
+# --------------------------------------------------------------------------
+# Voseo (sólo portal Argentina).
+#
+# La máquina normaliza al español neutro ("querés" → "quieres", "vení" →
+# "ven", "anotate" → "anótate", "Te llevás" → "Te llevas") y los oídos no lo
+# ven: comparan sin tildes, así que "llevas"/"llevás" les parecen iguales y
+# "quieres"/"queres" se descarta como diferencia de escritura. La regla mira
+# palabra por palabra, CON tildes, qué escribió cada oído en esa posición.
+#
+# Nunca vosea a ciegas: una balada, un folklore o un artista extranjero
+# tutean de verdad. Sólo propone con evidencia:
+# - prioritario (``required``, se lista primero; no bloquea la aprobación):
+#   dos oídos oyeron la forma de vos, o uno la oyó y la canción ya vosea en
+#   otra línea;
+# - sugerencia: un solo oído, o sólo el voseo de la propia canción (y nunca
+#   para formas que también son otra palabra: "ven", "mira", "ganas").
+# La letra oficial que dice la forma de tú veta la inferencia.
+# --------------------------------------------------------------------------
+
+VOSEO_PORTALS = {"argentina"}
+
+
+def _heard_form(raw: str) -> str:
+    return unicodedata.normalize("NFC", _split_punct(str(raw or ""))[1]).lower()
+
+
+def _ear_says(heard: str, form: str, other: str) -> bool:
+    """``heard`` es ``form`` y no ``other``. Sin tildes alcanza sólo si las dos
+    formas se escriben distinto ("queres" es vos; "llevas" no dice nada)."""
+    if heard == form:
+        return True
+    return fold(heard) == fold(form) and fold(form) != fold(other)
+
+
+def _ear_word_map(screen: list[dict], tokens: list[dict]) -> dict[int, dict]:
+    """Palabra del oído en la misma posición que cada palabra de la pantalla
+    (tramos iguales y reemplazos uno a uno)."""
+    if not screen or not tokens:
+        return {}
+    out: dict[int, dict] = {}
+    for tag, i1, i2, j1, j2 in aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens]):
+        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+            for k in range(i2 - i1):
+                out[i1 + k] = tokens[j1 + k]
+    return out
+
+
+def _timed_witness_tokens(witness: list[dict]) -> list[dict]:
+    out = []
+    for w in witness:
+        raw = str(w.get("word") or "")
+        tok = norm_token(raw)
+        if tok and tok not in _FILLERS and not _NON_LATIN.search(raw):
+            out.append({"tok": tok, "raw": raw, "start": _f(w.get("start"))})
+    return out
+
+
+def _rule_voseo(segments: list[dict], screen: list[dict], ears: dict[str, list[dict]],
+                human_edited: dict[int, set[str]]) -> list[dict]:
+    maps = {src: _ear_word_map(screen, toks) for src, toks in ears.items() if toks}
+
+    def heard_at(src: str, idx: int) -> str | None:
+        tok = maps.get(src, {}).get(idx)
+        if tok is None:
+            return None
+        if "start" in tok:
+            seg = segments[screen[idx]["line"]]
+            if not (_f(seg.get("start")) - 2.0 <= tok["start"] <= _f(seg.get("end")) + 2.0):
+                return None  # el testigo lo oyó en otra repetición
+        return _heard_form(tok["raw"])
+
+    # Un oído que en esa línea escribió tú ("quiereme", "Ámame") no sabe
+    # nada de tildes ahí: su "besame" sin tilde no es un voseo.
+    tu_lines: set[tuple[str, int]] = set()
+    for idx, s in enumerate(screen):
+        pair = voseo_pair(_split_punct(s["raw"])[1])
+        if pair is None:
+            continue
+        for src in maps:
+            h = heard_at(src, idx)
+            if h and _ear_says(h, pair.tu, pair.vos) and not _ear_says(h, pair.vos, pair.tu):
+                tu_lines.add((src, s["line"]))
+
+    def says_vos(src: str, idx: int, pair) -> bool:
+        h = heard_at(src, idx)
+        if not h or not _ear_says(h, pair.vos, pair.tu):
+            return False
+        accent_only = fold(pair.tu) == fold(pair.vos)
+        return not (accent_only and (src, screen[idx]["line"]) in tu_lines)
+
+    marker_lines = {s["line"] for s in screen if is_vos_marker(_split_punct(s["raw"])[1])}
+    ear_marker_lines = {
+        screen[idx]["line"] for src in maps for idx in maps[src]
+        if (h := heard_at(src, idx)) and is_vos_marker(h)
+    }
+    out = []
+    for idx, s in enumerate(screen):
+        word = _split_punct(s["raw"])[1]
+        pair = voseo_pair(word)
+        if pair is None:
+            continue
+        seg = segments[s["line"]]
+        line_words = _words(seg.get("text"))
+        if _looks_english(line_words):
+            continue
+        heard = {src for src in maps if says_vos(src, idx, pair)}
+        official = heard_at("official", idx) if "official" in maps else None
+        official_tu = official is not None and _ear_says(official, pair.tu, pair.vos)
+        song_vos = bool((marker_lines | ear_marker_lines) - {s["line"]})
+        edited = any(s["tok"] in span.split() for span in human_edited.get(s["line"], ()))
+        if heard:
+            if official_tu and len(heard) < 2:
+                continue
+            required = (len(heard) >= 2 or song_vos) and not official_tu and not edited
+        else:
+            prev = screen[idx - 1] if idx > 0 and screen[idx - 1]["line"] == s["line"] else None
+            explicit_tu = any(w.lower() in TU_MARKERS for w in line_words if w.lower() != pair.tu)
+            if (not song_vos or pair.ambiguous or official_tu or edited or explicit_tu
+                    or (prev is not None and is_determiner(prev["tok"]))):
+                continue
+            required = False
+        sources = set(heard)
+        if heard:
+            why = f"En Argentina va «{pair.vos}». {_why(sources)}"
+        else:
+            why = f"La canción usa voseo en otras líneas: en Argentina va «{pair.vos}»"
+        out.append({
+            "kind": "voseo", "line": s["line"], "required": required,
+            "title": "Voseo", "why": why, "sources": sources,
+            "fix": {"type": "replace", "find": word, "replace": _match_case(word, pair.vos),
+                    "at_word": s["pos"], "scope": "one"},
+            "action": "Corregir", "dismiss": "Se canta así",
+            "_tu": norm_token(pair.tu), "_vos": norm_token(pair.vos), "_form": pair.vos,
+            "_can_require": not official_tu and not edited,
+        })
+    return out
+
+
+def _absorb_voseo_ear_items(items: list[dict], voseo: list[dict]) -> list[dict]:
+    """Un oído que propone lo mismo que el voseo ("ven" → "vení", "Tú eres"
+    → "Vos sos") no es otro punto: suma su fuente a los puntos de voseo."""
+    if not voseo:
+        return items
+    by_line: dict[int, list[dict]] = defaultdict(list)
+    for v in voseo:
+        by_line[v["line"]].append(v)
+    kept = []
+    for item in items:
+        fix = item.get("fix") or {}
+        if item.get("kind") == "heard_different" and fix.get("type") == "replace":
+            find, repl = _key_text(fix.get("find")).split(), _key_text(fix.get("replace")).split()
+            covering = [v for v in by_line.get(item.get("line"), ()) if v["_tu"] in find]
+            swap = {v["_tu"]: v["_vos"] for v in covering}
+            if covering and [swap.get(t, t) for t in find] == repl:
+                for v in covering:
+                    v["sources"] |= set(item.get("sources") or ())
+                continue
+        kept.append(item)
+    for v in voseo:
+        if v["sources"]:
+            v["required"] = v["required"] or (len(v["sources"]) >= 2 and v["_can_require"])
+            v["why"] = f"En Argentina va «{v['_form']}». {_why(v['sources'])}"
+        for key in ("_tu", "_vos", "_form", "_can_require"):
+            v.pop(key, None)
+    return kept
+
+
 def _map_to_current(segments: list[dict], orig: dict) -> int | None:
     """Línea actual que corresponde a una línea de la máquina: por identidad
     si se conservó, si no por solapamiento en el tiempo."""
@@ -957,50 +1575,29 @@ def _rule_layout_official(segments: list[dict], screen: list[dict],
     return out
 
 
-def _rule_timing(segments: list[dict], witness: list[dict], machine: list[dict]) -> list[dict]:
-    """La línea se va antes de que termine la última palabra ("alargar
-    brasero", UMG #115) o aparece mucho antes de que se cante. Sólo si la
-    máquina y el testigo coinciden en el tiempo de esa palabra."""
+def _rule_voice_timing(segments: list[dict], machine_evidence: Any, enforce: bool) -> list[dict]:
+    """La línea entra antes de la voz, entra tarde o se va antes de que
+    termine el canto, medido con los alineadores guardados (ver
+    ``lyric_timing_review``). Reemplaza a la vieja regla con los tiempos del
+    testigo whisper-1, que sobre 298 canciones aprobadas dio 52 avisos y
+    acertó 1 pedido. Prioritario (``required``) sólo lo inequívoco y sólo en
+    ``enforce``; como toda la Revisión rápida, no bloquea la aprobación."""
     out = []
-    for i, seg in enumerate(segments):
-        toks = [t for t in (norm_token(w) for w in str(seg.get("text") or "").split()) if t]
-        if len(toks) < 2:
-            continue
-        start, end = _f(seg.get("start")), _f(seg.get("end"))
-        nxt = segments[i + 1] if i + 1 < len(segments) else None
-        prv = segments[i - 1] if i > 0 else None
-
-        def times(tok: str, lo: float, hi: float, stream: list[dict]) -> list[dict]:
-            return [w for w in stream if lo <= w["start"] <= hi and norm_token(w["word"]) == tok]
-        last_w = times(toks[-1], end - 1.5, end + 2.5, witness)
-        last_m = times(toks[-1], end - 1.5, end + 2.5, machine)
-        if last_w and last_m:
-            we, me = max(w["end"] for w in last_w), max(w["end"] for w in last_m)
-            limit = (_f(nxt.get("start")) - 0.05) if nxt else we + 1.0
-            if abs(we - me) <= 0.4 and min(we, me) > end + 0.5 and limit > end + 0.3:
-                new_end = round(min(max(we, me) + 0.1, limit), 2)
-                out.append({
-                    "kind": "timing", "line": i, "required": False,
-                    "title": "Timing",
-                    "why": f"Se va {min(we, me) - end:.1f} s antes de que termine «{toks[-1]}»",
-                    "fix": {"type": "timing", "end": new_end},
-                    "preview_after": f"Termina en {new_end:.1f} s", "action": "Alargar",
-                })
-                continue
-        first_w = times(toks[0], start - 1.0, start + 2.5, witness)
-        first_m = times(toks[0], start - 1.0, start + 2.5, machine)
-        if first_w and first_m:
-            ws, ms = min(w["start"] for w in first_w), min(w["start"] for w in first_m)
-            floor = (_f(prv.get("end")) + 0.05) if prv else 0.0
-            if abs(ws - ms) <= 0.4 and min(ws, ms) > start + 0.7:
-                new_start = round(max(min(ws, ms) - 0.1, floor), 2)
-                out.append({
-                    "kind": "timing", "line": i, "required": False,
-                    "title": "Timing",
-                    "why": f"Aparece {min(ws, ms) - start:.1f} s antes de que se cante",
-                    "fix": {"type": "timing", "start": new_start},
-                    "preview_after": f"Aparece en {new_start:.1f} s", "action": "Ajustar",
-                })
+    for finding in find_timing_issues(segments, machine_evidence):
+        text = describe(finding)
+        line_text = str(segments[finding["line"]].get("text") or "")
+        fix = {"type": "timing", finding["field"]: finding["proposed"],
+               # El editor no aplica el arreglo si la línea ya no está donde
+               # la vio el servidor (la movieron a mano después).
+               f"expect_{finding['field']}": finding["current"]}
+        out.append({
+            "kind": TIMING_KIND[finding["kind"]], "line": finding["line"],
+            "required": bool(enforce and finding["required"]),
+            "title": text["title"], "why": text["why"],
+            "sources": set(finding["sources"]), "fix": fix,
+            "preview_before": line_text, "preview_after": line_text,
+            "action": text["action"], "dismiss": "Está bien así",
+        })
     return out
 
 
@@ -1116,8 +1713,14 @@ def build_review(
     title: str = "",
     official_text: str | None = None,
     memory_pairs: dict[str, str] | None = None,
+    portal: str | None = None,
+    official_origin: str = "",
 ) -> dict:
-    """Todos los puntos de la letra actual, listos para el editor."""
+    """Todos los puntos de la letra actual, listos para el editor.
+
+    ``portal`` (``argentina``/``chile``/``umg``) activa el perfil de estilo
+    de ese portal de UMG; sin portal, sólo las reglas de siempre."""
+    profile = style_profile(portal)
     segments = [
         {**s, "text": unicodedata.normalize("NFC", str(s.get("text") or ""))}
         for s in (segments or []) if isinstance(s, dict)
@@ -1138,11 +1741,10 @@ def build_review(
     blocks: list[dict] = []
     similarity: dict[str, float] = {}
     confirmed_by_official: set[int] = set()
-    official_tokens = _ear_tokens(official_clean)
+    official_tokens, official_window = _official_ear(screen, official_clean)
     official_ops: list[tuple] = []
-    if official_tokens and _looks_corrupt(official_tokens, screen):
-        official_tokens = []
     witness_text = " ".join(w["word"] for w in witness)
+    voseo_ears: dict[str, list[dict]] = {}
     for source, tokens, timed in (
         ("witness", _ear_tokens(witness_text), witness),
         ("gemini", _ear_tokens(gemini), None),
@@ -1154,14 +1756,19 @@ def build_review(
         similarity[source] = round(sim, 3)
         # Un oído que casi no coincide con la pantalla es otra versión o una
         # alucinación: no aporta.
-        if sim >= (0.45 if source != "witness" else 0.35):
+        if sim >= (EAR_MIN_SIMILARITY if source != "witness" else WITNESS_MIN_SIMILARITY):
             blocks.extend(found)
+            voseo_ears[source] = _timed_witness_tokens(witness) if source == "witness" else tokens
         if source == "official":
             confirmed_by_official = confirmed
             if tokens:
                 official_ops = aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens])
     same_version = similarity.get("official", 0.0) >= 0.85
     human_edited = _human_edited_lines(segments, original_segments)
+    # Diferencias de un oído que no se proponen por duda (borde del fragmento,
+    # agregado de otra versión): un arreglo pegado a una de ellas queda a medias.
+    withheld: list[tuple[set, int, tuple[int, int]]] = []
+    ear_items: list[tuple[dict, tuple[int, int]]] = []
     for block in _merge_ear_blocks(blocks):
         sources = block["sources"]
         only_official = sources == {"official"}
@@ -1172,11 +1779,18 @@ def build_review(
             covered = range(i1, i2) if i2 > i1 else (i1 - 1, i1)
             if all(k in confirmed_by_official for k in covered):
                 continue
+        if only_official and official_window is not None and _fragment_edge_addition(block, len(screen)):
+            # El borde del fragmento corta la letra: lo que sólo la letra
+            # oficial agrega antes de la primera o después de la última
+            # palabra puede no estar en el audio.
+            withheld.append((sources, block["line"], (i1, i2)))
+            continue
         if only_official and block["fix"]["type"] == "insert" and (
             not same_version or len(block["diff_heard"]) > 3
         ):
             # Otra versión (en vivo, con partes habladas): lo que sólo la
             # letra oficial agrega no se propone.
+            withheld.append((sources, block["line"], (i1, i2)))
             continue
         if block["spelling_only"] and "official" not in sources:
             continue  # "urgo"/"hurgo" sólo lo decide la letra oficial
@@ -1195,35 +1809,54 @@ def build_review(
             # Un solo oído automático acierta el lugar pero casi nunca el texto
             # (pedidos #112-#131: 48 puntos, texto correcto en 6; y ~1 falsa
             # alarma por canción aprobada). Se ofrece escuchar, no corregir.
-            heard = block["fix"].get("replace") if kind == "heard_different" else block["fix"].get("text")
-            items.append({
-                "kind": kind, "line": block["line"], "required": False, "listen": True,
-                "title": "Escuchá este tramo", "why": _listen_hint(sources, heard or ""),
-                "sources": sources, "fix": block["fix"], "alternatives": [],
-                "action": "Escuchar", "dismiss": "Está bien así",
-            })
+            ear_items.append((_listen_item(kind, block["line"], sources, block["fix"]), (i1, i2)))
             continue
-        items.append({
+        ear_items.append(({
             "kind": kind, "line": block["line"], "required": len(sources) >= 2 and not edited,
             "title": "Se escucha distinto" if kind == "heard_different" else "Falta texto",
             "why": _why(sources), "sources": sources, "fix": block["fix"],
             "alternatives": block.get("alternatives") or [],
             "action": "Corregir" if kind == "heard_different" else "Agregar",
             "dismiss": "Está bien así" if kind == "heard_different" else "No se canta",
-        })
+        }, (i1, i2)))
+    ear_review = _one_click_guard(ear_items, withheld)
+    voseo: list[dict] = []
+    if str(portal or "").strip().lower() in VOSEO_PORTALS:
+        voseo = _rule_voseo(segments, screen, voseo_ears, human_edited)
+        ear_review = _absorb_voseo_ear_items(ear_review, voseo)
+    items.extend(ear_review)
+    items.extend(voseo)
 
     vocabulary = {norm_token(w["word"]) for w in witness} | {
         t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in official_tokens}
-    items.extend(_rule_question_marks(segments))
+    items.extend(_rule_question_marks(segments, profile))
+    if profile is not None:
+        items.extend(_rule_question_balance(segments, profile))
+        items.extend(_rule_terminal_period(segments))
+        if profile.get("parentheses"):
+            items.extend(_rule_parentheses(segments))
+        items.extend(_rule_missing_accents(segments, required=bool(profile.get("accents_required", True))))
     items.extend(_rule_title(segments, title))
     items.extend(_rule_accents(segments))
     items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_clean), vocabulary))
     items.extend(_rule_orphans(segments))
     items.extend(_rule_phrase_structure(segments))
+    if official_origin in {"operator", "sheet"}:
+        from reference_lines import crossed_reference_boundaries
+
+        items.extend({
+            "kind": "reference_boundary", "line": line, "required": True,
+            "title": "Corte de verso pendiente",
+            "why": "Este cartel une palabras de dos versos consecutivos de la letra oficial. Escuchá el tramo y corregí el corte.",
+            "sources": {"official"}, "fix": {"type": "inspect_structure"},
+            "listen": True, "action": "Escuchar", "dismiss": "Está bien así",
+        } for line in crossed_reference_boundaries(segments, official_text or ""))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
-    # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
-    # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
+    # Sincronización: detrás de LYRIC_REVIEW_TIMING_MODE (observe por defecto).
+    timing_mode = timing_review_mode()
+    if timing_mode != "off":
+        items.extend(_rule_voice_timing(segments, machine_evidence, timing_mode == "enforce"))
     if same_version and official_ops:
         items.extend(_rule_layout_official(segments, screen, official_tokens, official_ops))
 
@@ -1238,12 +1871,56 @@ def build_review(
         "items": pending[:MAX_ITEMS],
         "required_count": sum(1 for i in pending if i["required"]),
         "suggested_count": sum(1 for i in pending if not i["required"]),
+        "profile": str(portal).lower() if profile is not None else None,
         "sources": {
             "witness": bool(witness), "gemini": bool(gemini),
             "official": bool(official_tokens), "memory": len(memory_pairs or {}),
             "similarity": similarity,
+            **({"official_window": official_window} if official_window else {}),
         },
         "risk": _risk(witness, similarity, pending, len(segments)),
+        "timing_trust": _song_timing_trust(segments, original_segments, machine_evidence, witness),
+    }
+
+
+def _song_timing_trust(segments: list[dict], original_segments: Any,
+                       machine_evidence: Any, witness: list[dict]) -> dict | None:
+    """Aviso de canción: el timing de la máquina no es confiable entero
+    (``song_timing_trust``). Se mide sobre la versión 0 (la de la máquina) y
+    las líneas sospechosas se ubican en la letra actual. Sólo ordena: nunca
+    bloquea la aprobación."""
+    import song_timing_trust as stt
+
+    if stt.mode() == "off":
+        return None
+    original = [s for s in (original_segments or []) if isinstance(s, dict)] \
+        if isinstance(original_segments, list) else []
+    if not original:
+        return None
+    try:
+        verdict = stt.assess(original, None, witness=witness,
+                             control_text=gemini_text(machine_evidence))
+    except Exception:  # pragma: no cover - un detector nunca tumba el editor
+        return None
+    lines: list[dict] = []
+    seen: set[int] = set()
+    for row in verdict.get("lines") or []:
+        current = _map_to_current(segments, original[row["line"]])
+        if current is None or current in seen:
+            continue
+        seen.add(current)
+        seg = segments[current]
+        lines.append({
+            "line": current, "line_segment_id": _seg_id(segments, current),
+            "start": round(_f(seg.get("start")), 2), "end": round(_f(seg.get("end")), 2),
+            "reasons": list(row.get("reasons") or []),
+        })
+    return {
+        "schema": verdict["schema"],
+        "unreliable": bool(verdict.get("unreliable")),
+        "score": verdict.get("score"),
+        "reasons": list(verdict.get("reason_text") or []),
+        "lines": lines,
     }
 
 
@@ -1293,6 +1970,7 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             if prev.get("listen") and not item.get("listen"):
                 for field in ("listen", "title", "action", "dismiss", "alternatives"):
                     prev[field] = item.get(field)
+            prev["style_rule"] = bool(prev.get("style_rule")) or bool(item.get("style_rule"))
             prev["required"] = prev["required"] or item["required"] or (
                 prev["kind"] in {"missing", "heard_different"} and len(prev["sources"]) >= 2)
             if prev["kind"] in {"missing", "heard_different"} and prev["sources"]:
@@ -1303,6 +1981,10 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
         fix = occ["fix"]
         if fix["type"] == "new_line":
             group_sig = ("new_line", sig[1:])
+        elif item["kind"] in _GROUP_ACROSS_LINES:
+            # Un solo punto con todas las líneas ("Quitar el punto final" en
+            # 7 líneas); cada aparición lleva su propio texto esperado.
+            group_sig = (item["kind"],)
         elif fix["type"] in {"replace", "insert"}:
             group_sig = (item["kind"], sig[1])
         elif fix["type"] == "inspect_structure":
@@ -1324,11 +2006,13 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
                 "keys": [key], "occurrences": [occ],
                 "alternatives": item.get("alternatives") or [],
                 "listen": bool(item.get("listen")),
+                "style_rule": bool(item.get("style_rule")),
             }
         else:
             g["occurrences"].append(occ)
             g["keys"].append(key)
             g["required"] = g["required"] or bool(item["required"])
+            g["style_rule"] = g["style_rule"] or bool(item.get("style_rule"))
             g["sources"] = sorted(set(g["sources"]) | item["sources"])
             g["listen"] = g["listen"] and bool(item.get("listen"))
     out = []
@@ -1398,14 +2082,14 @@ def gemini_text(machine_evidence: Any) -> str:
 
 
 def required_for_scope(review: dict, scope: str) -> list[dict]:
-    """Puntos que bloquean según el camino de aprobación: ``full`` (editor y
-    campañas), ``missing_only`` (re-render por pedido de cambio: sólo lo que
-    se canta y se perdió) o ``none``."""
+    """Filtro legado de prioridad por alcance; no concede poder de bloqueo.
+    La política activa se determina en ``mode()`` y es orientativa.
+    """
     if scope == "none":
         return []
     items = [i for i in review.get("items") or [] if i.get("required")]
     if scope == "missing_only":
-        items = [i for i in items if i.get("kind") == "missing"]
+        items = [i for i in items if i.get("kind") == "missing" or i.get("style_rule")]
     return items
 
 

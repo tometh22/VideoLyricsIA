@@ -167,4 +167,21 @@ describe("LyricsEditor — repeat-line propagation", () => {
     fireEvent.click(screen.getByRole("button", { name: /Aplicar a todas/i }));
     expect(screen.getByDisplayValue("Quizá fue en la TARDE")).toBeInTheDocument();
   });
+
+  it("lists each repetition with its time and applies only the ticked ones", () => {
+    const props = baseProps({
+      segments: [
+        { start: 10.0, end: 12.0, text: "Quizá fue en la mañana" },
+        { start: 30.0, end: 32.0, text: "Quizá fue en la mañana" },
+        { start: 70.0, end: 72.0, text: "Quizá fue en la mañana" },
+      ],
+    });
+    render(<LyricsEditor {...props} />);
+    editLine(screen.getAllByDisplayValue("Quizá fue en la mañana")[0], "Quizás fue en la mañana");
+    expect(screen.getByRole("checkbox", { name: /repetición de 0:30/ })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /repetición de 1:10/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Aplicar a las 1 marcadas/i }));
+    expect(screen.getAllByDisplayValue("Quizás fue en la mañana")).toHaveLength(2);
+    expect(screen.getAllByDisplayValue("Quizá fue en la mañana")).toHaveLength(1);
+  });
 });

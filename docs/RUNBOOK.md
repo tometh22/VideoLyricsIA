@@ -20,13 +20,17 @@ primeras semanas.
 
 - `api`: recibe uploads, encola jobs, sirve `/status`, redirige `/download`
   a signed URLs de R2.
-- `worker.py`: corre los jobs en procesos separados. Precarga Whisper turbo
-  al arrancar.
+- `worker.py`: corre los jobs en procesos separados. Whisper se carga en el
+  primer job salvo `WHISPER_PRELOAD=1` (worker interactivo y batch-short).
 - PostgreSQL: estado canónico de usuarios, jobs, facturas, provenance,
   audit log, tokens de password reset y email verification. Hard dependency
   — sin Postgres el API no arranca (`init_db()` corre en startup).
-- Redis: cola de jobs (RQ). Dos colas con prioridad: `enterprise` y
-  `default`. Si falta, `queue_jobs.py` cae a `threading.Thread` (solo dev).
+- Redis: cola de jobs (RQ). Render escucha `enterprise` (y `canary`); un
+  worker liviano escucha solo `default`; ProRes tiene `prores_portal` y
+  `prores_prewarm` cuando `PRORES_*_QUEUE` está seteado. Sin esas
+  variables, ProRes sigue en `enterprise` (Railway). Si falta Redis,
+  `queue_jobs.py` cae a `threading.Thread` (solo dev). Layout OVH:
+  `docs/OVH_WORKERS.md`.
 - R2: storage permanente de los masters (egress gratis). Si falta, los
   deliverables se sirven desde disco local (slow para archivos grandes).
 - Sentry: errores + contexto. Gated por `SENTRY_DSN`.

@@ -994,6 +994,42 @@ class BatchCampaignItem(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class TeamCoordinator(Base):
+    """Scoped permission; never grants platform administration."""
+    __tablename__ = "team_coordinators"
+    tenant_id = Column(String(100), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class TeamAssignment(Base):
+    __tablename__ = "team_assignments"
+    item_id = Column(String(36), ForeignKey("batch_campaign_items.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    assignee_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    priority = Column(String(10), nullable=False, default="normal")
+    due_date = Column(Date, nullable=True)
+    note = Column(Text, nullable=False, default="")
+    blocked_reason = Column(Text, nullable=False, default="")
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+
+class TeamActivity(Base):
+    __tablename__ = "team_activity"
+    __table_args__ = (Index("ix_team_activity_tenant_created", "tenant_id", "created_at"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False)
+    item_id = Column(String(36), ForeignKey("batch_campaign_items.id", ondelete="CASCADE"), nullable=True)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(String(40), nullable=False)
+    detail = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class BatchUploadSession(Base):
     """Short-lived, campaign-only credential exchanged from a pairing code."""
 
@@ -1229,6 +1265,47 @@ class EditorVersion(Base):
     provenance = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_versions")
+
+
+class EditorRetranscription(Base):
+    """Append-only archive of one reviewer-requested re-transcription.
+
+    The editor's machine snapshot (``original_segments`` + ``machine_evidence``)
+    is frozen on purpose: it is the baseline for correction learning.  When a
+    reviewer asks Genly to listen to the song again in another language, the
+    previous baseline is copied here *before* the worker installs the new one,
+    so the pre-human snapshot of every attempt stays auditable.  The human
+    text at the moment of the request remains an ordinary ``editor_versions``
+    row (``archived_version_id``); nothing in history is deleted.
+    """
+    __tablename__ = "editor_retranscriptions"
+    __table_args__ = (
+        Index("ix_editor_retranscriptions_job_created", "job_id", "created_at"),
+        Index("ix_editor_retranscriptions_attempt", "attempt_id", unique=True),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    # Outbox event id of the transcription attempt that serves this request.
+    attempt_id = Column(String(36), nullable=False)
+    requested_language = Column(String(8), nullable=False)
+    previous_language = Column(String(16), nullable=True)
+    base_revision = Column(Integer, nullable=False)
+    archived_version_id = Column(String(36), nullable=True)
+    archived_original_segments = Column(JSONB, nullable=True)
+    archived_machine_evidence = Column(JSONB, nullable=True)
+    archived_transcription_quality = Column(JSONB, nullable=True)
+    # pending → applied | failed | discarded
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    result_revision = Column(Integer, nullable=True)
+    error = Column(String(500), nullable=True)
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class ProductEvent(Base):

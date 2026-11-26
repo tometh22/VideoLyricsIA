@@ -299,4 +299,61 @@ describe("JobDetail UMG delivery recovery", () => {
     ));
     expect(await screen.findByText("Video publicado en umgchile.genly.pro")).toBeTruthy();
   });
+
+  it("shows what nobody heard before publishing and «Publicar igual» resends its token", async () => {
+    const currentReport = {
+      status: "COMPLETE", mode: "enforce", decision: "PASS", report_id: "qc-ready-review",
+      source_fingerprint: "source-current", visual_fingerprint: "visual-current",
+      delivery_spec: {}, issues: [], approval: { blocked: false, can_approve: true },
+    };
+    const preparedJob = {
+      ...job,
+      umg_spec: { frame_size: "HD", fps: 29.97, prores_profile: 3 },
+      s3_keys: { ...job.s3_keys, umg_master: "tenant/job/umg_master.mov", umg_short: "tenant/job/umg_short.mov" },
+    };
+    const token = "a".repeat(64);
+    const summary = {
+      job_id: job.job_id, title: "Variante", artist: "Artista", listening_status: "measured",
+      lines_total: 24, lines_unheard: 3, warnings_count: 1, needs_attention: true, token,
+      unheard: [{ line_index: 7, start: 75.2, end: 78, text: "La línea del segundo verso" }],
+      warnings: [{ id: "w1", category: "style", title: "Quitar el punto final", count: 2,
+        occurrences: [{ start: 12, before: "Lejos de vos.", after: "Lejos de vos" }] }],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      if (url.includes("/delivery-qc/recheck")) return response(200, { ok: true, delivery_qc: currentReport });
+      if (url.includes("/admin/deliveries/from-job/")) {
+        const body = JSON.parse(options.body);
+        if (body.publish_review_token !== token) {
+          return response(409, { detail: { code: "publish_review_required", summaries: [summary],
+            totals: { songs: 1, songs_needing_attention: 1, lines_unheard: 3, lines_total: 24, warnings: 1 } } });
+        }
+        return response(200, { ok: true, label: "Renderizado", replaced: false, portal_id: "argentina" });
+      }
+      throw new Error(`Unexpected fetch: ${url} ${options?.body || ""}`);
+    });
+
+    render(
+      <MemoryRouter>
+        <AlertProvider>
+          <JobDetail job={preparedJob} onBack={vi.fn()} onJobUpdate={vi.fn()} />
+        </AlertProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("detail.send_umg"));
+    fireEvent.click(screen.getByText("umg.portal_argentina"));
+
+    const dialog = await screen.findByRole("dialog", { name: "Resumen antes de publicar" });
+    expect(dialog).toHaveTextContent("3 líneas sin escuchar y 1 aviso sin mirar.");
+    expect(dialog).toHaveTextContent("1:15");
+    expect(dialog).toHaveTextContent("La línea del segundo verso");
+    expect(dialog).toHaveTextContent("Estilo del portal");
+    expect(screen.queryByText("Video publicado en umg.genly.pro")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Publicar igual" }));
+    expect(await screen.findByText("Video publicado en umg.genly.pro")).toBeTruthy();
+    const publishCalls = fetchMock.mock.calls.filter(([url]) => url.includes("/admin/deliveries/from-job/"));
+    expect(publishCalls).toHaveLength(2);
+    expect(JSON.parse(publishCalls[1][1].body)).toEqual({ portal_id: "argentina", publish_review_token: token });
+  });
 });

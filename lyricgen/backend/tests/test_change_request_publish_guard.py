@@ -117,6 +117,10 @@ def test_visual_only_requests():
 @pytest.fixture
 def guard_on(monkeypatch):
     monkeypatch.setenv("CHANGE_REQUEST_PUBLISH_GUARD_ENABLED", "1")
+    # Estos tests cubren el control de texto anterior (frase en cualquier
+    # parte). La verificación punto por punto lo reemplaza y tiene sus tests
+    # en test_change_request_verification*.py; acá queda apagada.
+    monkeypatch.setenv("CHANGE_REQUEST_CLOSE_VERIFICATION", "0")
 
 
 @pytest.fixture
@@ -324,5 +328,30 @@ def test_a_ticked_text_request_stays_open_when_its_text_is_not_published(client,
 def test_a_ticked_text_request_closes_when_its_text_is_published(client, admin_token, storage_ready, actions, guard_on, cleanup):
     campaign, job_id, first = ticked_text_request(client, admin_token, cleanup, "text-found", "Pintamos el mono, pero nos da lo mismo")
     response = send(client, admin_token, campaign, job_id, [first], "text-found-send-001")
+    atc.process_delivery_batch(response.json()["operation_id"])
+    assert state(first)[:2] == (True, "publication")
+
+
+def test_bulk_send_keeps_open_a_request_with_an_unverified_point(client, admin_token, storage_ready, actions, cleanup):
+    """Verificación punto por punto (prendida por defecto, sin el flag del
+    guard): "Marcar todos" en el envío ya no cierra un pedido a medias."""
+    campaign, job_id, first = ticked_text_request(client, admin_token, cleanup, "verify-missing", "Pintamos el mono, que nos da lo mismo")
+    response = send(client, admin_token, campaign, job_id, [first], "verify-missing-send-1")
+    assert response.status_code == 202, response.text
+    atc.process_delivery_batch(response.json()["operation_id"])
+    assert state(first)[0] is False
+    with SessionLocal() as db:
+        item = db.query(DeliveryBatchItem).filter_by(delivery_batch_id=response.json()["operation_id"]).one()
+        assert item.status == "sent"            # la publicación sigue
+        [skipped] = item.receipt["change_requests"]["skipped"]
+        assert skipped["reason"] == "points_unverified"
+        assert skipped["missing"] == [PERO]
+        audit = db.query(AuditLog).filter_by(action="delivery.change_request.points_unverified").all()
+        assert any((row.detail or {}).get("change_request_id") == first for row in audit)
+
+
+def test_bulk_send_closes_a_request_whose_points_are_all_published(client, admin_token, storage_ready, actions, cleanup):
+    campaign, job_id, first = ticked_text_request(client, admin_token, cleanup, "verify-found", "Pintamos el mono, pero nos da lo mismo")
+    response = send(client, admin_token, campaign, job_id, [first], "verify-found-send-01")
     atc.process_delivery_batch(response.json()["operation_id"])
     assert state(first)[:2] == (True, "publication")

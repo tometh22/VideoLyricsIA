@@ -393,6 +393,23 @@ def _manual_operation(instruction: dict) -> dict:
     }
 
 
+def _canonical_request_met(metadata, field, requested) -> bool:
+    """"Corregir artista: LOS ENANITOS VERDES" ya está cumplido si el video
+    dice "Los Enanitos Verdes": el catálogo de UMG fija la escritura y el
+    render vuelve a ella; proponer el cambio otra vez no lo acerca."""
+    if not requested or field not in {"artist", "song_title"}:
+        return False
+    try:
+        from umg_metadata import normalize
+    except ImportError:  # pragma: no cover
+        return False
+    if field == "artist":
+        expected = normalize(requested, metadata.get("song_title") or "").artist
+    else:
+        expected = normalize(metadata.get("artist") or "", requested).title
+    return bool(expected) and metadata.get(field) == expected != requested
+
+
 def _explicit_timing_operation(segments, instruction, metadata, duration):
     op = _manual_operation(instruction)
     kind = instruction.get("kind")
@@ -404,7 +421,8 @@ def _explicit_timing_operation(segments, instruction, metadata, duration):
         if field not in {"artist", "song_title"} or not instruction.get("requested_text"):
             op["reason"] = "unsupported_metadata_field"
             return op
-        if metadata.get(field) == instruction.get("requested_text"):
+        if metadata.get(field) == instruction.get("requested_text") or _canonical_request_met(
+                metadata, field, instruction.get("requested_text")):
             op.update(status="already_satisfied", reason="already_satisfied", warnings=[])
             return op
     elif kind == "delete_from":
@@ -581,6 +599,58 @@ def _merge_interpretation(
     return [*operations, *added], remaining
 
 
+def _repetition_operations(current: list[dict], operations: list[dict]) -> list[dict]:
+    """El mismo cambio en las otras apariciones de la MISMA línea original.
+
+    UMG cita un estribillo una vez y espera que se corrija en todas sus
+    repeticiones ("Se repite mucho la misma corrección en la letra"); en el
+    banco sep-nov 2026, 189 puntos pedían la misma corrección en otra
+    repetición de la misma línea. Hasta acá el pedido sólo tocaba la línea
+    del tiempo citado salvo que el cliente escribiera "todas las apariciones".
+
+    Cada repetición es una operación aparte (el operador puede destildarla),
+    marcada ``repetition_of`` y nunca automática: el cliente no la nombró.
+    Sólo líneas con el texto idéntico al original (NFC, sin espacios de
+    borde); una variante con otra puntuación no se toca sola.
+    """
+    claimed = {segments_content_hash([row]) for op in operations for row in op.get("current_segments") or []}
+    added: list[dict] = []
+    for operation in list(operations):
+        if (operation.get("kind") not in {"replace_text", "remove_terminal_period"}
+                or operation.get("scope") == "all_matching" or operation.get("repetition_of")):
+            continue
+        before = operation.get("current_segments") or []
+        after = operation.get("proposed_segments") or []
+        if len(before) != 1 or len(after) != 1:
+            continue
+        original = _identity(before[0].get("text"))
+        proposed_text = str(after[0].get("text") or "")
+        if len(original.split()) < 2 or _identity(proposed_text) == original:
+            continue
+        for index, row in enumerate(current):
+            row_hash = segments_content_hash([row])
+            if row_hash in claimed or _identity(row.get("text")) != original:
+                continue
+            sibling = _text_operation(
+                instruction={"id": f"{operation.get('group_key')}:repetition",
+                             "confidence": operation.get("confidence"), "scope": "repetition",
+                             "source_excerpt": operation.get("source_excerpt"),
+                             "source_start": operation.get("source_start"),
+                             "source_end": operation.get("source_end")},
+                index=index, current=row, proposed_text=proposed_text,
+            )
+            sibling.update(
+                kind=operation["kind"], group_key=operation.get("group_key"),
+                repetition_of=operation["id"], repetition_of_start=float(before[0].get("start") or 0),
+                automatic_apply_allowed=False, timecode_seconds=None,
+                warnings=[*sibling.get("warnings", []), "repetition_of_requested_line"],
+                **({"origin": operation["origin"], "why": operation.get("why", "")} if operation.get("origin") else {}),
+            )
+            claimed.add(row_hash)
+            added.append(sibling)
+    return added
+
+
 def build_proposal(
     *, comment: str, segments: Iterable[dict], base_revision: int,
     audio_revision: int = 0, audio_sha256: str = "",
@@ -685,6 +755,7 @@ def build_proposal(
 
     if interpretation:
         operations, unresolved = _merge_interpretation(operations, unresolved, interpretation)
+    operations = [*operations, *_repetition_operations(current, operations)]
 
     # Detect competing claims before presenting a jointly applicable selection.
     claims: dict[str, list[dict]] = {}

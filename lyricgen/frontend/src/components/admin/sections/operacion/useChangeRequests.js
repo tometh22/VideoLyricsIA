@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
+import { publishReviewFrom } from "../../../../lib/publishReview";
 import { describePublishError } from "./changeRequestWorkflow";
 import { byPublicationMode, setPublicationMode } from "./publicationMode";
 
@@ -62,11 +63,21 @@ function proposalMatchesSummary(proposal, item) {
     || revision === proposal.lyrics_context.revision;
 }
 
-// Pedidos que la publicación dejó abiertos porque el texto pedido no está
-// en la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+// Publication and request closure are separate results. A literal text check
+// cannot attest a timing instruction or decide a human-reviewed difference.
 function keptOpenText(kept) {
-  return (kept || []).map((entry) => ` El pedido #${entry.id} sigue abierto: la letra publicada no tiene ${
-    (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}.`).join("");
+  return (kept || []).map((entry) => (entry.reason === "points_unverified"
+    ? ` El pedido #${entry.id} sigue abierto: ${(entry.failing || entry.missing || []).length || "algún"} punto(s) no están en la letra publicada (${
+      (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ")}). Corregilos o justificá cada uno para cerrarlo.`
+    : ` El pedido #${entry.id} sigue abierto: no pudimos comprobar automáticamente ${
+      (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}. Revisá cada punto en el video publicado para darlo por resuelto.`)).join("");
+}
+
+// 409 change_request_points_unverified: cuántos puntos quedan sin justificar.
+function unverifiedText(err) {
+  if (err?.detail?.code !== "change_request_points_unverified") return null;
+  const count = (err.detail.failing || []).length;
+  return `No se cerró: ${count} punto(s) del pedido no están en la letra publicada. Corregilos o escribí la justificación de cada uno en “Verificación contra la letra”.`;
 }
 
 export const INTERPRETATION_POLL_MS = 4000;
@@ -497,7 +508,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     return () => clearInterval(iv);
   }, [hasActiveWork, loadChangeRequests]);
 
-  const resolveChangeRequest = useCallback(async (id, note) => {
+  const resolveChangeRequest = useCallback(async (id, note, pointOverrides) => {
     const reason = (note || "").trim();
     if (!reason) {
       setCrPublishNotice({ requestId: id, tone: "error", text: "Escribí el motivo para cerrar el pedido sin publicar otro video." });
@@ -511,7 +522,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       const data = await fetchJson(`${API}/admin/change-requests/${id}/resolve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolution_note: reason }),
+        body: JSON.stringify({ resolution_note: reason,
+          ...(pointOverrides && Object.keys(pointOverrides).length ? { point_overrides: pointOverrides } : {}) }),
       });
       if (data.ok !== true || (data.already_resolved !== true
         && (typeof data.resolved_at !== "string" || !Number.isFinite(Date.parse(data.resolved_at))))) {
@@ -524,7 +536,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } catch (err) {
       setCrPublishNotice({ requestId: id, outcomeUnknown: mutationOutcomeUnknown(err), tone: mutationOutcomeUnknown(err) ? "wait" : "error",
         text: mutationOutcomeUnknown(err) ? "No pudimos confirmar el cierre. Actualizando el estado del pedido; no publiques otra versión para reintentar."
-          : `No pude marcar como resuelto: ${err.message || err}` });
+          : unverifiedText(err) || `No pude marcar como resuelto: ${err?.detail?.message || err.message || err}` });
       await loadChangeRequests({ silent: true });
     } finally {
       mutationLocksRef.current.delete(lock);
@@ -535,7 +547,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   // The corrected cut is already in the portal (sent from a campaign without
   // ticking this request): record the close as a publication, bound to the
   // exact cut the operator is looking at. No note needed.
-  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems, textReview) => {
+  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems, textReview, pointOverrides, publishReviewToken) => {
     if (!publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: id, tone: "error", text: "Falta verificar el corte publicado. Actualizá el pedido y reintentá." });
       return;
@@ -557,6 +569,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             publication_review_reason: textReview.reason, confirmed_published_review: true,
           } : textReview ? { text_review_token: textReview.token,
             text_review_reason: textReview.reason } : {}),
+          ...(pointOverrides && Object.keys(pointOverrides).length ? { point_overrides: pointOverrides } : {}),
+          ...(publishReviewToken ? { publish_review_token: publishReviewToken } : {}),
         }),
       });
       if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
@@ -565,6 +579,14 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         : `Pedido resuelto ${textReview?.publicationToken ? "con revisión humana de" : textReview ? "con revisión manual de" : "con"} la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
       await loadChangeRequests();
     } catch (err) {
+      const publishReview = publishReviewFrom(err?.detail);
+      if (publishReview) {
+        // Mismo resumen que al publicar: "Dar por resuelto igual" reenvía el token.
+        setCrPublishNotice({ requestId: id, tone: "wait", text: "Antes de darlo por resuelto, mirá qué quedó sin escuchar y sin revisar.",
+          publishReview: { ...publishReview, action: "confirm",
+            args: [id, publication, confirmedItems, textReview, pointOverrides] } });
+        return;
+      }
       const unknown = mutationOutcomeUnknown(err);
       const review = err?.detail?.code === "requested_text_not_found"
         && typeof err.detail.review_token === "string" && Array.isArray(err.detail.missing)
@@ -574,7 +596,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrPublishNotice({ requestId: id, outcomeUnknown: unknown, tone: unknown ? "wait" : "error",
         ...(review ? { textReview: review } : {}),
         text: unknown ? "No pudimos confirmar el cierre. Actualizando el estado del pedido."
-          : `No pude cerrar el pedido: ${err?.detail?.message || err.message || err}` });
+          : unverifiedText(err) || `No pude cerrar el pedido: ${err?.detail?.message || err.message || err}` });
       await loadChangeRequests({ silent: true });
     } finally {
       mutationLocksRef.current.delete(lock);
@@ -625,7 +647,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } finally { renderLockRef.current = false; endProposalWork(work); }
   }, [crRenderReview, loadChangeRequests, beginProposalWork, endProposalWork]);
 
-  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication) => {
+  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication, pointOverrides, publishReviewToken) => {
     if (!portalId || !publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: crId, tone: "error", text: "Falta verificar el destino o la revisión del corte. Actualizá el pedido antes de publicar." });
       return;
@@ -654,10 +676,22 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           body: JSON.stringify({ portal_id: portalId,
             ...(publication ? { change_request_id: crId,
               reviewed_render_fingerprint: publication.render_fingerprint,
-              reviewed_editor_revision: publication.editor_revision } : {}),
+              reviewed_editor_revision: publication.editor_revision,
+              ...(pointOverrides && Object.keys(pointOverrides).length
+                ? { change_request_point_overrides: pointOverrides } : {}) } : {}),
+            ...(publishReviewToken ? { publish_review_token: publishReviewToken } : {}),
           }),
         });
       } catch (err) {
+        const publishReview = publishReviewFrom(err?.detail);
+        if (publishReview) {
+          // PUBLISH_REVIEW_SUMMARY=prompt: nada se publicó. "Publicar igual"
+          // reenvía el token del resumen visto.
+          setCrPublishNotice({ requestId: crId, tone: "wait", text: "Antes de publicar, mirá qué quedó sin escuchar y sin revisar.",
+            publishReview: { ...publishReview, action: "publish",
+              args: [jobId, portalId, crId, publication, pointOverrides] } });
+          return;
+        }
         const gate = err?.detail?.delivery_qc;
         if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
           const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId)}`;
@@ -723,7 +757,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         setCrPublishNotice({
           requestId: crId,
           tone: "ok",
-          text: `Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.${data.hidden_from_client ? ` OJO: el cliente no lo ve, está oculto.${HIDDEN_HINT}` : ""}`,
+          text: `La versión ${data.revision} ya está publicada. Reenviar el mismo corte no cambia la versión ni cierra pedidos pendientes: revisá el pedido publicado para darlo por resuelto.${data.hidden_from_client ? ` OJO: el cliente no lo ve, está oculto.${HIDDEN_HINT}` : ""}`,
         });
       }
       // A committed publication stays confirmed even if the follow-up list read
@@ -753,6 +787,17 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       if (item?.resolution_source === "publication" && item.resolved_at) {
         setCrPublishNotice({ requestId, tone: "ok",
           text: `Publicación confirmada. El pedido quedó resuelto en la versión ${item.resolved_by_revision || item.publication?.revision || "actual"}.` });
+        await loadChangeRequests({ silent: true });
+      } else if (item?.publication?.needs_publish === false
+          && item.publication.render_matches_editor === true
+          && item.publication.answers_request === true
+          && Number.isInteger(item.publication.revision) && item.publication.revision > 0) {
+        // Megagilda Mix: publication committed, but the literal-text guard
+        // kept the request open. Never ask the operator to publish again or
+        // claim resolution just because the corrected cut reached the portal.
+        setCrPublishNotice({ requestId, tone: "ok",
+          text: `Publicación confirmada: versión ${item.publication.revision}.${item.publication.hidden_from_client
+            ? ` El cliente todavía no la ve: está oculta.${HIDDEN_HINT}` : " El video corregido ya está en el portal."} El pedido sigue abierto; revisá cada punto en el video publicado para darlo por resuelto.` });
         await loadChangeRequests({ silent: true });
       } else {
         setCrPublishNotice({ requestId, outcomeUnknown: true, tone: "wait",

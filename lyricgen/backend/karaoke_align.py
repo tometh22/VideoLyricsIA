@@ -159,7 +159,7 @@ def enrich_segments_with_word_timings(segments, audio_path):
         retimed = 0
         for seg in segments:
             txt = str(seg.get("text", "")).strip()
-            if not txt or _has_valid_words(seg):
+            if not txt:
                 merged.append(seg)
                 continue
             key = _norm(txt)
@@ -172,6 +172,13 @@ def enrich_segments_with_word_timings(segments, audio_path):
                     cursor = j + 1
                     break
                 j += 1
+            if _has_valid_words(seg):
+                # Keep its words, but the search above still advanced the
+                # cursor: FA aligns EVERY line, so skipping the timed ones
+                # without consuming their aligned line left the 6-line window
+                # stuck near the top and no later wordless line could match.
+                merged.append(seg)
+                continue
             if (
                 found
                 and _retime_enabled()
@@ -213,6 +220,123 @@ def enrich_segments_with_word_timings(segments, audio_path):
         return merged
     except Exception as e:  # never break a render over karaoke timing
         logger.warning("[KARAOKE] word-timing enrichment failed (%s) — using synthesis", e)
+        return segments
+
+
+def recover_words_from_reference(segments, reference_segments, *,
+                                 pad_s: float = 0.35, min_match: float = 0.5):
+    """Give wordless lines the word timing of the ORIGINAL transcription.
+
+    Operators edit text and timing in the editor, which drops a line's
+    `words`. Forced alignment is the first way to get them back; when it is
+    unavailable or fails (the hosted aligner can error on a whole song), the
+    editor's original transcription still holds aligned words for the same
+    audio. Its words whose start falls in the line's window are matched to the
+    line's tokens (order-preserving diff on normalised text), so edited words
+    ("No" -> "hoy") only lose their own timing: unmatched tokens are
+    interpolated between their matched neighbours.
+
+    A line is left untouched (synthesis) unless at least `min_match` of its
+    tokens match. Every word stays inside the line's window, in order, with a
+    positive duration — the contract `ass_render._word_timings` validates.
+    Returns the same list object when nothing changed. Never raises.
+    """
+    import difflib
+    import math
+
+    try:
+        ref = []
+        for seg in reference_segments or []:
+            for w in (seg.get("words") or []) if isinstance(seg, dict) else []:
+                try:
+                    ws, we = float(w["start"]), float(w["end"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                key = _norm(str(w.get("word", "")))
+                if key and math.isfinite(ws) and math.isfinite(we) and we > ws:
+                    ref.append((ws, we, key))
+        if not ref:
+            return segments
+        ref.sort()
+
+        out, changed = [], 0
+        for seg in segments:
+            txt = str(seg.get("text", "")).strip()
+            if not txt or _has_valid_words(seg):
+                out.append(seg)
+                continue
+            try:
+                start, end = float(seg["start"]), float(seg["end"])
+            except (KeyError, TypeError, ValueError):
+                out.append(seg)
+                continue
+            tokens = txt.split()
+            cand = [w for w in ref if start - pad_s <= w[0] < end]
+            if not cand or end <= start:
+                out.append(seg)
+                continue
+            matcher = difflib.SequenceMatcher(
+                None, [_norm(t) for t in tokens], [w[2] for w in cand], autojunk=False)
+            times: list[list[float] | None] = [None] * len(tokens)
+            matched = 0
+            for blk in matcher.get_matching_blocks():
+                for k in range(blk.size):
+                    ws, we, _ = cand[blk.b + k]
+                    times[blk.a + k] = [max(start, ws), min(end, we)]
+                    matched += 1
+            if matched < max(1, math.ceil(min_match * len(tokens))):
+                out.append(seg)
+                continue
+            # Interpolate unmatched runs between their matched neighbours,
+            # weighted by length (a trailing run gets ~0.35 s per word).
+            i = 0
+            while i < len(tokens):
+                if times[i] is not None:
+                    i += 1
+                    continue
+                j = i
+                while j < len(tokens) and times[j] is None:
+                    j += 1
+                left = times[i - 1][1] if i > 0 else start
+                if j < len(tokens):
+                    right = times[j][0]
+                else:
+                    right = min(end, left + 0.35 * (j - i))
+                if right - left < 0.02 * (j - i):
+                    right = min(end, left + 0.05 * (j - i))
+                weights = [len(tokens[k]) + 1 for k in range(i, j)]
+                total = float(sum(weights))
+                cursor = left
+                for k, wgt in zip(range(i, j), weights):
+                    nxt = cursor + (right - left) * wgt / total
+                    times[k] = [cursor, nxt]
+                    cursor = nxt
+                i = j
+            words, prev_end, ok = [], start, True
+            for tok, (ws, we) in zip(tokens, times):
+                ws = max(ws, prev_end)
+                we = min(max(we, ws + 0.01), end)
+                if we <= ws:
+                    ok = False
+                    break
+                words.append({"word": tok, "start": round(ws, 3), "end": round(we, 3),
+                              "source": "original_transcription"})
+                prev_end = we
+            if not ok:
+                out.append(seg)
+                continue
+            new_seg = dict(seg)
+            new_seg["words"] = words
+            out.append(new_seg)
+            changed += 1
+        if not changed:
+            return segments
+        logger.info("[KARAOKE] recovered word timing for %d line(s) from the "
+                    "original transcription", changed)
+        return out
+    except Exception as e:  # never break a render over word timing
+        logger.warning("[KARAOKE] word recovery from the original transcription "
+                       "failed (%s) — using synthesis", e)
         return segments
 
 

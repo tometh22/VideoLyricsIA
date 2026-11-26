@@ -137,6 +137,9 @@ class DeliveryCreate(BaseModel):
     publish_anyway: bool = False
     override_reason: str | None = Field(default=None, max_length=1000)
     override_job_ids: list[str] | None = Field(default=None, max_length=1000)
+    # PUBLISH_REVIEW_SUMMARY=prompt: job_id -> token del resumen (líneas sin
+    # escuchar y avisos sin mirar) que se vio antes de "Publicar igual".
+    publish_review_tokens: dict[str, str] | None = Field(default=None, max_length=1000)
 
 
 def _asset_key(asset: BatchCampaignAsset) -> str:
@@ -359,10 +362,16 @@ def register_art_manifest(
         cover_asset = cover_rows.get(("cover", matched.sha256.lower())) if matched else None
         next_ordinal += 1
         metadata_error = None if audio.title and audio.artist else "missing_metadata"
+        item_title = (audio.title or "").strip() or None
+        item_artist = (audio.artist or "").strip() or None
+        if item_title and item_artist:
+            import umg_metadata
+            canonical = umg_metadata.normalize_for_db(db, item_artist, item_title)
+            item_artist, item_title = canonical.artist, canonical.title
         row = BatchCampaignItem(
             id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id,
-            ordinal=next_ordinal, filename=audio.filename, title=(audio.title or "").strip() or None,
-            artist=(audio.artist or "").strip() or None, technical_code=(audio.technical_code or "").strip().upper() or None,
+            ordinal=next_ordinal, filename=audio.filename, title=item_title,
+            artist=item_artist, technical_code=(audio.technical_code or "").strip().upper() or None,
             size_bytes=audio.size_bytes, duration_seconds=audio.duration_seconds, sha256=digest,
             metadata_error=metadata_error, upload_state="registered", upload_key=asset.upload_key,
             cover_asset_id=cover_asset.id if cover_asset else None, cover_match_state="matched" if cover_asset else method,
@@ -687,6 +696,34 @@ def delivery_change_request_guard(campaign_id: str, job_ids: str = Query(default
             "blocked": [_guard_entry(job, results[job.job_id]) for job in jobs if results.get(job.job_id, {}).get("blocked")]}
 
 
+@router.get("/art-track-campaigns/{campaign_id}/deliveries/publish-review")
+@router.get("/campaigns/{campaign_id}/deliveries/publish-review")
+def delivery_publish_review(campaign_id: str, job_ids: str = Query(default="", max_length=20000),
+                            current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY=prompt). Sólo lectura.
+
+    Por canción: líneas que nadie escuchó en el editor y avisos precisos de la
+    Revisión rápida sin mirar. El diálogo de envío lo muestra una vez con el
+    total por canción; el envío vuelve a calcularlo y exige sus tokens.
+    """
+    import publish_review
+    _require_scope(current_user); campaign = _campaign_for_delivery(db, campaign_id, current_user)
+    current = publish_review.mode()
+    if current != "prompt" or campaign.kind == "art_track":
+        return {"mode": current, "available": True, "summaries": [], "totals": publish_review.totals([])}
+    wanted = [value for value in job_ids.split(",") if value][:1000]
+    jobs = db.query(Job).filter(
+        Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id,
+        Job.job_id.in_(wanted or [""]),
+    ).all()
+    decision = publish_review.evaluate(db, jobs)
+    if decision["error"]:
+        return {"mode": current, "available": False, "summaries": [], "totals": publish_review.totals([])}
+    shown = [summary for summary in decision["summaries"].values() if summary["needs_attention"]]
+    return {"mode": current, "available": True, "summaries": shown,
+            "totals": {**publish_review.totals(shown), "songs": len(decision["summaries"])}}
+
+
 def _apply_publish_guard(db, ddb, candidates, body) -> tuple[list[dict], dict[str, dict]]:
     """Regla de versión por canción: (frenadas, publicadas igual con motivo).
 
@@ -828,6 +865,14 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
                 "code": guard.GUARD_CODE, "blocked": guard_blocked,
                 "message": "Todas las canciones elegidas tienen pedidos de cambio abiertos más nuevos que su versión aprobada. Corregí y aprobá la letra, o publicá igual indicando el motivo.",
             })
+    # Resumen antes de publicar (PUBLISH_REVIEW_SUMMARY): una sola
+    # confirmación para todo el envío, con el total por canción.
+    import publish_review
+    review_tokens = {str(k): str(v) for k, v in (body.publish_review_tokens or {}).items()}
+    review_decision = (publish_review.evaluate(db, [job for _item, job in candidates], review_tokens)
+                       if campaign.kind != "art_track" else {"mode": "off", "summaries": {}, "pending": [], "error": None})
+    if review_decision["pending"]:
+        raise HTTPException(status_code=409, detail=publish_review.required_detail(review_decision["pending"]))
     intents = _validated_close_intents(db, ddb, campaign, candidates, destination, body)
     operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id, destination_portal=destination, status="queued", idempotency_key=body.idempotency_key, created_by=current_user["id"], total_count=len(candidates), created_at=_now(), updated_at=_now())
     db.add(operation); db.flush()
@@ -846,6 +891,11 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
             db.add(guard.override_audit(current_user["id"], job, result, reason, "campaign_bulk",
                                         campaign_id=campaign.id, delivery_batch_id=operation.id,
                                         portal_id=destination))
+    for row in publish_review.audit_entries(
+            current_user["id"], review_decision, review_tokens, "campaign_bulk",
+            job_ids=[job.job_id for _item, job in candidates],
+            campaign_id=campaign.id, delivery_batch_id=operation.id, portal_id=destination):
+        db.add(row)
     for item, job in candidates:
         db.add(DeliveryBatchItem(id=str(uuid.uuid4()), delivery_batch_id=operation.id, campaign_id=campaign.id, job_id=job.job_id, approved_render_fingerprint=_fingerprint(job), status="pending", change_request_intent=intents.get(job.job_id), created_at=_now(), updated_at=_now()))
     db.commit()
@@ -1084,8 +1134,24 @@ def _evaluate_close_intent(db, ddb, row, job, active, changed) -> tuple[list, li
 
 
 def _text_gate(db, job, resolvable) -> list[dict]:
-    """Pedidos a dejar abiertos porque su texto no está en la letra publicada."""
+    """Pedidos a dejar abiertos porque algún punto no está en la letra publicada.
+
+    El envío por campaña no pide justificaciones: un pedido con un punto ✘
+    queda abierto y se cierra desde Cambios/Campañas, punto por punto. Antes
+    "Marcar todos" cerraba por publicación pedidos corregidos a medias."""
     import change_request_publish_guard as guard
+    import change_request_verification as verification
+    if resolvable and verification.enabled():
+        kept = []
+        for request in resolvable:
+            try:
+                result = verification.verify_request(db, job, request, at=_now())
+            except Exception:
+                logger.warning("[DELIVERY] verification failed for change request %s", request.id, exc_info=True)
+                continue
+            if result is not None and result["blocking"]:
+                kept.append(verification.kept_entry(request, result))
+        return kept
     if not resolvable or not guard.enabled():
         return []
     _closable, kept = guard.text_gate(db, job, resolvable, _now())
@@ -1120,6 +1186,12 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     guard_failure = _publish_guard_failure(db, ddb, row, job)
                     if guard_failure:
                         row.status = "failed"; row.error_code = "change_request_newer_than_version"; row.error_detail = guard_failure; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    # A video rendered with a name UMG asked to write otherwise
+                    # (catalog or an applied correction) stays out of the portal.
+                    from umg_metadata import publication_problem
+                    metadata_problem = publication_problem(db, job)
+                    if metadata_problem:
+                        row.status = "failed"; row.error_code = "metadata_not_canonical"; row.error_detail = metadata_problem["message"][:500]; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                     if storage.is_enabled():
                         # The MP4/short/thumbnail are produced by the render.
                         missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
@@ -1270,10 +1342,10 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         "resolved_change_requests": [r.id for r in resolvable],
                     }))
                     if text_kept:
-                        import change_request_publish_guard as guard
+                        import change_request_verification as verification
                         for kept in text_kept:
-                            db.add(guard.text_not_found_audit(op.created_by, job, kept, "campaign_bulk",
-                                                              delivery_batch_id=op.id, delivery_id=active.id))
+                            db.add(verification.kept_audit(op.created_by, job, kept, "campaign_bulk",
+                                                           delivery_batch_id=op.id, delivery_id=active.id))
                     ddb.commit()
                     db.commit()
                 except Exception:

@@ -130,7 +130,7 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
     render(<LyricsEditor {...props} />);
     // Rediseño 2026-07: la confianza es una línea muted "Sincronizado con
     // tu letra"; el contador vive dentro del chip primario "Revisar · •N".
-    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/Pendiente de revisión/i)).toBeInTheDocument();
     // El chip navegador "Revisar" está presente y muestra el contador (3).
     expect(screen.getByTestId("review-next-btn")).toBeInTheDocument();
     expect(within(screen.getByTestId("review-next-btn")).getByText("3")).toBeInTheDocument();
@@ -147,7 +147,7 @@ describe("LyricsEditor — banner de confianza + señal review calma (2026-07)",
       ],
     });
     render(<LyricsEditor {...props} />);
-    expect(screen.getByText(/Sincronizado con tu letra/i)).toBeInTheDocument();
+    expect(screen.getByText(/Pendiente de revisión/i)).toBeInTheDocument();
     // El chip "Revisar" muestra el contador aun con una sola línea (1).
     expect(within(screen.getByTestId("review-next-btn")).getByText("1")).toBeInTheDocument();
   });
@@ -1225,5 +1225,66 @@ describe("LyricsEditor — editar NO retroalimenta al padre (guard anti-loop, re
     // (cero canal de retroalimentación → cero loop).
     expect(JSON.stringify(parentSegments)).toBe(snapshotBefore);
     expect(parentRenders).toBe(1);
+  });
+});
+
+describe("LyricsEditor — bulk correction recovery", () => {
+  const jobId = "bulk-correction-recovery";
+  const props = () => baseProps({
+    transcribeJobId: jobId,
+    segments: [
+      { start: 1, end: 3, text: "alpha beta gamma delta" },
+      { start: 4, end: 6, text: "epsilon cancion" },
+    ],
+    referenceLyrics: "alpha beta\ngamma delta\nepsilon canción",
+    onPersistSegments: vi.fn().mockResolvedValue({ ok: true }),
+  });
+
+  it("previews without mutation and undoes the whole batch without phantom entries", async () => {
+    render(<LyricsEditor {...props()} />);
+    const initial = structuredClone(segmentsStore.get(jobId));
+    await userEvent.click(screen.getByRole("button", { name: /Agregar línea/i }));
+    const beforeFix = structuredClone(segmentsStore.get(jobId));
+    await userEvent.click(screen.getByTestId("apply-fix-chip"));
+    expect(segmentsStore.get(jobId)).toEqual(beforeFix);
+    expect(screen.getByTestId("apply-fix-popover")).toHaveTextContent("Auto-dividir 1");
+    await userEvent.click(screen.getByTestId("confirm-apply-fixes"));
+    expect(segmentsStore.get(jobId)).toHaveLength(beforeFix.length + 1);
+    expect(segmentsStore.get(jobId).some(line => line.text === "epsilon canción")).toBe(true);
+    await userEvent.click(screen.getByTestId("editor-undo-button"));
+    expect(segmentsStore.get(jobId)).toEqual(beforeFix);
+    await userEvent.click(screen.getByTestId("editor-undo-button"));
+    expect(segmentsStore.get(jobId)).toEqual(initial);
+  });
+
+  it("keeps undo available after the last correction disappears", async () => {
+    render(<LyricsEditor {...props()} segments={[{ start: 1, end: 3, text: "epsilon cancion" }]} />);
+    const before = structuredClone(segmentsStore.get(jobId));
+    await userEvent.click(screen.getByTestId("apply-fix-chip"));
+    await userEvent.click(screen.getByTestId("confirm-apply-fixes"));
+    expect(screen.queryByTestId("apply-fix-chip")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("editor-undo-button"));
+    expect(segmentsStore.get(jobId)).toEqual(before);
+  });
+
+  it("preserves manual wording when applying remaining fixes", async () => {
+    render(<LyricsEditor {...props()} />);
+    fireEvent.change(screen.getByDisplayValue("epsilon cancion"), { target: { value: "my final wording" } });
+    await userEvent.click(screen.getByTestId("apply-fix-chip"));
+    await userEvent.click(screen.getByTestId("confirm-apply-fixes"));
+    expect(screen.getByDisplayValue("my final wording")).toBeInTheDocument();
+  });
+});
+
+ describe("LyricsEditor — preserve manual segmentation", () => {
+  it("does not split manually rewritten text using the reference", () => {
+    render(<LyricsEditor {...baseProps({
+      segments: [{ start: 1, end: 3, text: "alpha beta gamma delta" }],
+      referenceLyrics: "alpha beta\ngamma delta",
+    })} />);
+    fireEvent.change(screen.getByDisplayValue("alpha beta gamma delta"), {
+      target: { value: "alpha beta gamma delta custom" },
+    });
+    expect(screen.queryByTestId("apply-fix-chip")).not.toBeInTheDocument();
   });
 });

@@ -1,8 +1,8 @@
 """Content validation for generated background assets.
 
 Gemini Vision is used as a classifier, not as the policy authority.  It
-reports independent detections for people, atmospheric effects, commercial
-brands and readable text; the caller then decides which dimensions are allowed
+reports independent detections for people, malformed anatomy, atmospheric
+effects, commercial brands and readable text; the caller then decides which dimensions are allowed
 for this render.  Keeping detection separate from enforcement prevents an opt-in
 for one visual element from accidentally disabling the other safety gates.
 
@@ -15,6 +15,12 @@ se detecta y se registra, pero sólo bloquea con `enforce_text=True`: antes de
 ponerlo en bloqueo hay que medir su tasa de falsos positivos sobre escenas
 urbanas legítimas, porque este repo ya tuvo un incidente de sobre-bloqueo del
 validador (jul-2026).
+
+QC extendido (2026-11-18, pedidos UMG de imagen): `weapon`, `gore`,
+`body_parts` y `overlay` por una llamada Vision APARTE (el prompt base no se
+toca), más `letterbox` medido sin IA en background_technical_qc. Gobernado por
+BACKGROUND_EXTENDED_QC_MODE (default observe: se registra y se muestra en
+Delivery QC, no rechaza). Ver el bloque "Extended background QC".
 """
 
 import logging
@@ -146,7 +152,7 @@ def _check_frame_with_gemini(image_path: str) -> dict:
 
     Returns ``safe`` for backwards compatibility plus independent
     ``detections`` and categorized ``issues``.  ``safe`` only reflects the
-    immutable people/brand baseline; atmospheric permission is applied by
+    people/brand/anatomy baseline; atmospheric permission is applied by
     :func:`_evaluate_frame_result`.
     Raises ValidatorCheckError if the verdict cannot be produced (caller
     must decide policy: pre-fix this fell through to "safe" silently,
@@ -200,6 +206,17 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "instruments, furniture, vehicles, clothing laid on a surface, "
             "footprints, tools, doors, paths, or recently disturbed objects are "
             "not people.\n\n"
+            "Set detections.anatomy=true for clearly malformed human anatomy: "
+            "disconnected or floating limbs, extra or fused limbs, or body parts "
+            "emerging implausibly from objects or the ground without a coherent "
+            "body. Report this independently of people, even without a face. "
+            "Do not flag normal cropping, natural occlusion, ordinary poses, "
+            "disability, prostheses, empty clothing, or distant ambiguous shapes. "
+            "Normal people, faces, hands and feet are NOT anatomical defects. "
+            "If perspective, occlusion or cropping plausibly explains a shape, "
+            "set anatomy=false. Only report unmistakable visible defects, including "
+            "realistic detached mannequin limbs used as human body parts. "
+            "Describe the specific visible defect, not an inferred injury.\n\n"
             "Set detections.atmospherics=true if smoke, fog, haze, mist, "
             "steam, vapor, a smoke machine, or a smoke-like atmospheric cloud "
             "is visibly present. Ordinary clouds in the sky, rain, dust, lens "
@@ -259,8 +276,8 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "object could be operated by one. "
             "Respond ONLY with JSON using exactly this schema: "
             '{"detections":{"people":true/false,"atmospherics":true/false,'
-            '"brand":true/false,"text":true/false},'
-            '"issues":[{"category":"people|atmospherics|brand|text",'
+            '"brand":true/false,"text":true/false,"anatomy":true/false},'
+            '"issues":[{"category":"people|atmospherics|brand|text|anatomy",'
             '"reason":"specific visible evidence"}]}'
         )
         response = None
@@ -303,10 +320,10 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             detections = data.get("detections")
             if not isinstance(detections, dict):
                 raise ValidatorCheckError("Gemini Vision 'detections' must be a JSON object")
-            categories = ("people", "atmospherics", "brand")
+            categories = ("people", "atmospherics", "brand", "text", "anatomy")
             if any(type(detections.get(category)) is not bool for category in categories):
                 raise ValidatorCheckError(
-                    "Gemini Vision detections must contain boolean people, atmospherics and brand"
+                    "Gemini Vision detections must contain boolean people, atmospherics, brand, text and anatomy"
                 )
             issues = data.get("issues", [])
             if not isinstance(issues, list) or not all(
@@ -328,7 +345,7 @@ def _check_frame_with_gemini(image_path: str) -> dict:
                 if issue.get("reason", "").strip():
                     detections[issue["category"]] = True
             return {
-                "safe": not detections["people"] and not detections["brand"],
+                "safe": not any(detections[c] for c in ("people", "brand", "anatomy")),
                 "detections": {category: detections[category] for category in categories},
                 "issues": issues,
             }
@@ -346,6 +363,7 @@ def _evaluate_frame_result(
     allow_atmospherics: bool,
     enforce_atmospherics: bool,
     enforce_text: bool = False,
+    anatomy_only: bool = False,
 ) -> dict:
     """Apply render policy to a classifier result.
 
@@ -365,7 +383,7 @@ def _evaluate_frame_result(
             "passed": legacy_safe and not legacy_issues,
             "issues": legacy_issues,
             "detections": {"people": False, "atmospherics": False,
-                           "brand": False, "text": False},
+                           "brand": False, "text": False, "anatomy": False},
             "observations": [],
         }
 
@@ -374,9 +392,10 @@ def _evaluate_frame_result(
         "atmospherics": detections.get("atmospherics") is True,
         "brand": detections.get("brand") is True,
         "text": detections.get("text") is True,
+        "anatomy": detections.get("anatomy") is True,
     }
     reasons_by_category: dict[str, list[str]] = {
-        "people": [], "atmospherics": [], "brand": [], "text": [],
+        "people": [], "atmospherics": [], "brand": [], "text": [], "anatomy": [],
     }
     for item in result.get("issues", []):
         if isinstance(item, dict) and item.get("category") in reasons_by_category:
@@ -396,6 +415,8 @@ def _evaluate_frame_result(
     blocked_categories = []
     if normalized["people"] and not allow_people:
         blocked_categories.append("people")
+    if normalized["anatomy"]:
+        blocked_categories.append("anatomy")
     if normalized["brand"]:
         blocked_categories.append("brand")
     if (
@@ -411,12 +432,20 @@ def _evaluate_frame_result(
     if normalized["text"] and enforce_text:
         blocked_categories.append("text")
 
+    observed_categories = []
+    if anatomy_only:
+        observed_categories = [c for c in blocked_categories if c != "anatomy"]
+        blocked_categories = [c for c in blocked_categories if c == "anatomy"]
+
     blocked_issues = []
     for category in blocked_categories:
         reasons = reasons_by_category[category] or [f"Detected prohibited {category}"]
         blocked_issues.extend(f"{category}: {reason}" for reason in reasons)
 
-    observations = []
+    observations = [
+        f"{c}: {reason}" for c in observed_categories
+        for reason in (reasons_by_category[c] or [f"Detected {c}"])
+    ]
     if normalized["atmospherics"] and not allow_atmospherics:
         reasons = reasons_by_category["atmospherics"] or ["Atmospheric effect detected"]
         observations.extend(f"atmospherics: {reason}" for reason in reasons)
@@ -430,6 +459,284 @@ def _evaluate_frame_result(
         "detections": normalized,
         "observations": observations,
     }
+
+
+# ── Extended background QC (pedidos UMG sep-nov 2026) ─────────────────────
+# 20 change requests were about the BACKGROUND, not the lyric: guns ("Sacar el
+# arma", Amor Suicida / Virus Anti-Amor / Niño Jefe), blood and raw meat
+# ("que no se vea la carne ni el trapo con sangre"), body parts without a face
+# ("sacar las piernas", "sin partes de cuerpo humano"), a burned-in "16:9"
+# label and black letterbox bars. None is covered by the base categories:
+# ``people`` is deliberately limited to identifiable/prominent humans (jul-2026
+# over-block) and ``text`` lists stylised strings as acceptable.
+#
+# Why a SEPARATE Vision call and not four more fields in the base prompt: the
+# base prompt gates production (people/brand/anatomy reject an asset). A
+# combined prompt was measured on 2026-11-18 and moved those gating answers on
+# identical frames (76 paired frames: people 0→2, brand 0→2, anatomy 2→0).
+# Keeping the base request byte-identical means zero drift on what already
+# blocks; the extended call is additive, capped to a few frames, and anything
+# it cannot answer (429, timeout, malformed JSON) is "not evaluated" —
+# fail-OPEN, never an inconclusive verdict (2026-08-20 incident).
+#
+# Rollout (BACKGROUND_EXTENDED_QC_MODE):
+#   off     — nothing new runs; results keep their previous shape.
+#   observe — DEFAULT. The extended call and the deterministic letterbox scan
+#             run; findings are stored as observations and shown in Delivery QC
+#             before publishing, but never reject a background.
+#   enforce — categories in BACKGROUND_EXTENDED_QC_ENFORCE (default
+#             weapon,gore,overlay,letterbox: the ones with ≤5 % flags on the
+#             accepted sample) reject the asset like malformed anatomy does,
+#             i.e. even under BACKGROUND_VALIDATION_ENFORCEMENT=observe, and
+#             route it through the existing regenerate-once → safe-gradient
+#             recovery. body_parts (10 % on accepted backgrounds: statues,
+#             gloves, a framed photo) stays observe-only by default.
+EXTENDED_QC_MODE_ENV = "BACKGROUND_EXTENDED_QC_MODE"
+EXTENDED_QC_ENFORCE_ENV = "BACKGROUND_EXTENDED_QC_ENFORCE"
+EXTENDED_QC_MAX_FRAMES_ENV = "BACKGROUND_EXTENDED_QC_MAX_FRAMES"
+EXTENDED_VISION_CATEGORIES = ("weapon", "gore", "body_parts", "overlay")
+TECHNICAL_CATEGORIES = ("letterbox",)
+EXTENDED_CATEGORIES = EXTENDED_VISION_CATEGORIES + TECHNICAL_CATEGORIES
+_DEFAULT_EXTENDED_ENFORCE = ("weapon", "gore", "overlay", "letterbox")
+
+EXTENDED_PROMPT = (
+    "You are classifying a frame from a music-video background. Report each "
+    "category independently and classify only visible evidence.\n\n"
+    "Set detections.weapon=true when a firearm (pistol, revolver, rifle, "
+    "shotgun, machine gun), ammunition, a grenade, or a knife, dagger, machete "
+    "or sword presented as a weapon is visible — held, lying on a surface, "
+    "stuck in something or hanging on a wall, toy or replica included. Kitchen "
+    "utensils in normal culinary use, tools and scissors are not weapons.\n"
+    "Set detections.gore=true for visible blood, blood-stained cloth or "
+    "bandages, wounds, raw or butchered meat, carcasses or exposed flesh. Red "
+    "paint, wine, coffee, rust, red light or red fabric are not gore unless "
+    "they clearly read as blood.\n"
+    "Set detections.body_parts=true when any part of a real human body is "
+    "visible, even without a face and even if it is not the subject: legs, "
+    "feet, hands, arms, torso, bare skin, or limbs emerging from objects, "
+    "walls or clothing, including realistic mannequin parts. Do not report "
+    "empty clothing, shoes or gloves with no body inside, statues or "
+    "sculptures that read as art objects, people inside photos or posters, or "
+    "figures too small or blurred to resolve.\n"
+    "Set detections.overlay=true when a graphic or text is laid OVER the "
+    "picture instead of belonging to the scene: a watermark, an aspect-ratio "
+    "or format label such as '16:9' or '4K', a timecode, a channel or "
+    "stock-footage logo, user-interface elements, captions or subtitles. Text "
+    "that is physically part of the scene (signs, posters, packaging) is not "
+    "overlay.\n\n"
+    "Respond ONLY with JSON using exactly this schema: "
+    '{"detections":{"weapon":true/false,"gore":true/false,'
+    '"body_parts":true/false,"overlay":true/false},'
+    '"issues":[{"category":"weapon|gore|body_parts|overlay",'
+    '"reason":"specific visible evidence"}]}'
+)
+
+
+def extended_qc_mode() -> str:
+    """``off`` | ``observe`` | ``enforce``; unknown values fail SAFE to observe.
+
+    Observe never rejects an asset, so a typo must neither switch the evidence
+    off nor start blocking."""
+    value = os.environ.get(EXTENDED_QC_MODE_ENV, "observe").strip().lower()
+    return value if value in {"off", "observe", "enforce"} else "observe"
+
+
+def extended_enforced_categories() -> frozenset:
+    """Extended categories that reject an asset right now (empty unless enforce)."""
+    if extended_qc_mode() != "enforce":
+        return frozenset()
+    raw = os.environ.get(EXTENDED_QC_ENFORCE_ENV)
+    names = (
+        [item.strip().lower() for item in raw.split(",")]
+        if raw is not None else list(_DEFAULT_EXTENDED_ENFORCE)
+    )
+    return frozenset(name for name in names if name in EXTENDED_CATEGORIES)
+
+
+def _extended_max_frames() -> int:
+    try:
+        return max(1, min(48, int(os.environ.get(EXTENDED_QC_MAX_FRAMES_ENV, "8"))))
+    except ValueError:
+        return 8
+
+
+def _spread(items: list, limit: int) -> list:
+    """``limit`` items evenly spread over ``items``, endpoints included."""
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[0]]
+    picks = sorted({round(k * (len(items) - 1) / (limit - 1)) for k in range(limit)})
+    return [items[i] for i in picks]
+
+
+def _check_frame_extended(image_path: str) -> dict | None:
+    """One extended-category Vision call; ``None`` when it could not answer.
+
+    Fail-open by contract: quota, transport, auth or parse errors return None
+    (recorded as a frame not evaluated). One retry only for retryable errors —
+    the quota is shared with production and the base gate has priority.
+    """
+    try:
+        from pipeline import _get_genai_client, _call_with_timeout
+        from google import genai
+        import json as _json
+
+        client = _get_genai_client()
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        response = None
+        for attempt in (1, 2):
+            try:
+                response = _call_with_timeout(
+                    lambda: client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[
+                            genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                            EXTENDED_PROMPT,
+                        ],
+                        config=genai.types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=400,
+                            thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                        ),
+                    ),
+                    timeout_s=45.0,
+                    label="VALIDATOR_EXTENDED",
+                )
+                break
+            except Exception as error:  # noqa: BLE001
+                if attempt == 2 or not _is_retryable_vision_error(error):
+                    raise
+                time.sleep(_VISION_RETRY_BACKOFF_S)
+        match = re.search(r"\{.*\}", (response.text or "").strip(), re.DOTALL)
+        data = _json.loads(match.group()) if match else {}
+        detections = data.get("detections")
+        if not isinstance(detections, dict):
+            return None
+        evaluated = [c for c in EXTENDED_VISION_CATEGORIES if type(detections.get(c)) is bool]
+        normalized = {c: detections[c] is True for c in evaluated}
+        issues = []
+        for item in data.get("issues") or []:
+            if (
+                isinstance(item, dict)
+                and item.get("category") in EXTENDED_VISION_CATEGORIES
+                and str(item.get("reason") or "").strip()
+            ):
+                issues.append({"category": item["category"], "reason": str(item["reason"]).strip()})
+                # Same contradiction rule as the base parser: a categorized
+                # reason is positive evidence.
+                normalized[item["category"]] = True
+                if item["category"] not in evaluated:
+                    evaluated.append(item["category"])
+        return {"detections": normalized, "issues": issues, "evaluated": evaluated}
+    except Exception as exc:  # noqa: BLE001 — fail-open by contract
+        logger.warning("[VALIDATION] extended check not evaluated: %s", exc)
+        return None
+
+
+def _technical_scan(path: str) -> dict:
+    """Deterministic letterbox scan; an error is an abstention, never a finding."""
+    try:
+        from background_technical_qc import analyze_background
+        analysis = analyze_background(path)
+    except Exception as exc:  # noqa: BLE001
+        analysis = {"ran": False, "abstained": f"error:{type(exc).__name__}",
+                    "findings": [], "metrics": {}}
+    return {
+        "ran": bool(analysis.get("ran")),
+        "abstained": analysis.get("abstained"),
+        "findings": [
+            {k: f.get(k) for k in ("category", "code", "reason", "evidence")}
+            for f in analysis.get("findings") or []
+        ],
+        "metrics": analysis.get("metrics") or {},
+    }
+
+
+def _apply_extended(
+    result: dict,
+    *,
+    asset_path: str,
+    frame_paths: list[str],
+    allow_people: bool,
+    technical: dict | None = None,
+) -> dict:
+    """Run the extended checks and fold them into a validator ``result``.
+
+    Only ADDS information: observations always; issues + ``passed=False`` +
+    ``hard_violation`` only for categories enforced right now. Never touches
+    ``inconclusive`` and never runs when the base verdict already failed (the
+    asset is going to be discarded; do not spend shared quota on it).
+    """
+    mode = extended_qc_mode()
+    if mode == "off":
+        return result
+    enforced = extended_enforced_categories()
+    result.setdefault("hard_violation", False)
+    detections = result.setdefault("detections", {})
+    for category in EXTENDED_CATEGORIES:
+        detections.setdefault(category, False)
+    summary = {
+        "mode": mode, "enforced": sorted(enforced),
+        "frames_planned": 0, "frames_evaluated": 0, "frames_unevaluated": 0,
+        "technical": None,
+    }
+    result["extended_qc"] = summary
+    global_observe = (
+        os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower() == "observe"
+    )
+    base_rejects = result.get("passed") is not True and (
+        result.get("inconclusive")
+        or not global_observe
+        or detections.get("anatomy") is True
+    )
+    if base_rejects:
+        # Under the global observe kill-switch a people/brand failure is
+        # waived later by the pipeline, so the asset may still ship: the
+        # extended evidence is still wanted there (Amor Suicida's gun sat
+        # behind an observed "brand" verdict).
+        summary["skipped"] = "base_verdict_rejects_asset"
+        return result
+
+    findings: list[tuple[int, str, str]] = []
+    technical = technical if technical is not None else _technical_scan(asset_path)
+    summary["technical"] = technical
+    for finding in technical.get("findings") or []:
+        findings.append((-1, finding["category"], finding["reason"]))
+
+    frames = _spread(list(enumerate(frame_paths)), _extended_max_frames())
+    summary["frames_planned"] = len(frames)
+    for index, frame_path in frames:
+        answer = _check_frame_extended(frame_path)
+        if answer is None:
+            summary["frames_unevaluated"] += 1
+            continue
+        summary["frames_evaluated"] += 1
+        reasons = {c: [] for c in EXTENDED_VISION_CATEGORIES}
+        for issue in answer["issues"]:
+            reasons[issue["category"]].append(issue["reason"])
+        for category, present in answer["detections"].items():
+            if present:
+                findings.append((index, category, (reasons[category] or [f"Detected {category}"])[0]))
+        if any(c in enforced for _i, c, _r in findings):
+            break  # decisive: later frames cannot make the asset acceptable
+
+    issues, observations = [], []
+    for index, category, reason in findings:
+        # A body part is a person for policy purposes: when the operator's
+        # prompt allows people it is neither a violation nor worth a note.
+        if category == "body_parts" and allow_people:
+            continue
+        detections[category] = True
+        row = {"frame": index, "type": f"{category}: {reason}"}
+        (issues if category in enforced else observations).append(row)
+    result.setdefault("observations", []).extend(observations)
+    if issues:
+        result["passed"] = False
+        result["hard_violation"] = True
+        result.setdefault("issues", []).extend(issues)
+    return result
 
 
 def validate_video(
@@ -449,13 +756,33 @@ def validate_video(
     """
     from provenance import record_ai_call
 
+    # Deterministic letterbox scan first: when it is enforced and fires, the
+    # asset is rejected before a single Vision frame is paid for.
+    technical = _technical_scan(video_path) if extended_qc_mode() != "off" else None
+    if technical and any(
+        f["category"] in extended_enforced_categories() for f in technical["findings"]
+    ):
+        logger.info("[VALIDATION] job=%s: technical rejection before Vision", job_id)
+        return _apply_extended(
+            {
+                "passed": True, "inconclusive": False, "issues": [],
+                "frames_checked": 0, "frames_planned": 0, "extraction_errors": 0,
+                "check_errors": 0,
+                "detections": {"people": False, "atmospherics": False, "brand": False,
+                               "text": False, "anatomy": False},
+                "observations": [], "shadow_atmospherics_detected": False,
+            },
+            asset_path=video_path, frame_paths=[], allow_people=allow_people,
+            technical=technical,
+        )
+
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="output_validation",
         tool_name="gemini-2.5-flash-vision",
         tool_provider="google_vertex",
         prompt=(
-            "Classify frames for people, commercial brands and atmospheric effects; "
+            "Classify frames for people, malformed anatomy, commercial brands and atmospheric effects; "
             f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
             f"observe_atmospherics={observe_atmospherics}, "
             f"enforce_atmospherics={enforce_atmospherics}"
@@ -468,7 +795,7 @@ def validate_video(
     check_errors = 0
     frames_checked = 0
     detected = {"people": False, "atmospherics": False, "brand": False,
-                "text": False}
+                "text": False, "anatomy": False}
     observations = []
 
     try:
@@ -485,10 +812,11 @@ def validate_video(
                 allow_people=allow_people,
                 allow_atmospherics=allow_atmospherics,
                 enforce_atmospherics=enforce_atmospherics,
+                anatomy_only=os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower() == "observe",
             )
             for category, present in verdict["detections"].items():
                 detected[category] = detected[category] or present
-            if observe_atmospherics:
+            if verdict["observations"]:
                 observations.extend(
                     {"frame": i, "type": issue}
                     for issue in verdict["observations"]
@@ -497,19 +825,9 @@ def validate_video(
                 for issue in verdict["issues"]:
                     all_issues.append({"frame": i, "type": issue})
                 break
-    finally:
-        # Clean up temp frames + dir even when _extract_frames produced
-        # zero usable frames (mkdtemp leaks otherwise).
-        for fp in frame_paths:
-            try:
-                os.unlink(fp)
-            except OSError:
-                pass
-        if tmp_dir:
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+    except BaseException:
+        _cleanup_frames(frame_paths, tmp_dir)
+        raise
 
     # Fail closed on ANY partial extraction/check failure. Previously one
     # successful safe frame plus nine Vision timeouts passed the asset. A
@@ -548,7 +866,7 @@ def validate_video(
         recorder.finish(response_summary=summary)
 
     logger.info(f"[VALIDATION] job={job_id}: {summary}")
-    return {
+    result = {
         "passed": passed,
         # "We could not finish looking" is NOT "we saw something forbidden".
         # Both fail closed, but only the decisive verdict is evidence about the
@@ -566,6 +884,30 @@ def validate_video(
             observe_atmospherics and detected["atmospherics"] and not enforce_atmospherics
         ),
     }
+    try:
+        # Additive and fail-open; the frames already extracted for the base
+        # gate are reused, so no extra decode.
+        return _apply_extended(
+            result, asset_path=video_path, frame_paths=frame_paths,
+            allow_people=allow_people, technical=technical,
+        )
+    finally:
+        _cleanup_frames(frame_paths, tmp_dir)
+
+
+def _cleanup_frames(frame_paths: list[str], tmp_dir: str | None) -> None:
+    """Remove temp frames + dir even when _extract_frames produced zero usable
+    frames (mkdtemp leaks otherwise)."""
+    for fp in frame_paths:
+        try:
+            os.unlink(fp)
+        except OSError:
+            pass
+    if tmp_dir:
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
 
 def validate_image(
@@ -589,7 +931,7 @@ def validate_image(
         tool_name="gemini-2.5-flash-vision-image",
         tool_provider="google_vertex",
         prompt=(
-            "Classify image for people, commercial brands and atmospheric effects; "
+            "Classify image for people, malformed anatomy, commercial brands and atmospheric effects; "
             f"allow_people={allow_people}, allow_atmospherics={allow_atmospherics}, "
             f"observe_atmospherics={observe_atmospherics}, "
             f"enforce_atmospherics={enforce_atmospherics}"
@@ -622,29 +964,33 @@ def validate_image(
         allow_people=allow_people,
         allow_atmospherics=allow_atmospherics,
         enforce_atmospherics=enforce_atmospherics,
+        anatomy_only=os.getenv("BACKGROUND_VALIDATION_ENFORCEMENT", "block").strip().lower() == "observe",
     )
     issues = [{"frame": 0, "type": issue} for issue in verdict["issues"]]
     observations = (
         [{"frame": 0, "type": issue} for issue in verdict["observations"]]
-        if observe_atmospherics else []
+        if verdict["observations"] else []
     )
     passed = verdict["passed"]
 
     if recorder:
         recorder.finish(response_summary=f"passed={passed}, issues={len(issues)}")
 
-    return {
-        "passed": passed,
-        # The classifier answered: pass or fail, the verdict is about the asset.
-        "inconclusive": False,
-        "issues": issues,
-        "frames_checked": 1,
-        "check_errors": 0,
-        "detections": verdict["detections"],
-        "observations": observations,
-        "shadow_atmospherics_detected": bool(
-            observe_atmospherics
-            and verdict["detections"]["atmospherics"]
-            and not enforce_atmospherics
-        ),
-    }
+    return _apply_extended(
+        {
+            "passed": passed,
+            # The classifier answered: pass or fail, the verdict is about the asset.
+            "inconclusive": False,
+            "issues": issues,
+            "frames_checked": 1,
+            "check_errors": 0,
+            "detections": verdict["detections"],
+            "observations": observations,
+            "shadow_atmospherics_detected": bool(
+                observe_atmospherics
+                and verdict["detections"]["atmospherics"]
+                and not enforce_atmospherics
+            ),
+        },
+        asset_path=image_path, frame_paths=[image_path], allow_people=allow_people,
+    )

@@ -34,6 +34,31 @@ const tab = (name) => screen.getByRole("tab", { name: new RegExp(`^${name}`) });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); clearCampaignResourceCache(); localStorage.clear(); });
 
 describe("campaign workspace", () => {
+  it("opens the overview with only header and pipeline, and fetches settings on generation", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "ready"), makeSong(2, "lyrics"), makeSong(3, "qc")] });
+    mount(api);
+    await screen.findByText("Canción 1");
+    expect(api.state.calls.filter(call => call.method === "GET").map(call => call.path)).toEqual([
+      "/batch/campaigns/c1", "/batch/campaigns/c1/pipeline",
+    ]);
+    const row = screen.getByText("Canción 1").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Generar · Canción 1" }));
+    await waitFor(() => expect(api.state.calls.some(call => call.path.endsWith("/creative"))).toBe(true));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(api.state.calls.some(call => call.path.endsWith("/report") || call.path.endsWith("/review-queue"))).toBe(false);
+  });
+
+  it("fetches video evidence only for the drawer song and never the campaign history", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "qc"), makeSong(2, "qc")] });
+    mount(api, "/campaigns/c1?song=i2");
+    await screen.findByRole("dialog", { name: "Canción Canción 2" });
+    await waitFor(() => expect(api.state.calls.some(call => call.path.endsWith("/report"))).toBe(true));
+    const request = api.state.calls.find(call => call.path.endsWith("/report"));
+    expect(new URLSearchParams(request.search).get("job_id")).toBe("j2");
+    expect(new URLSearchParams(request.search).get("history_limit")).toBe("0");
+    expect(api.state.calls.some(call => call.path.endsWith("/review-queue") || call.path.endsWith("/creative"))).toBe(false);
+  });
+
   it("opens Ricardo's 17-song priority tab only in the audited campaign and links to the exact lyric editor", async () => {
     const campaignId = "5f1bd3aa1b31";
     const api = createCampaignApi({ songs: [makeSong(1, "ready", { job_id: "49c027206392" })] });

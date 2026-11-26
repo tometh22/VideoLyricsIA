@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import LyricsEditor from "./LyricsEditor";
@@ -41,10 +41,76 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   segmentsStore._clearAll();
 });
 
 describe("LyricsEditor — aprobación por canción", () => {
+  it("mueve el resaltado con el audio sin cambiar la línea que se está editando", async () => {
+    let frame;
+    vi.stubGlobal("requestAnimationFrame", vi.fn((callback) => { frame = callback; return 1; }));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    const { container } = render(<LyricsEditor {...props({ audioUrl: "https://example.com/song.mp3" })} />);
+    const audio = container.querySelector("audio");
+    const first = screen.getByTestId("review-line-1");
+    const second = screen.getByTestId("review-line-2");
+    const input = screen.getByLabelText("Letra de esta línea");
+    expect(first).toHaveAttribute("aria-current", "true");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: false });
+    fireEvent.play(audio);
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveClass("bg-brand/20");
+
+    // Keep a text edit in progress as playback crosses to the next lyric.
+    act(() => { input.focus(); });
+    fireEvent.change(input, { target: { value: "Primera corregida" } });
+    input.setSelectionRange(5, 5);
+
+    // An intro/seek with no active lyric must not claim the edit target is playing.
+    act(() => { audio.currentTime = 0; frame(); });
+    expect(first).not.toHaveAttribute("aria-current");
+    expect(second).not.toHaveAttribute("aria-current");
+    expect(first).not.toHaveClass("bg-brand/20");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
+
+    act(() => { audio.currentTime = 5.5; frame(); });
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(second).toHaveClass("bg-brand/20");
+    expect(first).not.toHaveClass("bg-brand/20");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(input).toHaveValue("Primera corregida");
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([5, 5]);
+    expect(screen.getByTestId("selected-line-panel")).toHaveTextContent("Línea 1");
+
+    // Backward playback/seek follows the same clock rather than a row counter.
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(second).not.toHaveAttribute("aria-current");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: true });
+    fireEvent.pause(audio);
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(first).toHaveClass("bg-brand/20");
+    await userEvent.click(second);
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(input).toHaveValue("Segunda línea");
+
+    Object.defineProperty(audio, "paused", { configurable: true, value: false });
+    fireEvent.play(audio);
+    act(() => { audio.currentTime = 1.5; frame(); });
+    expect(first).toHaveAttribute("aria-current", "true");
+    Object.defineProperty(audio, "paused", { configurable: true, value: true });
+    fireEvent.ended(audio);
+    expect(second).toHaveAttribute("aria-current", "true");
+    expect(second).toHaveClass("bg-brand/20");
+    expect(first).not.toHaveClass("bg-brand/20");
+  });
+
   it("no recorta ni persiste timings al abrir una campaña de 41 líneas", async () => {
     const longSegments = Array.from({ length: 41 }, (_, index) => ({
       segment_id: `long-line-${index + 1}`,
@@ -154,4 +220,49 @@ describe("LyricsEditor — aprobación por canción", () => {
 
     expect(onBack).toHaveBeenCalledTimes(1);
   });
+});
+
+ it("previews the selected paused line when two lines share their start", async () => {
+   const user = userEvent.setup();
+   render(<LyricsEditor {...props({segments:[
+     {segment_id:"tie-a",start:1,end:2,text:"Primera frase empatada"},
+     {segment_id:"tie-b",start:1,end:3,text:"Segunda frase empatada"},
+   ]})} />);
+   await user.click(screen.getByTestId("review-line-2"));
+   const preview = screen.getByTestId("review-live-preview");
+   expect(preview).toHaveTextContent(/Segunda frase empatada/i);
+   expect(preview).not.toHaveTextContent(/Primera frase empatada/i);
+   const input = screen.getByLabelText("Letra de esta línea",{exact:true});
+   await user.clear(input);
+   await user.type(input,"Segunda corregida en pausa");
+   expect(preview).toHaveTextContent(/Segunda corregida en pausa/i);
+ });
+
+it.each(["original", "split", "undo"])("attests duplicate legacy occurrences after %s", async operation => {
+  const onApprove = vi.fn();
+  const rows = [
+    { id: "16", start: 1, end: 3, text: "Primera línea completa" },
+    { id: "16", start: 5, end: 7, text: "Segunda línea completa" },
+    { segment_id: "index:0", start: 8, end: 9, text: "Tercera" },
+  ];
+  render(<LyricsEditor {...props({ segments: rows, onApprove })} />);
+  if (operation !== "original") {
+    const field = screen.getByLabelText("Letra de esta línea");
+    act(() => { field.focus(); field.setSelectionRange(8, 8); });
+    fireEvent.select(field);
+    await userEvent.click(screen.getByRole("button", { name: "Dividir aquí", exact: true }));
+    if (operation === "undo") await userEvent.click(screen.getByRole("button", { name: "Deshacer", exact: true }));
+  }
+  const snapshot = structuredClone(segmentsStore.get("campaign-review-job"));
+  await userEvent.click(screen.getByRole("button", { name: "Aprobar letra y timing", exact: true }));
+  await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+  const ids = onApprove.mock.calls[0][1].confirmedLineIds;
+  if (operation === "split") {
+    expect(ids).toHaveLength(4);
+    expect(ids.slice(0, 2)).toEqual(snapshot.slice(0, 2).map(row => row.segment_id));
+    expect(ids.slice(2)).toEqual(["16", "index:0"]);
+  } else expect(ids).toEqual(["index:0#1", "index:1", "index:0"]);
+  expect(new Set(ids).size).toBe(ids.length);
+  expect(onApprove.mock.calls[0][0].map(({ text, start, end }) => ({ text, start, end })))
+    .toEqual((operation === "split" ? snapshot : rows).map(({ text, start, end }) => ({ text, start, end })));
 });

@@ -64,6 +64,62 @@ def test_pick_keyword_takes_last_content_word():
     assert L.pick_keyword("Y SE FUE".split()) is None
 
 
+AMIGOS_LINE = [{"text": "aunque el mundo se caiga", "start": 1.0, "end": 3.4, "words": [
+    {"word": "aunque", "start": 1.0, "end": 1.4}, {"word": "el", "start": 1.45, "end": 1.6},
+    {"word": "mundo", "start": 1.6, "end": 2.0}, {"word": "se", "start": 2.05, "end": 2.2},
+    {"word": "caiga", "start": 2.2, "end": 3.0}]}]
+
+
+@pytest.mark.parametrize("look_id", ["escalera", "una_por_una", "ventana"])
+@pytest.mark.parametrize(("width", "height"), [(1920, 1080), (1080, 1920)])
+def test_amigos_looks_keep_oswald_and_the_green_knewave_key(look_id, width, height):
+    import lyric_recipes
+
+    look, recipe = lyric_recipes.resolve(look_id, genre="rock", variant=0)
+    assert recipe["fonts"]["main"]["id"] == "oswald"
+    assert recipe["fonts"]["key"]["id"] == "knewave"
+    doc = L.build_look_ass(AMIGOS_LINE, look, width=width, height=height, duration=4.0)
+    events = _dialogues(doc)
+    assert events
+    for d in events:
+        assert 1.0 <= _secs(d.split(",")[1]) and _secs(d.split(",")[2]) <= 3.4, d[:80]
+    keyed = [d for d in events if "\\fnKnewave" in d]
+    assert keyed and all(L._c("#77ED59") in d for d in keyed)
+
+
+def test_one_word_shows_a_single_word_at_a_time():
+    doc = L.build_look_ass(AMIGOS_LINE, L.LOOKS["una_por_una"], width=1920, height=1080, duration=4.0)
+    spans = [(_secs(d.split(",")[1]), _secs(d.split(",")[2])) for d in _dialogues(doc)]
+    assert len(spans) == 3            # "el" and "se" (0.15 s) ride with the next word
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+    last = _dialogues(doc)[-1]
+    assert "}SE" in last and "} CAIGA" in last
+    assert "}EL" in _dialogues(doc)[1] and "} MUNDO" in _dialogues(doc)[1]
+
+
+def test_escalera_types_each_letter_in_order_and_bursts_inside_the_line():
+    doc = L.build_look_ass(AMIGOS_LINE, L.LOOKS["escalera"], width=1920, height=1080, duration=4.0)
+    events = _dialogues(doc)
+    letters = sum(len(w["word"]) for w in AMIGOS_LINE[0]["words"])
+    assert len(events) == 2 * letters      # one typed-in + one burst event per letter
+    typed, bursts = events[0::2], events[1::2]
+    starts = [_secs(d.split(",")[1]) for d in typed[:6]]   # A-U-N-Q-U-E
+    assert starts == sorted(starts) and starts[0] < starts[-1]
+    assert all(d.split(",")[2] == "0:00:03.40" for d in bursts)
+    assert all("\\frz" in d and "\\alpha&HFF&" in d for d in bursts)
+    # Normal tracking: no letter-spacing tricks (the first draft spaced rows).
+    assert "\\fsp" not in doc
+
+
+def test_word_window_keeps_at_most_two_words_settled_on_screen():
+    doc = L.build_look_ass(AMIGOS_LINE, L.LOOKS["ventana"], width=1920, height=1080, duration=4.0)
+    # Leaving words start dimmed and fade out right away.
+    settled = [d for d in _dialogues(doc) if not re.search(r"\\alpha&H60&\\t\(0,\d+,\\alpha&HFF&", d)]
+    for t in (1.2, 1.7, 2.1, 2.6):
+        on = [d for d in settled if _secs(d.split(",")[1]) <= t < _secs(d.split(",")[2])]
+        assert 1 <= len(on) <= 2, (t, on)
+
+
 def test_keyword_layout_puts_small_lead_over_big_key():
     doc = L.build_look_ass(SEGS[:1], L.LOOKS["cine"], width=1920, height=1080,
                            duration=4.0)

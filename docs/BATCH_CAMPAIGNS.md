@@ -15,7 +15,7 @@ usuarios sólo cuando su tenant o billing group está en `BATCH_CAMPAIGN_SCOPES`
 Crear dos servicios Railway adicionales usando los archivos versionados:
 
 - `BatchShortWorker`: `railway/batch-short-worker.toml`, 2 réplicas,
-  colas `campaign_control,transcription_batch`.
+  colas `campaign_control,transcription_batch`, `WHISPER_PRELOAD=1`.
 - `BatchWorker`: `railway/batch-worker.toml`, 2 réplicas, cola `batch_render`.
 
 No modificar los servicios existentes: ShortWorker conserva 3 réplicas y

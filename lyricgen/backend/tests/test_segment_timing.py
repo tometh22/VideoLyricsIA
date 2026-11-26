@@ -61,16 +61,13 @@ def test_editor_order_repairs_tail_duplicates_without_changing_timestamps():
     assert [segment["start"] for segment in ordered] == [45.1106, 45.9252, 114.766]
 
 
-def test_editor_canonicalization_repairs_regressed_overlap_and_drops_copies():
+def test_editor_canonicalization_orders_without_repairing_or_deleting_occurrences():
     payload = json.loads(FIXTURE.read_text())
 
     canonical = normalize_editor_segments(payload["segments"])
 
-    assert [segment["_id"] for segment in canonical] == [9, 10, 11, 22]
-    assert [segment["start"] for segment in canonical] == [
-        45.1106, 45.9252, 46.5773, 114.766,
-    ]
-    assert canonical[1]["end"] + 0.05 <= canonical[2]["start"]
+    assert canonical == sort_segments_chronologically(payload["segments"])
+    assert len(canonical) == len(payload["segments"])
     assert all(
         current["start"] >= previous["start"]
         for previous, current in zip(canonical, canonical[1:])
@@ -110,10 +107,11 @@ def test_editor_persistence_normalizer_canonicalizes_the_durable_order():
 
     normalized = normalize_segments(payload["segments"])
 
-    assert [segment["_id"] for segment in normalized] == [9, 10, 11, 22]
-    assert [segment["start"] for segment in normalized] == [
-        45.1106, 45.9252, 46.5773, 114.766,
-    ]
+    expected = sort_segments_chronologically(payload["segments"])
+    assert [segment["_id"] for segment in normalized] == [segment["_id"] for segment in expected]
+    for actual, original in zip(normalized, expected):
+        assert actual["start"] == round(original["start"], 4)
+        assert actual["end"] == round(original["end"], 4)
 
 
 def test_final_normalization_repairs_postpass_duplicate_starts():
@@ -148,3 +146,15 @@ def test_final_normalization_clamps_selector_breaking_same_motif_overlap():
     assert normalized[0]["timing_overlap_clamped"] is True
     # Different simultaneous lyrics can be a legitimate harmony.
     assert normalized[2]["end"] == 74.0
+
+
+def test_collision_dedupe_preserves_explicit_distinct_identities():
+    from segment_timing import canonicalize_editor_segments
+    rows = [{"segment_id": "original", "start": 1, "end": 2, "text": "misma línea"},
+            {"segment_id": "copy", "start": 1, "end": 2, "text": "misma línea"}]
+    assert len(canonicalize_editor_segments(rows)) == 2
+    rows[1]["segment_id"] = "original"
+    assert len(canonicalize_editor_segments(rows)) == 1
+    rows[0].pop("segment_id")
+    rows[1].pop("segment_id")
+    assert len(canonicalize_editor_segments(rows)) == 1

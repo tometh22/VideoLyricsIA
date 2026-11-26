@@ -10,6 +10,7 @@ from __future__ import annotations
 from campaign_search import matches_search, matches_song
 
 import hashlib
+from collections import Counter
 import logging
 import math
 import os
@@ -19,12 +20,13 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, load_only
 
 from auth import get_current_user, has_art_track_access
 from campaign_review_access import granted_campaign_ids, has_reviewer_grant
@@ -43,6 +45,7 @@ from database import (
 from jobs import create_job
 from machine_evidence import MachineSnapshotMissing
 import storage
+import umg_metadata
 
 
 router = APIRouter(prefix="/batch", tags=["batch-campaigns"])
@@ -344,20 +347,7 @@ def _campaign_rows(db: Session, campaign_id: str) -> list[tuple[BatchCampaignIte
     ).all()
 
 
-def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
-    counters = {
-        key: 0 for key in (
-            "waiting_upload", "uploading", "waiting_processing", "transcribing",
-            "separating", "separation_ready",
-            "lyrics_ready", "lyrics_approved", "rendering", "final_review",
-            "done", "failed", "discarded",
-        )
-    }
-    rows = _campaign_rows(db, campaign.id)
-    from reviewer_campaign_product import campaign_payload
-    reviewer_summary, _ = campaign_payload(db, campaign.id, rows)
-    for item, job in rows:
-        counters[_phase(item.upload_state, job.status if job else None, item.metadata_error)] += 1
+def _summary_payload(campaign, counters, registered_count, reviewer_summary):
     return {
         "id": campaign.id,
         "reviewer_campaign_status": reviewer_summary,
@@ -368,13 +358,71 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
         "kind": campaign.kind or "lyric_video",
         "destination_portal": campaign.destination_portal,
         "preset_version": campaign.preset_version,
-        "registered_count": len(rows),
+        "registered_count": registered_count,
         "default_render_params": campaign.default_render_params or {},
         "counters": counters,
         "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
         "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
         "completed_at": campaign.completed_at.isoformat() if campaign.completed_at else None,
     }
+
+
+def _summaries(db: Session, campaigns: list[BatchCampaign]) -> dict[str, dict[str, Any]]:
+    """Legacy phase counters in one small query, independent of catalog size.
+
+    Group the raw inputs, then reuse _phase so its precedence stays identical
+    for errors, missing jobs and in-flight statuses. Pipeline counts have a
+    different lineage/publication contract and remain separate.
+    """
+    if not campaigns:
+        return {}
+    counters = {campaign.id: {key: 0 for key in (
+        "waiting_upload", "uploading", "waiting_processing", "transcribing",
+        "separating", "separation_ready", "lyrics_ready", "lyrics_approved",
+        "rendering", "final_review", "done", "failed", "discarded",
+    )} for campaign in campaigns}
+    totals = dict.fromkeys(counters, 0)
+    grouped = db.query(
+        BatchCampaignItem.campaign_id, BatchCampaignItem.upload_state,
+        BatchCampaignItem.metadata_error, Job.status, func.count().label("item_count"),
+    ).outerjoin(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(
+        BatchCampaignItem.campaign_id.in_(list(counters)),
+    ).group_by(
+        BatchCampaignItem.campaign_id, BatchCampaignItem.upload_state,
+        BatchCampaignItem.metadata_error, Job.status,
+    ).all()
+    for row in grouped:
+        counters[row.campaign_id][_phase(row.upload_state, row.status, row.metadata_error)] += row.item_count
+        totals[row.campaign_id] += row.item_count
+    from reviewer_assist_scope import display_enabled
+    from reviewer_campaign_product import campaign_payload
+    result = {}
+    for campaign in campaigns:
+        reviewer_summary = None
+        if display_enabled(campaign.id):
+            # The single explicitly enabled roster still needs source-bound
+            # receipts. Load only the fields needed for freshness validation.
+            receipt_rows = db.execute(select(
+                BatchCampaignItem.id, Job.job_id, Job.campaign_id,
+                Job.input_audio_sha256, Job.audio_revision,
+                Job.transcription_quality["reviewer_campaign_status"].label("receipt"),
+            ).outerjoin(Job, Job.campaign_item_id == BatchCampaignItem.id).where(
+                BatchCampaignItem.campaign_id == campaign.id,
+            )).all()
+            pairs = [(row.id, SimpleNamespace(
+                job_id=row.job_id, campaign_id=row.campaign_id,
+                input_audio_sha256=row.input_audio_sha256, audio_revision=row.audio_revision,
+                transcription_quality=({"reviewer_campaign_status": row.receipt} if row.receipt is not None else {}),
+            ) if row.job_id else None) for row in receipt_rows]
+            reviewer_summary, _ = campaign_payload(db, campaign.id, pairs)
+        result[campaign.id] = _summary_payload(
+            campaign, counters[campaign.id], totals[campaign.id], reviewer_summary,
+        )
+    return result
+
+
+def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
+    return _summaries(db, [campaign])[campaign.id]
 
 
 class CampaignCreate(BaseModel):
@@ -530,9 +578,12 @@ def list_campaigns(
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     from campaign_pipeline import pipeline_counts_bulk
     pipelines = pipeline_counts_bulk(db, rows)
+    from campaign_change_requests import feature_enabled as changes_enabled
+    summaries = _summaries(db, rows)
     return {"items": [
-        {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
-    ], "can_view_accounts": current_user.get("role") == "admin"}
+        {**summaries[row.id], "pipeline": pipelines.get(row.id)} for row in rows
+    ], "can_view_accounts": current_user.get("role") == "admin",
+        "features": {"change_requests_inbox": changes_enabled()}}
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -663,6 +714,9 @@ def patch_campaign_item(
             if attr == "technical_code" and normalized:
                 normalized = normalized.upper()
             setattr(item, attr, normalized)
+    if (body.title is not None or body.artist is not None) and item.artist and item.title:
+        canonical = umg_metadata.normalize_for_db(db, item.artist, item.title)
+        item.artist, item.title = canonical.artist, canonical.title
     if body.render_overrides is not None:
         if "creative_assignment" in (item.render_overrides or {}) or "creative_assignment" in body.render_overrides:
             raise HTTPException(409, detail="Usá Estilo y fondos para cambiar una asignación registrada")
@@ -914,6 +968,11 @@ def register_manifest(
             next_ordinal += 1
             title = (incoming.title or "").strip() or None
             artist = (incoming.artist or "").strip() or None
+            if artist and title:
+                # Nombre como lo pide UMG desde el registro: es lo que ve el
+                # operador, lo que dibuja la tarjeta y lo que llega al portal.
+                canonical = umg_metadata.normalize_for_db(db, artist, title)
+                artist, title = canonical.artist, canonical.title
             metadata_error = incoming.metadata_error
             if incoming.size_bytes > MAX_AUDIO_BYTES:
                 metadata_error = "invalid_size"
@@ -1205,15 +1264,32 @@ def claim_next_review(
 
 
 def _review_line_ids(segments: list[dict[str, Any]]) -> list[str]:
+    def identity_text(value):
+        if isinstance(value, str):
+            # Exactly the ECMAScript whitespace set used by reviewLineIds.
+            return value.strip(" \t\n\v\f\r\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and abs(value) <= 2**53 - 1 and math.isfinite(value) and value == int(value)):
+            return str(int(value))
+        return ""
+
+    # Match frontend reviewLineIds: identities attest occurrences in this
+    # exact revision, not a repair of stored segment metadata. Old split/copy
+    # operations can leave repeated IDs; reserve all literal IDs before
+    # allocating positional keys so even literal index:N/#suffix IDs are safe.
+    candidates = [identity_text(segment.get("segment_id"))
+                  or identity_text(segment.get("id")) or f"index:{index}"
+                  for index, segment in enumerate(segments)]
+    counts = Counter(candidates)
+    reserved = set(candidates)
     line_ids: list[str] = []
-    for index, segment in enumerate(segments):
-        value = str(segment.get("segment_id") or segment.get("id") or "").strip()
-        # Campaigns created before stable line identities were introduced
-        # contain only ordered lyric rows. Approval is already bound to the
-        # exact EditorDocument revision/version; this deterministic fallback
-        # lets the one song-level attestation cover those legacy rows without
-        # weakening the stale/partial-list check below.
-        value = value or f"index:{index}"
+    for index, value in enumerate(candidates):
+        if counts[value] > 1:
+            base = value = f"index:{index}"
+            suffix = 1
+            while value in reserved or value in line_ids:
+                value = f"{base}#{suffix}"
+                suffix += 1
         if value in line_ids:
             raise HTTPException(
                 status_code=409,
@@ -1667,16 +1743,15 @@ def _review_minutes_by_job(
     job_ids: list[str],
     *,
     since: datetime | None = None,
+    activity_events=None,
 ) -> dict[str, float]:
     if not job_ids:
         return {}
-    query = db.query(ProductEvent.job_id, ProductEvent.user_id, ProductEvent.occurred_at, ProductEvent.created_at).filter(
-        ProductEvent.name == "editor_activity_heartbeat",
-        ProductEvent.job_id.in_(job_ids),
-    )
+    from campaign_review_history import review_activity
+    events = review_activity(db, job_ids) if activity_events is None else activity_events
     if since is not None:
-        query = query.filter(ProductEvent.created_at >= since)
-    events = query.order_by(ProductEvent.created_at.asc()).all()
+        events = [event for event in events
+                  if event.created_at and _aware(event.created_at) >= _aware(since)]
     stamps: dict[tuple[str, int | None], list[datetime]] = {}
     for event in events:
         when = _aware(event.occurred_at or event.created_at)
@@ -1699,20 +1774,20 @@ def _review_minutes_by_job(
     }
 
 
-def _review_minutes_today(db: Session, job_ids: list[str]) -> dict[str, Any]:
+def _review_minutes_today(db: Session, job_ids: list[str], *, activity_events=None) -> dict[str, Any]:
     now = _now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    minutes_by_job = _review_minutes_by_job(db, job_ids, since=today)
+    from campaign_review_history import review_activity
+    events = review_activity(db, job_ids) if activity_events is None else activity_events
+    telemetry_events = [event for event in events
+                        if event.created_at and _aware(event.created_at) >= today]
+    minutes_by_job = _review_minutes_by_job(
+        db, job_ids, since=today, activity_events=telemetry_events,
+    )
     minutes = list(minutes_by_job.values())
-    telemetry_events = db.query(ProductEvent).filter(
-        ProductEvent.name == "editor_activity_heartbeat",
-        ProductEvent.job_id.in_(job_ids),
-        ProductEvent.created_at >= today,
-    ).all() if job_ids else []
     session_keys = set()
     for event in telemetry_events:
-        props = event.properties if isinstance(event.properties, dict) else {}
-        session_id = str(props.get("session_id") or "").strip()
+        session_id = str(event.session_id or "").strip()
         session_keys.add((str(event.job_id), session_id or f"user:{event.user_id or 'unknown'}"))
     observed_jobs = {str(event.job_id) for event in telemetry_events}
     return {
@@ -1927,11 +2002,52 @@ def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
     return result[:10]
 
 
+_REVIEW_JOB_COLUMNS = (
+    Job.job_id, Job.campaign_id, Job.artist, Job.song_title, Job.status,
+    Job.input_audio_sha256, Job.audio_revision, Job.segments_json,
+    Job.approved_by, Job.approved_at, Job.video_url, Job.s3_keys,
+)
+_REVIEW_QUALITY_KEYS = (
+    "reference_hypothesis", "unsafe_windows", "manual_full_review_required",
+    "analysis_status", "catalog_reference", "reviewer_campaign_status",
+)
+
+
+def _review_queue_rows(db: Session, campaign_id: str):
+    """Read-only queue projections; never load render params or quality traces.
+
+    Segments are retained because line counting must preserve Python's exact
+    handling of whitespace and historical malformed entries. Only the quality
+    fields consumed by classification/reference/receipt code cross the wire.
+    Use detached namespaces so partial quality data cannot overwrite a Job.
+    """
+    quality = [Job.transcription_quality[key].label("quality_" + key)
+               for key in _REVIEW_QUALITY_KEYS]
+    rows = db.execute(select(BatchCampaignItem, *_REVIEW_JOB_COLUMNS, *quality).outerjoin(
+        Job, Job.campaign_item_id == BatchCampaignItem.id,
+    ).where(BatchCampaignItem.campaign_id == campaign_id).order_by(
+        BatchCampaignItem.ordinal.asc(),
+    )).all()
+    result = []
+    for row in rows:
+        item = row[0]
+        job = None
+        if row.job_id is not None:
+            values = {column.key: getattr(row, column.key) for column in _REVIEW_JOB_COLUMNS}
+            values["transcription_quality"] = {
+                key: getattr(row, "quality_" + key) for key in _REVIEW_QUALITY_KEYS
+                if getattr(row, "quality_" + key) is not None
+            }
+            job = SimpleNamespace(**values)
+        result.append((item, job))
+    return result
+
+
 @router.get("/campaigns/{campaign_id}/review-queue")
 def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
-    order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
+    order: str = Query(default="effort", pattern="^(calendar|delivery|effort|learning)$"),
     scope: str = Query(default="pending", pattern="^(pending|approved|all|discarded|drafts)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
@@ -1948,22 +2064,29 @@ def review_queue(
     """Operational queue for pre-background and post-render review."""
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
-    pairs = _campaign_rows(db, campaign.id)
+    pairs = _review_queue_rows(db, campaign.id)
     job_ids = [job.job_id for _, job in pairs if job is not None]
-    from sqlalchemy.orm import load_only
+    from reviewer_assist_scope import display_enabled
+    document_columns = [
+        EditorDocument.job_id, EditorDocument.revision, EditorDocument.lock_user_id,
+        EditorDocument.lock_expires_at, EditorDocument.updated_by, EditorDocument.updated_at,
+    ]
+    if display_enabled(campaign.id):
+        document_columns.append(EditorDocument.current_segments)
     documents = {
         row.job_id: row for row in db.query(EditorDocument).options(load_only(
-            EditorDocument.job_id, EditorDocument.revision, EditorDocument.current_segments,
-            EditorDocument.lock_user_id, EditorDocument.lock_expires_at,
-            EditorDocument.updated_by, EditorDocument.updated_at,
+            *document_columns,
         )).filter(
             EditorDocument.job_id.in_(job_ids)
         ).all()
     } if job_ids else {}
     from reviewer_campaign_product import campaign_payload
     reviewer_summary, reviewer_rows = campaign_payload(db, campaign.id, pairs, documents)
-    from campaign_review_history import saved_review_history
-    review_history = saved_review_history(db, job_ids) if stage == "lyrics" else {}
+    from campaign_review_history import saved_review_history, review_activity
+    activity_events = review_activity(db, job_ids)
+    review_history = saved_review_history(
+        db, job_ids, activity_events=activity_events,
+    ) if stage == "lyrics" else {}
     reviewer_ids = {entry["user_id"] for entry in review_history.values()}
     reviewer_ids.update({
         int(row.lock_user_id) for row in documents.values()
@@ -1987,7 +2110,7 @@ def review_queue(
         50, min(80, int(_number(queue_config.get("calibration_target"), 50))),
     )
     confidence_gate_passed = bool(queue_config.get("confidence_gate_passed"))
-    active_minutes = _review_minutes_by_job(db, job_ids)
+    active_minutes = _review_minutes_by_job(db, job_ids, activity_events=activity_events)
     effective_scope = state if state in _ALL_REVIEW_STATES else scope
     draft_ids = {
         job.job_id for _, job in pairs
@@ -2164,6 +2287,8 @@ def review_queue(
     counter_rows = list(rows)
     if scope == "drafts":
         rows.sort(key=lambda row: (row["last_reviewed_at"] or "", -row["ordinal"]), reverse=True)
+    elif order == "calendar":
+        rows.sort(key=lambda row: row["ordinal"])
     elif order == "learning":
         rows.sort(key=lambda row: (-row["disagreement"], row["ordinal"]))
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
@@ -2208,10 +2333,11 @@ def review_queue(
         # Count only campaign jobs from the already materialized rows to
         # avoid JSON-path dialect drift between SQLite and PostgreSQL.
         approved_today_ids = {
-            str((log.detail or {}).get("job_id") or "")
-            for log in db.query(AuditLog).filter(
+            str(row[0] or "")
+            for row in db.query(AuditLog.detail["job_id"].as_string()).filter(
                 AuditLog.action == "batch.lyrics_and_timing_approved",
                 AuditLog.created_at >= today,
+                AuditLog.detail["job_id"].as_string().in_(job_ids),
             ).all()
         }
         counters["approved_today"] = len(approved_today_ids.intersection(
@@ -2284,7 +2410,7 @@ def review_queue(
             "basis": "human_work_scope_rules",
         },
         "background_split": background_split,
-        "review_minutes_today": _review_minutes_today(db, job_ids),
+        "review_minutes_today": _review_minutes_today(db, job_ids, activity_events=activity_events),
         "confidence": {
             "gate_passed": confidence_gate_passed,
             "calibration_target": calibration_target,
@@ -2697,7 +2823,7 @@ def reconcile_batch_campaigns() -> dict[str, int]:
     return {"promoted": promoted, "dispatched": dispatched}
 
 
-def enforce_render_capacity(db: Session, job: Job) -> None:
+def enforce_render_capacity(db: Session, job: Job, *, correction: bool = False) -> None:
     """Keep campaign rendering bounded without consuming interactive quota."""
     if job.workload_class != "batch" or not job.campaign_id:
         return
@@ -2723,7 +2849,13 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
         # campaign reached FINAL_REVIEW_LIMIT.
         Job.job_id != job.job_id,
     ).scalar() or 0
-    if final_review >= FINAL_REVIEW_LIMIT:
+    # The review backlog bounds new production. Existing-video corrections
+    # must remain possible even when that backlog is full: otherwise operators
+    # have to approve incorrect videos before they can repair delivered work.
+    # Only server-side edit routes opt in, and only post-render states qualify.
+    # Human approval, campaign state and simultaneous-render gates still apply.
+    correcting_existing_video = correction and job.status in _POST_RENDER_REVIEW
+    if final_review >= FINAL_REVIEW_LIMIT and not correcting_existing_video:
         raise HTTPException(
             status_code=429,
             detail={"code": "batch_final_review_full", "limit": FINAL_REVIEW_LIMIT},

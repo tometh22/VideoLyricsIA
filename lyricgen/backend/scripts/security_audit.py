@@ -29,7 +29,7 @@ def main() -> int:
     with tempfile.NamedTemporaryFile(suffix=".json") as output:
         result = subprocess.run(
             [sys.executable, "-m", "pip_audit", "-r", str(ROOT / "requirements.txt"),
-             "--format", "json", "--output", output.name],
+             "--timeout", "120", "--format", "json", "--output", output.name],
             check=False,
         )
         output.seek(0)

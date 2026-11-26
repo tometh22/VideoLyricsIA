@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import useReviewerCandidateTelemetry from "./useReviewerCandidateTelemetry";
+import QualityComparisonDialog from "./QualityComparisonDialog";
+import { buildQualityComparison } from "../lib/qualityComparison";
 
 const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled", "observed"]);
 
@@ -12,6 +14,9 @@ const REASON_LABELS = {
   text_audio_mismatch: "La letra no coincide claramente con el audio",
   text_mismatch: "Posible diferencia entre letra y audio",
   voiced_gap: "Hay voz detectada sin una frase asignada",
+  card_ends_before_stable_vocal_tail: "Revisar el final de la frase contra el audio",
+  fixed_wrapper_padding: "Revisar el margen al final de la frase",
+  display_boundary_inherited_from_next_line: "Revisar la separación con la frase siguiente",
   vocalization: "Posible vocalización faltante o incorrecta",
 };
 
@@ -35,7 +40,7 @@ function reasonLabel(reason) {
   }
   const value = String(reason).trim();
   if (!value) return "Revisión de calidad recomendada";
-  return REASON_LABELS[value] || `${value.charAt(0).toUpperCase()}${value.slice(1).replaceAll("_", " ")}`;
+  return REASON_LABELS[value.toLowerCase().replaceAll(" ", "_")] || "Ajuste sugerido · verificar con el audio";
 }
 
 function segmentView(segment, fallbackStart, fallbackEnd) {
@@ -116,13 +121,16 @@ export default function QualityProposalPanel({
   onObserve,
   onRejectWindow,
   onReviewTelemetry,
+  comparisonSource,
   applying = false,
   dismissing = false,
   observing = false,
   rejecting = false,
 }) {
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const [hiddenUnavailableKey, setHiddenUnavailableKey] = useState(null);
   const [clock, setClock] = useState(() => Date.now());
+  const [comparisonId, setComparisonId] = useState(null);
   const telemetryRoot = useReviewerCandidateTelemetry(proposal, onReviewTelemetry);
 
   const windows = useMemo(
@@ -151,10 +159,31 @@ export default function QualityProposalPanel({
     && String(currentRevision) !== String(proposal.base_revision)
   );
   const unavailable = stale || expired || closed;
+  const comparisonSegments = comparisonSource?.segments;
+  const comparisonDuration = comparisonSource?.duration;
+  const comparisons = useMemo(() => {
+    if (!comparisonSegments || unavailable) return new Map();
+    return new Map(windows.filter(window => window?.id != null).map(window => [
+      window.id, buildQualityComparison(comparisonSegments, window, comparisonDuration),
+    ]).filter(([, comparison]) => comparison && (comparison.timingDelta == null || comparison.timingDelta >= 0.35)));
+  }, [comparisonDuration, comparisonSegments, unavailable, windows]);
+  const priorityKeys = useMemo(() => {
+    const ranked = windowEntries.filter(({ window }) => comparisons.has(window.id))
+      .sort(({ window: a }, { window: b }) =>
+        Number(b.selector_policy === "timing-ab-pilot-v1") - Number(a.selector_policy === "timing-ab-pilot-v1")
+        || Number(b.suggestion_type !== "timing") - Number(a.suggestion_type !== "timing")
+        || (comparisons.get(b.id).timingDelta ?? 0) - (comparisons.get(a.id).timingDelta ?? 0));
+    return new Set(ranked.slice(0, 3).map(({ key }) => key));
+  }, [comparisons, windowEntries]);
 
   useEffect(() => {
     setSelectedKeys(new Set());
+    setComparisonId(null);
   }, [proposal?.id, proposal?.base_revision]);
+
+  useEffect(() => {
+    if (!comparisons.has(comparisonId)) setComparisonId(null);
+  }, [comparisonId, comparisons]);
 
   useEffect(() => {
     const validKeys = new Set(windowEntries.map((entry) => entry.key));
@@ -174,12 +203,22 @@ export default function QualityProposalPanel({
     return () => window.clearTimeout(timeout);
   }, [clock, expiry]);
 
-  if (!proposal) return null;
+  const unavailableKey = JSON.stringify([proposal?.id, proposal?.base_revision, currentRevision, status]);
+  if (!proposal || (unavailable && hiddenUnavailableKey === unavailableKey)) return null;
 
   const selectedEntries = windowEntries.filter((entry) => selectedKeys.has(entry.key));
   const busy = applying || dismissing || observing || rejecting;
   const applyDisabled = unavailable || busy || selectedEntries.length === 0;
   const dismissDisabled = unavailable || busy;
+  const primaryWindows = comparisonSource
+    ? windowEntries.filter(({ key }) => priorityKeys.has(key))
+    : windowEntries;
+  const extraWindows = comparisonSource
+    ? windowEntries.filter(({ key }) => !priorityKeys.has(key))
+    : [];
+  const editWindow = comparisonSource?.onEdit
+    ? (window) => { setComparisonId(null); comparisonSource.onEdit(window); }
+    : null;
 
   const toggleWindow = (key) => {
     if (unavailable || busy) return;
@@ -202,9 +241,9 @@ export default function QualityProposalPanel({
   };
 
   const stateMessage = stale
-    ? "Esta propuesta corresponde a una versión anterior de la letra. Actualizá el análisis para continuar."
+    ? "Esta propuesta corresponde a una versión anterior de la letra y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
     : expired
-      ? "Esta propuesta venció. Solicitá un nuevo análisis antes de aplicar cambios."
+      ? "Esta propuesta venció y no se puede aplicar. Podés ocultarla y aprobar tu letra actual sin resolverla."
       : closed
         ? status === "applied"
           ? "Esta propuesta ya fue aplicada."
@@ -216,11 +255,32 @@ export default function QualityProposalPanel({
   return (
     <section
       ref={telemetryRoot}
-      className="rounded-2xl border border-cyan-400/20 bg-slate-950/80 p-4 text-gray-100 shadow-xl shadow-black/20"
+      className="rounded-2xl border border-cyan-400/20 bg-slate-950/80 px-3 py-2 text-gray-100 shadow-xl shadow-black/20"
       aria-labelledby={`quality-proposal-title-${proposal.id}`}
       data-testid="quality-proposal-panel"
       data-proposal-state={stale ? "stale" : expired ? "expired" : closed ? status : "active"}
     >
+      {busy && <p role="status" className="mb-2 text-xs text-cyan-200">{applying ? "Aplicando cambios…" : dismissing ? "Descartando propuesta…" : "Guardando decisión…"}</p>}
+      {stateMessage && (
+        <div
+          className="mt-4 rounded-xl border border-amber-400/30 bg-amber-950/30 px-3 py-2 text-sm text-amber-100"
+          role="alert"
+        >
+          {stateMessage}
+          {(stale || expired) && <button type="button" disabled={busy}
+            onClick={() => setHiddenUnavailableKey(unavailableKey)}
+            className="ml-3 rounded-lg border border-white/20 px-3 py-2 text-sm text-white hover:bg-white/10">
+            Ocultar propuesta
+          </button>}
+        </div>
+      )}
+
+      <details key={proposal.id} className="group/proposals" data-testid="quality-proposal-disclosure">
+        <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 rounded-lg py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300">
+          <span><span className="font-semibold">Sugerencias de ajuste · {windowEntries.length} zonas</span><span className="ml-2 text-xs text-gray-400">Aplicación manual</span></span>
+          <span className="text-cyan-200"><span aria-hidden="true" className="mr-2 inline-block transition-transform group-open/proposals:rotate-90">▸</span>Ver propuestas</span>
+        </summary>
+        <div className="mt-3 max-h-[min(52dvh,480px)] overflow-y-auto overscroll-contain pr-2" data-testid="quality-proposal-scroll">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
@@ -246,14 +306,6 @@ export default function QualityProposalPanel({
         </span>
       </div>
 
-      {stateMessage && (
-        <div
-          className="mt-4 rounded-xl border border-amber-400/30 bg-amber-950/30 px-3 py-2 text-sm text-amber-100"
-          role="alert"
-        >
-          {stateMessage}
-        </div>
-      )}
 
       {proposal?.reviewer_assist?.candidate && (
         <section className="mt-4 space-y-3" aria-label="Canción candidata completa">
@@ -281,7 +333,9 @@ export default function QualityProposalPanel({
           <p className="rounded-xl border border-white/10 bg-white/[0.025] p-4 text-sm text-gray-400">
             No hay ventanas sugeridas para revisar.
           </p>
-        ) : windowEntries.map(({ window: proposalWindow, index, key }) => {
+        ) : [primaryWindows, extraWindows].map((group, groupIndex) => {
+          if (!group.length) return null;
+          const cards = group.map(({ window: proposalWindow, index, key }) => {
           const label = `Zona ${index + 1}`;
           const range = `${formatTime(proposalWindow?.start)} a ${formatTime(proposalWindow?.end)}`;
           const reasons = Array.isArray(proposalWindow?.reasons) ? proposalWindow.reasons : [];
@@ -291,17 +345,11 @@ export default function QualityProposalPanel({
           const currentEnd = asFiniteNumber(proposalWindow?.current_end);
           const proposedEnd = asFiniteNumber(proposalWindow?.proposed_end);
           const previewStart = asFiniteNumber(proposalWindow?.preview_start ?? proposalWindow?.start);
+          const comparison = comparisons.get(proposalWindow?.id);
 
-          return (
-            <article
-              key={key}
-              data-reviewer-receipt={proposalWindow.telemetry_id || undefined}
-              className={`rounded-2xl border p-3 transition-colors sm:p-4 ${
-                checked ? "border-cyan-300/50 bg-cyan-950/20" : "border-white/10 bg-white/[0.025]"
-              }`}
-              data-testid={`quality-proposal-window-${key}`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
+          const details = (
+            <>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                 <label className="flex min-w-0 items-center gap-3 text-sm font-semibold text-white">
                   {!observationOnly && <input
                     type="checkbox"
@@ -318,6 +366,8 @@ export default function QualityProposalPanel({
                     </span>
                   </span>
                 </label>
+                {!comparison && editWindow && <button type="button" onClick={() => editWindow(proposalWindow)}
+                  className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold text-white">Corregir en el editor</button>}
                 <button
                   type="button"
                   className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-200 hover:border-cyan-300/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -437,11 +487,51 @@ export default function QualityProposalPanel({
                   </button>
                 </div>
               )}
+            </>
+          );
+          return (
+            <article key={key} data-reviewer-receipt={proposalWindow.telemetry_id || undefined}
+              className={`rounded-2xl border p-3 transition-colors sm:p-4 ${
+                checked ? "border-cyan-300/50 bg-cyan-950/20" : "border-white/10 bg-white/[0.025]"
+              }`}
+              data-testid={`quality-proposal-window-${key}`}>
+              {comparison ? (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">{formatTime(comparison.start)} – {formatTime(comparison.end)}</p>
+                      {reasons.length > 0 && <p className="text-xs text-gray-300">{reasonLabel(reasons[0])}</p>}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {editWindow && <button type="button" onClick={() => editWindow(proposalWindow)}
+                        className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold text-white">Corregir en el editor</button>}
+                      <button type="button" disabled={busy || comparisonSource.canStart === false}
+                        className="rounded-lg border border-cyan-300/40 px-3 py-1.5 text-xs font-semibold text-cyan-100 disabled:opacity-50"
+                        onClick={() => {
+                          comparisonSource.onOpen();
+                          setComparisonId(proposalWindow.id);
+                        }}>Comparar A/B</button>
+                    </div>
+                  </div>
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-xs text-gray-300">Ver valores de la propuesta</summary>
+                    {details}
+                  </details>
+                </>
+              ) : details}
             </article>
+          );
+          });
+          return groupIndex === 0 ? <div key="primary" className="space-y-4">{cards}</div> : (
+            <details key="more">
+              <summary className="cursor-pointer text-sm text-cyan-200">Ver más sugerencias ({group.length})</summary>
+              <div className="mt-3 space-y-4">{cards}</div>
+            </details>
           );
         })}
       </fieldset>
 
+        </div>
       {!observationOnly && <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-gray-400" aria-live="polite">
           {selectedEntries.length === 0
@@ -467,6 +557,25 @@ export default function QualityProposalPanel({
           </button>
         </div>
       </div>}
+      </details>
+      {comparisons.has(comparisonId) && (
+        <QualityComparisonDialog
+          key={JSON.stringify([proposal.id, proposal.base_revision, comparisonId])}
+          comparison={comparisons.get(comparisonId)}
+          jobId={comparisonSource.jobId}
+          audioUrl={comparisonSource.audioUrl}
+          backgroundUrl={comparisonSource.backgroundUrl}
+          settings={comparisonSource.settings}
+          request={comparisonSource.request}
+          onClose={() => setComparisonId(null)}
+          onEdit={editWindow ? () => editWindow(windows.find(window => window.id === comparisonId)) : undefined}
+          onDecision={properties => comparisonSource.onDecision({
+            ...properties, proposal_id: proposal.id, window_id: comparisonId, revision: proposal.base_revision,
+          })}
+          onApply={!observationOnly && onApplySelected ? () => onApplySelected([comparisonId], proposal) : undefined}
+          applying={busy}
+        />
+      )}
     </section>
   );
 }

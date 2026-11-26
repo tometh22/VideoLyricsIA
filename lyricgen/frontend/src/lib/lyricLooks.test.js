@@ -26,7 +26,7 @@ describe("catálogo", () => {
   it("expone exactamente los códigos que acepta el backend, con sin-look primero", () => {
     expect(LYRIC_LOOK_CODES).toEqual([
       "", "cosmico", "cine", "pincel", "pop70", "pelicula",
-      "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
+      "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "escalera", "una_por_una", "ventana",
       "duotono", "romantico", "degrade", "y2k",
       "golpe", "recorte", "diptico", "diario", "nube", "puntada",
     ]);

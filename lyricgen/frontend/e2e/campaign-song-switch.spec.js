@@ -68,14 +68,47 @@ test("approved campaign lyrics without a video open, autosave and reload in the 
   await page.getByRole("dialog", { name: "Canción Canción sin video" }).getByRole("button", { name: "Editar letra y tiempos" }).click();
   await expect(page).toHaveURL(/\/review\/approved0001\?return_to=/);
   expect(new URL(page.url()).searchParams.get("return_to")).toContain("tab=approved&order=effort");
-  await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Transcripción aprobada");
+  await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Transcripción aprobada");
   await expect.poll(() => harness.heartbeats.length).toBeGreaterThan(0);
   await page.waitForFunction(() => [...document.querySelectorAll("audio")].some(a => a.readyState >= 1 && a.duration > 0));
   expect(harness.saves).toHaveLength(0);
-  await page.getByLabel("Letra de la línea 1").fill("Transcripción corregida");
+  await page.getByLabel("Letra de esta línea", { exact: true }).fill("Transcripción corregida");
   await expect.poll(() => harness.saves.length).toBeGreaterThan(0);
   expect(harness.saves.at(-1).segments[0].text).toBe("Transcripción corregida");
   await page.reload();
-  await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Transcripción corregida");
+  await expect(page.getByLabel("Letra de esta línea", { exact: true })).toHaveValue("Transcripción corregida");
   expect(forbidden).toEqual([]);
+});
+
+test("campaign structural edits keep keyboard focus and undo restores the selected line", async ({ page }) => {
+  const jobId = "structure001";
+  const segments = [
+    { start: 0, end: 2, text: "Primera línea" },
+    { start: 2, end: 5, text: "Segunda parte final" },
+    { start: 5, end: 8, text: "Tercera línea" },
+  ];
+  await installEditorHarness(page, { jobId, role: "admin", editorV2: true, segments });
+  await page.route(`**/status/${jobId}`, route => route.fulfill({ contentType: "application/json", body: JSON.stringify({
+    job_id: jobId, status: "transcribed_pending", campaign_id: "structural-campaign", campaign_item_id: "structural-item",
+    filename: "structural.wav", segments_revision: 0, segments_json: segments,
+  }) }));
+  await page.goto(`/review/${jobId}`);
+  const input = page.getByLabel("Letra de esta línea", { exact: true });
+  await page.getByTestId("review-line-2").click();
+  await expect(input).toHaveValue("Segunda parte final");
+  await input.focus();
+  await input.evaluate(node => node.setSelectionRange(8, 8));
+  await input.press("Enter");
+  await expect(input).toHaveValue("parte final");
+  await expect(input).toBeFocused();
+  await page.getByRole("button", { name: "Deshacer", exact: true }).click();
+  await expect(input).toHaveValue("Segunda parte final");
+  await page.getByRole("button", { name: "Eliminar línea", exact: true }).click();
+  await expect(input).toHaveValue("Tercera línea");
+  await expect(input).toBeFocused();
+  await page.getByRole("button", { name: "Agregar línea", exact: true }).click();
+  await expect(input).toHaveValue("");
+  await expect(input).toBeFocused();
+  await input.pressSequentially("Nueva letra con espacios");
+  await expect(input).toHaveValue("Nueva letra con espacios");
 });

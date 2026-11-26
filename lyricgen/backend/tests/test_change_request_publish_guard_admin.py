@@ -19,6 +19,10 @@ PERO = '0:46 la línea es "Pintamos el mono, pero NOS DA lo mismo"'
 @pytest.fixture
 def guard_on(monkeypatch):
     monkeypatch.setenv("CHANGE_REQUEST_PUBLISH_GUARD_ENABLED", "1")
+    # Estos tests cubren el control de texto anterior (frase en cualquier
+    # parte). La verificación punto por punto lo reemplaza y tiene sus tests
+    # en test_change_request_verification*.py; acá queda apagada.
+    monkeypatch.setenv("CHANGE_REQUEST_CLOSE_VERIFICATION", "0")
 
 
 def approve(db, job, at, line, revision=1):

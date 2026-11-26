@@ -6,7 +6,7 @@ de calidad que tenemos, y si las reglas dejan de reconocerlos el indicador
 queda mudo justo cuando más importa.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import change_request_stats as crs
@@ -180,3 +180,51 @@ def test_summarize_lista_vacia():
     s = crs.summarize([], deliveries_total=10)
     assert s["requests"] == 0
     assert all(c["count"] == 0 for c in s["categories"])
+
+
+def test_delivery_cohort_uses_first_create_event_and_full_followup():
+    now = datetime(2026, 11, 14, tzinfo=timezone.utc)
+    published = now - timedelta(days=45)
+    deliveries = [("job-1", "argentina"), ("job-2", "chile")]
+    events = [
+        (None, None, published, "delivery.create",
+         {"job_id": "job-1", "portal_id": "argentina"}),
+        # Re-publication updates the live row's added_at; it must not reset
+        # the first-delivery follow-up window.
+        (None, None, published + timedelta(days=5), "delivery.update",
+         {"job_id": "job-1", "portal_id": "argentina"}),
+    ]
+    requests = [
+        ("job-1", "argentina", published + timedelta(days=20),
+         'donde dice "cielo" debería decir "suelo"'),
+        ("job-1", "argentina", published + timedelta(days=31),
+         "revisar sincronización"),
+        ("job-2", "chile", published + timedelta(days=2),
+         "No estaba en el corte publicado"),
+        ("job-1", "argentina", published + timedelta(days=15),
+         "Dejar la frase completa en una sola línea"),
+    ]
+    s = crs.summarize_delivery_cohort(
+        deliveries, requests, events, as_of=now,
+    )
+    assert s["eligible_videos"] == 1
+    assert s["videos_with_lyric_or_timing_request"] == 1
+    assert s["lyric_or_timing_request_rate"] == 1.0
+    assert s["request_count"] == 1
+    assert s["videos_by_category"] == {"letra": 1, "estructura": 1}
+
+
+def test_delivery_cohort_excludes_untracked_and_not_yet_mature_deliveries():
+    now = datetime(2026, 11, 14, tzinfo=timezone.utc)
+    recent = now - timedelta(days=10)
+    s = crs.summarize_delivery_cohort(
+        [("tracked", "argentina"), ("missing", "argentina")],
+        [("tracked", "argentina", recent, "revisar sincronización")],
+        [(None, None, recent, "delivery.create",
+          {"job_id": "tracked", "portal_id": "argentina"})],
+        as_of=now,
+    )
+    assert s["delivered_videos"] == 2
+    assert s["eligible_videos"] == 0
+    assert s["videos_without_reconstructable_first_publish"] == 1
+    assert s["lyric_or_timing_request_rate"] is None

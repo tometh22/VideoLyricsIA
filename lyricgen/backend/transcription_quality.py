@@ -14,6 +14,7 @@ from copy import deepcopy
 from typing import Iterable
 
 from evidence_attestation import verify_artifact
+from lyric_observation import build_lyric_observation
 
 
 POLICY_VERSION = "lyrics-quality-v6"
@@ -413,6 +414,10 @@ def supersede_pending_analysis(
         for key in ("reference_hypothesis_unavailable", "manual_full_review_required"):
             if key in quality:
                 updated[key] = deepcopy(quality[key])
+    # Bound to the recording, not to the edited text (same as the reference):
+    # the language review must keep comparing the edited lines against it.
+    if isinstance(quality.get("language_probe"), dict):
+        updated["language_probe"] = deepcopy(quality["language_probe"])
     updated.update({
         "decision": "review_required", "render_blocked": True,
         "analysis_pending": False,
@@ -968,6 +973,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         "acoustic_evidence": acoustic_evidence,
         "reference_attestation": reference_attestation or None,
         "evidence_lineage": evidence_lineage,
+        "lyric_observation": build_lyric_observation(segments),
         "segments_hash": segments_hash(segments),
         **runtime_identity(),
     }

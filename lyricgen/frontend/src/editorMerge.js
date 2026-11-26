@@ -4,9 +4,11 @@
 
 export function decorateSegments(segments = []) {
   return segments.map((segment, index) => {
-    const stable = segment?.segment_id ?? segment?.id ?? segment?._id ?? String(index);
     const localId = Number.isFinite(segment?._id) ? segment._id : index;
-    return { ...segment, _id: localId, segment_id: String(stable) };
+    // Local React keys are not persisted identities. In particular a legacy
+    // row without an ID must not acquire an index-derived durable ID merely
+    // because another tab forced a rebase.
+    return { ...segment, _id: localId };
   });
 }
 
@@ -68,39 +70,148 @@ export function segmentsEquivalent(left = [], right = []) {
   });
 }
 
+// JSON object key order is not semantic (PostgreSQL JSONB can reorder it).
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") return Object.fromEntries(
+    Object.keys(value).sort().map(key => [key, stableValue(value[key])]),
+  );
+  return value;
+}
+function sameValue(a, b) {
+  return JSON.stringify(stableValue(a)) === JSON.stringify(stableValue(b));
+}
 function equal(a, b) {
-  return JSON.stringify(comparable(a)) === JSON.stringify(comparable(b));
+  return sameValue(comparable(a), comparable(b));
 }
 
 function keyOf(segment, index) {
   return String(segment?.segment_id ?? segment?.id ?? segment?._id ?? `index:${index}`);
 }
 
-// Rows sharing one `segment_id` are NOT hypothetical: hasta este fix,
-// duplicar/dividir una línea clonaba el `segment_id` del padre, y los jobs
-// editados antes siguen cargando esos duplicados. Con la clave pelada, cada
-// grupo de duplicados colapsaba en el `Map` (last-write-wins) y el merge
-// devolvía UNA fila por clave distinta: 44 líneas entraban y salían 38, sin
-// conflicto y sin aviso (job f866cbcf0e49, UMG Chile, 1-sep-2026 — el
-// operador había duplicado el estribillo a mano y perdió las 5 repeticiones
-// al reabrir el editor). Calificar la clave con el ordinal de aparición
-// mantiene distintas a las filas duplicadas y aparea la n-ésima copia de un
-// lado con la n-ésima del otro.
-function occurrenceKeys(segments) {
-  const seen = new Map();
-  return segments.map((segment, index) => {
-    const stable = keyOf(segment, index);
-    const occurrence = seen.get(stable) || 0;
-    seen.set(stable, occurrence + 1);
-    return occurrence === 0 ? stable : `${stable}#${occurrence}`;
-  });
+function identityGroup(segment) {
+  const durable = segment?.segment_id ?? segment?.id;
+  return JSON.stringify(durable == null ? ["legacy"] : ["durable", String(durable)]);
 }
 
-// El ordinal es un detalle interno del merge: lo que sale en `conflicts[].key`
-// (contrato con el editor) sigue siendo el id estable pelado.
+// Keys are tuples, never concatenated suffixes which can collide with a
+// literal ID. Match legacy occurrences against BASE rather than renumbering
+// each snapshot after a delete. Only unique evidence authorizes a match;
+// ambiguous rows remain distinct additions instead of overwriting a survivor.
+function alignOccurrences(base, rows, baseKeys, peerRows) {
+  const keys = Array(rows.length);
+  const ambiguousBase = new Set();
+  const baseGroups = new Map();
+  const groups = new Map();
+  const peerCounts = new Map();
+  const group = (map, id, index) => {
+    if (!map.has(id)) map.set(id, []);
+    map.get(id).push(index);
+  };
+  base.forEach((row, index) => group(baseGroups, identityGroup(row), index));
+  rows.forEach((row, index) => group(groups, identityGroup(row), index));
+  peerRows.forEach(row => {
+    const id = identityGroup(row);
+    peerCounts.set(id, (peerCounts.get(id) || 0) + 1);
+  });
+  const fingerprint = row => JSON.stringify(stableValue(comparable(row)));
+  for (const [id, indices] of groups) {
+    // A newly minted durable identity can already exist remotely after a
+    // committed save whose response was lost. Further typing changes its
+    // fingerprint, not its identity. Only pair IDs unique in BOTH snapshots
+    // and absent from base; known historical collisions retain occurrence
+    // matching below. Never pair ID-less additions by this rule.
+    const durable = rows[indices[0]]?.segment_id ?? rows[indices[0]]?.id;
+    if (durable != null && !baseGroups.has(id)
+      && indices.length === 1 && peerCounts.get(id) === 1) {
+      keys[indices[0]] = JSON.stringify([id, "added-durable"]);
+      continue;
+    }
+    const available = new Set(baseGroups.get(id) || []);
+    const pending = new Set(indices);
+    const match = (index, baseIndex) => {
+      keys[index] = baseKeys[baseIndex];
+      available.delete(baseIndex);
+      pending.delete(index);
+    };
+    if (available.size === 1 && pending.size === 1) {
+      match(indices[0], available.values().next().value);
+      continue;
+    }
+    // Index each kind of evidence, avoiding a scan of the entire document
+    // for every row in a long song. A match must be unique on BOTH sides.
+    const byEvidence = (positions, source, select) => {
+      const buckets = new Map();
+      for (const index of positions) group(buckets, select(source[index]), index);
+      return buckets;
+    };
+    for (const select of [fingerprint,
+      row => JSON.stringify([quantizeTime(row.start), quantizeTime(row.end)]),
+      row => JSON.stringify(row.text)]) {
+      const a = byEvidence(available, base, select);
+      const b = byEvidence(pending, rows, select);
+      for (const [evidence, local] of b) {
+        const original = a.get(evidence);
+        if (local.length === 1 && original?.length === 1) match(local[0], original[0]);
+      }
+    }
+    // Indistinguishable unchanged copies can be paired in order. Do not use
+    // an ordinal fallback for edited/deleted rows with no matching evidence.
+    const identical = byEvidence(available, base, fingerprint);
+    const cursors = new Map();
+    for (const index of [...pending]) {
+      const evidence = fingerprint(rows[index]);
+      const cursor = cursors.get(evidence) || 0;
+      const original = identical.get(evidence)?.[cursor];
+      if (original != null) {
+        match(index, original);
+        cursors.set(evidence, cursor + 1);
+      }
+    }
+    const addedCounts = new Map();
+    if (pending.size) available.forEach(index => ambiguousBase.add(baseKeys[index]));
+    for (const index of pending) {
+      const evidence = fingerprint(rows[index]);
+      const occurrence = addedCounts.get(evidence) || 0;
+      addedCounts.set(evidence, occurrence + 1);
+      keys[index] = JSON.stringify([id, "added", evidence, occurrence]);
+    }
+  }
+  return { keys, ambiguousBase };
+}
+
 function stableIdOf(key) {
-  const hash = key.lastIndexOf("#");
-  return hash === -1 ? key : key.slice(0, hash);
+  return JSON.parse(key)[0];
+}
+
+// Preserve independent fields, but treat start/end as one coherent interval.
+// A genuine same-field conflict retains the existing local-wins policy and
+// remains visible to callers through conflicts[]. Never lose remote timing
+// merely because this tab corrected the text on that same row.
+function mergeFields(base, local, remote) {
+  const ignored = new Set(["_id", "id", "segment_id", "words", "review", "start", "end"]);
+  const merged = { ...remote, ...local };
+  const conflicts = [];
+  const choose = (b, l, r, field) => {
+    if (sameValue(l, r) || sameValue(b, r)) return l;
+    if (sameValue(b, l)) return r;
+    conflicts.push(field);
+    return l;
+  };
+  const time = row => [quantizeTime(row.start), quantizeTime(row.end)];
+  const timing = choose(time(base), time(local), time(remote), "timing");
+  const timingSource = sameValue(timing, time(local)) ? local : remote;
+  merged.start = timingSource.start;
+  merged.end = timingSource.end;
+  if ("words" in timingSource) merged.words = timingSource.words;
+  else delete merged.words;
+  const fields = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+  for (const field of fields) {
+    if (ignored.has(field)) continue;
+    const value = choose(base[field], local[field], remote[field], field);
+    if (value === undefined) delete merged[field]; else merged[field] = value;
+  }
+  return { merged, conflicts };
 }
 
 function indexed(segments, keys) {
@@ -114,9 +225,11 @@ function indexed(segments, keys) {
  * conflicting when both sides changed the same stable segment differently.
  */
 export function mergeThreeWay(base = [], local = [], remote = []) {
-  const baseKeys = occurrenceKeys(base);
-  const localKeys = occurrenceKeys(local);
-  const remoteKeys = occurrenceKeys(remote);
+  const baseKeys = base.map((row, index) => JSON.stringify([keyOf(row, index), "base", index]));
+  const localAlignment = alignOccurrences(base, local, baseKeys, remote);
+  const remoteAlignment = alignOccurrences(base, remote, baseKeys, local);
+  const localKeys = localAlignment.keys;
+  const remoteKeys = remoteAlignment.keys;
   const baseMap = indexed(base, baseKeys);
   const localMap = indexed(local, localKeys);
   const remoteMap = indexed(remote, remoteKeys);
@@ -151,10 +264,25 @@ export function mergeThreeWay(base = [], local = [], remote = []) {
       if (l != null) merged.push(l);
       continue;
     }
-    conflicts.push({
-      key: stableIdOf(key), base: b || null, local: l || null, remote: r || null,
-    });
-    if (l != null) merged.push(l);
+    if (b && !l && r && localAlignment.ambiguousBase.has(key)) {
+      // A changed legacy copy could be a moved/rewritten occurrence rather
+      // than a deletion. Retain the remote correction alongside the unmatched
+      // local row; an ordinal guess is not permission to destroy either one.
+      conflicts.push({ key: stableIdOf(key), base: b, local: null, remote: r,
+        reason: "ambiguous-identity" });
+      merged.push(r);
+      continue;
+    }
+    if (b && l && r) {
+      const fields = mergeFields(b, l, r);
+      if (fields.conflicts.length) conflicts.push({
+        key: stableIdOf(key), base: b, local: l, remote: r, fields: fields.conflicts,
+      });
+      merged.push(fields.merged);
+    } else {
+      conflicts.push({ key: stableIdOf(key), base: b || null, local: l || null, remote: r || null });
+      if (l != null) merged.push(l);
+    }
   }
 
   // Invariante: cada fila de salida tiene que venir de una fila de entrada
@@ -188,5 +316,7 @@ export function mergeThreeWay(base = [], local = [], remote = []) {
       merged: merged.length,
     });
   }
-  return { merged: decorateSegments(deduped), conflicts };
+  // A remote insertion may have been appended above. Sorting is sufficient;
+  // never let downstream normalization interpret that order as bad timing.
+  return { merged: decorateSegments(deduped.sort((a, b) => Number(a.start) - Number(b.start))), conflicts };
 }
