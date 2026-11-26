@@ -878,6 +878,13 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                     "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0"
                 ).strip().lower() in {"1", "true", "yes", "on"}:
                     queue_names.append("transcription_quality")
+                try:
+                    from prores_capacity import dedicated_queue_names
+                    for name in dedicated_queue_names():
+                        if name not in queue_names:
+                            queue_names.append(name)
+                except Exception:
+                    pass
                 for qname in queue_names:
                     try:
                         queues[qname] = Queue(qname, connection=r).count

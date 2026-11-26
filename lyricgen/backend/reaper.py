@@ -1139,7 +1139,15 @@ def find_queues_without_consumer() -> list:
                 listened.update(w.queue_names())
             except Exception:
                 pass
-        return [q for q in _EXPECTED_QUEUES if q not in listened]
+        expected = list(_EXPECTED_QUEUES)
+        try:
+            from prores_capacity import dedicated_queue_names
+            for name in dedicated_queue_names():
+                if name not in expected:
+                    expected.append(name)
+        except Exception:
+            pass
+        return [q for q in expected if q not in listened]
     except Exception as e:  # pragma: no cover
         logger.debug("find_queues_without_consumer skipped: %s", e)
         return []

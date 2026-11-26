@@ -1,6 +1,12 @@
 # Railway Config-as-Code for the heavy render worker fleet.
 # Dashboard contract: Root Directory=/lyricgen, Config File=/railway/worker.toml,
 # QUEUES=enterprise,default,canary and RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200.
+#
+# OVH (deploy/ovh) splits this fleet: render listens to enterprise,canary,
+# a light process listens only to default, and ProRes has its own workers.
+# Do not drop `default` from this command until that migration. This process
+# is still the only consumer of `default` on Railway, and a toml file does
+# not create the extra service.
 
 [build]
 builder = "DOCKERFILE"
