@@ -19141,6 +19141,7 @@ def _render_lyrics_ass(
             # No look: the poster hierarchy (song leads, artist in spaced
             # caps), like the thumbnail — never the generic card.
             poster=look is None,
+            compact=look is not None,
         )
         from lyric_overlay import compose_lyric_overlay
         ass_doc = compose_lyric_overlay(
