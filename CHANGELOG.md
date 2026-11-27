@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.225] - 2026-11-27
+
+### Fixed
+- El portal UMG muestra cuándo falta publicar una corrección. El panel impide cerrar el pedido contra un corte anterior mientras se prepara su actualización.
+
 ## [1.1.221] - 2026-11-25
 
 ### Fixed

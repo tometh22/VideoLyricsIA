@@ -2432,9 +2432,9 @@ function renderVersionRow(song, version, versionIdx) {
     } else {
       const reviewedRevision = Number(version.revision) || 1;
       const reviewedAt = JSON.stringify(version.content_updated_at || null).replace(/"/g, '&quot;');
-      const unavailable = version.files_hidden || version.updating;
+      const unavailable = version.files_hidden || version.updating || version.publication_pending;
       const approveBtn = unavailable
-        ? `<button type="button" class="btn btn-success btn-sm" disabled title="Esperá a que la versión corregida esté publicada y disponible.">Actualizando…</button>`
+        ? `<button type="button" class="btn btn-success btn-sm" disabled title="Esperá a que la versión corregida esté publicada y disponible.">${version.publication_pending ? "Corrección sin publicar" : "Actualizando…"}</button>`
         : `<button type="button" class="btn btn-success btn-sm" onclick="approveDelivery(${version.delivery_id}, ${songLabelEsc}, ${reviewedRevision}, ${reviewedAt})" data-help-tip="Aprobar la versión que estás viendo. Si se actualizó, primero revisá el nuevo corte." data-help-article="how-to-approve">
         ✓ Aprobar
       </button>`;
@@ -2480,12 +2480,12 @@ function renderVersionRow(song, version, versionIdx) {
   const revTag = revision > 1
     ? `<span class="version-label-tag" data-help-tip="Se publicó una corrección. Descargá de nuevo: el archivo anterior ya no es el vigente.">v${revision}${updatedAt ? " · " + escapeHtml(updatedAt) : ""}</span>`
     : "";
-  // Ventana honesta: el MP4 se reemplaza minutos antes que el master de
-  // broadcast, así que mientras se re-renderiza la descarga no es definitiva.
-  const updatingTag = version.updating
+  const updatingTag = version.publication_pending
+    ? `<span class="version-label-tag warning" data-help-tip="Estás viendo la última versión publicada. La corrección todavía no está disponible.">Versión anterior</span>`
+    : version.updating
     ? `<span class="version-label-tag warning" data-help-tip="Estamos aplicando cambios sobre esta versión. Esperá a que termine antes de descargar el master.">Actualizando…</span>`
     : "";
-  const reviewTag = (version.awaiting_review && !version.updating)
+  const reviewTag = (version.awaiting_review && !version.updating && !version.publication_pending)
     ? `<span class="version-label-tag warning" data-help-tip="Hay una versión nueva desde tu última revisión.">Nueva · sin revisar</span>`
     : "";
 

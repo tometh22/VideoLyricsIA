@@ -154,3 +154,20 @@ test('approval button waits while the pointer cut is updating or hidden', () => 
     assert.doesNotMatch(rendered, /onclick="approveDelivery\(/);
   }
 });
+
+test('a published snapshot shows that the correction still needs publication', () => {
+  const p = portal([]);
+  const version = { delivery_id: 7, revision: 3, files: [], updating: true,
+    publication_pending: true, awaiting_review: true };
+  const song = { artist: 'Artist', song: 'Song', versions: [version] };
+  const pending = p.context.renderVersionRow(song, version, 0);
+  assert.match(pending, /Corrección sin publicar<\/button>/);
+  assert.match(pending, /Versión anterior/);
+  assert.doesNotMatch(pending, /Actualizando…|onclick="approveDelivery\(/);
+
+  version.revision = 4;
+  version.updating = version.publication_pending = false;
+  const published = p.context.renderVersionRow(song, version, 0);
+  assert.match(published, /onclick="approveDelivery\(/);
+  assert.doesNotMatch(published, /Corrección sin publicar|Versión anterior/);
+});
