@@ -4,7 +4,8 @@ import json
 
 
 def review_context(job, delivery, request):
-    from delivery_freshness import render_fingerprint
+    from change_request_workflow import timestamp
+    from delivery_freshness import has_unpublished_changes, needs_publish, render_fingerprint
     from delivery_snapshots import portal_key
 
     if (job is None or delivery is None or delivery.removed_at is not None
@@ -20,6 +21,13 @@ def review_context(job, delivery, request):
     ):
         # A legacy mutable key with no current render identity cannot be
         # presented as the particular published revision being reviewed.
+        return None
+    published_at = timestamp(delivery.content_updated_at or delivery.added_at)
+    submitted_at = timestamp(request.submitted_at)
+    if (published_at and submitted_at and published_at < submitted_at
+            and (has_unpublished_changes(delivery) or needs_publish(job, delivery))):
+        # When a correction is pending, a snapshot that predates the
+        # request cannot stand in for the cut the operator just prepared.
         return None
     # This is a concurrency receipt, not authorization. In pointer/legacy
     # mode the working render can change the published bytes, so bind it too.

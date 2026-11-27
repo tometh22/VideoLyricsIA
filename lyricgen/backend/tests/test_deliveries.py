@@ -104,6 +104,45 @@ def test_portal_approval_waits_for_visible_published_cut(
     assert db.get(Delivery, delivery_id).approved_at is None
 
 
+def test_portal_requires_a_new_publication_after_a_snapshot_is_marked_stale(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    from database import Delivery
+    from delivery_freshness import STALE_EDITING
+
+    publish_url = f"/admin/deliveries/from-job/{approved_job.job_id}"
+    published = client.post(publish_url, headers=auth(admin_token), json={})
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    old_cut = _portal_approval_body(db, delivery_id)
+    row = db.get(Delivery, delivery_id)
+    assert row.published_file_keys
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = STALE_EDITING
+    _edit_the_render(db, approved_job)
+
+    headers = {"X-Portal-Token": PORTAL_TOKEN}
+    endpoint = f"/api/deliveries/{delivery_id}/approve"
+
+    def listed_version():
+        items = client.get("/api/deliveries/items", headers=headers).json()
+        return next(v for song in items["songs"] for v in song["versions"]
+                    if v["delivery_id"] == delivery_id)
+
+    version = listed_version()
+    assert version["publication_pending"] is True
+    assert version["files_hidden"] is False
+    assert client.post(endpoint, headers=headers, json=old_cut).status_code == 409
+
+    republished = client.post(publish_url, headers=auth(admin_token), json={})
+    assert republished.status_code == 200, republished.text
+    assert listed_version()["publication_pending"] is False
+    new_cut = _portal_approval_body(db, delivery_id)
+    assert new_cut["expected_revision"] == old_cut["expected_revision"] + 1
+    assert client.post(endpoint, headers=headers, json=old_cut).status_code == 409
+    assert client.post(endpoint, headers=headers, json=new_cut).status_code == 200
+
+
 def _signed_umg_qc_report(job, reviewer_id):
     from delivery_qc_runtime import (
         MANDATORY_REVIEW_CHECKS, delivery_qc_source_fingerprint,

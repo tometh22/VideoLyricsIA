@@ -211,6 +211,30 @@ def _human_publication_body(client, admin_token, request):
             'confirmed_published_review': True, 'confirmed_items': 1}
 
 
+@pytest.mark.parametrize('working_cut', ['edit_marked', 'rendered'])
+def test_cannot_close_request_against_older_snapshot_with_correction_pending(
+        client, admin_token, manual_request, db, working_cut):
+    job, _, request, delivery = _published_without_ticking(client, admin_token, manual_request, db)
+    delivery.content_updated_at = request.submitted_at - timedelta(minutes=5)
+    db.commit()
+    body = _human_publication_body(client, admin_token, request)
+    if working_cut == 'edit_marked':
+        delivery.stale_since = request.submitted_at + timedelta(minutes=1)
+        delivery.stale_reason = 'editing'
+    else:
+        job.edit_count += 1
+    db.commit()
+
+    listed = client.get(f'/admin/change-requests?status=all&change_request_id={request.id}&limit=1',
+                        headers=auth(admin_token)).json()['items'][0]
+    assert listed['published_review'] is None
+    response = client.post(f'/admin/change-requests/{request.id}/confirm-publication',
+                           headers=auth(admin_token), json=body)
+    assert response.status_code == 409, response.text
+    db.refresh(request)
+    assert request.resolved_at is None
+
+
 @pytest.mark.parametrize('problem', ['older_save', 'newer_document', 'art_track', 'later_request', 'prores', 'text'])
 def test_human_can_resolve_one_reviewed_publication_despite_automatic_evidence(
         client, admin_token, manual_request, db, monkeypatch, problem):

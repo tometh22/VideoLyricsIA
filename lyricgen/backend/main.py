@@ -22413,11 +22413,7 @@ async def portal_approve_delivery(
             status_code=409,
             detail="La versión cambió desde que abriste el portal. Actualizá la página y revisá el video antes de aprobar.",
         )
-    if is_hidden_from_client(delivery) or (
-        delivery.published_file_keys is None
-        and delivery.stale_since is not None
-        and (delivery.stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
-    ):
+    if is_hidden_from_client(delivery) or delivery_freshness.has_unpublished_changes(delivery):
         raise HTTPException(
             status_code=409,
             detail="Esta versión se está actualizando o no está disponible. Esperá a que vuelva a publicarse.",
@@ -22725,6 +22721,7 @@ def portal_get_items(
             elif ft == "short" and url is not None:
                 short_preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
         change_requests = cr_map.get(d.id, [])
+        has_unpublished_changes = delivery_freshness.has_unpublished_changes(d)
         bucket["versions"].append({
             "delivery_id": d.id,
             "job_id": d.job_id,
@@ -22757,14 +22754,10 @@ def portal_get_items(
             "content_updated_at": (
                 d.content_updated_at.isoformat() if d.content_updated_at else None
             ),
-            # True mientras se está re-renderizando: el MP4 puede haberse
-            # reemplazado ya y el master de broadcast todavía no. Un edit que
-            # murió NO cuenta (stale_reason=edit_failed): la fila sigue
-            # marcada para el operador, pero al cliente no se le promete un
-            # trabajo en curso que no existe.
-            "updating": (
-                d.stale_since is not None
-                and (d.stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
+            # Keep the legacy flag for portal clients that have not updated.
+            "updating": has_unpublished_changes,
+            "publication_pending": (
+                has_unpublished_changes and d.published_file_keys is not None
             ),
             # True when the operator (or the automatic rule while changes are
             # unpublished) is keeping this version's files out of the client's

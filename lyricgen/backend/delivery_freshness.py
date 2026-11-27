@@ -300,6 +300,14 @@ def clear_size_cache(r2_keys: Iterable[str]) -> int:
         return 0
 
 
+def has_unpublished_changes(delivery) -> bool:
+    """Whether the delivery is waiting for an edit or its publication."""
+    return (
+        delivery.stale_since is not None
+        and delivery.stale_reason in STALE_IN_FLIGHT
+    )
+
+
 def needs_publish(job, delivery) -> bool:
     """Whether ``delivery`` still points at the cut from before an edit.
 
