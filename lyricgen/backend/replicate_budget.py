@@ -313,6 +313,7 @@ def call_with_budget(
     call_label: str = "replicate",
     on_progress: Optional[Callable[[float], None]] = None,
     typical_runtime_s: float = 90.0,
+    error_sink: Optional[list] = None,
 ):
     """Call `replicate.run(model, input=input_factory())` with a global
     wall-clock budget and typed-error short-circuit. Returns the model
@@ -326,6 +327,10 @@ def call_with_budget(
     `call_label` is a short identifier (`forced`, `whisperx`, `demucs`)
     used as a log prefix and a Sentry breadcrumb category. Helps trace
     which path burned the budget when reading logs.
+
+    `error_sink` (optional): list that receives the last exception when the
+    call returns None, so a caller can tell a provider rejection (429) or a
+    transient network error from an empty result and decide how to retry.
 
     `on_progress` (optional): callback `(fraction: float) -> None` called
     with 0..1 as the model runs. Demucs uses this to keep the "Aislando
@@ -418,6 +423,8 @@ def call_with_budget(
             if is_non_retryable(e):
                 logger.warning("[%s] non-retryable error on attempt %s (%s) — aborting",
                                call_label, attempt + 1, e)
+                if error_sink is not None:
+                    error_sink.append(e)
                 return None
             logger.warning("[%s] attempt %s/%s failed (%s)",
                            call_label, attempt + 1, len(backoff), e)
@@ -428,6 +435,8 @@ def call_with_budget(
                 except Exception:                # already closed / read-only buffer / etc.
                     pass
     logger.warning("[%s] exhausted attempts/budget — last_err=%s", call_label, last_err)
+    if error_sink is not None and last_err is not None:
+        error_sink.append(last_err)
     return None
 
 

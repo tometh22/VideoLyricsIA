@@ -7972,6 +7972,7 @@ async def _run_transcription_for_job(
             out["_recognition_attempt_count"] = recognition_snapshot[
                 "completed_attempt_count"
             ]
+            out["_vocal_window_outcomes"] = recognition_snapshot.get("window_outcomes") or []
 
             # Language + discrepancy are evaluated at the same single output
             # chokepoint as timing, over the FINAL lines the operator approves,

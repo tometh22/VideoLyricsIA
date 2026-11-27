@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.225] - 2026-11-27
+
+### Fixed
+- WhisperX vocal windows rejected by Replicate (429 rate limit) or by a transient network error are retried on WhisperX after the wait the provider asks for, up to 5 attempts within the song's time budget, instead of falling back on the first error to whisper-1 (which invents text on singing and gives no word timing). Measured on 20 Spanish songs from audio only, with the same rules as the 68.8 baseline: words written correctly and placed within ±0.2 s went from 68.8 to 74.7 per 100 sung; invented words from 283 to 189.
+
+### Added
+- Every vocal window records what happened (attempts, errors, detected language and its confidence, whether a fallback was used, and whether Genly accepted, found no voice or could not transcribe it) in `transcription_quality.vocal_windows`.
+- A window with voice that ends without any transcription is a critical `incomplete_transcription` review window: the song can never be a quality `pass` or a shadow auto-approval, and the editor shows the untranscribed seconds with a button to jump to each, in observe and enforce modes.
 ## [1.1.223] - 2026-11-26
 
 ### Changed
