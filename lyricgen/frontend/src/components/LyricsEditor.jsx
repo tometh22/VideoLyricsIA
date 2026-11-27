@@ -331,6 +331,30 @@ function normalizeUnsafeWindows(quality) {
   return [...byId.values()].sort((a, b) => a.start - b.start || a.end - b.end);
 }
 
+// Vocal windows the recognizer could not transcribe (provider kept rejecting
+// the call, or everything heard was discarded). The editor has no row there,
+// so the row-level guidance cannot show them: surface the seconds explicitly.
+// Read from the persisted window outcomes and, defensively, from the review
+// windows, regardless of quality mode (observe/enforce).
+export function incompleteVocalWindows(quality) {
+  const fromOutcomes = Array.isArray(quality?.vocal_windows?.incomplete)
+    ? quality.vocal_windows.incomplete : [];
+  const fromWindows = Array.isArray(quality?.unsafe_windows)
+    ? quality.unsafe_windows.filter((window) => window?.reason === "vocal_window_unrecognized"
+      || (Array.isArray(window?.reasons) && window.reasons.includes("vocal_window_unrecognized")))
+    : [];
+  const seen = new Set();
+  return [...fromOutcomes, ...fromWindows].flatMap((window) => {
+    const start = Number(window?.start);
+    const end = Number(window?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+    const key = `${start.toFixed(2)}-${end.toFixed(2)}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ start, end }];
+  }).sort((a, b) => a.start - b.start);
+}
+
 function isTranscriptionQualityV5(quality) {
   const explicitVersions = [quality?.schema_version, quality?.version, quality?.quality_version];
   if (explicitVersions.some((value) => [5, 6].includes(Number(value)))) return true;
@@ -4244,6 +4268,10 @@ export default function LyricsEditor({
     () => normalizeUnsafeWindows(qualityRefreshPending ? null : transcriptionQuality),
     [qualityRefreshPending, transcriptionQuality],
   );
+  const incompleteWindows = useMemo(
+    () => incompleteVocalWindows(transcriptionQuality),
+    [transcriptionQuality],
+  );
   const focusedQualityReview = !requireLineReview
     && transcriptionQuality?.decision === "review_required"
     && isTranscriptionQualityV5(transcriptionQuality)
@@ -5330,6 +5358,28 @@ export default function LyricsEditor({
             </div>
           )}
         </details>
+      )}
+      {incompleteWindows.length > 0 && (
+        <div role="alert" data-testid="incomplete-transcription" className="mb-3 rounded-xl bg-red-500/[0.08] px-4 py-3 text-xs text-red-100 ring-1 ring-red-400/30">
+          <p className="font-semibold">
+            Transcripción incompleta: {Math.round(incompleteWindows.reduce((total, w) => total + (w.end - w.start), 0))} s con voz quedaron sin transcribir.
+          </p>
+          <p className="mt-1 leading-relaxed text-red-100/80">
+            No se pudo reconocer la letra en estos tramos. Escuchalos y escribí lo que se canta antes de aprobar; la canción no se aprueba sola mientras falten.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {incompleteWindows.map((window) => (
+              <button
+                key={`${window.start}-${window.end}`}
+                type="button"
+                onClick={() => jumpToUnsafeWindow(window)}
+                className="rounded-lg bg-white/[0.06] px-2.5 py-1 font-medium tabular-nums text-red-50 hover:bg-white/[0.12]"
+              >
+                {formatTime(window.start)}–{formatTime(window.end)}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
       {requireLineReview && (
         <details className="mb-3 rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25" data-testid="line-review-gate">

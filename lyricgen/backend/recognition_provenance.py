@@ -72,10 +72,20 @@ class RecognitionCollector:
         *,
         completed_attempt_count: int = 0,
         hypotheses: list[dict] | None = None,
+        window_outcomes: list[dict] | None = None,
     ) -> None:
         self._lock = Lock()
         self._completed_attempt_count = max(0, int(completed_attempt_count))
         self._hypotheses: list[dict] = deepcopy(hypotheses or [])
+        # What happened to each vocal recognition window (attempts, language,
+        # confidence, accepted/discarded). Operational evidence, not lyrics.
+        self._window_outcomes: list[dict] = deepcopy(window_outcomes or [])
+
+    def record_window_outcome(self, outcome: dict) -> None:
+        if not isinstance(outcome, dict):
+            return
+        with self._lock:
+            self._window_outcomes.append(deepcopy(outcome))
 
     def record_completed(
         self,
@@ -122,6 +132,7 @@ class RecognitionCollector:
                     self._hypotheses,
                     key=lambda item: int(item.get("attempt_id", -1)),
                 )),
+                "window_outcomes": deepcopy(self._window_outcomes),
             }
 
 
@@ -151,9 +162,14 @@ def resume_from_result(result: dict) -> RecognitionCollector:
     count = result.get("_recognition_attempt_count")
     if type(count) is not int:
         count = len(hypotheses)
+    outcomes = [
+        row for row in (result.get("_vocal_window_outcomes") or [])
+        if isinstance(row, dict)
+    ]
     collector = RecognitionCollector(
         completed_attempt_count=count,
         hypotheses=hypotheses,
+        window_outcomes=outcomes,
     )
     _CURRENT.set(collector)
     return collector
@@ -168,6 +184,7 @@ def snapshot_into_result(result: dict) -> dict:
     result["_recognition_attempt_count"] = snapshot[
         "completed_attempt_count"
     ]
+    result["_vocal_window_outcomes"] = snapshot["window_outcomes"]
     return result
 
 
@@ -193,3 +210,18 @@ def record_completed(
         view=view,
         transformation=transformation,
     )
+
+
+def record_window_outcome(outcome: dict) -> None:
+    collector = _CURRENT.get()
+    if collector is not None:
+        collector.record_window_outcome(outcome)
+
+
+def window_outcomes(result: dict | None = None) -> list[dict]:
+    """Outcomes from the active collector, else from a serialized result."""
+    collector = _CURRENT.get()
+    if collector is not None:
+        return collector.snapshot()["window_outcomes"]
+    return [row for row in ((result or {}).get("_vocal_window_outcomes") or [])
+            if isinstance(row, dict)]

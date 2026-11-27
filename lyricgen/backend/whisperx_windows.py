@@ -20,6 +20,47 @@ logger = logging.getLogger("genly.whisperx.windows")
 POLICY = "vocal-windows-v1"
 MAX_WINDOW_S = 26.0
 MIN_LANGUAGE_PROBABILITY = 0.60
+OUTCOME_SCHEMA = "vocal-window-outcome-v1"
+# Provider rejections (Replicate 429 while the account is rate-limited) and
+# transient network errors are retried on the SAME provider with a wait,
+# bounded by attempts and by the shared deadline. They are not silence and
+# must not be routed to the whisper-1 language fallback on the first error.
+MAX_RETRY_WAIT_S = 30.0
+_TRANSIENT_MARKERS = (
+    "429", "throttl", "rate limit", "too many requests",
+    "timed out", "timeout", "temporarily unavailable", "connection reset",
+    "connection aborted", "connection refused", "broken pipe", "reset by peer",
+    "remote end closed", "server disconnected", "readerror", "connecterror",
+    "remoteprotocolerror", "status: 502", "status: 503", "status: 504",
+)
+
+
+def max_window_attempts() -> int:
+    try:
+        return max(1, min(10, int(os.environ.get("WHISPERX_WINDOW_MAX_ATTEMPTS", "5"))))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _error_code(err) -> str:
+    text = f"{type(err).__name__} {err}".lower()
+    if "429" in text or "throttl" in text or "rate limit" in text:
+        return "rate_limited"
+    if any(marker in text for marker in _TRANSIENT_MARKERS):
+        return "transient_network"
+    return "provider_error"
+
+
+def _retry_wait_s(err, attempt: int) -> float | None:
+    """Seconds to wait before retrying `err`, or None when it is not transient.
+
+    Honours the provider's own hint ("rate limit resets in ~2s"); otherwise a
+    short exponential backoff. Always capped by MAX_RETRY_WAIT_S."""
+    if err is None or _error_code(err) == "provider_error":
+        return None
+    hint = re.search(r"resets in ~?\s*(\d+(?:\.\d+)?)\s*s", str(err), re.IGNORECASE)
+    wait = float(hint.group(1)) + 1.0 if hint else 2.0 * (2 ** max(0, attempt - 1))
+    return min(MAX_RETRY_WAIT_S, max(0.5, wait))
 _CHARACTER_LOOP = re.compile(r"([^\W\d_])\1{29,}", re.IGNORECASE)
 
 
@@ -131,7 +172,7 @@ def _independent_retry(path: str, remaining: float):
 
 def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: float) -> dict | None:
     from replicate_budget import call_with_budget
-    from recognition_provenance import record_completed
+    from recognition_provenance import record_completed, record_window_outcome
     from whisperx_transcribe import _raw_provider_segments
     from pipeline import _is_whisper_hallucination
 
@@ -152,11 +193,33 @@ def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: flo
                 "ffmpeg", "-v", "error", "-y", "-ss", str(start), "-i", audio_path,
                 "-t", str(end - start), "-ar", "16000", "-ac", "1", path,
             ], check=True, capture_output=True, timeout=min(30, remaining))
-            output = call_with_budget(
-                model, lambda: {"audio_file": open(path, "rb"), **inputs},
-                total_budget_s=max(0, deadline - time.monotonic()), backoff=[0],
-                call_label="WHISPERX",
-            )
+            outcome = {
+                "schema": OUTCOME_SCHEMA, "policy": POLICY,
+                "start": round(start, 3), "end": round(end, 3),
+                "attempts": 0, "errors": [],
+            }
+            output = None
+            for attempt in range(1, max_window_attempts() + 1):
+                errors: list = []
+                outcome["attempts"] = attempt
+                output = call_with_budget(
+                    model, lambda: {"audio_file": open(path, "rb"), **inputs},
+                    total_budget_s=max(0, deadline - time.monotonic()), backoff=[0],
+                    call_label="WHISPERX", error_sink=errors,
+                )
+                if isinstance(output, dict):
+                    break
+                err = errors[-1] if errors else None
+                outcome["errors"].append(_error_code(err) if err is not None else "empty_response")
+                wait = _retry_wait_s(err, attempt)
+                if wait is None or attempt >= max_window_attempts():
+                    break
+                if deadline - time.monotonic() <= wait + 1:
+                    outcome["errors"].append("deadline")
+                    break
+                logger.info("[WHISPERX-WINDOW] %.2f-%.2f %s — retry %s in %.1fs",
+                            start, end, outcome["errors"][-1], attempt + 1, wait)
+                time.sleep(wait)
             failed = not isinstance(output, dict)
             raw = _raw_provider_segments(output) if not failed else []
             language = output.get("detected_language") if not failed else None
@@ -170,12 +233,22 @@ def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: flo
                     transformation=f"replicate_raw:offset={start:.3f};end={end:.3f};{POLICY}",
                 )
             logger.info("[WHISPERX-WINDOW] %.2f-%.2f language=%s confidence=%s", start, end, language, probability)
+            outcome.update(
+                whisperx="failed" if failed else "succeeded",
+                language=language, language_probability=probability,
+                whisperx_rows=len(raw),
+            )
             suspicious = bool(raw) and (
                 probability is None or probability < MIN_LANGUAGE_PROBABILITY
                 or any(_is_whisper_hallucination(str(s.get("text") or "")) for s in raw)
                 or not absolute_segments(raw, start, end)
             )
             if suspicious or failed:
+                outcome["fallback_reason"] = "whisperx_failed" if failed else (
+                    "low_language_confidence"
+                    if probability is None or probability < MIN_LANGUAGE_PROBABILITY
+                    else "hallucination_or_invalid_bounds"
+                )
                 remaining = deadline - time.monotonic()
                 if remaining <= 1:
                     raise TimeoutError("WhisperX window recovery budget exhausted")
@@ -183,6 +256,8 @@ def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: flo
                     retry, retry_language = _independent_retry(path, remaining)
                 except Exception as exc:
                     raise RuntimeError("Vocal window recovery failed; refusing partial transcription") from exc
+                outcome.update(fallback="openai/whisper-1", fallback_language=retry_language,
+                               fallback_rows=len(retry or []))
                 record_completed(
                     family="openai/whisper-1", events=retry, view="bounded_vocal_window",
                     transformation=f"language_retry_raw:offset={start:.3f};end={end:.3f};language={retry_language}",
@@ -196,13 +271,58 @@ def transcribe_windows(audio_path: str, model: str, payload: dict, budget_s: flo
                     )):
                         raise RuntimeError("Vocal window recovery produced a repetition loop; refusing partial transcription")
                     logger.warning("[WHISPERX-WINDOW] structurally invalid retry at %.2f-%.2f; keeping timed evidence", start, end)
+                    outcome["source"] = "whisperx_kept_over_looping_fallback"
                 else:
                     raw = retry
+                    outcome["source"] = "whisper-1"
+            else:
+                outcome["source"] = "whisperx"
             # Credits generated on silence are not lyrics. Empty neural-VAD
             # windows are legitimate; transport errors above are not silence.
+            before_filter = len(raw)
             raw = [s for s in raw if not _is_whisper_hallucination(str(s.get("text") or ""))]
-            combined.extend(absolute_segments(raw, start, end))
+            accepted = absolute_segments(raw, start, end)
+            combined.extend(accepted)
+            outcome["hallucinations_discarded"] = before_filter - len(raw)
+            outcome["accepted_rows"] = len(accepted)
+            outcome["decision"] = _window_decision(outcome)
+            record_window_outcome(outcome)
     return {"segments": combined, "_windowed": True}
+
+
+def _window_decision(outcome: dict) -> str:
+    """accepted / no_voice / unrecognized.
+
+    A window is `unrecognized` (an incomplete transcription) when nothing
+    usable came back although the provider never confirmed silence: WhisperX
+    failed after its retries, or every row heard was discarded. A successful
+    WhisperX call with no rows is the provider's VAD saying there is no voice.
+    """
+    if int(outcome.get("accepted_rows") or 0) > 0:
+        return "accepted"
+    if outcome.get("whisperx") == "succeeded" and not int(outcome.get("whisperx_rows") or 0):
+        return "no_voice"
+    return "unrecognized"
+
+
+def unrecognized_windows(outcomes) -> list[dict]:
+    """Review windows for vocal windows that ended without any transcription."""
+    rows = []
+    for item in outcomes or []:
+        if not isinstance(item, dict) or item.get("decision") != "unrecognized":
+            continue
+        try:
+            start, end = float(item["start"]), float(item["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            rows.append({
+                "start": round(start, 3), "end": round(end, 3),
+                "reason": "vocal_window_unrecognized",
+                "attempts": int(item.get("attempts") or 0),
+                "errors": list(item.get("errors") or [])[:10],
+            })
+    return rows
 
 
 def recover_reference_conflict(audio_path: str, segments: list[dict], reference: str,

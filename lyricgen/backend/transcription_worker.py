@@ -884,6 +884,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_reference_line_contract", None)
             r.pop("_recognition_hypotheses", None)
             r.pop("_recognition_attempt_count", None)
+            r.pop("_vocal_window_outcomes", None)
             r.pop("_reconcile_capture", None)
             r.pop("_pipeline_observation", None)
             r.pop("_primary_asr_family", None)
@@ -1548,6 +1549,19 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         )
     post = r.get("postpass_stats") or {}
     windows = post.get("quality_windows") or []
+    # Vocal windows that ended without any transcription are review windows
+    # in their own right: the editor has no row there, so row-level checks
+    # cannot see them. Added after the bounded retry on purpose (no new paid
+    # recovery calls), and kept in transcription_quality for the editor.
+    from recognition_provenance import window_outcomes as _window_outcomes
+    from whisperx_windows import unrecognized_windows as _unrecognized_windows
+    vocal_outcomes = _window_outcomes(r)
+    incomplete_windows = _unrecognized_windows(vocal_outcomes)
+    if incomplete_windows:
+        windows = [*windows, *incomplete_windows]
+        logger.warning("[WHISPERX-WINDOW] incomplete transcription: %d window(s), %.1fs job=%s",
+                       len(incomplete_windows),
+                       sum(w["end"] - w["start"] for w in incomplete_windows), job_id)
 
     diagnostics = retry_stats.get("structural_hybrid_diagnostics") or []
     acoustic_evidence = diagnostics[-1].get("evidence") if diagnostics else None
@@ -1562,6 +1576,16 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         acoustic_evidence=_sanitize_analytical_evidence(acoustic_evidence),
         reference_attestation=r.get("reference_attestation"),
     )
+    if vocal_outcomes:
+        final["vocal_windows"] = {
+            "schema": "vocal-window-outcomes-v1",
+            "windows": vocal_outcomes[:200],
+            "incomplete": incomplete_windows,
+            "incomplete_seconds": round(sum(
+                w["end"] - w["start"] for w in incomplete_windows), 3),
+            "retried_windows": sum(
+                1 for w in vocal_outcomes if int(w.get("attempts") or 0) > 1),
+        }
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
     final["evaluated_revision"] = 0
@@ -1688,6 +1712,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_transcription_source", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
+    r.pop("_vocal_window_outcomes", None)
     r.pop("_reconcile_capture", None)
     r.pop("_pipeline_observation", None)
     r.pop("_primary_asr_family", None)

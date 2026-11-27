@@ -861,6 +861,23 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         for reason in reasons
     ):
         add("unsafe_windows_pending_review", "critical", len(unsafe_windows), 30)
+    # A vocal window that ended with no transcription at all (the provider kept
+    # rejecting it, or everything heard was discarded) means the editor may be
+    # missing a whole verse. Never let that pass as a complete song.
+    unrecognized = [
+        window for window in unsafe_windows
+        if isinstance(window, dict) and (
+            window.get("reason") == "vocal_window_unrecognized"
+            or "vocal_window_unrecognized" in (window.get("reasons") or [])
+        )
+    ]
+    if unrecognized:
+        add(
+            "incomplete_transcription", "critical",
+            round(sum(max(0.0, _f(w.get("end")) - _f(w.get("start")))
+                      for w in unrecognized), 2),
+            45,
+        )
 
     # Capture the counterfactual shadow decision *before* the rollout
     # calibration blocker is added. This lets us measure what the candidate
@@ -869,7 +886,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
     ineligible_codes = {
         "quality_evidence_unavailable", "quality_retry_failed",
         "quality_windows_unprocessed", "quality_windows_truncated",
-        "acoustic_structure_unavailable",
+        "acoustic_structure_unavailable", "incomplete_transcription",
     }
     shadow_eligible = not any(
         reason["code"] in ineligible_codes for reason in reasons
