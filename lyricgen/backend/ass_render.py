@@ -636,8 +636,9 @@ def title_card_lines(
         # the song floated a whole line away from the artist.
         try:
             import lyric_looks as _L
-            paths = [artist_font_path if is_artist else lyric_font_path
-                     for (_t, _s, _f, is_artist, _o, _n) in stack]
+            # The stack is artist→song, or song→artist when poster=True.
+            paths = ([lyric_font_path, artist_font_path] if poster
+                     else [artist_font_path, lyric_font_path])
             if all(paths):
                 ink = []
                 for (_t, size, _f, _b, _o, nlines), path in zip(stack, paths):
@@ -649,6 +650,7 @@ def title_card_lines(
     total_h = sum(line_hs) + gap * (len(stack) - 1)
 
     if ink is not None:
+        # Gap scales with the smaller (second) row's cap height.
         gap = COMPACT_TITLE_GAP * ink[1][1]
         line_hs = [h for h, _c, _a, _s in ink]
         total_h = sum(line_hs) + gap
