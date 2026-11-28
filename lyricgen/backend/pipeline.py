@@ -19140,7 +19140,10 @@ def _render_lyrics_ass(
             song_lines=(title_song_break.split("\n") if title_song_break else None),
             # No look: the poster hierarchy (song leads, artist in spaced
             # caps), like the thumbnail — never the generic card.
-            poster=look is None,
+            # Song first, artist under it — the way lyric-video covers are set
+            # (Tomás, 26-nov, after comparing references), with or without a look.
+            poster=True,
+            compact=look is not None,
         )
         from lyric_overlay import compose_lyric_overlay
         ass_doc = compose_lyric_overlay(

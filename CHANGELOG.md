@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.224] - 2026-11-26
+
+### Changed
+- Lyric-look title cards are 50 % larger and set the song right under the artist, laid out by the letters' real height so display faces no longer leave a line of air between them.
+
 ## [1.1.223] - 2026-11-26
 
 ### Changed

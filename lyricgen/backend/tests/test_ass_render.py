@@ -981,3 +981,35 @@ def test_poster_title_card_leads_with_the_song_and_spaces_the_artist():
         assert "\\fsp" in doc
     classic = title_card_lines("Charly García", "Happy And Real", 12.0, **kw)
     assert classic[0].text == "CHARLY GARCÍA" and all(not l.spacing for l in classic)
+
+
+def test_look_title_card_is_larger_and_keeps_the_song_under_the_artist():
+    # Tomás, 26-nov (Golpe on "Hecho En Buenos Aires"): less space between the
+    # artist and the song, and a bit larger.
+    import os
+    from ass_render import title_card_lines
+    fonts = os.path.join(os.path.dirname(__file__), "..", "fonts")
+    bungee = os.path.join(fonts, "Bungee-Regular.ttf")
+    kw = dict(width=1280, height=720, text_scale=720 / 1080, lyric_font_family="Bungee",
+              artist_font_family="Bungee", lyric_font_path=bungee, artist_font_path=bungee)
+    old = title_card_lines("Bersuit Vergarabat", "Hecho En Buenos Aires", 12.78, **kw)
+    new = title_card_lines("Bersuit Vergarabat", "Hecho En Buenos Aires", 12.78, compact=True, **kw)
+    assert new[0].fontsize > old[0].fontsize and new[1].fontsize > old[1].fontsize
+    assert (new[1].pos[1] - new[0].pos[1]) < (old[1].pos[1] - old[0].pos[1])
+    assert new[0].text == "BERSUIT VERGARABAT" and new[0].pos[1] < new[1].pos[1]
+
+
+def test_look_title_card_can_lead_with_the_song():
+    # With a look the card is poster-ordered too: song first in the look's
+    # main face, artist under it in its display face, tightly spaced.
+    import os
+    from ass_render import title_card_lines
+    fonts = os.path.join(os.path.dirname(__file__), "..", "fonts")
+    oswald, knewave = (os.path.join(fonts, f) for f in ("Oswald-Bold.ttf", "Knewave-Regular.ttf"))
+    lines = title_card_lines("Los Enanitos Verdes", "Amigos", 12.0, width=1280, height=720,
+                             text_scale=720 / 1080, lyric_font_family="Oswald", artist_font_family="Knewave",
+                             lyric_font_path=oswald, artist_font_path=knewave, poster=True, compact=True)
+    song, artist = lines
+    assert song.text == "AMIGOS" and song.font_name == "Oswald"
+    assert artist.text == "LOS ENANITOS VERDES" and artist.font_name == "Knewave"
+    assert song.pos[1] < artist.pos[1] and song.fontsize > artist.fontsize

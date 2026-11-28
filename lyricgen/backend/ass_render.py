@@ -437,6 +437,10 @@ def title_card_layout(template: str, has_long_intro: bool, *,
     }
 
 
+COMPACT_TITLE_GROW = 1.5    # lyric-look card: 50 % larger
+COMPACT_TITLE_GAP = 0.55    # gap between artist and song, x the song's cap height
+
+
 def title_card_lines(
     artist: str,
     song: str,
@@ -463,6 +467,9 @@ def title_card_lines(
     # smaller, in spaced capitals — the same hierarchy as the poster
     # thumbnail (thumbnail_poster). False keeps the artist-over-song card.
     poster: bool = False,
+    # Lyric-look card (Tomás, 26-nov): a bit larger, with the song tucked
+    # right under the artist instead of floating a line away from it.
+    compact: bool = False,
 ) -> list[AssLine]:
     """Build the artist/song title-card overlay as ASS lines, mirroring the
     moviepy title card (pipeline.generate_lyric_video) so the look matches
@@ -501,8 +508,9 @@ def title_card_lines(
     # length → sizes/alignment/anchor/width/opacity. Shared with the moviepy
     # fallback via title_card_layout so the two engines stay in lockstep.
     L = title_card_layout(template, has_long_intro, size_multiplier=size_multiplier)
-    artist_size = max(L["floor_artist"], int(round(L["artist_base"] * text_scale)))
-    title_size = max(L["floor_title"], int(round(L["title_base"] * text_scale)))
+    grow = COMPACT_TITLE_GROW if compact else 1.0
+    artist_size = max(L["floor_artist"], int(round(L["artist_base"] * text_scale * grow)))
+    title_size = max(L["floor_title"], int(round(L["title_base"] * text_scale * grow)))
     alignment = L["alignment"]
     op_artist, op_song = L["op_artist"], L["op_song"]
     card_w_frac = L["card_w_frac"]
@@ -527,8 +535,18 @@ def title_card_lines(
     max_w = width * card_w_frac
 
     def _fit(text: str, base: int, font_path):
+        limit = max_w
+        if compact and font_path:
+            # fit_title_text measures with PIL at `base` em, but libass sizes
+            # \fs by the face's ascent+descent: wide display faces (Bungee)
+            # were shrunk though they fit. Convert to libass pixels.
+            try:
+                import lyric_looks as _L
+                limit = max_w / max(0.2, _L._em_per_fs(font_path))
+            except Exception:
+                limit = max_w
         return fit_title_text(
-            text, font_path, base, max_w, max(16, int(round(base * 0.62))),
+            text, font_path, base, limit, max(16, int(round(base * 0.62))),
         )
 
     # Stack the present lines and compute each one's vertical CENTER as a
@@ -611,8 +629,31 @@ def title_card_lines(
 
     line_hs = [1.2 * size * nlines for _, size, _, _, _, nlines in stack]
     gap = 8.0
+    ink = None
+    if compact and len(stack) == 2:
+        # Lay the rows out by the letters' real height, not the font's line
+        # box: display faces (Bungee, Metal Mania…) carry so much air that
+        # the song floated a whole line away from the artist.
+        try:
+            import lyric_looks as _L
+            # The stack is artist→song, or song→artist when poster=True.
+            paths = ([lyric_font_path, artist_font_path] if poster
+                     else [artist_font_path, lyric_font_path])
+            if all(paths):
+                ink = []
+                for (_t, size, _f, _b, _o, nlines), path in zip(stack, paths):
+                    cap = _L.cap_per_fs(path) * size
+                    asc = _L._asc_ratio(path) * size
+                    ink.append((cap * nlines + 0.45 * size * (nlines - 1), cap, asc, size))
+        except Exception:  # metrics unavailable → historical spacing
+            ink = None
     total_h = sum(line_hs) + gap * (len(stack) - 1)
 
+    if ink is not None:
+        # Gap scales with the smaller (second) row's cap height.
+        gap = COMPACT_TITLE_GAP * ink[1][1]
+        line_hs = [h for h, _c, _a, _s in ink]
+        total_h = sum(line_hs) + gap
     anchor = L["anchor"]
     if anchor == "center":
         top = (height - total_h) / 2.0
@@ -629,8 +670,13 @@ def title_card_lines(
     cursor = top
     fade_in_ms = int(round(fade_in * 1000))
     fade_out_ms = int(round(fade_out * 1000))
-    for (txt, size, fam, bold, opacity, _nlines), lh, spacing in zip(stack, line_hs, spacings):
+    for i_row, ((txt, size, fam, bold, opacity, _nlines), lh, spacing) in enumerate(zip(stack, line_hs, spacings)):
         center_y = cursor + lh / 2.0
+        if ink is not None:
+            # \an5 centres the line box; shift it so the letters' ink is
+            # centred on center_y (same as lyric_looks._cap_center).
+            _h, cap, asc, fsz = ink[i_row]
+            center_y += (cap + (fsz - asc) - asc) / 2.0
         lines.append(AssLine(
             text=txt,
             start_s=START_T,
