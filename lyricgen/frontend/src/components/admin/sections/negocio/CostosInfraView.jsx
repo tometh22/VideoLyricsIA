@@ -6,11 +6,19 @@
 // factura puede hacer; éste es la verdad pero no se desagrega.
 //
 // LA REGLA VISUAL DE ESTA PANTALLA
-// Un día que el proveedor no contestó se dibuja idéntico a un día barato.
-// Por eso la cobertura no es un detalle al pie: cuando faltan celdas, el
-// total se rotula como PISO y el banner dice exactamente qué falta. Si esa
-// distinción no se ve, el panel es peor que no tener panel — que es
-// literalmente el requisito con el que se pidió.
+// Un día que el proveedor no contestó, en el GRÁFICO, se dibuja idéntico
+// a un día barato: una barra necesita un número. Por eso la cobertura no
+// es un detalle al pie: cuando faltan celdas, el total del rango se
+// rotula como PISO y el banner dice exactamente qué falta.
+//
+// La tabla diaria no puede heredar ese cero. `coverage.missing` lista los
+// (día, fuente) sin recolectar y `series[].by` sólo trae filas que existen.
+// Sin fila y en `missing` → "Pendiente". Con fila, aunque el importe sea
+// 0 → el importe. Sin fila y sin hueco — las suscripciones son un hecho
+// mensual el día 1; el colector marca el resto del mes como cubierto a
+// propósito — → $0.00, no Pendiente. El total de un día con algún hueco
+// se rotula "subtotal registrado". El número no cambia: sigue siendo la
+// suma de lo recolectado, el mismo piso de siempre.
 import { useMemo, useState } from "react";
 
 import {
@@ -48,6 +56,12 @@ const ETIQUETA_FUENTE = {
   gcp: "Google Vertex", railway: "Railway", r2: "Cloudflare R2",
   openai: "OpenAI", replicate: "Replicate", fixed: "Suscripciones",
 };
+
+// Mismo orden que `cost_series.SOURCES`. Sirve para ubicar, al final de la
+// tabla, una fuente que el rango no sumó (no está en `by_group`) pero que
+// igual hay que mostrar: OpenAI siempre, y cualquiera que la cobertura
+// marque como hueco. No se cicla ni se usa para colorear.
+const ORDEN_FUENTES = ["gcp", "railway", "r2", "openai", "replicate", "fixed"];
 const ETIQUETA_COMPORTAMIENTO = {
   fijo: "Fijo (capacidad)", variable: "Variable (por video)",
   stock: "Stock (acumulado)", sin_clasificar: "Sin clasificar",
@@ -58,6 +72,68 @@ function nombre(grupo, groupBy) {
   if (groupBy === "source") return ETIQUETA_FUENTE[grupo] || grupo;
   if (groupBy === "behavior") return ETIQUETA_COMPORTAMIENTO[grupo] || grupo;
   return grupo;
+}
+
+/** (día → fuentes sin recolectar), leído de `coverage.missing`.
+ *
+ * El importe no entra en esta decisión: un 0 recolectado no está en
+ * `missing`, y un hueco no trae fila. La lista viene cortada a 200 en el
+ * backend; un mes (≤186 celdas) entra entero. */
+function huecosPorDia(coverage) {
+  const map = new Map();
+  for (const m of coverage?.missing || []) {
+    if (!m?.day || !m?.source) continue;
+    let set = map.get(m.day);
+    if (!set) {
+      set = new Set();
+      map.set(m.day, set);
+    }
+    set.add(m.source);
+  }
+  return map;
+}
+
+/** Columnas de la tabla. El gráfico sigue usando `grupos` (sólo lo que
+ *  tuvo importe). Acá, con el corte por proveedor, OpenAI no puede
+ *  desaparecer porque el rango no lo sumó, y una fuente que sólo existe
+ *  como hueco tiene que tener columna para poder decir "Pendiente". */
+function columnasDeTabla(grupos, groupBy, coverage) {
+  if (groupBy !== "source") return grupos;
+  const base = grupos.filter((g) => g !== OTROS);
+  const tengo = new Set(base);
+  const pedidas = new Set(["openai"]);
+  for (const m of coverage?.missing || []) {
+    if (m?.source) pedidas.add(m.source);
+  }
+  const extras = ORDEN_FUENTES.filter((s) => pedidas.has(s) && !tengo.has(s));
+  for (const s of pedidas) {
+    if (!tengo.has(s) && !extras.includes(s)) extras.push(s);
+  }
+  return [...base, ...extras, ...(grupos.includes(OTROS) ? [OTROS] : [])];
+}
+
+/** Una celda es "Pendiente" sólo si no hay fila Y la cobertura marca ese
+ *  día×fuente como no recolectado. Una fila con importe 0 es un cero
+ *  confirmado. Sin fila y sin hueco (suscripción mensual, día ≠ 1) es
+ *  $0.00: el colector ya cubrió ese día a propósito.
+ *
+ *  Sólo en grano día y corte por proveedor. La cobertura habla de
+ *  (día, fuente); en semana/mes o por SKU el bucket no es esa celda. */
+function celdaPendiente(by, bucket, fuente, huecos, groupBy, granularity) {
+  if (fuente === OTROS) return false;
+  if (groupBy !== "source" || granularity !== "day") return false;
+  if (by && Object.prototype.hasOwnProperty.call(by, fuente)) return false;
+  return huecos.get(bucket)?.has(fuente) === true;
+}
+
+function montoCelda(by, fuente, plegados) {
+  if (fuente === OTROS) {
+    return plegados.reduce((a, p) => a + (Number(by?.[p]) || 0), 0);
+  }
+  if (by && Object.prototype.hasOwnProperty.call(by, fuente)) {
+    return Number(by[fuente]) || 0;
+  }
+  return 0;
 }
 
 function TooltipCosto({ active, payload, label, groupBy }) {
@@ -182,6 +258,9 @@ export default function CostosInfraView({
   }, [data]);
 
   // Recharts quiere un objeto plano por bucket con una clave por serie.
+  // El `?? 0` es del gráfico: una barra no puede dibujar "falta el dato".
+  // La tabla NO lee estos ceros; mira si la fila existe y qué dice la
+  // cobertura (ver `celdaPendiente`).
   const datosGrafico = useMemo(() => (data?.series || []).map((b) => {
     const fila = { bucket: b.bucket };
     for (const g of grupos) {
@@ -191,6 +270,12 @@ export default function CostosInfraView({
     }
     return fila;
   }), [data, grupos, plegados]);
+
+  const huecos = useMemo(() => huecosPorDia(data?.coverage), [data]);
+  const columnasTabla = useMemo(
+    () => columnasDeTabla(grupos, groupBy, data?.coverage),
+    [grupos, groupBy, data],
+  );
 
   const totalPorGrupo = useMemo(() => Object.fromEntries(grupos.map((g) => [
     g,
@@ -281,20 +366,38 @@ export default function CostosInfraView({
             <DataTable
               dense
               rowKey={(r) => r.bucket}
-              rows={datosGrafico}
+              rows={data?.series || []}
               columns={[
                 { key: "bucket", header: granularity === "month" ? "Mes" : "Desde" },
-                ...grupos.map((g) => ({
+                ...columnasTabla.map((g) => ({
                   key: g, header: nombre(g, groupBy), align: "right",
-                  render: (r) => <span className="tabular-nums">{fmtMoney(r[g])}</span>,
+                  render: (r) => (
+                    celdaPendiente(r.by, r.bucket, g, huecos, groupBy, granularity)
+                      ? <span className="text-[#F5A524]">Pendiente</span>
+                      : <span className="tabular-nums">{fmtMoney(montoCelda(r.by, g, plegados))}</span>
+                  ),
                 })),
                 {
                   key: "_t", header: "Total", align: "right",
-                  render: (r) => (
-                    <span className="tabular-nums font-semibold">
-                      {fmtMoney(grupos.reduce((a, g) => a + (r[g] || 0), 0))}
-                    </span>
-                  ),
+                  render: (r) => {
+                    // Misma suma de antes: un hueco aporta 0, no se inventa
+                    // gasto. Lo que cambia es el rótulo cuando el día no
+                    // está completo.
+                    const monto = columnasTabla.reduce(
+                      (a, g) => a + montoCelda(r.by, g, plegados), 0);
+                    const incompletoDia = groupBy === "source" && granularity === "day"
+                      && (huecos.get(r.bucket)?.size > 0);
+                    return (
+                      <span className="tabular-nums">
+                        <span className="font-semibold">{fmtMoney(monto)}</span>
+                        {incompletoDia && (
+                          <span className="mt-0.5 block text-label font-normal text-[#F5A524]">
+                            subtotal registrado
+                          </span>
+                        )}
+                      </span>
+                    );
+                  },
                 },
               ]}
             />
