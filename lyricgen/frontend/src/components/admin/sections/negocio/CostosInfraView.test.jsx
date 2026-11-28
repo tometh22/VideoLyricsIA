@@ -9,7 +9,7 @@
  * idéntico a un día barato — y el panel muestra una caída que parece una
  * buena noticia.
  */
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AdminProvider } from "../../AdminContext";
@@ -204,5 +204,103 @@ describe("una fuente que contesta ok pero devuelve cero", () => {
   it("no dice nada cuando ninguna fuente está sospechosa", () => {
     montar({ stale_sources: [] });
     expect(screen.queryByText(/contestó bien pero devolvió cero/i)).toBeNull();
+  });
+});
+
+// Espejo del 2026-11-27 en staging: railway / r2 / replicate tienen fila;
+// gcp y openai están `not_configured` (no hay fila). `fixed` es un hecho
+// mensual el día 1 ($24) y el colector marca el resto del mes como
+// cubierto, así que esos días no son huecos.
+const DIA_FIJO = "2026-11-01";
+const DIA_CERO = "2026-11-26";
+const DIA_HUECO = "2026-11-27";
+
+function tablaEvolucion() {
+  fireEvent.click(screen.getByRole("button", { name: "Ver como tabla" }));
+  const card = screen.getByRole("button", { name: "Ver gráfico" }).closest(".glass");
+  const tabla = card.querySelector("table");
+  const headers = [...tabla.querySelectorAll("thead th")].map((th) => th.textContent.trim());
+  const fila = (dia) => {
+    const tr = [...tabla.querySelectorAll("tbody tr")]
+      .find((r) => r.querySelector("td")?.textContent.trim() === dia);
+    const celdas = [...tr.querySelectorAll("td")];
+    return (nombre) => celdas[headers.indexOf(nombre)].textContent;
+  };
+  return { headers, fila };
+}
+
+describe("tabla diaria por proveedor: hueco ≠ cero", () => {
+  const data = {
+    since: "2026-11-01", until: DIA_HUECO,
+    granularity: "day", group_by: "source",
+    // El piso del rango no se recalcula en el cliente. La tabla sólo
+    // rotula; este número tiene que seguir saliendo igual.
+    total_usd: 50.2777,
+    by_group: {
+      fixed: 24, railway: 16.3772, r2: 5.0693, gcp: 3, replicate: 1.8312,
+    },
+    series: [
+      {
+        bucket: DIA_FIJO, total: 29.5,
+        by: { fixed: 24, railway: 1, r2: 1, gcp: 3, replicate: 0.5 },
+      },
+      {
+        bucket: DIA_CERO, total: 0,
+        // Ceros confirmados: hay fila y la cobertura no los lista.
+        by: { railway: 0, r2: 0, gcp: 0, replicate: 0, openai: 0 },
+      },
+      {
+        bucket: DIA_HUECO, total: 20.7777,
+        by: { railway: 15.3772, r2: 4.0693, replicate: 1.3312 },
+      },
+    ],
+    invoiced_usd: 0, estimated_usd: 50.2777, estimated_share: 1,
+    coverage: {
+      expected_cells: 162, collected_cells: 159, complete: false,
+      missing_total: 3,
+      missing: [
+        { day: DIA_FIJO, source: "openai", status: "not_configured" },
+        { day: DIA_HUECO, source: "gcp", status: "not_configured" },
+        { day: DIA_HUECO, source: "openai", status: "not_configured" },
+      ],
+    },
+  };
+
+  it("dice Pendiente en el hueco, $0.00 en el cero confirmado y subtotal en el día incompleto", () => {
+    montar(data);
+    // El banner y el KPI de piso siguen siendo los de siempre.
+    expect(screen.getByText(/el total es un piso, no el total/i)).toBeTruthy();
+    expect(screen.getByText(/total \(piso\)/i)).toBeTruthy();
+    // total_usd y estimated_usd salen los dos por fmtMoney; no se recalculan.
+    expect(screen.getAllByText("$50.28").length).toBeGreaterThan(0);
+
+    const { headers, fila } = tablaEvolucion();
+    // OpenAI no tiene importe en `by_group` y aun así es columna.
+    expect(headers).toContain("OpenAI");
+
+    const hueco = fila(DIA_HUECO);
+    expect(hueco("Google Vertex")).toBe("Pendiente");
+    expect(hueco("OpenAI")).toBe("Pendiente");
+    expect(hueco("Railway")).toBe("$15.38");
+    expect(hueco("Cloudflare R2")).toBe("$4.07");
+    expect(hueco("Replicate")).toBe("$1.33");
+    // 15.3772 + 4.0693 + 1.3312 = 20.7777 → $20.78. fixed no tiene fila
+    // ese día y la cobertura no lo marca: es $0.00, no Pendiente.
+    expect(hueco("Suscripciones")).toBe("$0.00");
+    expect(hueco("Suscripciones")).not.toContain("Pendiente");
+    expect(hueco("Total")).toContain("$20.78");
+    expect(hueco("Total")).toContain("subtotal registrado");
+
+    const cero = fila(DIA_CERO);
+    expect(cero("Google Vertex")).toBe("$0.00");
+    expect(cero("OpenAI")).toBe("$0.00");
+    expect(cero("Google Vertex")).not.toContain("Pendiente");
+    expect(cero("Suscripciones")).toBe("$0.00");
+    expect(cero("Total")).not.toContain("subtotal registrado");
+
+    const fijo = fila(DIA_FIJO);
+    expect(fijo("Suscripciones")).toBe("$24.00");
+    expect(fijo("Suscripciones")).not.toContain("Pendiente");
+    expect(fijo("OpenAI")).toBe("Pendiente");
   });
 });
